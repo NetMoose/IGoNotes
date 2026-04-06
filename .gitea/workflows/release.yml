@@ -1,16 +1,16 @@
+version: "1"
 name: Release
-
 on:
   push:
-    branches: [master]
-
+    branches:
+      - master
 jobs:
   release:
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.21'
@@ -19,8 +19,7 @@ jobs:
         run: go build -o igonotes cmd/api/main.go
 
       - name: Release
-        uses: softprops/action-gh-release@v1
-        if: github.ref == 'refs/heads/master'
+        uses: go-gitea/act-gitea-release@main
         with:
           files: igonotes
           generate_release_notes: true
