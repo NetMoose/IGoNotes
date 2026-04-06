@@ -1,0 +1,36 @@
+title: IGoNotes
+email: contact@igonotes.dev
+description: >-
+  Редактор заметок на Go
+baseurl: 
+url: "https://gitverse.ru/IGoNotes/pages"
+twitter_username: igonotes_dev
+github_username: igonotes
+
+# Тема
+remote_theme: jekyll-theme-minimal
+
+# Посты
+collections:
+  docs:
+    output: true
+    permalink: /:collection/:path/
+
+# Сборка
+markdown: kramdown
+theme: jekyll-theme-minimal
+plugins:
+  - jekyll-remote-theme
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor
+  - go.mod
+  - go.sum
+  - cmd/
+  - internal/
+  - web/
+  - docs/
+  - .github/
