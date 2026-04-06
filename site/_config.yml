@@ -19,8 +19,8 @@ collections:
 # Сборка
 markdown: kramdown
 theme: jekyll-theme-minimal
-plugins:
-  - jekyll-remote-theme
+# plugins:
+#   - jekyll-remote-theme
 
 exclude:
   - Gemfile
