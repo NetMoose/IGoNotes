@@ -2,13 +2,14 @@ title: IGoNotes
 email: contact@igonotes.dev
 description: >-
   Редактор заметок на Go
-baseurl: 
-url: "https://gitverse.ru/IGoNotes/pages"
+baseurl: /igonotes
+url: "https://netmoose.gitverse.site"
 twitter_username: igonotes_dev
 github_username: igonotes
 
 # Тема
-remote_theme: jekyll-theme-minimal
+# Используем встроенную минималистичную тему без необходимости в sass
+theme: minima
 
 # Посты
 collections:
@@ -18,9 +19,6 @@ collections:
 
 # Сборка
 markdown: kramdown
-theme: jekyll-theme-minimal
-plugins:
-  - jekyll-remote-theme
 
 exclude:
   - Gemfile
@@ -32,5 +30,4 @@ exclude:
   - cmd/
   - internal/
   - web/
-  - docs/
   - .github/

@@ -27,8 +27,8 @@ igonotes start
 
 ## Документация
 
-- [Пользовательское руководство](/docs/user.html)
-- [Разработчикам](/docs/developer.html)
-- [API](/docs/api.html)
+- [Пользовательское руководство]({{ site.baseurl }}/docs/user.html)
+- [Разработчикам]({{ site.baseurl }}/docs/developer.html)
+- [API]({{ site.baseurl }}/docs/api.html)
 
 Создано с ❤️ на Go.
