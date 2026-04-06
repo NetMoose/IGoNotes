@@ -8,7 +8,8 @@ twitter_username: igonotes_dev
 github_username: igonotes
 
 # Тема
-remote_theme: jekyll-theme-minimal
+# Используем встроенную минималистичную тему без необходимости в sass
+theme: minima
 
 # Посты
 collections:
@@ -18,9 +19,6 @@ collections:
 
 # Сборка
 markdown: kramdown
-theme: jekyll-theme-minimal
-# plugins:
-#   - jekyll-remote-theme
 
 exclude:
   - Gemfile
