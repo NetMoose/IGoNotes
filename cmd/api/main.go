@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"IGoNotes/internal/handlers"
 	"IGoNotes/internal/service"
 )
 
@@ -25,6 +26,11 @@ func main() {
 	configService := service.NewConfigService(configFile)
 	noteService := service.NewNoteService()
 
+	// Создаем обработчики
+	noteHandler := handlers.NewNoteHandler(noteService)
+	configHandler := handlers.NewConfigHandler(configService)
+	staticHandler := handlers.NewStaticHandler("web/static/")
+
 	// Проверяем, существует ли конфигурация
 	if !configService.Exists() {
 		log.Println("Конфигурация не найдена. Запуск мастера настройки...")
@@ -32,27 +38,25 @@ func main() {
 	}
 
 	// Маршрутизация
-	http.HandleFunc("/api/notes", noteService.GetNotes)
-	http.HandleFunc("/api/note", noteService.GetNote)
-	http.HandleFunc("/api/save", noteService.SaveNote)
+	http.HandleFunc("/api/notes", noteHandler.GetNotes)
+	http.HandleFunc("/api/note", noteHandler.GetNote)
+	http.HandleFunc("/api/save", noteHandler.SaveNote)
 
-	// Статические файлы
-	fs := http.FileServer(http.Dir("web/static/"))
-	http.Handle("/static/", http.StripPrefix("/static/", fs))
+	// Обработчик для статических файлов
+	http.Handle("/static/", staticHandler)
 
 	// Главная страница
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "web/templates/index.html")
-	})
+	http.HandleFunc("/", handlers.RootHandler("web/templates"))
 
 	// API для работы с конфигурацией
+	http.HandleFunc("/api/config", configHandler.SaveConfig)
+
+	// GET /api/config для получения конфигурации
 	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "PUT" {
-			// TODO: Реализовать сохранение конфигурации
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("{\"status\": \"saved\"}"))
+		if r.Method == "GET" {
+			configHandler.GetConfig(w, r)
 		} else {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			configHandler.SaveConfig(w, r)
 		}
 	})
 
