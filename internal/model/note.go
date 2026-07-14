@@ -22,6 +22,7 @@ type NoteNode struct {
 	Name     string       `json:"name"`
 	Type     string       `json:"type"` // "dir" или "file"
 	Path     string       `json:"path"`
+	ParentID string       `json:"parent_id,omitempty"` // ID родительской папки
 	Children []NoteNode   `json:"children,omitempty"`
 	Note     *NoteSummary `json:"note,omitempty"`
 }

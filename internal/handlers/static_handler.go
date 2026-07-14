@@ -1,29 +1,40 @@
 package handlers
 
 import (
+	"io/fs"
 	"net/http"
+	"strings"
 )
 
-// StaticHandler обрабатывает HTTP-запросы к статическим файлам
-type StaticHandler struct {
-	FileServer http.Handler
+// SPAHandler обрабатывает раздачу статических файлов Svelte (Vite)
+// и реализует fallback на index.html для роутинга на стороне клиента.
+type SPAHandler struct {
+	staticFS fs.FS
 }
 
-// NewStaticHandler создает новый экземпляр StaticHandler
-func NewStaticHandler(staticDir string) *StaticHandler {
-	return &StaticHandler{
-		FileServer: http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir))),
+// NewSPAHandler создает новый обработчик SPA
+func NewSPAHandler(staticFS fs.FS) *SPAHandler {
+	return &SPAHandler{staticFS: staticFS}
+}
+
+func (h *SPAHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Убираем ведущий слэш для поиска в fs.FS
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path == "" {
+		path = "index.html"
 	}
-}
 
-// ServeHTTP обрабатывает запросы к статическим файлам
-func (h *StaticHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.FileServer.ServeHTTP(w, r)
-}
-
-// RootHandler обрабатывает запросы к корню сайта
-func RootHandler(templateDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, templateDir+"/index.html")
+	// Пытаемся открыть файл
+	f, err := h.staticFS.Open(path)
+	if err == nil {
+		f.Close()
+		// Файл существует, отдаем его
+		http.FileServer(http.FS(h.staticFS)).ServeHTTP(w, r)
+		return
 	}
+
+	// Если файл не найден (например, это SPA роут типа /settings), 
+	// отдаем index.html
+	r.URL.Path = "/"
+	http.FileServer(http.FS(h.staticFS)).ServeHTTP(w, r)
 }
