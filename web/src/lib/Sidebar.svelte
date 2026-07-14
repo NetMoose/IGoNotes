@@ -7,7 +7,7 @@
   let nodes = $state([]);
   let activeId = $state(null);
   let activeName = $state(""); // имя выбранного узла для переименования
-  let activeFolderId = $state(""); // корень по умолчанию
+  let activeFolderId = $state(null); // корень по умолчанию (null вместо "")
   let isRefreshing = $state(false);
   
   // Храним ID открытых папок для восстановления после обновления дерева
@@ -76,7 +76,7 @@
       }
       activeFolderId = node.id;
     } else {
-      activeFolderId = node.parent_id || "";
+      activeFolderId = node.parent_id || null;
       if (onSelect) onSelect(node);
     }
   }
@@ -101,7 +101,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          parent_id: activeFolderId,
+          parent_id: activeFolderId || "",
           name: createName.trim(),
           type: createType
         })
@@ -121,7 +121,7 @@
             openFolders.add(node.parent_id);
             activeFolderId = node.parent_id;
           } else {
-            activeFolderId = "";
+            activeFolderId = null;
           }
 
           if (node.type === 'file' && onSelect) {
@@ -182,7 +182,7 @@
         // Если удаляем папку, её тоже надо удалить из списка открытых
         openFolders.delete(activeId);
         activeId = null;
-        activeFolderId = ""; // Сбрасываем активную папку на корень
+        activeFolderId = null; // Сбрасываем активную папку на корень
         activeName = "";
         showDeleteModal = false;
         loadTree();
@@ -195,7 +195,7 @@
   function handleContainerClick(e) {
     if (e.target === e.currentTarget) {
       activeId = null;
-      activeFolderId = "";
+      activeFolderId = null;
       activeName = "";
     }
   }
@@ -218,7 +218,7 @@
       <button onclick={() => showDeleteModal = true} disabled={!activeId} class="flex-1 text-xs bg-white border border-red-200 rounded py-1.5 text-red-600 hover:bg-red-50 disabled:opacity-50 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer">🗑️ Удал.</button>
     </div>
     {#if activeFolderId || activeId}
-      <button onclick={() => { activeId = null; activeFolderId = ""; activeName = ""; }} class="text-[11px] text-gray-500 hover:text-gray-800 text-left cursor-pointer transition-colors mt-1">
+      <button onclick={() => { activeId = null; activeFolderId = null; activeName = ""; }} class="text-[11px] text-gray-500 hover:text-gray-800 text-left cursor-pointer transition-colors mt-1">
         Сбросить выделение (в корень) ✕
       </button>
     {/if}

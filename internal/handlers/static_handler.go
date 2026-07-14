@@ -3,6 +3,7 @@ package handlers
 import (
 	"io/fs"
 	"net/http"
+	"path"
 	"strings"
 )
 
@@ -18,14 +19,20 @@ func NewSPAHandler(staticFS fs.FS) *SPAHandler {
 }
 
 func (h *SPAHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Убираем ведущий слэш для поиска в fs.FS
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	if path == "" {
-		path = "index.html"
+	// Очищаем путь
+	cleanPath := path.Clean(r.URL.Path)
+	p := strings.TrimPrefix(cleanPath, "/")
+	if p == "" {
+		p = "index.html"
+	}
+
+	if !fs.ValidPath(p) {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
 	}
 
 	// Пытаемся открыть файл
-	f, err := h.staticFS.Open(path)
+	f, err := h.staticFS.Open(p)
 	if err == nil {
 		f.Close()
 		// Файл существует, отдаем его
