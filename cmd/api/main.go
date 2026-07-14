@@ -86,6 +86,7 @@ func main() {
 	
 	http.HandleFunc("/api/save", noteHandler.SaveNote)
 	http.HandleFunc("/api/rename", noteHandler.RenameNote)
+	http.HandleFunc("/api/assets", noteHandler.UploadAsset)
 
 	// API для работы с конфигурацией
 	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,10 @@ package service
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"time"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -297,4 +300,46 @@ func (s *NoteService) RenameNode(id, newName string) error {
 
 	// Синхронизируем ФС с БД, чтобы обновились все пути (особенно важно для папок, т.к. пути детей меняются)
 	return s.SyncFS()
+}
+
+// SaveAsset сохраняет загруженный файл в директорию assets/images и возвращает его относительный путь
+func (s *NoteService) SaveAsset(file io.Reader, originalFilename string) (string, error) {
+	if s.basePath == "" {
+		return "", os.ErrNotExist
+	}
+
+	assetsDir := filepath.Join(s.basePath, "assets", "images")
+	if err := os.MkdirAll(assetsDir, 0755); err != nil {
+		return "", err
+	}
+
+	ext := filepath.Ext(originalFilename)
+	base := strings.TrimSuffix(filepath.Base(originalFilename), ext)
+	
+	// Если имя пустое (например, вставлено из буфера без имени), генерируем
+	if base == "" || base == "image" {
+		base = fmt.Sprintf("Pasted image %s", time.Now().Format("20060102150405"))
+	}
+
+	filename := base + ext
+	fullPath := filepath.Join(assetsDir, filename)
+
+	// Если файл с таким именем уже существует, добавляем таймстемп
+	if _, err := os.Stat(fullPath); err == nil {
+		filename = fmt.Sprintf("%s_%d%s", base, time.Now().Unix(), ext)
+		fullPath = filepath.Join(assetsDir, filename)
+	}
+
+	outFile, err := os.Create(fullPath)
+	if err != nil {
+		return "", err
+	}
+	defer outFile.Close()
+
+	if _, err := io.Copy(outFile, file); err != nil {
+		return "", err
+	}
+
+	// Возвращаем относительный путь
+	return filepath.Join("assets", "images", filename), nil
 }

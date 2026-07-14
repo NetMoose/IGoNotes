@@ -12,6 +12,66 @@
   let editorContainer;
   let editorView;
   let mode = $state('edit');
+  let fileInput = $state();
+
+  async function uploadImage(file, pos) {
+    if (!file.type.startsWith('image/')) return;
+    
+    const placeholder = `![[Загрузка...]]`;
+    editorView.dispatch({
+      changes: { from: pos, insert: placeholder }
+    });
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const res = await fetch('/api/assets', {
+        method: 'POST',
+        body: formData
+      });
+      if (!res.ok) throw new Error('Upload failed');
+      const data = await res.json();
+      
+      const docStr = editorView.state.doc.toString();
+      const searchIndex = docStr.indexOf(placeholder);
+      if (searchIndex !== -1) {
+        editorView.dispatch({
+          changes: {
+            from: searchIndex,
+            to: searchIndex + placeholder.length,
+            insert: `![[${data.path}]]`
+          }
+        });
+      }
+    } catch (err) {
+      console.error(err);
+      const docStr = editorView.state.doc.toString();
+      const searchIndex = docStr.indexOf(placeholder);
+      if (searchIndex !== -1) {
+        editorView.dispatch({
+          changes: {
+            from: searchIndex,
+            to: searchIndex + placeholder.length,
+            insert: `![[Ошибка загрузки]]`
+          }
+        });
+      }
+    }
+  }
+
+  function handleToolbarImage() {
+    fileInput.click();
+  }
+
+  function handleFileInput(e) {
+    const file = e.target.files?.[0];
+    if (file && editorView) {
+      const pos = editorView.state.selection.main.head;
+      uploadImage(file, pos);
+    }
+    e.target.value = '';
+  }
 
   onMount(() => {
     const state = EditorState.create({
@@ -27,6 +87,33 @@
         EditorView.theme({
           "&": { height: "100%", fontSize: "15px" },
           ".cm-scroller": { overflow: "auto" }
+        }),
+        EditorView.domEventHandlers({
+          paste(e, view) {
+            if (e.clipboardData && e.clipboardData.files && e.clipboardData.files.length > 0) {
+              const file = e.clipboardData.files[0];
+              if (file.type.startsWith('image/')) {
+                e.preventDefault();
+                uploadImage(file, view.state.selection.main.head);
+                return true;
+              }
+            }
+            return false;
+          },
+          drop(e, view) {
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+              const file = e.dataTransfer.files[0];
+              if (file.type.startsWith('image/')) {
+                e.preventDefault();
+                const pos = view.posAtCoords({x: e.clientX, y: e.clientY});
+                if (pos !== null) {
+                  uploadImage(file, pos);
+                }
+                return true;
+              }
+            }
+            return false;
+          }
         })
       ]
     });
@@ -143,17 +230,41 @@
 </script>
 
 <div class="flex flex-col h-full bg-white relative w-full">
-  <div class="flex border-b border-gray-200 bg-gray-50 p-2 gap-2">
-    <button 
-      class="px-4 py-1.5 text-sm font-medium rounded-md transition-colors {mode === 'edit' ? 'bg-blue-100 text-blue-700 shadow-sm cursor-default' : 'text-gray-600 hover:bg-gray-200 cursor-pointer'}"
-      onclick={() => mode = 'edit'}>
-      Редактор
-    </button>
-    <button 
-      class="px-4 py-1.5 text-sm font-medium rounded-md transition-colors {mode === 'preview' ? 'bg-blue-100 text-blue-700 shadow-sm cursor-default' : 'text-gray-600 hover:bg-gray-200 cursor-pointer'}"
-      onclick={() => mode = 'preview'}>
-      Превью
-    </button>
+  <div class="flex border-b border-gray-200 bg-gray-50 p-2 gap-2 justify-between items-center">
+    <div class="flex gap-2">
+      <button 
+        class="px-4 py-1.5 text-sm font-medium rounded-md transition-colors {mode === 'edit' ? 'bg-blue-100 text-blue-700 shadow-sm cursor-default' : 'text-gray-600 hover:bg-gray-200 cursor-pointer'}"
+        onclick={() => mode = 'edit'}>
+        Редактор
+      </button>
+      <button 
+        class="px-4 py-1.5 text-sm font-medium rounded-md transition-colors {mode === 'preview' ? 'bg-blue-100 text-blue-700 shadow-sm cursor-default' : 'text-gray-600 hover:bg-gray-200 cursor-pointer'}"
+        onclick={() => mode = 'preview'}>
+        Превью
+      </button>
+    </div>
+    
+    {#if mode === 'edit'}
+      <div class="flex items-center">
+        <input 
+          type="file" 
+          accept="image/*" 
+          class="hidden" 
+          bind:this={fileInput} 
+          onchange={handleFileInput} 
+        />
+        <button 
+          class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors"
+          title="Вставить картинку"
+          onclick={handleToolbarImage}>
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+            <circle cx="8.5" cy="8.5" r="1.5"></circle>
+            <polyline points="21 15 16 10 5 21"></polyline>
+          </svg>
+        </button>
+      </div>
+    {/if}
   </div>
 
   <div class="flex-1 overflow-hidden relative">
