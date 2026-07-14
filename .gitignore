@@ -28,4 +28,5 @@ go.work.sum
 opencode.json
 igonotes
 .vscode
-__debug*main
+__debug*
+main
