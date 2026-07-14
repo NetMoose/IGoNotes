@@ -139,9 +139,32 @@
   function renderMarkdown(md) {
     if (!md) return "";
     
+    // Выделяем Frontmatter (YAML метаданные)
+    let frontmatterHtml = "";
+    let markdownContent = md;
+    const frontmatterRegex = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/;
+    const match = md.match(frontmatterRegex);
+    
+    if (match) {
+      const frontmatterText = match[1].trim();
+      markdownContent = md.replace(frontmatterRegex, "");
+      
+      frontmatterHtml = `
+        <details class="bg-gray-50 border border-gray-200 rounded-md mb-4 group">
+          <summary class="cursor-pointer px-3 py-2 font-medium text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-100 transition-colors list-none flex items-center justify-between">
+            <span>Свойства (Frontmatter)</span>
+            <svg class="w-4 h-4 text-gray-400 group-open:rotate-180 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+          </summary>
+          <div class="p-3 border-t border-gray-200 overflow-x-auto text-xs text-gray-700 bg-white rounded-b-md">
+            <pre class="m-0 font-mono text-[11px] leading-relaxed text-gray-600">${frontmatterText}</pre>
+          </div>
+        </details>
+      `;
+    }
+    
     // Преобразуем Obsidian-стиль ссылок на изображения ![[...]] в стандартный Markdown ![...](/api/raw?path=...)
     // Регулярка учитывает возможные опечатки (отсутствие закрывающих ]])
-    let processedMd = md.replace(/!\[\[([^\]\n]+)(?:\]\])?/g, (match, p1) => {
+    let processedMd = markdownContent.replace(/!\[\[([^\]\n]+)(?:\]\])?/g, (match, p1) => {
       let filename = p1.trim();
       let parts = filename.split('|');
       let urlPath = encodeURIComponent(parts[0].trim());
@@ -162,7 +185,8 @@
     html = html.replace(/<input([^>]*)disabled([^>]*)>/g, '<input$1$2>');
     // Все ссылки в превью открываем в новой вкладке
     html = html.replace(/<a /g, '<a target="_blank" rel="noopener noreferrer" ');
-    return html;
+    
+    return frontmatterHtml + html;
   }
 
   function handlePreviewClick(e) {
