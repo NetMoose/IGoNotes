@@ -30,3 +30,6 @@ igonotes
 .vscode
 __debug*
 main
+
+# Build directory
+builds/

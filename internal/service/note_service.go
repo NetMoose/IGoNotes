@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"IGoNotes/internal/model"
 	"IGoNotes/internal/repository"
@@ -16,6 +17,7 @@ var ErrAlreadyExists = errors.New("file or directory already exists")
 type NoteService struct {
 	repo     *repository.NoteRepository
 	basePath string
+	syncMu   sync.Mutex
 }
 
 // NewNoteService создает новый экземпляр NoteService
@@ -25,6 +27,9 @@ func NewNoteService(repo *repository.NoteRepository, basePath string) *NoteServi
 
 // SyncFS сканирует файловую систему и обновляет SQLite
 func (s *NoteService) SyncFS() error {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+
 	if s.basePath == "" {
 		return nil // Нет базы для синхронизации
 	}

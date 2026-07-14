@@ -17,6 +17,7 @@
   let showCreateModal = $state(false);
   let createType = $state("");
   let createName = $state("");
+  let createError = $state("");
 
   let showDeleteModal = $state(false);
 
@@ -84,6 +85,7 @@
   function openCreateModal(type) {
     createType = type;
     createName = "";
+    createError = "";
     showCreateModal = true;
   }
 
@@ -95,6 +97,7 @@
 
   async function confirmCreate() {
     if (!createName.trim()) return;
+    createError = "";
     
     try {
       const res = await fetch('/api/notes', {
@@ -107,35 +110,17 @@
         })
       });
 
-      if (res.ok || res.status === 409) {
-        const node = await res.json();
+      if (res.ok) {
         showCreateModal = false;
-        
-        if (res.status === 409) {
-          alert(`Элемент "${node.name}" уже существует. Выполнен переход к нему.`);
-          
-          activeId = node.id;
-          activeName = node.name;
-          
-          if (node.parent_id) {
-            openFolders.add(node.parent_id);
-            activeFolderId = node.parent_id;
-          } else {
-            activeFolderId = null;
-          }
-
-          if (node.type === 'file' && onSelect) {
-            onSelect(node);
-          } else if (node.type === 'dir') {
-            openFolders.add(node.id);
-            activeFolderId = node.id;
-          }
-        }
-        
         loadTree();
+      } else if (res.status === 409) {
+        createError = createType === 'dir' 
+          ? `Папка "${createName.trim()}" уже существует.` 
+          : `Файл "${createName.trim()}" уже существует.`;
       }
     } catch (err) {
       console.error(err);
+      createError = "Произошла ошибка при создании";
     }
   }
 
@@ -267,6 +252,7 @@
   title={`Создать ${createType === 'dir' ? 'папку' : 'файл'} ${activeFolderId ? 'в текущей папке' : 'в корне'}`}
   input={true}
   bind:inputValue={createName}
+  error={createError}
   confirmText="Создать"
   onConfirm={confirmCreate}
   onCancel={() => showCreateModal = false}
