@@ -51,7 +51,26 @@
 
   function renderMarkdown(md) {
     if (!md) return "";
-    let html = marked(md);
+    
+    // Преобразуем Obsidian-стиль ссылок на изображения ![[...]] в стандартный Markdown ![...](/api/raw?path=...)
+    // Регулярка учитывает возможные опечатки (отсутствие закрывающих ]])
+    let processedMd = md.replace(/!\[\[([^\]\n]+)(?:\]\])?/g, (match, p1) => {
+      let filename = p1.trim();
+      let parts = filename.split('|');
+      let urlPath = encodeURIComponent(parts[0].trim());
+      return `![${parts[0].trim()}](/api/raw?path=${urlPath})`;
+    });
+
+    let html = marked(processedMd);
+    
+    // Перехватываем стандартные относительные Markdown-картинки ![alt](image.png)
+    html = html.replace(/<img([^>]*)src="([^"]+)"([^>]*)>/g, (match, before, src, after) => {
+      if (!src.startsWith('http') && !src.startsWith('data:') && !src.startsWith('/api/raw')) {
+        return `<img${before}src="/api/raw?path=${encodeURIComponent(src)}"${after}>`;
+      }
+      return match;
+    });
+
     // Убираем атрибут disabled у чекбоксов, чтобы они стали кликабельными
     html = html.replace(/<input([^>]*)disabled([^>]*)>/g, '<input$1$2>');
     // Все ссылки в превью открываем в новой вкладке

@@ -54,6 +54,24 @@ func (h *NoteHandler) GetNote(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetRawFile обрабатывает GET /api/raw?path=...
+// Отдает сырой файл (например, картинку) из файловой системы.
+func (h *NoteHandler) GetRawFile(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+
+	fullPath, err := h.NoteService.GetAbsoluteFilePath(filePath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	http.ServeFile(w, r, fullPath)
+}
+
 // SaveNote обрабатывает POST /api/save
 func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

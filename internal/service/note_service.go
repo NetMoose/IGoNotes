@@ -140,8 +140,24 @@ func (s *NoteService) GetNoteContent(id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
 	return string(data), nil
+}
+
+// GetAbsoluteFilePath возвращает полный абсолютный путь к файлу в базе
+func (s *NoteService) GetAbsoluteFilePath(relPath string) (string, error) {
+	if s.basePath == "" {
+		return "", os.ErrNotExist
+	}
+	// Очищаем путь, чтобы предотвратить path traversal
+	cleanPath := filepath.Clean(relPath)
+	fullPath := filepath.Join(s.basePath, cleanPath)
+	
+	// Проверяем, что итоговый путь находится внутри basePath
+	if !strings.HasPrefix(fullPath, s.basePath) {
+		return "", os.ErrPermission
+	}
+	
+	return fullPath, nil
 }
 
 // SaveNoteContent сохраняет содержимое заметки на диск

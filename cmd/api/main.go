@@ -82,6 +82,8 @@ func main() {
 		}
 	})
 	
+	http.HandleFunc("/api/raw", noteHandler.GetRawFile)
+	
 	http.HandleFunc("/api/save", noteHandler.SaveNote)
 	http.HandleFunc("/api/rename", noteHandler.RenameNote)
 
