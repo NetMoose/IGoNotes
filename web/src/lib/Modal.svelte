@@ -2,8 +2,10 @@
     let { show = false, title = "", onConfirm, onCancel, confirmText = "OK", cancelText = "Отмена", input = false, inputValue = $bindable(""), error = "" } = $props();
 
     function focusInput(node) {
-        // Небольшая задержка помогает в некоторых случаях при рендере модалок
-        setTimeout(() => node.focus(), 10);
+        // requestAnimationFrame гарантирует, что элемент уже отрендерен браузером
+        requestAnimationFrame(() => {
+            node.focus();
+        });
     }
 </script>
 

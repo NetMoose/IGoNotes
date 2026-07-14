@@ -4,6 +4,7 @@
   import { EditorView, keymap } from '@codemirror/view';
   import { defaultKeymap } from '@codemirror/commands';
   import { markdown } from '@codemirror/lang-markdown';
+  import { syntaxTree } from '@codemirror/language';
   import { marked } from 'marked';
 
   let { content = $bindable() } = $props();
@@ -63,20 +64,60 @@
       const checkboxes = Array.from(e.currentTarget.querySelectorAll('input[type="checkbox"]'));
       const index = checkboxes.indexOf(e.target);
       
-      if (index !== -1) {
-        let currentIndex = 0;
-        // Регулярка ищет элементы списка задач, учитывая отступы
-        const regex = /^([ \t]*[-*+]\s+)\[([ xX])\]/gm;
+      if (index !== -1 && editorView) {
+        let currentIdx = 0;
+        let found = false;
         
-        content = content.replace(regex, (match, p1, p2) => {
-          if (currentIndex === index) {
-            const newVal = (p2 === ' ' ? 'x' : ' ');
-            currentIndex++;
-            return `${p1}[${newVal}]`;
+        // Используем AST от CodeMirror для надежного поиска чекбокса
+        syntaxTree(editorView.state).iterate({
+          enter(node) {
+            if (node.name === "TaskMarker") {
+              if (currentIdx === index) {
+                const from = node.from;
+                const to = node.to;
+                const text = editorView.state.doc.sliceString(from, to);
+                // Инвертируем состояние (в тексте маркера)
+                const newVal = text.toLowerCase().includes('x') ? '[ ]' : '[x]';
+                
+                // Диспатчим изменения в редактор, что автоматически обновит 'content'
+                editorView.dispatch({
+                  changes: {from, to, insert: newVal}
+                });
+                found = true;
+                return false; // Останавливаем итерацию
+              }
+              currentIdx++;
+            }
           }
-          currentIndex++;
-          return match;
         });
+        
+        // Fallback-вариант на случай рассинхронизации парсеров
+        if (!found) {
+          console.warn("Чекбокс не найден в AST CodeMirror. Попытка текстового поиска...");
+          let lineIdx = 0;
+          let inCodeBlock = false;
+          const lines = content.split('\n');
+          
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.trim().startsWith('```')) {
+              inCodeBlock = !inCodeBlock;
+              continue;
+            }
+            if (!inCodeBlock) {
+              const match = line.match(/^([ \t]*[-*+]\s+)\[([ xX])\]/);
+              if (match) {
+                if (lineIdx === index) {
+                  const newVal = match[2] === ' ' ? 'x' : ' ';
+                  lines[i] = line.replace(/^([ \t]*[-*+]\s+)\[([ xX])\]/, `$1[${newVal}]`);
+                  content = lines.join('\n');
+                  break;
+                }
+                lineIdx++;
+              }
+            }
+          }
+        }
       }
     }
   }
