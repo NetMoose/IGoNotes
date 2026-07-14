@@ -33,6 +33,22 @@ func (h *NoteHandler) GetNotes(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(nodes)
 }
 
+// SyncNotes обрабатывает POST /api/sync
+func (h *NoteHandler) SyncNotes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := h.NoteService.SyncFS(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status": "ok"}`))
+}
+
 // GetNote обрабатывает GET /api/note?id=...
 func (h *NoteHandler) GetNote(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")

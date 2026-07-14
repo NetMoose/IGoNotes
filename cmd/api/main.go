@@ -47,6 +47,16 @@ func main() {
 	
 	noteService := service.NewNoteService(noteRepo, defaultBaseDir)
 
+	// Запускаем первичную синхронизацию базы с диском при старте программы
+	go func() {
+		log.Println("Запуск первичной синхронизации файловой системы...")
+		if err := noteService.SyncFS(); err != nil {
+			log.Printf("Ошибка первичной синхронизации: %v", err)
+		} else {
+			log.Println("Первичная синхронизация завершена успешно.")
+		}
+	}()
+
 	// Создаем обработчики
 	noteHandler := handlers.NewNoteHandler(noteService)
 	configHandler := handlers.NewConfigHandler(configService)
@@ -81,6 +91,8 @@ func main() {
 			noteHandler.GetNote(w, r)
 		}
 	})
+	
+	http.HandleFunc("/api/sync", noteHandler.SyncNotes)
 	
 	http.HandleFunc("/api/raw", noteHandler.GetRawFile)
 	

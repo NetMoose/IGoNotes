@@ -60,6 +60,19 @@
     }
   }
 
+  async function syncTree() {
+    isRefreshing = true;
+    try {
+      const res = await fetch('/api/sync', { method: 'POST' });
+      if (res.ok) {
+        await loadTree();
+      }
+    } catch (err) {
+      console.error("Ошибка при синхронизации дерева:", err);
+      isRefreshing = false;
+    }
+  }
+
   onMount(() => {
     loadTree();
   });
@@ -190,7 +203,7 @@
   <div class="p-3 border-b border-gray-200 bg-gray-100 flex flex-col gap-2">
     <div class="flex justify-between items-center">
       <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wider">База заметок</h2>
-      <button onclick={loadTree} class="text-gray-400 hover:text-blue-500 transition-colors p-1 cursor-pointer" title="Обновить дерево">
+      <button onclick={syncTree} class="text-gray-400 hover:text-blue-500 transition-colors p-1 cursor-pointer" title="Обновить дерево (Синхронизировать с диском)">
         <svg class="w-4 h-4 {isRefreshing ? 'animate-spin' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
       </button>
     </div>

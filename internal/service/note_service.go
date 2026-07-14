@@ -94,18 +94,13 @@ func (s *NoteService) SyncFS() error {
 
 // GetTree возвращает иерархическое дерево заметок
 func (s *NoteService) GetTree() ([]model.NoteNode, error) {
-	// 1. Сначала синхронизируем ФС (при реальной работе это можно делать асинхронно или по кнопке)
-	if err := s.SyncFS(); err != nil {
-		return nil, err
-	}
-
-	// 2. Получаем плоский список из БД
+	// Получаем плоский список из БД (без полного сканирования ФС)
 	flatNodes, err := s.repo.GetAllNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. Строим дерево
+	// Строим дерево
 	nodeMap := make(map[string][]model.NoteNode) // parentID -> list of children
 
 	// Распределяем узлы по их родителям
