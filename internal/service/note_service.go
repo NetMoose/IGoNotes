@@ -18,20 +18,31 @@ import (
 var ErrAlreadyExists = errors.New("file or directory already exists")
 
 type NoteService struct {
-	repo     *repository.NoteRepository
-	basePath string
-	syncMu   sync.Mutex
+	repo            *repository.NoteRepository
+	basePath        string
+	syncMu          sync.Mutex
+	initialSyncDone chan struct{}
+	once            sync.Once
 }
 
 // NewNoteService создает новый экземпляр NoteService
 func NewNoteService(repo *repository.NoteRepository, basePath string) *NoteService {
-	return &NoteService{repo: repo, basePath: basePath}
+	return &NoteService{
+		repo:            repo,
+		basePath:        basePath,
+		initialSyncDone: make(chan struct{}),
+	}
 }
 
 // SyncFS сканирует файловую систему и обновляет SQLite
+func (s *NoteService) GetBasePath() string {
+	return s.basePath
+}
+
 func (s *NoteService) SyncFS() error {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
+	defer s.once.Do(func() { close(s.initialSyncDone) })
 
 	if s.basePath == "" {
 		return nil // Нет базы для синхронизации
@@ -94,6 +105,9 @@ func (s *NoteService) SyncFS() error {
 
 // GetTree возвращает иерархическое дерево заметок
 func (s *NoteService) GetTree() ([]model.NoteNode, error) {
+	// Дожидаемся завершения первичной синхронизации
+	<-s.initialSyncDone
+
 	// Получаем плоский список из БД (без полного сканирования ФС)
 	flatNodes, err := s.repo.GetAllNodes()
 	if err != nil {

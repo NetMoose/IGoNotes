@@ -5,13 +5,32 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 
 	"IGoNotes/internal/handlers"
 	"IGoNotes/internal/repository"
 	"IGoNotes/internal/service"
 	"IGoNotes/web"
 )
+
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start"}
+	case "darwin":
+		cmd = "open"
+	default: // "linux", "freebsd", "openbsd", "netbsd"
+		cmd = "xdg-open"
+	}
+	args = append(args, url)
+	return exec.Command(cmd, args...).Start()
+}
 
 func main() {
 	// Определение CLI-флагов
@@ -76,6 +95,8 @@ func main() {
 	}
 
 	// Маршрутизация
+	http.HandleFunc("/api/info", noteHandler.GetInfo)
+
 	http.HandleFunc("/api/notes", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			noteHandler.CreateNote(w, r)
@@ -113,7 +134,16 @@ func main() {
 	http.Handle("/", spaHandler)
 
 	address := ":" + *port
-	log.Printf("Сервер запущен на %s", address)
+	url := "http://localhost" + address
+	log.Printf("Сервер запущен на %s", url)
+
+	if !*noBrowser {
+		log.Printf("Открываем браузер: %s", url)
+		if err := openBrowser(url); err != nil {
+			log.Printf("Не удалось открыть браузер автоматически: %v", err)
+		}
+	}
+
 	if err := http.ListenAndServe(address, nil); err != nil {
 		log.Fatal(err)
 	}

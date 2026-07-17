@@ -17,6 +17,15 @@ func NewNoteHandler(noteService *service.NoteService) *NoteHandler {
 	return &NoteHandler{NoteService: noteService}
 }
 
+// GetInfo обрабатывает GET /api/info
+func (h *NoteHandler) GetInfo(w http.ResponseWriter, r *http.Request) {
+	info := map[string]string{
+		"base_path": h.NoteService.GetBasePath(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
+}
+
 // GetNotes обрабатывает GET /api/notes
 func (h *NoteHandler) GetNotes(w http.ResponseWriter, r *http.Request) {
 	nodes, err := h.NoteService.GetTree()

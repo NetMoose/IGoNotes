@@ -1,15 +1,29 @@
 <script>
+  import { onMount } from 'svelte';
   import Sidebar from './lib/Sidebar.svelte';
   import Editor from './lib/Editor.svelte';
 
   let activeNote = $state(null);
   let markdownContent = $state('');
+  let basePath = $state('');
   
   // Переменные для debounce
   let saveTimer = null;
   let saveStatus = $state('idle'); // 'idle', 'saving', 'saved', 'error'
   let statusTimer = null;
   let ignoreNextChange = false;
+
+  onMount(async () => {
+    try {
+      const res = await fetch('/api/info');
+      if (res.ok) {
+        const data = await res.json();
+        basePath = data.base_path;
+      }
+    } catch (e) {
+      console.error("Failed to load app info:", e);
+    }
+  });
 
   async function loadNote(node) {
     try {
@@ -63,11 +77,12 @@
   });
 </script>
 
-<div class="flex h-screen w-full bg-white text-gray-800 font-sans overflow-hidden">
-  <Sidebar onSelect={loadNote} onDelete={(id) => { if (activeNote?.id === id) activeNote = null; }} />
+<div class="flex flex-col h-screen w-full bg-white text-gray-800 font-sans overflow-hidden">
+  <div class="flex-1 flex overflow-hidden">
+    <Sidebar onSelect={loadNote} onDelete={(id) => { if (activeNote?.id === id) activeNote = null; }} />
 
-  <main class="flex-1 flex flex-col h-screen overflow-hidden min-w-0">
-    <header class="bg-white border-b border-gray-200 px-4 py-2 flex items-center justify-between shrink-0 h-14">
+    <main class="flex-1 flex flex-col h-full overflow-hidden min-w-0">
+      <header class="bg-white border-b border-gray-200 px-4 py-2 flex items-center justify-between shrink-0 h-14">
       <div class="font-semibold text-gray-800 truncate">
         {activeNote ? activeNote.name : 'Выберите заметку'}
       </div>
@@ -104,5 +119,13 @@
         </div>
       {/if}
     </div>
-  </main>
+    </main>
+  </div>
+
+  <!-- Status Line -->
+  <footer class="bg-gray-100 border-t border-gray-200 px-3 py-1 flex items-center shrink-0 h-6">
+    <span class="text-[11px] text-gray-500 font-mono truncate" title="Текущая база заметок">
+      {basePath ? `📂 ${basePath}` : 'Загрузка информации о базе...'}
+    </span>
+  </footer>
 </div>
