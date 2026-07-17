@@ -6,6 +6,7 @@
   import { markdown } from '@codemirror/lang-markdown';
   import { languages } from '@codemirror/language-data';
   import { syntaxTree } from '@codemirror/language';
+  import { autocompletion } from '@codemirror/autocomplete';
   import { marked } from 'marked';
   import { markedHighlight } from 'marked-highlight';
   import hljs from 'highlight.js';
@@ -93,6 +94,38 @@
     const prefix = '#'.repeat(level) + ' ';
     applyFormat(prefix, '');
     showHeadingMenu = false;
+  }
+
+  function slashCommands(context) {
+    let word = context.matchBefore(/\/\w*/);
+    if (!word) return null;
+    
+    // Проверка, что слеш стоит после пробела или в начале строки
+    if (word.from > 0) {
+      let before = context.state.sliceDoc(word.from - 1, word.from);
+      if (!/\s/.test(before)) return null;
+    }
+    if (word.from == word.to && !context.explicit) return null;
+
+    return {
+      from: word.from,
+      options: [
+        { label: "/h1", type: "keyword", detail: "Заголовок 1", apply: "# " },
+        { label: "/h2", type: "keyword", detail: "Заголовок 2", apply: "## " },
+        { label: "/h3", type: "keyword", detail: "Заголовок 3", apply: "### " },
+        { label: "/h4", type: "keyword", detail: "Заголовок 4", apply: "#### " },
+        { label: "/h5", type: "keyword", detail: "Заголовок 5", apply: "##### " },
+        { label: "/bold", type: "keyword", detail: "Жирный", apply: "****" },
+        { label: "/italic", type: "keyword", detail: "Курсив", apply: "**" },
+        { label: "/strike", type: "keyword", detail: "Зачеркнутый", apply: "~~~~" },
+        { label: "/quote", type: "keyword", detail: "Цитата", apply: "> " },
+        { label: "/list", type: "keyword", detail: "Список", apply: "- " },
+        { label: "/todo", type: "keyword", detail: "Чекбокс", apply: "- [ ] " },
+        { label: "/code", type: "keyword", detail: "Блок кода", apply: "```\n\n```" },
+        { label: "/link", type: "keyword", detail: "Ссылка", apply: "[]()" },
+        { label: "/image", type: "keyword", detail: "Картинка", apply: "![]()" }
+      ]
+    };
   }
 
   async function uploadImage(file, pos) {
@@ -184,6 +217,7 @@
       extensions: [
         keymap.of(defaultKeymap),
         markdown({ codeLanguages: languages }),
+        autocompletion({ override: [slashCommands] }),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             content = update.state.doc.toString();
@@ -486,8 +520,9 @@
             <h3 class="text-lg font-medium text-gray-900 mb-4">Вставить ссылку</h3>
             
             <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 mb-1">Подпись к ссылке</label>
+                <label for="link-text-input" class="block text-sm font-medium text-gray-700 mb-1">Подпись к ссылке</label>
                 <input 
+                    id="link-text-input"
                     use:focusInput
                     type="text" 
                     bind:value={linkText} 
@@ -498,8 +533,9 @@
             </div>
 
             <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 mb-1">Адрес ссылки</label>
+                <label for="link-url-input" class="block text-sm font-medium text-gray-700 mb-1">Адрес ссылки</label>
                 <input 
+                    id="link-url-input"
                     type="url" 
                     bind:value={linkUrl} 
                     class="w-full border border-gray-300 rounded px-3 py-2 focus:outline-none focus:border-blue-500" 
