@@ -27,6 +27,9 @@
   let fileInput = $state();
   let showHeadingMenu = $state(false);
   let showCodeMenu = $state(false);
+  let showTableMenu = $state(false);
+  let tableHoverRows = $state(0);
+  let tableHoverCols = $state(0);
 
   let showLinkModal = $state(false);
   let linkText = $state('');
@@ -83,6 +86,34 @@
     { label: 'SQL', val: 'sql' },
   ];
 
+  function insertTable(rows, cols) {
+    if (rows === 0 || cols === 0) return;
+    
+    let md = '\n';
+    md += '|';
+    for (let c = 1; c <= cols; c++) {
+      md += ` Заголовок ${c} |`;
+    }
+    md += '\n|';
+    for (let c = 1; c <= cols; c++) {
+      md += '---|';
+    }
+    md += '\n';
+    
+    for (let r = 1; r <= rows; r++) {
+      md += '|';
+      for (let c = 1; c <= cols; c++) {
+        md += ' Данные |';
+      }
+      md += '\n';
+    }
+    
+    applyFormat(md, '');
+    showTableMenu = false;
+    tableHoverRows = 0;
+    tableHoverCols = 0;
+  }
+
   function insertCodeBlock(lang) {
     const prefix = '```' + lang + '\n';
     const suffix = '\n```';
@@ -122,9 +153,12 @@
         { label: prefix + "bold", type: "keyword", detail: "Жирный", apply: "****" },
         { label: prefix + "italic", type: "keyword", detail: "Курсив", apply: "**" },
         { label: prefix + "strike", type: "keyword", detail: "Зачеркнутый", apply: "~~~~" },
+        { label: prefix + "underline", type: "keyword", detail: "Подчеркнутый", apply: "<u></u>" },
         { label: prefix + "quote", type: "keyword", detail: "Цитата", apply: "> " },
         { label: prefix + "list", type: "keyword", detail: "Список", apply: "- " },
+        { label: prefix + "numlist", type: "keyword", detail: "Нумерованный", apply: "1. " },
         { label: prefix + "todo", type: "keyword", detail: "Чекбокс", apply: "- [ ] " },
+        { label: prefix + "table", type: "keyword", detail: "Таблица", apply: "\n| Заголовок 1 | Заголовок 2 |\n|---|---|\n| Данные | Данные |\n" },
         { label: prefix + "code", type: "keyword", detail: "Блок кода", apply: "```\n\n```" },
         { label: prefix + "link", type: "keyword", detail: "Ссылка", apply: "[]()" },
         { label: prefix + "image", type: "keyword", detail: "Картинка", apply: "![]()" }
@@ -400,7 +434,7 @@
   }
 </script>
 
-<svelte:window onclick={() => { showHeadingMenu = false; showCodeMenu = false; }} />
+<svelte:window onclick={() => { showHeadingMenu = false; showCodeMenu = false; showTableMenu = false; }} />
 
 <div class="flex flex-col h-full bg-white relative w-full">
   <div class="flex border-b border-gray-200 bg-gray-50 p-1.5 gap-2 justify-between items-center h-12 shrink-0">
@@ -415,6 +449,9 @@
         </button>
         <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Зачеркнутый" onclick={() => applyFormat('~~', '~~')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><path d="M16 6C16 6 14.5 4 12 4C9.5 4 8 6 8 6"></path><path d="M8 18C8 18 9.5 20 12 20C14.5 20 16 18 16 18"></path></svg>
+        </button>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Подчеркнутый" onclick={() => applyFormat('<u>', '</u>')}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"></path><line x1="4" y1="21" x2="20" y2="21"></line></svg>
         </button>
         <div class="w-px h-4 bg-gray-300 mx-1"></div>
         <div class="relative">
@@ -467,9 +504,43 @@
         <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Список" onclick={() => applyFormat('- ', '')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
         </button>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Нумерованный список" onclick={() => applyFormat('1. ', '')}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="10" y1="6" x2="21" y2="6"></line><line x1="10" y1="12" x2="21" y2="12"></line><line x1="10" y1="18" x2="21" y2="18"></line><path d="M4 6h1v4"></path><path d="M4 10h2"></path><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"></path></svg>
+        </button>
         <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Чекбокс" onclick={() => applyFormat('- [ ] ', '')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
         </button>
+        <div class="relative">
+          <button 
+            class="p-1.5 rounded-md transition-colors {showTableMenu ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-blue-600 hover:bg-blue-50'}" 
+            title="Таблица" 
+            onclick={(e) => { e.stopPropagation(); showTableMenu = !showTableMenu; }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="3" y1="15" x2="21" y2="15"></line><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line></svg>
+          </button>
+          
+          {#if showTableMenu}
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div 
+              class="absolute top-full left-0 mt-1 bg-white border border-gray-200 shadow-lg rounded-md p-2 z-10 w-48 flex flex-col items-center"
+              onmouseleave={() => { tableHoverRows = 0; tableHoverCols = 0; }}>
+              <div class="text-xs text-gray-500 mb-2 font-medium">
+                {tableHoverCols > 0 ? `${tableHoverCols} x ${tableHoverRows}` : 'Выберите размер'}
+              </div>
+              <div class="grid grid-cols-10 gap-0.5" style="grid-template-columns: repeat(10, minmax(0, 1fr));">
+                {#each Array(10) as _, r}
+                  {#each Array(10) as _, c}
+                    <!-- svelte-ignore a11y_click_events_have_key_events -->
+                    <div 
+                      class="w-3.5 h-3.5 border rounded-sm cursor-pointer transition-colors {r < tableHoverRows && c < tableHoverCols ? 'bg-blue-200 border-blue-400' : 'bg-white border-gray-200 hover:border-blue-300'}"
+                      onmouseenter={() => { tableHoverRows = r + 1; tableHoverCols = c + 1; }}
+                      onclick={() => insertTable(tableHoverRows, tableHoverCols)}>
+                    </div>
+                  {/each}
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
         <div class="w-px h-4 bg-gray-300 mx-1"></div>
         <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Ссылка" onclick={handleLinkClick}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
