@@ -201,23 +201,30 @@
 
 <aside class="w-72 bg-gray-50 border-r border-gray-200 flex flex-col h-screen shrink-0">
   <div class="p-3 border-b border-gray-200 bg-gray-100 flex flex-col gap-2">
-    <div class="flex justify-between items-center">
+    <div class="flex justify-between items-center mb-1">
       <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wider">База заметок</h2>
       <button onclick={syncTree} class="text-gray-400 hover:text-blue-500 transition-colors p-1 cursor-pointer" title="Обновить дерево (Синхронизировать с диском)">
         <svg class="w-4 h-4 {isRefreshing ? 'animate-spin' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
       </button>
     </div>
-    <div class="flex gap-1">
-      <button onclick={() => openCreateModal('file')} class="flex-1 text-xs bg-white border border-gray-300 rounded py-1.5 hover:bg-gray-50 transition-colors shadow-sm cursor-pointer">📄 Файл</button>
-      <button onclick={() => openCreateModal('dir')} class="flex-1 text-xs bg-white border border-gray-300 rounded py-1.5 hover:bg-gray-50 transition-colors shadow-sm cursor-pointer">📁 Папка</button>
-    </div>
-    <div class="flex gap-1">
-      <button onclick={openRenameModal} disabled={!activeId} class="flex-1 text-xs bg-white border border-gray-300 rounded py-1.5 hover:bg-gray-50 disabled:opacity-50 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer">✏️ Переим.</button>
-      <button onclick={() => showDeleteModal = true} disabled={!activeId} class="flex-1 text-xs bg-white border border-red-200 rounded py-1.5 text-red-600 hover:bg-red-50 disabled:opacity-50 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer">🗑️ Удал.</button>
+    <div class="flex gap-1.5 justify-between">
+      <button onclick={() => openCreateModal('file')} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-gray-600 hover:text-blue-600 hover:bg-blue-50 transition-colors shadow-sm cursor-pointer" title="Создать новую заметку">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>
+      </button>
+      <button onclick={() => openCreateModal('dir')} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-gray-600 hover:text-blue-600 hover:bg-blue-50 transition-colors shadow-sm cursor-pointer" title="Создать новую папку">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path><line x1="12" y1="11" x2="12" y2="17"></line><line x1="9" y1="14" x2="15" y2="14"></line></svg>
+      </button>
+      <button onclick={openRenameModal} disabled={!activeId} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-gray-600 hover:text-blue-600 hover:bg-blue-50 disabled:opacity-50 disabled:hover:text-gray-600 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer" title="Переименовать выбранное">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+      </button>
+      <button onclick={() => showDeleteModal = true} disabled={!activeId} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:hover:text-red-500 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer" title="Удалить выбранное">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+      </button>
     </div>
     {#if activeFolderId || activeId}
-      <button onclick={() => { activeId = null; activeFolderId = null; activeName = ""; }} class="text-[11px] text-gray-500 hover:text-gray-800 text-left cursor-pointer transition-colors mt-1">
-        Сбросить выделение (в корень) ✕
+      <button onclick={() => { activeId = null; activeFolderId = null; activeName = ""; }} class="text-[11px] text-gray-500 hover:text-gray-800 text-left cursor-pointer transition-colors mt-0.5 flex items-center gap-1">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        Сбросить выделение (в корень)
       </button>
     {/if}
   </div>
