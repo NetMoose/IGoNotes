@@ -6,7 +6,7 @@
   import { markdown } from '@codemirror/lang-markdown';
   import { languages } from '@codemirror/language-data';
   import { syntaxTree } from '@codemirror/language';
-  import { autocompletion } from '@codemirror/autocomplete';
+  import { autocompletion, closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
   import { marked } from 'marked';
   import { markedHighlight } from 'marked-highlight';
   import hljs from 'highlight.js';
@@ -97,7 +97,8 @@
   }
 
   function slashCommands(context) {
-    let word = context.matchBefore(/\/\w*/);
+    // Поддерживаем и прямой слеш /, и обратный \ (его проще нажать в русской раскладке на Windows)
+    let word = context.matchBefore(/[\/\\]\w*/);
     if (!word) return null;
     
     // Проверка, что слеш стоит после пробела или в начале строки
@@ -107,23 +108,26 @@
     }
     if (word.from == word.to && !context.explicit) return null;
 
+    // Определяем символ, чтобы в списке опций показать тот же префикс, что ввел пользователь
+    const prefix = context.state.sliceDoc(word.from, word.from + 1);
+
     return {
       from: word.from,
       options: [
-        { label: "/h1", type: "keyword", detail: "Заголовок 1", apply: "# " },
-        { label: "/h2", type: "keyword", detail: "Заголовок 2", apply: "## " },
-        { label: "/h3", type: "keyword", detail: "Заголовок 3", apply: "### " },
-        { label: "/h4", type: "keyword", detail: "Заголовок 4", apply: "#### " },
-        { label: "/h5", type: "keyword", detail: "Заголовок 5", apply: "##### " },
-        { label: "/bold", type: "keyword", detail: "Жирный", apply: "****" },
-        { label: "/italic", type: "keyword", detail: "Курсив", apply: "**" },
-        { label: "/strike", type: "keyword", detail: "Зачеркнутый", apply: "~~~~" },
-        { label: "/quote", type: "keyword", detail: "Цитата", apply: "> " },
-        { label: "/list", type: "keyword", detail: "Список", apply: "- " },
-        { label: "/todo", type: "keyword", detail: "Чекбокс", apply: "- [ ] " },
-        { label: "/code", type: "keyword", detail: "Блок кода", apply: "```\n\n```" },
-        { label: "/link", type: "keyword", detail: "Ссылка", apply: "[]()" },
-        { label: "/image", type: "keyword", detail: "Картинка", apply: "![]()" }
+        { label: prefix + "h1", type: "keyword", detail: "Заголовок 1", apply: "# " },
+        { label: prefix + "h2", type: "keyword", detail: "Заголовок 2", apply: "## " },
+        { label: prefix + "h3", type: "keyword", detail: "Заголовок 3", apply: "### " },
+        { label: prefix + "h4", type: "keyword", detail: "Заголовок 4", apply: "#### " },
+        { label: prefix + "h5", type: "keyword", detail: "Заголовок 5", apply: "##### " },
+        { label: prefix + "bold", type: "keyword", detail: "Жирный", apply: "****" },
+        { label: prefix + "italic", type: "keyword", detail: "Курсив", apply: "**" },
+        { label: prefix + "strike", type: "keyword", detail: "Зачеркнутый", apply: "~~~~" },
+        { label: prefix + "quote", type: "keyword", detail: "Цитата", apply: "> " },
+        { label: prefix + "list", type: "keyword", detail: "Список", apply: "- " },
+        { label: prefix + "todo", type: "keyword", detail: "Чекбокс", apply: "- [ ] " },
+        { label: prefix + "code", type: "keyword", detail: "Блок кода", apply: "```\n\n```" },
+        { label: prefix + "link", type: "keyword", detail: "Ссылка", apply: "[]()" },
+        { label: prefix + "image", type: "keyword", detail: "Картинка", apply: "![]()" }
       ]
     };
   }
@@ -215,7 +219,11 @@
     const state = EditorState.create({
       doc: content,
       extensions: [
-        keymap.of(defaultKeymap),
+        closeBrackets(),
+        EditorState.languageData.of(() => [{
+          closeBrackets: { brackets: ["(", "[", "{", "'", '"', "`", "*", "_", "~"] }
+        }]),
+        keymap.of([...closeBracketsKeymap, ...defaultKeymap]),
         markdown({ codeLanguages: languages }),
         autocompletion({ override: [slashCommands] }),
         EditorView.updateListener.of((update) => {
