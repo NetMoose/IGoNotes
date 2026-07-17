@@ -27,6 +27,49 @@
   let showHeadingMenu = $state(false);
   let showCodeMenu = $state(false);
 
+  let showLinkModal = $state(false);
+  let linkText = $state('');
+  let linkUrl = $state('');
+  let linkRange = $state(null);
+
+  function focusInput(node) {
+    requestAnimationFrame(() => node.focus());
+  }
+
+  function handleLinkClick() {
+    if (!editorView) return;
+    const range = editorView.state.selection.main;
+    const selected = editorView.state.sliceDoc(range.from, range.to);
+    linkText = selected;
+    linkUrl = '';
+    linkRange = range;
+    showLinkModal = true;
+  }
+
+  function insertLink() {
+    if (!editorView || !linkRange) return;
+    
+    // Если ничего не заполнено, просто вставляем как раньше
+    if (!linkText && !linkUrl) {
+      applyFormat('[', '](url)');
+      showLinkModal = false;
+      return;
+    }
+    
+    const t = linkText;
+    const u = linkUrl || 'url';
+    const textToInsert = `[${t}](${u})`;
+    
+    const tr = editorView.state.update({
+      changes: { from: linkRange.from, to: linkRange.to, insert: textToInsert },
+      selection: { anchor: linkRange.from + textToInsert.length }
+    });
+    
+    editorView.dispatch(tr);
+    editorView.focus();
+    showLinkModal = false;
+  }
+
   const codeLanguages = [
     { label: 'Без подсветки', val: '' },
     { label: 'Bash', val: 'bash' },
@@ -386,7 +429,7 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
         </button>
         <div class="w-px h-4 bg-gray-300 mx-1"></div>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Ссылка" onclick={() => applyFormat('[', '](url)')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Ссылка" onclick={handleLinkClick}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
         </button>
         <input type="file" accept="image/*" class="hidden" bind:this={fileInput} onchange={handleFileInput} />
@@ -429,4 +472,47 @@
       </div>
     {/if}
   </div>
+
+  <!-- Модальное окно для вставки ссылки -->
+  {#if showLinkModal}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" 
+         onclick={(e) => { if(e.target === e.currentTarget) showLinkModal = false; }} 
+         onkeydown={(e) => { if (e.key === 'Escape') showLinkModal = false; }}
+         role="dialog"
+         tabindex="-1">
+        <div class="bg-white rounded-lg shadow-lg w-96 p-5 relative" role="document">
+            <h3 class="text-lg font-medium text-gray-900 mb-4">Вставить ссылку</h3>
+            
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">Подпись к ссылке</label>
+                <input 
+                    use:focusInput
+                    type="text" 
+                    bind:value={linkText} 
+                    class="w-full border border-gray-300 rounded px-3 py-2 focus:outline-none focus:border-blue-500" 
+                    placeholder="Текст ссылки"
+                    onkeydown={(e) => e.key === 'Enter' && insertLink()}
+                />
+            </div>
+
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">Адрес ссылки</label>
+                <input 
+                    type="url" 
+                    bind:value={linkUrl} 
+                    class="w-full border border-gray-300 rounded px-3 py-2 focus:outline-none focus:border-blue-500" 
+                    placeholder="https://"
+                    onkeydown={(e) => e.key === 'Enter' && insertLink()}
+                />
+            </div>
+
+            <div class="flex justify-end gap-2 mt-6">
+                <button onclick={() => showLinkModal = false} class="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded cursor-pointer transition-colors">Отмена</button>
+                <button onclick={insertLink} class="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 cursor-pointer transition-colors">Ок</button>
+            </div>
+        </div>
+    </div>
+  {/if}
 </div>
