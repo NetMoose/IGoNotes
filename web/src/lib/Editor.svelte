@@ -19,7 +19,7 @@
     }
   }));
 
-  let { content = $bindable() } = $props();
+  let { noteId, content = $bindable() } = $props();
   
   let editorContainer;
   let editorView;
@@ -578,11 +578,13 @@
     ></div>
     
     {#if mode === 'preview'}
-      <div class="absolute inset-0 overflow-y-auto p-6 bg-white" onclick={handlePreviewClick} role="presentation">
-        <article class="prose max-w-4xl mx-auto">
-          {@html renderMarkdown(content)}
-        </article>
-      </div>
+      {#key noteId}
+        <div class="absolute inset-0 overflow-y-auto p-6 bg-white" onclick={handlePreviewClick} role="presentation">
+          <article class="prose max-w-4xl mx-auto">
+            {@html renderMarkdown(content)}
+          </article>
+        </div>
+      {/key}
     {/if}
   </div>
 

@@ -112,7 +112,7 @@
 
     <div class="flex-1 overflow-hidden">
       {#if activeNote}
-        <Editor bind:content={markdownContent} />
+        <Editor noteId={activeNote.id} bind:content={markdownContent} />
       {:else}
         <div class="h-full flex items-center justify-center text-gray-400 bg-gray-50">
           Выберите файл в меню слева
