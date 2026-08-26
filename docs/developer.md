@@ -24,7 +24,7 @@
 go mod tidy
 
 # Запуск сервера
-go run cmd/api/main.go --port 8080 --base mynotes
+go run ./cmd/api --port 8080
 
 # Сборка бинарника
 go build -o igonotes cmd/api/main.go
@@ -130,7 +130,7 @@ var staticFiles embed.FS
 
 - `--config` — каталог конфигурации (по умолчанию `<os.UserConfigDir()>/igonotes`)
 - `--port` — порт сервера (по умолчанию 8080)
-- `--base` — имя базы для открытия
+- `--base` — имя уже настроенной базы, присутствующее в `config.json`
 - `--no-browser` — не открывать браузер автоматически
 
 ## Документация

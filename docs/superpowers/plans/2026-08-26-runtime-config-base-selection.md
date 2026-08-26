@@ -1,6 +1,6 @@
 # План реализации конфигурации при запуске и выбора базы заметок
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Все записанные шаги отмечены как завершённые.
 
 **Goal:** Подключить сохранённую конфигурацию к запуску приложения, реализовать выбор базы через `--base` и использовать системный XDG-совместимый каталог конфигурации.
 
@@ -730,6 +730,8 @@ Expected: PASS. Это фиксирует рабочее состояние ко
 
 - [x] **Step 2: Заменить жёсткие пути и игнорирование `--base` в `main.go`**
 
+> **Историческое примечание:** следующий snippet отражает реализацию Task 5 с `os.Getenv("HOME")`. Окончательная реализация заменена в Task 8 на `resolveDataDir(os.UserHomeDir)` с явной обработкой ошибки и пустого домашнего каталога.
+
 Заменить блок от определения флагов до создания `NoteService` в `cmd/api/main.go` следующим кодом:
 
 ```go
@@ -964,3 +966,35 @@ Expected: рабочее дерево чистое, кроме самого фа
 - HTTP API и расположение SQLite не меняются.
 
 Expected: каждый пункт подтверждён тестом или прямой runtime-интеграцией в `main.go`.
+
+## Task 8: Исправления финального review
+
+**Files:**
+- Create: `cmd/api/data_path.go`
+- Create: `cmd/api/data_path_test.go`
+- Modify: `cmd/api/main.go`
+- Modify: `AGENTS.md`
+- Modify: `docs/user.md`
+- Modify: `docs/developer.md`
+- Modify: `docs/superpowers/specs/2026-08-26-runtime-config-base-selection-design.md`
+- Modify: `docs/superpowers/plans/2026-08-26-runtime-config-base-selection.md`
+
+- [x] **Step 1: Зафиксировать RED-тесты системного домашнего каталога**
+
+Добавлены тесты успешного разрешения `<home>/.igonotes`, возврата ошибки `os.UserHomeDir()` и отклонения пустого домашнего каталога. Первый запуск `go test ./cmd/api -run TestResolveDataDir -v` завершился ожидаемым FAIL из-за отсутствующего `resolveDataDir`.
+
+- [x] **Step 2: Реализовать системное разрешение каталога данных**
+
+Добавлен `resolveDataDir`, который вызывает переданную функцию домашнего каталога, оборачивает её ошибку, отклоняет пустой результат и возвращает `<home>/.igonotes`. `main.go` подключён через `resolveDataDir(os.UserHomeDir)` и завершает запуск с контекстной ошибкой, если каталог определить нельзя. Целевые тесты после реализации прошли.
+
+- [x] **Step 3: Зафиксировать runtime-исправление**
+
+Файлы `cmd/api/data_path.go`, `cmd/api/data_path_test.go` и `cmd/api/main.go` зафиксированы commit `fix: resolve platform data directory`.
+
+- [x] **Step 4: Синхронизировать команды запуска и описание путей**
+
+Пользовательский пример запуска больше не подставляет ненастроенное имя базы, команда разработчика использует пакет `./cmd/api`, а `--base` описан только как выбор имени из существующего `config.json`. Спецификация фиксирует семантический путь `~/.igonotes`, разрешение home через `os.UserHomeDir()` и понятную ошибку для недоступного или пустого home. Исторический snippet Task 5 помечен как заменённый этой задачей.
+
+- [x] **Step 5: Выполнить полную проверку и зафиксировать документацию**
+
+Проверены отсутствие устаревших команд через `git grep`, отсутствие незавершённых Step в плане, `git diff --check` и полный smoke-run `go test ./...`. Документационные исправления зафиксированы commit `docs: align startup path documentation`.
