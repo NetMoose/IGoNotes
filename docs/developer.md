@@ -27,7 +27,7 @@ go mod tidy
 go run ./cmd/api --port 8080
 
 # Сборка бинарника
-go build -o igonotes cmd/api/main.go
+go build -o igonotes ./cmd/api
 ```
 
 Рекомендуемая команда сборки:
