@@ -76,11 +76,11 @@ var staticFiles embed.FS
 ```
 
 ```
-~/.config/igonotes/
+$XDG_CONFIG_HOME/igonotes/
 └── config.json
 ```
 
-- Конфигурация приложения: `~/.config/igonotes/config.json` (XDG-совместимо)
+- Конфигурация приложения: `<os.UserConfigDir()>/igonotes/config.json` (в Linux учитывается `XDG_CONFIG_HOME`)
 - BoltDB с метаданными: `~/.igonotes/metadata.db`
 - Каждая база может иметь `.git/`, если включена синхронизация
 
@@ -127,7 +127,7 @@ var staticFiles embed.FS
 
 Поддерживаемые флаги:
 
-- `--config` — путь к конфигурации (по умолчанию `~/.config/igonotes`)
+- `--config` — каталог конфигурации (по умолчанию `<os.UserConfigDir()>/igonotes`)
 - `--port` — порт сервера (по умолчанию 8080)
 - `--base` — имя базы для открытия
 - `--no-browser` — не открывать браузер автоматически

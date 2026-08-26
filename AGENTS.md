@@ -21,7 +21,7 @@ IGoNotes — это CLI-приложение на Go, которое при за
 - [x] Загрузка и отображение изображений (Paste, Drag & Drop), хранятся в `assets/images/`
 - [x] Статус-бар внизу окна с отображением текущей директории базы заметок
 - [x] Оформление интерфейса на **Tailwind CSS v4**
-- [ ] Настройки программы хранятся в `~/.config` (XDG-совместимо) — *Реализовано API, но пока нет UI мастера*
+- [x] Конфигурация подключена к runtime и хранится в системном каталоге пользователя (XDG-совместимо); доступен GET/PUT API
 - [ ] При первом запуске — мастер настройки параметров в веб-интерфейсе
 - [ ] Синхронизация с Git через **go-git** (автосинхронизация по расписанию)
 - [x] Сборка бинарников под Linux, Windows и macOS для amd64 и arm64 через GitHub Actions
@@ -71,11 +71,12 @@ go:
             └── images/
                 └── Paste image 20260714150000.png
 
-~/.config/igonotes/
+$XDG_CONFIG_HOME/igonotes/
 └── config.json
 ```
 
-- Конфигурация приложения: `~/.config/igonotes/config.json`
+- Конфигурация приложения: `<os.UserConfigDir()>/igonotes/config.json`
+- Обычный путь в Linux: `~/.config/igonotes/config.json`
 - SQLite с метаданными: `~/.igonotes/metadata.db`
 
 ## REST API
@@ -96,7 +97,7 @@ go:
 | POST | `/api/git/sync` | *(В планах)* Запустить синхронизацию с Git |
 
 ## CLI-флаги
-- `--config` — путь к конфигурации (по умолчанию `~/.config/igonotes`)
+- `--config` — каталог конфигурации (по умолчанию `<os.UserConfigDir()>/igonotes`)
 - `--port` — порт сервера (по умолчанию `8080`)
 - `--base` — имя базы для открытия
 - `--no-browser` — не открывать браузер автоматически
