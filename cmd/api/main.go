@@ -47,7 +47,10 @@ func main() {
 	configFile := filepath.Join(resolvedConfigDir, "config.json")
 	configService := service.NewConfigService(configFile)
 
-	appDataDir := filepath.Join(os.Getenv("HOME"), ".igonotes")
+	appDataDir, err := resolveDataDir(os.UserHomeDir)
+	if err != nil {
+		log.Fatal("Ошибка определения каталога данных: ", err)
+	}
 	basePath, err := service.ResolveStartupBase(configService, *base, appDataDir)
 	if err != nil {
 		log.Fatal("Ошибка выбора базы заметок: ", err)
