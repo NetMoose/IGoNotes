@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -143,12 +144,26 @@ func TestResolveStartupBaseRejectsInvalidConfig(t *testing.T) {
 	if err := os.WriteFile(filePath, []byte("not a directory"), 0644); err != nil {
 		t.Fatalf("os.WriteFile(%q) error = %v, want nil", filePath, err)
 	}
+	invalidPath := "bad\x00path"
+	_, statErr := os.Stat(invalidPath)
+	if statErr == nil {
+		t.Fatalf("os.Stat(%q) error = nil, want non-nil", invalidPath)
+	}
+	if os.IsNotExist(statErr) {
+		t.Fatalf("os.Stat(%q) error = %v, want error other than not exist", invalidPath, statErr)
+	}
+	var pathErr *os.PathError
+	if !errors.As(statErr, &pathErr) {
+		t.Fatalf("os.Stat(%q) error = %T, want *os.PathError", invalidPath, statErr)
+	}
+	invalidPathCause := pathErr.Err
 
 	tests := []struct {
 		name          string
 		config        *model.Config
 		requestedBase string
 		wantErrors    []string
+		wantCause     error
 	}{
 		{
 			name: "unknown CLI base",
@@ -161,6 +176,15 @@ func TestResolveStartupBaseRejectsInvalidConfig(t *testing.T) {
 			},
 			requestedBase: "missing",
 			wantErrors:    []string{"--base", "missing", "personal, work"},
+		},
+		{
+			name: "base names are case-sensitive",
+			config: &model.Config{
+				Bases:       []model.Base{{Name: "Work", Path: validPath}},
+				CurrentBase: "Work",
+			},
+			requestedBase: "work",
+			wantErrors:    []string{"--base", "work", "Work"},
 		},
 		{
 			name: "unknown current base",
@@ -189,6 +213,18 @@ func TestResolveStartupBaseRejectsInvalidConfig(t *testing.T) {
 			wantErrors: []string{"повторяющееся", "personal"},
 		},
 		{
+			name: "duplicate unselected base name",
+			config: &model.Config{
+				Bases: []model.Base{
+					{Name: "selected", Path: validPath},
+					{Name: "duplicate", Path: validPath},
+					{Name: "duplicate", Path: validPath},
+				},
+				CurrentBase: "selected",
+			},
+			wantErrors: []string{"повторяющееся", "duplicate"},
+		},
+		{
 			name: "empty selected path",
 			config: &model.Config{
 				Bases:       []model.Base{{Name: "personal"}},
@@ -212,6 +248,15 @@ func TestResolveStartupBaseRejectsInvalidConfig(t *testing.T) {
 			},
 			wantErrors: []string{"не является каталогом"},
 		},
+		{
+			name: "selected path cannot be statted",
+			config: &model.Config{
+				Bases:       []model.Base{{Name: "personal", Path: invalidPath}},
+				CurrentBase: "personal",
+			},
+			wantErrors: []string{"не удалось проверить"},
+			wantCause:  invalidPathCause,
+		},
 	}
 
 	for _, tt := range tests {
@@ -234,6 +279,9 @@ func TestResolveStartupBaseRejectsInvalidConfig(t *testing.T) {
 				if !strings.Contains(err.Error(), wantError) {
 					t.Errorf("ResolveStartupBase() error = %q, want substring %q", err, wantError)
 				}
+			}
+			if tt.wantCause != nil && !errors.Is(err, tt.wantCause) {
+				t.Errorf("ResolveStartupBase() error = %v, want cause %v", err, tt.wantCause)
 			}
 
 			after, readErr := os.ReadFile(configPath)
