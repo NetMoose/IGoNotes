@@ -1,34 +1,34 @@
-# Runtime Configuration and Base Selection Design
+# Конфигурация при запуске и выбор базы заметок
 
-## Goal
+## Цель
 
-Use the persisted application configuration during startup, make `--base` select a configured notes base, and derive the default configuration directory through the operating system's XDG-aware configuration lookup.
+Использовать сохранённую конфигурацию приложения при запуске, выбирать настроенную базу заметок с помощью `--base` и определять каталог конфигурации через системный механизм с поддержкой XDG.
 
-The setup wizard, runtime base switching, Git synchronization, and per-base metadata databases are outside this change.
+Мастер первичной настройки, переключение базы во время работы, Git-синхронизация и отдельные базы метаданных для каждой базы заметок не входят в эту задачу.
 
-## Configuration Location
+## Расположение конфигурации
 
-The `--config` flag continues to represent a configuration directory. When it is explicitly provided, the application uses that directory and reads `<directory>/config.json`.
+Флаг `--config` по-прежнему обозначает каталог конфигурации. Если он задан явно, приложение использует этот каталог и читает файл `<каталог>/config.json`.
 
-When `--config` is omitted, the application calls `os.UserConfigDir()` and uses `<user-config-dir>/igonotes/config.json`. On Unix this honors `XDG_CONFIG_HOME` when it is set and otherwise uses the platform default. It also gives Windows and macOS their native user configuration locations.
+Если `--config` не указан, приложение вызывает `os.UserConfigDir()` и использует `<пользовательский-каталог-конфигурации>/igonotes/config.json`. В Unix это учитывает `XDG_CONFIG_HOME`, если переменная задана, а в остальных случаях использует системный путь по умолчанию. В Windows и macOS используются соответствующие системные каталоги пользовательской конфигурации.
 
-Failure to determine the user configuration directory stops startup with a descriptive error. An explicit `--config` value does not require that lookup.
+Если определить пользовательский каталог конфигурации не удалось, запуск завершается с понятной ошибкой. При явно заданном `--config` системное определение каталога не требуется.
 
-## Startup Resolver
+## Сервис разрешения запуска
 
-A startup resolver in `internal/service` coordinates configuration initialization and base selection. `ConfigService` remains responsible only for loading and saving JSON. `cmd/api/main.go` remains responsible for parsing flags and wiring dependencies.
+Отдельный сервис в `internal/service` координирует инициализацию конфигурации и выбор базы при запуске. `ConfigService` продолжает отвечать только за загрузку и сохранение JSON. `cmd/api/main.go` продолжает отвечать за разбор флагов и связывание зависимостей.
 
-The resolver receives:
+Сервис разрешения запуска получает:
 
-- the `ConfigService` for the selected `config.json`;
-- the optional value of `--base`;
-- the application data directory used for first-run defaults.
+- `ConfigService` для выбранного файла `config.json`;
+- необязательное значение флага `--base`;
+- каталог данных приложения, используемый для первоначальных значений.
 
-It returns the absolute or configured filesystem path of the selected notes base, or an error that prevents server startup.
+Сервис возвращает абсолютный или указанный в конфигурации путь к выбранной базе заметок. Ошибка разрешения останавливает запуск приложения.
 
-## First-Run Initialization
+## Инициализация при первом запуске
 
-When `config.json` does not exist or is empty, the resolver creates a usable default configuration. It creates the default base directory and saves the following logical values, using absolute paths rather than a literal `~`:
+Если `config.json` отсутствует или пуст, сервис создаёт рабочую конфигурацию по умолчанию. Он создаёт каталог базы `default` и сохраняет следующие логические значения, используя абсолютные пути вместо буквального `~`:
 
 ```json
 {
@@ -44,59 +44,59 @@ When `config.json` does not exist or is empty, the resolver creates a usable def
 }
 ```
 
-Only this first-run default directory is created automatically. Paths referenced by an existing configuration are treated as deliberate user settings and are never created implicitly.
+Автоматически создаётся только каталог `default` при первом запуске. Пути из существующей конфигурации считаются явно заданными пользователем и никогда не создаются автоматически.
 
-Malformed, unreadable, or otherwise invalid existing configuration is not replaced by the default configuration.
+Повреждённая, недоступная для чтения или иным образом некорректная существующая конфигурация не заменяется конфигурацией по умолчанию.
 
-## Base Selection
+## Выбор базы
 
-Selection follows this precedence:
+База выбирается в следующем порядке:
 
-1. A non-empty `--base NAME` selects the entry in `config.bases` whose `name` exactly equals `NAME`.
-2. Otherwise, `config.current_base` selects the entry with that name.
+1. Непустой флаг `--base NAME` выбирает элемент `config.bases`, поле `name` которого точно совпадает с `NAME`.
+2. Если `--base` не задан, используется элемент с именем из `config.current_base`.
 
-Base names are case-sensitive and must be unique. `config.base_dir` is persisted for configuration and future UI use, but it is not used to synthesize paths for named entries. Each selected base must have its own non-empty `path`.
+Имена баз чувствительны к регистру и должны быть уникальными. `config.base_dir` сохраняется для конфигурации и будущего интерфейса, но не используется для формирования путей именованных баз. У каждой выбираемой базы должен быть собственный непустой `path`.
 
-The selected path is passed to `service.NewNoteService`; the temporary hard-coded `bases/default` path in `main.go` is removed.
+Путь выбранной базы передаётся в `service.NewNoteService`. Временный жёстко заданный путь `bases/default` удаляется из `main.go`.
 
-The selected CLI base is an invocation-only override. Startup does not modify `current_base` in the persisted configuration.
+Выбор через CLI действует только на текущий запуск. Приложение не изменяет сохранённое значение `current_base`.
 
-## Validation and Errors
+## Проверка и ошибки
 
-Startup fails before the HTTP server is started when:
+Запуск завершается до старта HTTP-сервера в следующих случаях:
 
-- `config.json` contains invalid JSON;
-- multiple configured bases have the same name;
-- `--base` names no configured base;
-- `current_base` is empty or names no configured base when `--base` is absent;
-- the selected base has an empty name or path;
-- the selected path does not exist;
-- the selected path exists but is not a directory;
-- the selected path cannot be inspected due to a filesystem error.
+- `config.json` содержит некорректный JSON;
+- несколько настроенных баз имеют одинаковое имя;
+- значение `--base` не соответствует ни одной настроенной базе;
+- `current_base` пуст или не соответствует ни одной настроенной базе при отсутствии `--base`;
+- у выбранной базы пустое имя или путь;
+- путь выбранной базы не существует;
+- путь существует, но не является каталогом;
+- путь невозможно проверить из-за ошибки файловой системы.
 
-An unknown `--base` error includes the requested name and the available configured names. Other validation errors identify the relevant configuration field or path. Errors from startup resolution are wrapped with enough context for `main.go` to report them through `log.Fatal`.
+Ошибка неизвестного значения `--base` содержит запрошенное имя и список доступных имён баз. Остальные ошибки проверки указывают соответствующее поле конфигурации или путь. Ошибки сервиса разрешения запуска дополняются контекстом, достаточным для вывода через `log.Fatal` в `main.go`.
 
-## Existing Behavior
+## Существующее поведение
 
-The SQLite metadata database remains at `~/.igonotes/metadata.db`, and the first-run notes base remains under `~/.igonotes/bases/default`. The current application data directory behavior is unchanged; only the configuration directory becomes platform- and XDG-aware.
+База метаданных SQLite остаётся в `~/.igonotes/metadata.db`, а первоначальная база заметок остаётся в `~/.igonotes/bases/default`. Текущее расположение каталога данных приложения не меняется. Платформенно-зависимым и совместимым с XDG становится только каталог конфигурации.
 
-The `/api/config` endpoint and JSON schema remain unchanged. Saving configuration through that endpoint does not switch the active `NoteService` during the current process; the new selection takes effect on the next application start.
+Эндпоинт `/api/config` и JSON-схема не меняются. Сохранение конфигурации через этот эндпоинт не переключает активный `NoteService` в текущем процессе. Новая выбранная база применяется при следующем запуске приложения.
 
-## Testing
+## Тестирование
 
-Unit tests cover configuration directory resolution and startup base resolution with temporary directories:
+Модульные тесты с временными каталогами покрывают определение каталога конфигурации и разрешение базы при запуске:
 
-- explicit `--config` precedence;
-- default `os.UserConfigDir()/igonotes` composition;
-- creation and persistence of the first-run default configuration;
-- initialization from an empty configuration file;
-- selection by `--base` over `current_base`;
-- selection by `current_base` without `--base`;
-- errors for unknown CLI and configured base names;
-- errors for duplicate configured base names;
-- errors for empty selected names and paths;
-- errors for missing paths and non-directory paths;
-- propagation of malformed JSON without overwriting it;
-- preservation of an existing valid configuration.
+- приоритет явно заданного `--config`;
+- формирование пути `os.UserConfigDir()/igonotes` по умолчанию;
+- создание и сохранение первоначальной конфигурации `default`;
+- инициализацию из пустого файла конфигурации;
+- приоритет `--base` над `current_base`;
+- выбор через `current_base` без `--base`;
+- ошибки для неизвестных имён из CLI и конфигурации;
+- ошибки для повторяющихся имён баз;
+- ошибки для пустых имён и путей выбранной базы;
+- ошибки для отсутствующих путей и путей, не являющихся каталогами;
+- возврат ошибки некорректного JSON без перезаписи файла;
+- сохранение существующей корректной конфигурации без изменений.
 
-Repository verification consists of `go test ./...`, `go vet ./...`, and a full project build. No HTTP API or frontend behavior changes are required for this feature.
+Проверка репозитория включает `go test ./...`, `go vet ./...` и полную сборку проекта. Изменения HTTP API или frontend для этой задачи не требуются.
