@@ -56,6 +56,18 @@ func (s *ConfigService) Save(config *model.Config) error {
 	return os.WriteFile(s.configPath, data, 0644)
 }
 
+// NeedsInitialization сообщает, отсутствует ли файл конфигурации или является пустым.
+func (s *ConfigService) NeedsInitialization() (bool, error) {
+	info, err := os.Stat(s.configPath)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Size() == 0, nil
+}
+
 // Exists проверяет, существует ли файл конфигурации
 func (s *ConfigService) Exists() bool {
 	_, err := os.Stat(s.configPath)
