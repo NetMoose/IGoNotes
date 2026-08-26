@@ -27,10 +27,10 @@ layout: default
 go mod tidy
 
 # Запуск сервера
-go run cmd/api/main.go
+go run ./cmd/api
 
 # Сборка бинарника
-go build -o igonotes cmd/api/main.go
+go build -o igonotes ./cmd/api
 ```
 
 ## Работа с Git

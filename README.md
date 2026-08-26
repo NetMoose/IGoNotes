@@ -47,7 +47,7 @@ IGoNotes/
 
 go mod tidy
 
-go run cmd/api/main.go
+go run ./cmd/api
 ```
 
 Сервер запустится на `http://localhost:8080`.

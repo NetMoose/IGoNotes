@@ -974,8 +974,11 @@ Expected: каждый пункт подтверждён тестом или п�
 - Create: `cmd/api/data_path_test.go`
 - Modify: `cmd/api/main.go`
 - Modify: `AGENTS.md`
+- Modify: `README.md`
 - Modify: `docs/user.md`
 - Modify: `docs/developer.md`
+- Modify: `site/docs/user.md`
+- Modify: `site/docs/developer.md`
 - Modify: `docs/superpowers/specs/2026-08-26-runtime-config-base-selection-design.md`
 - Modify: `docs/superpowers/plans/2026-08-26-runtime-config-base-selection.md`
 
@@ -993,8 +996,8 @@ Expected: каждый пункт подтверждён тестом или п�
 
 - [x] **Step 4: Синхронизировать команды запуска и описание путей**
 
-Пользовательский пример запуска больше не подставляет ненастроенное имя базы, команда разработчика использует пакет `./cmd/api`, а `--base` описан только как выбор имени из существующего `config.json`. Спецификация фиксирует семантический путь `~/.igonotes`, разрешение home через `os.UserHomeDir()` и понятную ошибку для недоступного или пустого home. Исторический snippet Task 5 помечен как заменённый этой задачей.
+Пользовательский пример запуска больше не подставляет ненастроенное имя базы, а executable-команды в `README.md`, `docs` и `site/docs` используют пакет `./cmd/api`. Флаг `--base` описан только как выбор имени из существующего `config.json`. Спецификация фиксирует семантический путь `~/.igonotes`, разрешение home через `os.UserHomeDir()` и понятную ошибку для недоступного или пустого home. Исторический snippet Task 5 помечен как заменённый этой задачей.
 
 - [x] **Step 5: Выполнить полную проверку и зафиксировать документацию**
 
-Проверены отсутствие устаревших команд через `git grep`, отсутствие незавершённых Step в плане, `git diff --check` и полный smoke-run `go test ./...`. Документационные исправления зафиксированы commit `docs: align startup path documentation`.
+Проверены отсутствие устаревших команд repository-wide grep `git grep -n -E 'go (run|build)( -o [^ ]+)? +cmd/api/main\.go' -- '*.md'`, отсутствие незавершённых Step в плане, package build и run/help, `git diff --check` и полный smoke-run `go test ./...`. Документационные исправления зафиксированы commit `docs: align startup path documentation`, а финальные package-command исправления — commit `docs: fix package-level Go commands`.
