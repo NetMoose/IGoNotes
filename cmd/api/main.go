@@ -34,21 +34,27 @@ func openBrowser(url string) error {
 
 func main() {
 	// Определение CLI-флагов
-	configPath := flag.String("config", filepath.Join(os.Getenv("HOME"), ".config", "igonotes"), "Путь к конфигурации")
+	configPath := flag.String("config", "", "Каталог конфигурации (по умолчанию системный каталог пользователя)")
 	port := flag.String("port", "8080", "Порт сервера")
 	base := flag.String("base", "", "Имя базы для открытия")
 	noBrowser := flag.Bool("no-browser", false, "Не открывать браузер автоматически")
 	flag.Parse()
 
-	_ = base
-	_ = noBrowser
+	resolvedConfigDir, err := resolveConfigDir(*configPath, os.UserConfigDir)
+	if err != nil {
+		log.Fatal("Ошибка определения каталога конфигурации: ", err)
+	}
+	configFile := filepath.Join(resolvedConfigDir, "config.json")
+	configService := service.NewConfigService(configFile)
 
-	// Создаем полный путь к файлу конфигурации
-	configFile := filepath.Join(*configPath, "config.json")
+	appDataDir := filepath.Join(os.Getenv("HOME"), ".igonotes")
+	basePath, err := service.ResolveStartupBase(configService, *base, appDataDir)
+	if err != nil {
+		log.Fatal("Ошибка выбора базы заметок: ", err)
+	}
 
 	// Инициализация базы данных
-	configDir := filepath.Join(os.Getenv("HOME"), ".igonotes")
-	dbPath := filepath.Join(configDir, "metadata.db")
+	dbPath := filepath.Join(appDataDir, "metadata.db")
 	db, err := repository.InitDB(dbPath)
 	if err != nil {
 		log.Fatal("Ошибка инициализации БД:", err)
@@ -58,13 +64,7 @@ func main() {
 	noteRepo := repository.NewNoteRepository(db)
 
 	// Инициализация сервисов
-	configService := service.NewConfigService(configFile)
-	
-	// Временная заглушка для определения пути базы (позже брать из config)
-	defaultBaseDir := filepath.Join(configDir, "bases", "default")
-	os.MkdirAll(defaultBaseDir, 0755) // создадим папку, чтобы было что сканировать
-	
-	noteService := service.NewNoteService(noteRepo, defaultBaseDir)
+	noteService := service.NewNoteService(noteRepo, basePath)
 
 	// Запускаем первичную синхронизацию базы с диском при старте программы
 	go func() {
@@ -87,13 +87,6 @@ func main() {
 	}
 	spaHandler := handlers.NewSPAHandler(distFS)
 
-	// Проверяем, существует ли конфигурация
-
-	if !configService.Exists() {
-		log.Println("Конфигурация не найдена. Запуск мастера настройки...")
-		// TODO: Реализовать перенаправление на мастер настройки
-	}
-
 	// Маршрутизация
 	http.HandleFunc("/api/info", noteHandler.GetInfo)
 
@@ -104,7 +97,7 @@ func main() {
 			noteHandler.GetNotes(w, r)
 		}
 	})
-	
+
 	http.HandleFunc("/api/note", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			noteHandler.DeleteNote(w, r)
@@ -112,11 +105,11 @@ func main() {
 			noteHandler.GetNote(w, r)
 		}
 	})
-	
+
 	http.HandleFunc("/api/sync", noteHandler.SyncNotes)
-	
+
 	http.HandleFunc("/api/raw", noteHandler.GetRawFile)
-	
+
 	http.HandleFunc("/api/save", noteHandler.SaveNote)
 	http.HandleFunc("/api/rename", noteHandler.RenameNote)
 	http.HandleFunc("/api/assets", noteHandler.UploadAsset)

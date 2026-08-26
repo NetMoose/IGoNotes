@@ -71,9 +71,3 @@ func (s *ConfigService) NeedsInitialization() (bool, error) {
 	}
 	return info.Size() == 0, nil
 }
-
-// Exists проверяет, существует ли файл конфигурации
-func (s *ConfigService) Exists() bool {
-	_, err := os.Stat(s.configPath)
-	return !os.IsNotExist(err)
-}
