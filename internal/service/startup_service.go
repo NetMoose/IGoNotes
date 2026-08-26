@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"IGoNotes/internal/model"
 )
@@ -57,6 +58,16 @@ func initializeDefaultConfig(configService *ConfigService, dataDir string) (*mod
 }
 
 func selectConfiguredBase(config *model.Config, requestedBase string) (string, error) {
+	basesByName := make(map[string]model.Base, len(config.Bases))
+	availableNames := make([]string, 0, len(config.Bases))
+	for _, base := range config.Bases {
+		if _, exists := basesByName[base.Name]; exists {
+			return "", fmt.Errorf("конфигурация содержит повторяющееся имя базы %q", base.Name)
+		}
+		basesByName[base.Name] = base
+		availableNames = append(availableNames, base.Name)
+	}
+
 	selectedName := requestedBase
 	source := "--base"
 	if selectedName == "" {
@@ -67,25 +78,26 @@ func selectConfiguredBase(config *model.Config, requestedBase string) (string, e
 		return "", fmt.Errorf("поле %s не может быть пустым", source)
 	}
 
-	for _, base := range config.Bases {
-		if base.Name != selectedName {
-			continue
+	base, exists := basesByName[selectedName]
+	if !exists {
+		available := strings.Join(availableNames, ", ")
+		if available == "" {
+			available = "нет настроенных баз"
 		}
-		if base.Path == "" {
-			return "", fmt.Errorf("у базы %q пустой путь", selectedName)
-		}
-		info, err := os.Stat(base.Path)
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("путь базы %q не существует", base.Path)
-		}
-		if err != nil {
-			return "", fmt.Errorf("не удалось проверить путь базы %q: %w", base.Path, err)
-		}
-		if !info.IsDir() {
-			return "", fmt.Errorf("путь базы %q не является каталогом", base.Path)
-		}
-		return base.Path, nil
+		return "", fmt.Errorf("%s %q не соответствует настроенной базе; доступны: %s", source, selectedName, available)
 	}
-
-	return "", fmt.Errorf("%s %q не соответствует настроенной базе", source, selectedName)
+	if base.Path == "" {
+		return "", fmt.Errorf("у базы %q пустой путь", selectedName)
+	}
+	info, err := os.Stat(base.Path)
+	if os.IsNotExist(err) {
+		return "", fmt.Errorf("путь базы %q не существует", base.Path)
+	}
+	if err != nil {
+		return "", fmt.Errorf("не удалось проверить путь базы %q: %w", base.Path, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("путь базы %q не является каталогом", base.Path)
+	}
+	return base.Path, nil
 }

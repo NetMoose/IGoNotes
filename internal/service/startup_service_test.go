@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"IGoNotes/internal/model"
@@ -129,5 +130,143 @@ func TestResolveStartupBaseSelectsConfiguredBase(t *testing.T) {
 				t.Errorf("config changed after ResolveStartupBase()\nbefore: %s\nafter:  %s", before, after)
 			}
 		})
+	}
+}
+
+func TestResolveStartupBaseRejectsInvalidConfig(t *testing.T) {
+	root := t.TempDir()
+	validPath := filepath.Join(root, "valid")
+	if err := os.MkdirAll(validPath, 0755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v, want nil", validPath, err)
+	}
+	filePath := filepath.Join(root, "file")
+	if err := os.WriteFile(filePath, []byte("not a directory"), 0644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v, want nil", filePath, err)
+	}
+
+	tests := []struct {
+		name          string
+		config        *model.Config
+		requestedBase string
+		wantErrors    []string
+	}{
+		{
+			name: "unknown CLI base",
+			config: &model.Config{
+				Bases: []model.Base{
+					{Name: "personal", Path: validPath},
+					{Name: "work", Path: validPath},
+				},
+				CurrentBase: "personal",
+			},
+			requestedBase: "missing",
+			wantErrors:    []string{"--base", "missing", "personal, work"},
+		},
+		{
+			name: "unknown current base",
+			config: &model.Config{
+				Bases:       []model.Base{{Name: "personal", Path: validPath}},
+				CurrentBase: "missing",
+			},
+			wantErrors: []string{"current_base", "missing"},
+		},
+		{
+			name: "empty current base",
+			config: &model.Config{
+				Bases: []model.Base{{Name: "", Path: validPath}},
+			},
+			wantErrors: []string{"current_base", "пустым"},
+		},
+		{
+			name: "duplicate base name",
+			config: &model.Config{
+				Bases: []model.Base{
+					{Name: "personal", Path: validPath},
+					{Name: "personal", Path: validPath},
+				},
+				CurrentBase: "personal",
+			},
+			wantErrors: []string{"повторяющееся", "personal"},
+		},
+		{
+			name: "empty selected path",
+			config: &model.Config{
+				Bases:       []model.Base{{Name: "personal"}},
+				CurrentBase: "personal",
+			},
+			wantErrors: []string{"personal", "пустой путь"},
+		},
+		{
+			name: "missing selected path",
+			config: &model.Config{
+				Bases:       []model.Base{{Name: "personal", Path: filepath.Join(root, "missing")}},
+				CurrentBase: "personal",
+			},
+			wantErrors: []string{"не существует"},
+		},
+		{
+			name: "selected path is a regular file",
+			config: &model.Config{
+				Bases:       []model.Base{{Name: "personal", Path: filePath}},
+				CurrentBase: "personal",
+			},
+			wantErrors: []string{"не является каталогом"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(root, tt.name, "config.json")
+			configService := NewConfigService(configPath)
+			if err := configService.Save(tt.config); err != nil {
+				t.Fatalf("Save() error = %v, want nil", err)
+			}
+			before, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatalf("os.ReadFile() before ResolveStartupBase error = %v, want nil", err)
+			}
+
+			_, err = ResolveStartupBase(configService, tt.requestedBase, filepath.Join(root, "data"))
+			if err == nil {
+				t.Fatal("ResolveStartupBase() error = nil, want non-nil")
+			}
+			for _, wantError := range tt.wantErrors {
+				if !strings.Contains(err.Error(), wantError) {
+					t.Errorf("ResolveStartupBase() error = %q, want substring %q", err, wantError)
+				}
+			}
+
+			after, readErr := os.ReadFile(configPath)
+			if readErr != nil {
+				t.Fatalf("os.ReadFile() after ResolveStartupBase error = %v, want nil", readErr)
+			}
+			if !bytes.Equal(after, before) {
+				t.Errorf("config changed after ResolveStartupBase()\nbefore: %s\nafter:  %s", before, after)
+			}
+		})
+	}
+}
+
+func TestResolveStartupBaseDoesNotOverwriteMalformedConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v, want nil", err)
+	}
+	original := []byte(`{"bases": [`)
+	if err := os.WriteFile(configPath, original, 0644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+
+	_, err := ResolveStartupBase(NewConfigService(configPath), "", filepath.Join(root, "data"))
+	if err == nil {
+		t.Fatal("ResolveStartupBase() error = nil, want non-nil")
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile() after ResolveStartupBase error = %v, want nil", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Errorf("config changed after ResolveStartupBase()\nbefore: %s\nafter:  %s", original, after)
 	}
 }
