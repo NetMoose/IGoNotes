@@ -21,7 +21,7 @@ IGoNotes — это CLI-приложение на Go, которое при за
 - [x] Загрузка и отображение изображений (Paste, Drag & Drop), хранятся в `assets/images/`
 - [x] Статус-бар внизу окна с отображением текущей директории базы заметок
 - [x] Оформление интерфейса на **Tailwind CSS v4**
-- [x] Конфигурация подключена к runtime и хранится в системном каталоге пользователя (XDG-совместимо); доступен GET/PUT API
+- [x] Конфигурация загружается и используется приложением при запуске, хранится в системном каталоге пользователя (XDG-совместимо); доступен GET/PUT API
 - [ ] При первом запуске — мастер настройки параметров в веб-интерфейсе
 - [ ] Синхронизация с Git через **go-git** (автосинхронизация по расписанию)
 - [x] Сборка бинарников под Linux, Windows и macOS для amd64 и arm64 через GitHub Actions
@@ -71,12 +71,13 @@ go:
             └── images/
                 └── Paste image 20260714150000.png
 
-$XDG_CONFIG_HOME/igonotes/
-└── config.json
+<os.UserConfigDir()>/
+└── igonotes/
+    └── config.json
 ```
 
 - Конфигурация приложения: `<os.UserConfigDir()>/igonotes/config.json`
-- Обычный путь в Linux: `~/.config/igonotes/config.json`
+- В Linux каталог конфигурации приложения — `$XDG_CONFIG_HOME/igonotes`, если `XDG_CONFIG_HOME` задана; иначе `~/.config/igonotes`
 - SQLite с метаданными: `~/.igonotes/metadata.db`
 
 ## REST API

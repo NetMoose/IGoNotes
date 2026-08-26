@@ -10,8 +10,8 @@
    igonotes --port 8080 --base mynotes
    ```
    Поддерживаемые флаги:
-   - `--config` — каталог конфигурации (по умолчанию `<os.UserConfigDir()>/igonotes`)
-     В Linux каталог обычно расположен в `~/.config/igonotes`.
+   - `--config` — каталог конфигурации (по умолчанию системный каталог конфигурации)
+     Пути по умолчанию: Linux `${XDG_CONFIG_HOME:-$HOME/.config}/igonotes`, macOS `~/Library/Application Support/igonotes`, Windows `%AppData%\igonotes`.
    - `--port` — порт сервера (по умолчанию 8080)
    - `--base` — имя базы для открытия
    - `--no-browser` — не открывать браузер автоматически
@@ -23,7 +23,7 @@
 Если конфигурация отсутствует или пуста, приложение автоматически:
 
 1. Создаёт базу `default` в `~/.igonotes/bases/default`.
-2. Сохраняет `config.json` в системном каталоге пользовательской конфигурации (`$XDG_CONFIG_HOME/igonotes` в Linux).
+2. Сохраняет `config.json` в системном каталоге пользовательской конфигурации (в Linux: `$XDG_CONFIG_HOME/igonotes`, если `XDG_CONFIG_HOME` задана; иначе `~/.config/igonotes`).
 3. Открывает базу `default` в редакторе.
 
 Для выбора другой уже настроенной базы используйте `--base <имя>`. Неизвестное имя базы завершает запуск с ошибкой и списком доступных баз.
@@ -56,7 +56,7 @@ IGoNotes использует парсер `marked.js` и поддерживае
 
 - Заметки хранятся в `~/.igonotes/bases/<база>/<тема>/notes/...`
 - Вспомогательные файлы (картинки, вложения) — в `~/.igonotes/bases/<база>/assets/images/`
-- Конфигурация — `<os.UserConfigDir()>/igonotes/config.json` (в Linux учитывается `XDG_CONFIG_HOME`)
+- Конфигурация — `config.json` в системном каталоге конфигурации. Пути по умолчанию: Linux `${XDG_CONFIG_HOME:-$HOME/.config}/igonotes`, macOS `~/Library/Application Support/igonotes`, Windows `%AppData%\igonotes`.
 - Метаданные (структура, теги) — `~/.igonotes/metadata.db` (BoltDB)
 
 ## Синхронизация через Git
