@@ -199,7 +199,7 @@
   }
 </script>
 
-<aside class="w-72 bg-gray-50 border-r border-gray-200 flex flex-col h-screen shrink-0">
+<aside class="w-72 bg-gray-50 border-r border-gray-200 flex flex-col h-full shrink-0">
   <div class="p-3 border-b border-gray-200 bg-gray-100 flex flex-col gap-2">
     <div class="flex justify-between items-center mb-1">
       <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wider">База заметок</h2>
