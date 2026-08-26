@@ -41,7 +41,7 @@ make build
 ```makefile
 build:
     npm run build  # если используется JS-сборка
-    go build -o igonotes .
+    go build -o igonotes ./cmd/api
 ```
 
 ## Фронтенд: сборка и внедрение
