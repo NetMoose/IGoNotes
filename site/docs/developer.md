@@ -93,7 +93,7 @@ go build -o igonotes cmd/api/main.go
 
 ## Сборка релиза
 
-Релиз осуществляется через gitverse.ru из ветки `develop` → `master`.
+Релизы публикуются через GitHub Actions при отправке тегов вида `v*` из стабильной ветки `master`.
 
 ---
 

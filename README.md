@@ -16,7 +16,7 @@ IGoNotes — это CLI-приложение на Go, которое запус�
 - **Бэкенд**: Go (1.21+)
 - **Фронтенд**: HTML, CSS, JavaScript (marked.js для парсинга Markdown)
 - **Хранение**: BoltDB (планируется)
-- **Сборка и релиз**: gitverse.ru
+- **Сборка и релиз**: GitHub Actions
 
 ## Структура проекта
 

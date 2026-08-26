@@ -147,7 +147,7 @@ var staticFiles embed.FS
 
 ## Сборка релиза
 
-Релиз осуществляется через gitverse.ru из ветки `develop` → `master`.
+Релизы публикуются через GitHub Actions при отправке тегов вида `v*` из стабильной ветки `master`.
 
 ---
 
