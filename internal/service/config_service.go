@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -64,6 +65,9 @@ func (s *ConfigService) NeedsInitialization() (bool, error) {
 	}
 	if err != nil {
 		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("путь конфигурации %q не является обычным файлом", s.configPath)
 	}
 	return info.Size() == 0, nil
 }

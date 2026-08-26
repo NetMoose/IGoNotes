@@ -51,6 +51,15 @@ func TestConfigServiceNeedsInitialization(t *testing.T) {
 		}
 	})
 
+	t.Run("directory path", func(t *testing.T) {
+		service := NewConfigService(t.TempDir())
+
+		got, err := service.NeedsInitialization()
+		if err == nil {
+			t.Fatalf("NeedsInitialization() = (%v, %v), want non-nil error", got, err)
+		}
+	})
+
 	t.Run("stat error", func(t *testing.T) {
 		dir := t.TempDir()
 		notDirectory := filepath.Join(dir, "not-a-directory")
