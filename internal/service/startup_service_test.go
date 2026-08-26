@@ -72,6 +72,35 @@ func TestResolveStartupBaseInitializesDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestResolveStartupBaseStoresAbsoluteDefaultPath(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	configPath := filepath.Join(root, "config", "config.json")
+	configService := NewConfigService(configPath)
+
+	gotPath, err := ResolveStartupBase(configService, "", ".igonotes")
+	if err != nil {
+		t.Fatalf("ResolveStartupBase() error = %v, want nil", err)
+	}
+	if !filepath.IsAbs(gotPath) {
+		t.Errorf("ResolveStartupBase() = %q, want absolute path", gotPath)
+	}
+
+	config, err := configService.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if !filepath.IsAbs(config.BaseDir) {
+		t.Errorf("saved BaseDir = %q, want absolute path", config.BaseDir)
+	}
+	if len(config.Bases) != 1 {
+		t.Fatalf("saved Bases length = %d, want 1", len(config.Bases))
+	}
+	if !filepath.IsAbs(config.Bases[0].Path) {
+		t.Errorf("saved default base path = %q, want absolute path", config.Bases[0].Path)
+	}
+}
+
 func TestResolveStartupBaseSelectsConfiguredBase(t *testing.T) {
 	tests := []struct {
 		name          string

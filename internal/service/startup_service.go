@@ -35,7 +35,10 @@ func ResolveStartupBase(configService *ConfigService, requestedBase, dataDir str
 }
 
 func initializeDefaultConfig(configService *ConfigService, dataDir string) (*model.Config, error) {
-	baseRoot := filepath.Join(dataDir, "bases")
+	baseRoot, err := filepath.Abs(filepath.Join(dataDir, "bases"))
+	if err != nil {
+		return nil, fmt.Errorf("не удалось определить абсолютный путь каталога баз: %w", err)
+	}
 	basePath := filepath.Join(baseRoot, defaultBaseName)
 	if err := os.MkdirAll(basePath, 0755); err != nil {
 		return nil, fmt.Errorf("не удалось создать базу по умолчанию %q: %w", basePath, err)
