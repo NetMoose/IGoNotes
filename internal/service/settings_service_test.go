@@ -61,6 +61,7 @@ type fakeBaseRuntime struct {
 	switchErr        error
 	switchErrs       []error
 	events           *orderedEvents
+	commitErr        error
 }
 
 func (f *fakeBaseRuntime) GetBasePath() string {
@@ -86,28 +87,32 @@ func (f *fakeBaseRuntime) SwitchBase(path string) error {
 	return nil
 }
 
-func (f *fakeBaseRuntime) SwitchBaseTransaction(path string, persist func() error) error {
+func (f *fakeBaseRuntime) switchBaseTransaction(path string, store ConfigStore, next *model.Config) (error, error) {
 	f.transactionCalls = append(f.transactionCalls, path)
 	if f.events != nil {
-		f.events.record("candidate:" + path)
+		f.events.record("prepare:" + path)
 	}
 	if err := f.nextSwitchError(); err != nil {
-		return err
+		return fmt.Errorf("switch runtime base: %w", err), nil
 	}
-	if err := persist(); err != nil {
+	if err := store.Save(next); err != nil {
 		if f.events != nil {
-			f.events.record("rollback")
+			f.events.record("rollback:" + path)
 		}
-		if rollbackErr := f.nextSwitchError(); rollbackErr != nil {
-			return errors.Join(ErrRollbackFailed, err, rollbackErr)
+		return fmt.Errorf("save settings: %w", err), f.nextSwitchError()
+	}
+	if f.commitErr != nil {
+		if f.events != nil {
+			f.events.record("commit:" + path)
+			f.events.record("rollback:" + path)
 		}
-		return err
+		return fmt.Errorf("commit note index: %w", f.commitErr), commitOutcomeError(f.nextSwitchError())
 	}
 	f.path = path
 	if f.events != nil {
-		f.events.record("publish:" + path)
+		f.events.record("commit:" + path)
 	}
-	return nil
+	return nil, nil
 }
 
 func (f *fakeBaseRuntime) nextSwitchError() error {
@@ -510,7 +515,7 @@ func TestSettingsServiceCompleteSetupCreatesSelectedBase(t *testing.T) {
 		t.Errorf("base paths = response %q, runtime %q; want %q", response.BasePath, runtime.path, target)
 	}
 	if !reflect.DeepEqual(runtime.transactionCalls, []string{target}) {
-		t.Errorf("SwitchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, target)
+		t.Errorf("switchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, target)
 	}
 	if store.saveCalls != 1 {
 		t.Errorf("Save calls = %d, want 1", store.saveCalls)
@@ -555,7 +560,7 @@ func TestSettingsServiceCompleteSetupConnectsSelectedBase(t *testing.T) {
 		t.Errorf("base paths = response %q, runtime %q; want %q", response.BasePath, runtime.path, absPath)
 	}
 	if !reflect.DeepEqual(runtime.transactionCalls, []string{absPath}) {
-		t.Errorf("SwitchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, absPath)
+		t.Errorf("switchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, absPath)
 	}
 }
 
@@ -662,7 +667,7 @@ func TestSettingsServiceCompleteSetupRollsBackRuntimeAndPreservesCreatedBaseAfte
 	}
 	target := filepath.Join(parent, "work")
 	if !reflect.DeepEqual(runtime.transactionCalls, []string{target}) {
-		t.Errorf("SwitchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, target)
+		t.Errorf("switchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, target)
 	}
 	assertDirectory(t, target)
 	assertDirectory(t, oldPath)
@@ -742,7 +747,7 @@ func TestSettingsServiceCompleteSetupFromEmptyRuntimeRollsBackAndPreservesCreate
 		t.Fatalf("CompleteSetup() error = %v, do not want ErrRollbackFailed", err)
 	}
 	if !reflect.DeepEqual(runtime.transactionCalls, []string{filepath.Join(parent, "work")}) {
-		t.Errorf("SwitchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
+		t.Errorf("switchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
 	}
 	if runtime.path != "" {
 		t.Errorf("runtime path = %q, want empty", runtime.path)
@@ -1154,7 +1159,7 @@ func TestSettingsServiceUpdateBasePreservesStateOnSwitchAndSaveFailures(t *testi
 		}
 		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 0)
 		if !reflect.DeepEqual(runtime.transactionCalls, []string{targetPath}) {
-			t.Errorf("SwitchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, targetPath)
+			t.Errorf("switchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, targetPath)
 		}
 	})
 	t.Run("save failure rolls back", func(t *testing.T) {
@@ -1169,9 +1174,9 @@ func TestSettingsServiceUpdateBasePreservesStateOnSwitchAndSaveFailures(t *testi
 			t.Fatalf("UpdateBase() error = %v, want %v", err, saveErr)
 		}
 		if !reflect.DeepEqual(runtime.transactionCalls, []string{targetPath}) {
-			t.Errorf("SwitchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
+			t.Errorf("switchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
 		}
-		wantEvents := []string{"candidate:" + targetPath, "save", "rollback"}
+		wantEvents := []string{"prepare:" + targetPath, "save", "rollback:" + targetPath}
 		if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 			t.Errorf("events = %v, want %v", got, wantEvents)
 		}
@@ -1231,7 +1236,7 @@ func TestSettingsServiceUpdateBaseRollbackRetainsOriginalRuntimePath(t *testing.
 	if !errors.Is(err, store.saveErr) {
 		t.Fatalf("UpdateBase() error = %v, want %v", err, store.saveErr)
 	}
-	wantEvents := []string{"candidate:" + targetPath, "save", "rollback"}
+	wantEvents := []string{"prepare:" + targetPath, "save", "rollback:" + targetPath}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 		t.Errorf("events = %v, want %v", got, wantEvents)
 	}
@@ -1373,7 +1378,7 @@ func TestSettingsServiceSwitchBaseIsTransactional(t *testing.T) {
 		t.Errorf("response/store = %#v path %q / %#v, want %#v path %q", response.Config, response.BasePath, *store.config, want, otherPath)
 	}
 	if !reflect.DeepEqual(runtime.transactionCalls, []string{otherPath}) {
-		t.Errorf("SwitchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, otherPath)
+		t.Errorf("switchBaseTransaction calls = %v, want [%q]", runtime.transactionCalls, otherPath)
 	}
 }
 
@@ -1410,9 +1415,9 @@ func TestSettingsServiceSwitchBaseRejectsMissingAndPreservesFailures(t *testing.
 			t.Fatalf("SwitchBase() error = %v, want %v", err, saveErr)
 		}
 		if !reflect.DeepEqual(runtime.transactionCalls, []string{otherPath}) {
-			t.Errorf("SwitchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
+			t.Errorf("switchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
 		}
-		wantEvents := []string{"candidate:" + otherPath, "save", "rollback"}
+		wantEvents := []string{"prepare:" + otherPath, "save", "rollback:" + otherPath}
 		if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 			t.Errorf("events = %v, want %v", got, wantEvents)
 		}
@@ -1707,9 +1712,9 @@ func TestSettingsServiceReplaceConfigIsTransactional(t *testing.T) {
 			t.Fatalf("ReplaceConfig() error = %v, want %v", err, saveErr)
 		}
 		if !reflect.DeepEqual(runtime.transactionCalls, []string{targetPath}) {
-			t.Errorf("SwitchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
+			t.Errorf("switchBaseTransaction calls = %v, want target only", runtime.transactionCalls)
 		}
-		wantEvents := []string{"candidate:" + targetPath, "save", "rollback"}
+		wantEvents := []string{"prepare:" + targetPath, "save", "rollback:" + targetPath}
 		if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 			t.Errorf("events = %v, want %v", got, wantEvents)
 		}

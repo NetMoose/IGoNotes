@@ -20,9 +20,15 @@ import (
 type fakeNoteRepository struct {
 	mu             sync.Mutex
 	nodes          []model.NoteNode
-	replaceErr     error
-	replaceErrs    []error
-	replaceCalls   int
+	prepareErr     error
+	prepareErrs    []error
+	commitErr      error
+	commitErrs     []error
+	rollbackErr    error
+	rollbackErrs   []error
+	prepareCalls   int
+	commitCalls    int
+	rollbackCalls  int
 	events         *orderedEvents
 	replaceStarted chan struct{}
 	replaceRelease <-chan struct{}
@@ -78,11 +84,22 @@ func (r *fakeNoteRepository) GetAllNodes() ([]model.NoteNode, error) {
 }
 
 func (r *fakeNoteRepository) ReplaceAll(nodes []model.NoteNode) error {
+	commit, rollback, err := r.BeginReplaceAll(nodes)
+	if err != nil {
+		return err
+	}
+	if err := commit(); err != nil {
+		return errors.Join(err, rollback())
+	}
+	return nil
+}
+
+func (r *fakeNoteRepository) BeginReplaceAll(nodes []model.NoteNode) (func() error, func() error, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.replaceCalls++
+	r.prepareCalls++
 	if r.events != nil {
-		r.events.record(fmt.Sprintf("replace:%d", r.replaceCalls))
+		r.events.record(fmt.Sprintf("prepare:%d", r.prepareCalls))
 	}
 	if r.replaceStarted != nil {
 		r.startedOnce.Do(func() { close(r.replaceStarted) })
@@ -90,17 +107,85 @@ func (r *fakeNoteRepository) ReplaceAll(nodes []model.NoteNode) error {
 	if r.replaceRelease != nil {
 		<-r.replaceRelease
 	}
-	if len(r.replaceErrs) != 0 {
-		err := r.replaceErrs[0]
-		r.replaceErrs = r.replaceErrs[1:]
+	if len(r.prepareErrs) != 0 {
+		err := r.prepareErrs[0]
+		r.prepareErrs = r.prepareErrs[1:]
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-	} else if r.replaceErr != nil {
-		return r.replaceErr
+	} else if r.prepareErr != nil {
+		return nil, nil, r.prepareErr
 	}
-	r.nodes = append([]model.NoteNode(nil), nodes...)
-	return nil
+	commitErr := r.commitErr
+	if len(r.commitErrs) != 0 {
+		commitErr = r.commitErrs[0]
+		r.commitErrs = r.commitErrs[1:]
+	}
+	rollbackErr := r.rollbackErr
+	if len(r.rollbackErrs) != 0 {
+		rollbackErr = r.rollbackErrs[0]
+		r.rollbackErrs = r.rollbackErrs[1:]
+	}
+	tx := &fakeReplaceTransaction{
+		repo:        r,
+		nodes:       append([]model.NoteNode(nil), nodes...),
+		commitErr:   commitErr,
+		rollbackErr: rollbackErr,
+	}
+	return tx.commit, tx.rollback, nil
+}
+
+type fakeReplaceTransaction struct {
+	mu             sync.Mutex
+	repo           *fakeNoteRepository
+	nodes          []model.NoteNode
+	commitErr      error
+	rollbackErr    error
+	commitCalled   bool
+	rollbackCalled bool
+}
+
+var errFakeReplaceTransactionDone = errors.New("fake replace transaction done")
+
+func (t *fakeReplaceTransaction) commit() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.commitCalled {
+		return t.commitErr
+	}
+	if t.rollbackCalled {
+		return errFakeReplaceTransactionDone
+	}
+	t.commitCalled = true
+	t.repo.mu.Lock()
+	defer t.repo.mu.Unlock()
+	t.repo.commitCalls++
+	if t.repo.events != nil {
+		t.repo.events.record(fmt.Sprintf("commit:%d", t.repo.commitCalls))
+	}
+	if t.commitErr == nil {
+		t.repo.nodes = append([]model.NoteNode(nil), t.nodes...)
+	}
+	return t.commitErr
+}
+
+func (t *fakeReplaceTransaction) rollback() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.rollbackCalled {
+		return t.rollbackErr
+	}
+	if t.commitCalled && t.commitErr == nil {
+		return errFakeReplaceTransactionDone
+	}
+	t.rollbackCalled = true
+	t.repo.mu.Lock()
+	defer t.repo.mu.Unlock()
+	t.repo.rollbackCalls++
+	if t.repo.events != nil {
+		t.repo.events.record(fmt.Sprintf("rollback:%d", t.repo.rollbackCalls))
+	}
+	return t.rollbackErr
 }
 
 func (r *fakeNoteRepository) DeleteNode(id string) error {
@@ -246,7 +331,7 @@ func TestNoteServiceSwitchBaseReplaceFailurePreservesBaseAndIndex(t *testing.T) 
 	}
 	wantErr := errors.New("replace failed")
 	wantNodes := []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}
-	repo := &fakeNoteRepository{nodes: append([]model.NoteNode(nil), wantNodes...), replaceErr: wantErr}
+	repo := &fakeNoteRepository{nodes: append([]model.NoteNode(nil), wantNodes...), prepareErr: wantErr}
 	service := newTestNoteService(t, repo, oldBase)
 
 	err := service.SwitchBase(target)
@@ -272,7 +357,7 @@ func TestNoteServiceSwitchBaseClosesRejectedCandidateRoot(t *testing.T) {
 	}
 	target := t.TempDir()
 	wantErr := errors.New("replace failed")
-	service := newTestNoteService(t, &fakeNoteRepository{replaceErr: wantErr}, oldBase)
+	service := newTestNoteService(t, &fakeNoteRepository{prepareErr: wantErr}, oldBase)
 	var candidate *os.Root
 	service.openRoot = func(name string) (*os.Root, error) {
 		root, err := os.OpenRoot(name)

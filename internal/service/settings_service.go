@@ -14,18 +14,20 @@ import (
 
 type ConfigStore interface {
 	Load() (*model.Config, error)
+	// Save only persists the supplied snapshot. It must not call BaseRuntime:
+	// runtime switches invoke Save while holding the runtime base lock.
 	Save(*model.Config) error
 }
 
 type BaseRuntime interface {
 	GetBasePath() string
 	SwitchBase(string) error
-	SwitchBaseTransaction(string, func() error) error
+	switchBaseTransaction(string, ConfigStore, *model.Config) (operationErr, rollbackErr error)
 }
 
 type SettingsService struct {
-	// Lock ordering: SettingsService.mu precedes BaseRuntime locks. BaseRuntime
-	// implementations must not call back into SettingsService while locked.
+	// Lock ordering: SettingsService.mu precedes BaseRuntime locks, which precede
+	// ConfigStore.Save. Neither dependency may call back into an earlier layer.
 	mu       sync.RWMutex
 	store    ConfigStore
 	notes    BaseRuntime
@@ -226,24 +228,18 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 		return nil
 	}
 
-	var saveErr error
-	err = s.notes.SwitchBaseTransaction(canonicalTarget, func() error {
-		if err := s.store.Save(&next); err != nil {
-			saveErr = fmt.Errorf("save settings: %w", err)
-			return saveErr
-		}
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, ErrRollbackFailed) {
-			s.logger.Printf("settings runtime rollback failed: %v", err)
-			s.degraded = err
-			return s.degraded
-		}
-		if saveErr != nil {
-			return err
-		}
-		return fmt.Errorf("switch runtime base: %w", err)
+	operationErr, rollbackErr := s.notes.switchBaseTransaction(canonicalTarget, s.store, &next)
+	if rollbackErr != nil {
+		s.degraded = errors.Join(
+			ErrRollbackFailed,
+			operationErr,
+			fmt.Errorf("restore runtime base: %w", rollbackErr),
+		)
+		s.logger.Printf("settings runtime rollback failed: %v", s.degraded)
+		return s.degraded
+	}
+	if operationErr != nil {
+		return operationErr
 	}
 
 	s.config = cloneConfig(next)

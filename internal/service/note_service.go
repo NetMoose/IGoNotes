@@ -25,6 +25,7 @@ type noteRepository interface {
 	UpsertNode(id, title, path string, parentID *string, nodeType string) error
 	GetAllNodes() ([]model.NoteNode, error)
 	ReplaceAll([]model.NoteNode) error
+	BeginReplaceAll([]model.NoteNode) (commit func() error, rollback func() error, err error)
 	DeleteNode(id string) error
 }
 
@@ -111,19 +112,71 @@ func (s *NoteService) Close() error {
 }
 
 func (s *NoteService) SwitchBase(target string) error {
-	return s.SwitchBaseTransaction(target, func() error { return nil })
-}
-
-func (s *NoteService) SwitchBaseTransaction(target string, persist func() error) error {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
-	if errors.Is(s.baseErr, os.ErrClosed) {
-		return os.ErrClosed
-	}
-	if persist == nil {
-		return os.ErrInvalid
+	if errors.Is(s.baseErr, os.ErrClosed) || errors.Is(s.baseErr, ErrRollbackFailed) {
+		return s.baseErr
 	}
 
+	candidate, err := s.prepareBaseSwitchLocked(target)
+	if err != nil {
+		return err
+	}
+	if err := candidate.commit(); err != nil {
+		rollbackErr := candidate.rollback()
+		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+		return s.failClosedLocked(
+			fmt.Errorf("commit note index: %w", err),
+			commitOutcomeError(rollbackErr),
+		)
+	}
+	s.publishBaseSwitchLocked(candidate)
+	return nil
+}
+
+func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, next *model.Config) (error, error) {
+	s.baseMu.Lock()
+	defer s.baseMu.Unlock()
+	if errors.Is(s.baseErr, os.ErrClosed) || errors.Is(s.baseErr, ErrRollbackFailed) {
+		return s.baseErr, nil
+	}
+	if store == nil || next == nil {
+		return os.ErrInvalid, nil
+	}
+
+	candidate, err := s.prepareBaseSwitchLocked(target)
+	if err != nil {
+		return fmt.Errorf("switch runtime base: %w", err), nil
+	}
+	config := cloneConfig(*next)
+	if err := store.Save(&config); err != nil {
+		operationErr := fmt.Errorf("save settings: %w", err)
+		if rollbackErr := candidate.rollback(); rollbackErr != nil {
+			s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+			s.failClosedLocked(operationErr, fmt.Errorf("rollback note index: %w", rollbackErr))
+			return operationErr, rollbackErr
+		}
+		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+		return operationErr, nil
+	}
+	if err := candidate.commit(); err != nil {
+		rollbackErr := commitOutcomeError(candidate.rollback())
+		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+		s.failClosedLocked(fmt.Errorf("commit note index: %w", err), rollbackErr)
+		return fmt.Errorf("commit note index: %w", err), rollbackErr
+	}
+	s.publishBaseSwitchLocked(candidate)
+	return nil, nil
+}
+
+type baseSwitchCandidate struct {
+	path     string
+	root     *os.Root
+	commit   func() error
+	rollback func() error
+}
+
+func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandidate, error) {
 	cleanTarget := ""
 	var candidate *os.Root
 	if target != "" {
@@ -131,46 +184,44 @@ func (s *NoteService) SwitchBaseTransaction(target string, persist func() error)
 		var err error
 		candidate, err = s.openRoot(cleanTarget)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	nodes, err := s.scan(candidate)
 	if err != nil {
-		return errors.Join(err, closeRoot(candidate))
+		return nil, errors.Join(err, closeRoot(candidate))
 	}
-	oldNodes, err := s.scan(s.baseRoot)
+	commit, rollback, err := s.repo.BeginReplaceAll(nodes)
 	if err != nil {
-		return errors.Join(err, closeRoot(candidate))
+		return nil, errors.Join(err, closeRoot(candidate))
 	}
-	if err := s.repo.ReplaceAll(nodes); err != nil {
-		return errors.Join(err, closeRoot(candidate))
-	}
+	return &baseSwitchCandidate{path: cleanTarget, root: candidate, commit: commit, rollback: rollback}, nil
+}
 
-	if persistErr := persist(); persistErr != nil {
-		if rollbackErr := s.repo.ReplaceAll(oldNodes); rollbackErr != nil {
-			// Runtime publication never occurred. The repository remains in the
-			// state left by its failed rollback and callers must enter degraded mode.
-			s.closeErr = errors.Join(s.closeErr, closeRoot(candidate))
-			return errors.Join(
-				ErrRollbackFailed,
-				persistErr,
-				fmt.Errorf("restore note index: %w", rollbackErr),
-			)
-		}
-		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate))
-		return persistErr
-	}
-
+func (s *NoteService) publishBaseSwitchLocked(candidate *baseSwitchCandidate) {
 	oldRoot := s.baseRoot
-	s.basePath = cleanTarget
-	s.baseRoot = candidate
+	s.basePath = candidate.path
+	s.baseRoot = candidate.root
 	s.baseErr = nil
 	// Publication has succeeded, so an old descriptor close error is deferred to Close.
 	if oldRoot != nil {
 		s.closeErr = errors.Join(s.closeErr, oldRoot.Close())
 	}
 	s.once.Do(func() { close(s.initialSyncDone) })
-	return nil
+}
+
+func (s *NoteService) failClosedLocked(operationErr, rollbackErr error) error {
+	s.baseErr = errors.Join(ErrRollbackFailed, operationErr, rollbackErr)
+	s.once.Do(func() { close(s.initialSyncDone) })
+	return s.baseErr
+}
+
+func commitOutcomeError(rollbackErr error) error {
+	unknown := errors.New("note index commit outcome is unknown")
+	if rollbackErr == nil {
+		return unknown
+	}
+	return errors.Join(unknown, fmt.Errorf("rollback after commit failure: %w", rollbackErr))
 }
 
 func closeRoot(root *os.Root) error {

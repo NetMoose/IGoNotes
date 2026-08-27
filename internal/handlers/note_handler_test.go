@@ -21,7 +21,10 @@ type handlerNoteRepository struct{}
 func (handlerNoteRepository) UpsertNode(string, string, string, *string, string) error { return nil }
 func (handlerNoteRepository) GetAllNodes() ([]model.NoteNode, error)                   { return nil, nil }
 func (handlerNoteRepository) ReplaceAll([]model.NoteNode) error                        { return nil }
-func (handlerNoteRepository) DeleteNode(string) error                                  { return nil }
+func (handlerNoteRepository) BeginReplaceAll([]model.NoteNode) (func() error, func() error, error) {
+	return func() error { return nil }, func() error { return nil }, nil
+}
+func (handlerNoteRepository) DeleteNode(string) error { return nil }
 
 func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 	t.Run("bad JSON", func(t *testing.T) {

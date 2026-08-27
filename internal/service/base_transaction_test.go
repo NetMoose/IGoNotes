@@ -16,7 +16,12 @@ type noteReadResult struct {
 	err     error
 }
 
-func TestNoteServiceSwitchBaseTransactionBlocksReadsUntilPersistenceFailureRollsBack(t *testing.T) {
+type baseTransactionResult struct {
+	operationErr error
+	rollbackErr  error
+}
+
+func TestNoteServiceBasePersistenceBlocksReadsUntilFailureRollsBack(t *testing.T) {
 	oldBase := t.TempDir()
 	target := t.TempDir()
 	writeTestNote(t, oldBase, "old.md", "old")
@@ -30,13 +35,11 @@ func TestNoteServiceSwitchBaseTransactionBlocksReadsUntilPersistenceFailureRolls
 	persistStarted := make(chan struct{})
 	persistRelease := make(chan struct{})
 	persistErr := errors.New("disk full")
-	transactionDone := make(chan error, 1)
+	store := &fakeConfigStore{saveErr: persistErr, saveStarted: persistStarted, saveRelease: persistRelease}
+	transactionDone := make(chan baseTransactionResult, 1)
 	go func() {
-		transactionDone <- service.SwitchBaseTransaction(target, func() error {
-			close(persistStarted)
-			<-persistRelease
-			return persistErr
-		})
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		transactionDone <- baseTransactionResult{operationErr: operationErr, rollbackErr: rollbackErr}
 	}()
 	<-persistStarted
 
@@ -72,8 +75,9 @@ func TestNoteServiceSwitchBaseTransactionBlocksReadsUntilPersistenceFailureRolls
 	}
 
 	close(persistRelease)
-	if err := <-transactionDone; !errors.Is(err, persistErr) || errors.Is(err, ErrRollbackFailed) {
-		t.Fatalf("SwitchBaseTransaction() error = %v, want original persist error", err)
+	transaction := <-transactionDone
+	if !errors.Is(transaction.operationErr, persistErr) || transaction.rollbackErr != nil {
+		t.Fatalf("switchBaseTransaction() errors = %v, %v; want persist error, nil", transaction.operationErr, transaction.rollbackErr)
 	}
 	result := <-readDone
 	if result.err != nil || result.content != "old" {
@@ -88,7 +92,7 @@ func TestNoteServiceSwitchBaseTransactionBlocksReadsUntilPersistenceFailureRolls
 	}
 }
 
-func TestNoteServiceSwitchBaseTransactionPublishesOnlyAfterPersistenceSuccess(t *testing.T) {
+func TestNoteServiceBasePersistencePublishesOnlyAfterSuccess(t *testing.T) {
 	oldBase := t.TempDir()
 	target := t.TempDir()
 	writeTestNote(t, oldBase, "note.md", "old")
@@ -98,16 +102,18 @@ func TestNoteServiceSwitchBaseTransactionPublishesOnlyAfterPersistenceSuccess(t 
 	if err := service.SyncFS(); err != nil {
 		t.Fatalf("SyncFS() error = %v", err)
 	}
+	repo.prepareCalls = 0
+	repo.commitCalls = 0
+	events := &orderedEvents{}
+	repo.events = events
 
 	persistStarted := make(chan struct{})
 	persistRelease := make(chan struct{})
-	done := make(chan error, 1)
+	store := &fakeConfigStore{saveStarted: persistStarted, saveRelease: persistRelease, events: events}
+	done := make(chan baseTransactionResult, 1)
 	go func() {
-		done <- service.SwitchBaseTransaction(target, func() error {
-			close(persistStarted)
-			<-persistRelease
-			return nil
-		})
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		done <- baseTransactionResult{operationErr: operationErr, rollbackErr: rollbackErr}
 	}()
 	<-persistStarted
 	readAttempted := make(chan struct{})
@@ -125,17 +131,22 @@ func TestNoteServiceSwitchBaseTransactionPublishesOnlyAfterPersistenceSuccess(t 
 	}
 
 	close(persistRelease)
-	if err := <-done; err != nil {
-		t.Fatalf("SwitchBaseTransaction() error = %v", err)
+	transaction := <-done
+	if transaction.operationErr != nil || transaction.rollbackErr != nil {
+		t.Fatalf("switchBaseTransaction() errors = %v, %v", transaction.operationErr, transaction.rollbackErr)
 	}
 	result := <-readDone
 	if result.err != nil || result.content != "new" {
 		t.Errorf("GetNoteContent() after commit = %q, %v; want new, nil", result.content, result.err)
 	}
 	assertRepositoryIDs(t, repo, "note.md")
+	wantEvents := []string{"prepare:1", "save", "commit:1"}
+	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
+		t.Errorf("events = %v, want %v", got, wantEvents)
+	}
 }
 
-func TestNoteServiceSwitchBaseTransactionRollbackRetainsPinnedOldRoot(t *testing.T) {
+func TestNoteServiceBasePersistenceRollbackRetainsPinnedOldRoot(t *testing.T) {
 	parent := t.TempDir()
 	oldPath := filepath.Join(parent, "base")
 	if err := os.Mkdir(oldPath, 0o755); err != nil {
@@ -155,13 +166,11 @@ func TestNoteServiceSwitchBaseTransactionRollbackRetainsPinnedOldRoot(t *testing
 	persistStarted := make(chan struct{})
 	persistRelease := make(chan struct{})
 	persistErr := errors.New("save failed")
-	done := make(chan error, 1)
+	store := &fakeConfigStore{saveErr: persistErr, saveStarted: persistStarted, saveRelease: persistRelease}
+	done := make(chan baseTransactionResult, 1)
 	go func() {
-		done <- service.SwitchBaseTransaction(target, func() error {
-			close(persistStarted)
-			<-persistRelease
-			return persistErr
-		})
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		done <- baseTransactionResult{operationErr: operationErr, rollbackErr: rollbackErr}
 	}()
 	<-persistStarted
 	originalPath := filepath.Join(parent, "original")
@@ -172,8 +181,9 @@ func TestNoteServiceSwitchBaseTransactionRollbackRetainsPinnedOldRoot(t *testing
 		t.Fatalf("Rename(replacement) error = %v", err)
 	}
 	close(persistRelease)
-	if err := <-done; !errors.Is(err, persistErr) {
-		t.Fatalf("SwitchBaseTransaction() error = %v, want %v", err, persistErr)
+	transaction := <-done
+	if !errors.Is(transaction.operationErr, persistErr) || transaction.rollbackErr != nil {
+		t.Fatalf("switchBaseTransaction() errors = %v, %v; want %v, nil", transaction.operationErr, transaction.rollbackErr, persistErr)
 	}
 
 	if got := service.GetBasePath(); got != oldPath {
@@ -193,7 +203,7 @@ func TestNoteServiceSwitchBaseTransactionRollbackRetainsPinnedOldRoot(t *testing
 	assertFileContent(t, filepath.Join(oldPath, "note.md"), []byte("replacement"))
 }
 
-func TestNoteServiceSwitchBaseTransactionFailurePhases(t *testing.T) {
+func TestNoteServiceBasePersistenceFailurePhases(t *testing.T) {
 	oldBase := t.TempDir()
 	target := t.TempDir()
 	writeTestNote(t, oldBase, "old.md", "old")
@@ -201,18 +211,15 @@ func TestNoteServiceSwitchBaseTransactionFailurePhases(t *testing.T) {
 
 	t.Run("candidate replace skips persist", func(t *testing.T) {
 		replaceErr := errors.New("candidate replace failed")
-		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md"}}, replaceErr: replaceErr}
+		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md"}}, prepareErr: replaceErr}
 		service := newTestNoteService(t, repo, oldBase)
-		persistCalled := false
-		err := service.SwitchBaseTransaction(target, func() error {
-			persistCalled = true
-			return nil
-		})
-		if !errors.Is(err, replaceErr) {
-			t.Fatalf("SwitchBaseTransaction() error = %v, want %v", err, replaceErr)
+		store := &fakeConfigStore{}
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		if !errors.Is(operationErr, replaceErr) || rollbackErr != nil {
+			t.Fatalf("switchBaseTransaction() errors = %v, %v; want %v, nil", operationErr, rollbackErr, replaceErr)
 		}
-		if persistCalled {
-			t.Error("persist callback called after candidate ReplaceAll failure")
+		if store.saveCalls != 0 {
+			t.Errorf("Save calls = %d, want none", store.saveCalls)
 		}
 		if got := service.GetBasePath(); got != oldBase {
 			t.Errorf("GetBasePath() = %q, want %q", got, oldBase)
@@ -220,43 +227,43 @@ func TestNoteServiceSwitchBaseTransactionFailurePhases(t *testing.T) {
 		assertRepositoryIDs(t, repo, "old.md")
 	})
 
-	t.Run("rollback replace reports all causes and keeps old runtime", func(t *testing.T) {
+	t.Run("rollback failure reports both causes and keeps committed index", func(t *testing.T) {
 		persistErr := errors.New("save failed")
 		rollbackErr := errors.New("rollback replace failed")
 		events := &orderedEvents{}
 		repo := &fakeNoteRepository{
 			nodes:       []model.NoteNode{{ID: "old.md"}},
-			replaceErrs: []error{nil, rollbackErr},
+			rollbackErr: rollbackErr,
 			events:      events,
 		}
 		service := newTestNoteService(t, repo, oldBase)
-		err := service.SwitchBaseTransaction(target, func() error {
-			events.record("persist")
-			return persistErr
-		})
-		if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, persistErr) || !errors.Is(err, rollbackErr) {
-			t.Fatalf("SwitchBaseTransaction() error = %v, want rollback, persist, and repository causes", err)
+		store := &fakeConfigStore{saveErr: persistErr, events: events}
+		operationErr, gotRollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		if !errors.Is(operationErr, persistErr) || !errors.Is(gotRollbackErr, rollbackErr) {
+			t.Fatalf("switchBaseTransaction() errors = %v, %v; want persist and rollback causes", operationErr, gotRollbackErr)
 		}
 		if got := service.GetBasePath(); got != oldBase {
 			t.Errorf("GetBasePath() = %q, want retained %q", got, oldBase)
 		}
-		assertRepositoryIDs(t, repo, "new.md")
-		wantEvents := []string{"replace:1", "persist", "replace:2"}
+		assertRepositoryIDs(t, repo, "old.md")
+		wantEvents := []string{"prepare:1", "save", "rollback:1"}
 		if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 			t.Errorf("events = %v, want %v", got, wantEvents)
 		}
 	})
 }
 
-func TestNoteServiceSwitchBaseTransactionEmptyRuntimeRollback(t *testing.T) {
+func TestNoteServiceBasePersistenceEmptyRuntimeRollback(t *testing.T) {
 	repo := &fakeNoteRepository{}
 	service := newTestNoteService(t, repo, "")
 	target := t.TempDir()
 	writeTestNote(t, target, "new.md", "new")
 	persistErr := errors.New("save failed")
 
-	if err := service.SwitchBaseTransaction(target, func() error { return persistErr }); !errors.Is(err, persistErr) {
-		t.Fatalf("SwitchBaseTransaction() error = %v, want %v", err, persistErr)
+	store := &fakeConfigStore{saveErr: persistErr}
+	operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+	if !errors.Is(operationErr, persistErr) || rollbackErr != nil {
+		t.Fatalf("switchBaseTransaction() errors = %v, %v; want %v, nil", operationErr, rollbackErr, persistErr)
 	}
 	if got := service.GetBasePath(); got != "" {
 		t.Errorf("GetBasePath() = %q, want empty", got)
@@ -414,7 +421,7 @@ func TestSettingsServiceCandidateIndexFailureSkipsSaveAndPreservesOldRuntime(t *
 	writeTestNote(t, oldBase, "old.md", "old")
 	writeTestNote(t, target, "new.md", "new")
 	replaceErr := errors.New("candidate index failed")
-	repo := &fakeNoteRepository{replaceErrs: []error{nil, replaceErr}}
+	repo := &fakeNoteRepository{prepareErrs: []error{nil, replaceErr}}
 	notes := newTestNoteService(t, repo, oldBase)
 	if err := notes.SyncFS(); err != nil {
 		t.Fatalf("SyncFS() error = %v", err)
@@ -571,7 +578,7 @@ func TestSettingsServiceRealRuntimeRollbackFailureDegradesMutations(t *testing.T
 	writeTestNote(t, target, "new.md", "new")
 	persistErr := errors.New("save failed")
 	rollbackErr := errors.New("repository rollback failed")
-	repo := &fakeNoteRepository{replaceErrs: []error{nil, nil, rollbackErr}}
+	repo := &fakeNoteRepository{rollbackErr: rollbackErr}
 	notes := newTestNoteService(t, repo, oldBase)
 	if err := notes.SyncFS(); err != nil {
 		t.Fatalf("SyncFS() error = %v", err)
@@ -591,7 +598,7 @@ func TestSettingsServiceRealRuntimeRollbackFailureDegradesMutations(t *testing.T
 	if got := notes.GetBasePath(); got != oldBase {
 		t.Errorf("runtime path = %q, want retained old path %q", got, oldBase)
 	}
-	assertRepositoryIDs(t, repo, "new.md")
+	assertRepositoryIDs(t, repo, "old.md")
 	saves := store.saveCalls
 	if _, laterErr := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "later", Path: t.TempDir()}); !errors.Is(laterErr, ErrRollbackFailed) {
 		t.Fatalf("AddBase() after rollback failure error = %v, want ErrRollbackFailed", laterErr)
@@ -612,7 +619,7 @@ func TestSettingsServiceFakeRuntimeTransactionEventOrder(t *testing.T) {
 	if _, err := service.SwitchBase("other"); err != nil {
 		t.Fatalf("SwitchBase() error = %v", err)
 	}
-	want := []string{"candidate:" + targetPath, "save", "publish:" + targetPath}
+	want := []string{"prepare:" + targetPath, "save", "commit:" + targetPath}
 	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
 		t.Errorf("events = %v, want %v", got, want)
 	}

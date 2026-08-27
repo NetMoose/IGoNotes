@@ -2,6 +2,8 @@ package repository
 
 import (
 	"database/sql"
+	"errors"
+	"sync"
 
 	"IGoNotes/internal/model"
 )
@@ -56,21 +58,30 @@ func (r *NoteRepository) GetAllNodes() ([]model.NoteNode, error) {
 }
 
 func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) error {
-	tx, err := r.db.Begin()
+	commit, rollback, err := r.BeginReplaceAll(nodes)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	if err := commit(); err != nil {
+		return errors.Join(err, rollback())
+	}
+	return nil
+}
+
+func (r *NoteRepository) BeginReplaceAll(nodes []model.NoteNode) (commit func() error, rollback func() error, err error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
 
 	if _, err := tx.Exec("DELETE FROM notes"); err != nil {
-		return err
+		return nil, nil, errors.Join(err, tx.Rollback())
 	}
 
 	stmt, err := tx.Prepare("INSERT INTO notes (id, title, path, parent_id, type) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
-		return err
+		return nil, nil, errors.Join(err, tx.Rollback())
 	}
-	defer stmt.Close()
 
 	for _, node := range nodes {
 		var parentID any
@@ -78,11 +89,52 @@ func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) error {
 			parentID = node.ParentID
 		}
 		if _, err := stmt.Exec(node.ID, node.Name, node.Path, parentID, node.Type); err != nil {
-			return err
+			return nil, nil, errors.Join(err, stmt.Close(), tx.Rollback())
 		}
 	}
+	if err := stmt.Close(); err != nil {
+		return nil, nil, errors.Join(err, tx.Rollback())
+	}
 
-	return tx.Commit()
+	finalizer := &replaceFinalizer{tx: tx}
+	return finalizer.commit, finalizer.rollback, nil
+}
+
+type replaceFinalizer struct {
+	mu             sync.Mutex
+	tx             *sql.Tx
+	commitCalled   bool
+	commitErr      error
+	rollbackCalled bool
+	rollbackErr    error
+}
+
+func (f *replaceFinalizer) commit() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.commitCalled {
+		return f.commitErr
+	}
+	if f.rollbackCalled {
+		return sql.ErrTxDone
+	}
+	f.commitCalled = true
+	f.commitErr = f.tx.Commit()
+	return f.commitErr
+}
+
+func (f *replaceFinalizer) rollback() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rollbackCalled {
+		return f.rollbackErr
+	}
+	if f.commitCalled && f.commitErr == nil {
+		return sql.ErrTxDone
+	}
+	f.rollbackCalled = true
+	f.rollbackErr = f.tx.Rollback()
+	return f.rollbackErr
 }
 
 // ClearAll удаляет все записи (полезно при полной синхронизации, если мы не отслеживаем удаления точечно)
