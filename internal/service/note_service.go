@@ -111,38 +111,54 @@ func (s *NoteService) Close() error {
 }
 
 func (s *NoteService) SwitchBase(target string) error {
+	return s.SwitchBaseTransaction(target, func() error { return nil })
+}
+
+func (s *NoteService) SwitchBaseTransaction(target string, persist func() error) error {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
 	if errors.Is(s.baseErr, os.ErrClosed) {
 		return os.ErrClosed
 	}
-
-	if target == "" {
-		if err := s.repo.ReplaceAll(nil); err != nil {
-			return err
-		}
-		oldRoot := s.baseRoot
-		s.basePath = ""
-		s.baseRoot = nil
-		s.baseErr = nil
-		if oldRoot != nil {
-			s.closeErr = errors.Join(s.closeErr, oldRoot.Close())
-		}
-		s.once.Do(func() { close(s.initialSyncDone) })
-		return nil
+	if persist == nil {
+		return os.ErrInvalid
 	}
 
-	cleanTarget := filepath.Clean(target)
-	candidate, err := s.openRoot(cleanTarget)
-	if err != nil {
-		return err
+	cleanTarget := ""
+	var candidate *os.Root
+	if target != "" {
+		cleanTarget = filepath.Clean(target)
+		var err error
+		candidate, err = s.openRoot(cleanTarget)
+		if err != nil {
+			return err
+		}
 	}
 	nodes, err := s.scan(candidate)
 	if err != nil {
-		return errors.Join(err, candidate.Close())
+		return errors.Join(err, closeRoot(candidate))
+	}
+	oldNodes, err := s.scan(s.baseRoot)
+	if err != nil {
+		return errors.Join(err, closeRoot(candidate))
 	}
 	if err := s.repo.ReplaceAll(nodes); err != nil {
-		return errors.Join(err, candidate.Close())
+		return errors.Join(err, closeRoot(candidate))
+	}
+
+	if persistErr := persist(); persistErr != nil {
+		if rollbackErr := s.repo.ReplaceAll(oldNodes); rollbackErr != nil {
+			// Runtime publication never occurred. The repository remains in the
+			// state left by its failed rollback and callers must enter degraded mode.
+			s.closeErr = errors.Join(s.closeErr, closeRoot(candidate))
+			return errors.Join(
+				ErrRollbackFailed,
+				persistErr,
+				fmt.Errorf("restore note index: %w", rollbackErr),
+			)
+		}
+		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate))
+		return persistErr
 	}
 
 	oldRoot := s.baseRoot
@@ -155,6 +171,13 @@ func (s *NoteService) SwitchBase(target string) error {
 	}
 	s.once.Do(func() { close(s.initialSyncDone) })
 	return nil
+}
+
+func closeRoot(root *os.Root) error {
+	if root == nil {
+		return nil
+	}
+	return root.Close()
 }
 
 func (s *NoteService) replaceIndexLocked() error {

@@ -21,6 +21,9 @@ type fakeNoteRepository struct {
 	mu             sync.Mutex
 	nodes          []model.NoteNode
 	replaceErr     error
+	replaceErrs    []error
+	replaceCalls   int
+	events         *orderedEvents
 	replaceStarted chan struct{}
 	replaceRelease <-chan struct{}
 	startedOnce    sync.Once
@@ -77,13 +80,23 @@ func (r *fakeNoteRepository) GetAllNodes() ([]model.NoteNode, error) {
 func (r *fakeNoteRepository) ReplaceAll(nodes []model.NoteNode) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.replaceCalls++
+	if r.events != nil {
+		r.events.record(fmt.Sprintf("replace:%d", r.replaceCalls))
+	}
 	if r.replaceStarted != nil {
 		r.startedOnce.Do(func() { close(r.replaceStarted) })
 	}
 	if r.replaceRelease != nil {
 		<-r.replaceRelease
 	}
-	if r.replaceErr != nil {
+	if len(r.replaceErrs) != 0 {
+		err := r.replaceErrs[0]
+		r.replaceErrs = r.replaceErrs[1:]
+		if err != nil {
+			return err
+		}
+	} else if r.replaceErr != nil {
 		return r.replaceErr
 	}
 	r.nodes = append([]model.NoteNode(nil), nodes...)

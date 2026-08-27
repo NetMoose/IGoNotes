@@ -20,6 +20,7 @@ type ConfigStore interface {
 type BaseRuntime interface {
 	GetBasePath() string
 	SwitchBase(string) error
+	SwitchBaseTransaction(string, func() error) error
 }
 
 type SettingsService struct {
@@ -195,46 +196,54 @@ func createBaseDirectory(prepared preparedBase) error {
 }
 
 func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string) error {
-	oldPath := ""
-	canonicalTarget := ""
-	switched := false
-	if targetPath != "" {
-		currentPath := s.notes.GetBasePath()
-		if currentPath != "" {
-			var err error
-			oldPath, err = canonicalExistingDirectory(currentPath)
-			if err != nil {
-				return fmt.Errorf("resolve current runtime base %q: %w", currentPath, err)
-			}
+	if targetPath == "" {
+		if err := s.store.Save(&next); err != nil {
+			return fmt.Errorf("save settings: %w", err)
 		}
-		var err error
-		canonicalTarget, err = canonicalExistingDirectory(targetPath)
-		if err != nil {
-			return fmt.Errorf("resolve target runtime base %q: %w", targetPath, err)
-		}
-		switched = canonicalTarget != oldPath
-	}
-	if switched {
-		if err := s.notes.SwitchBase(canonicalTarget); err != nil {
-			return fmt.Errorf("switch runtime base: %w", err)
-		}
+		s.config = cloneConfig(next)
+		return nil
 	}
 
-	if err := s.store.Save(&next); err != nil {
-		saveErr := fmt.Errorf("save settings: %w", err)
-		if !switched {
+	currentPath := s.notes.GetBasePath()
+	canonicalCurrent := ""
+	if currentPath != "" {
+		var err error
+		canonicalCurrent, err = canonicalExistingDirectory(currentPath)
+		if err != nil {
+			return fmt.Errorf("resolve current runtime base %q: %w", currentPath, err)
+		}
+	}
+	canonicalTarget, err := canonicalExistingDirectory(targetPath)
+	if err != nil {
+		return fmt.Errorf("resolve target runtime base %q: %w", targetPath, err)
+	}
+	requiresTransaction := canonicalTarget != canonicalCurrent || currentPath != canonicalTarget
+	if !requiresTransaction {
+		if err := s.store.Save(&next); err != nil {
+			return fmt.Errorf("save settings: %w", err)
+		}
+		s.config = cloneConfig(next)
+		return nil
+	}
+
+	var saveErr error
+	err = s.notes.SwitchBaseTransaction(canonicalTarget, func() error {
+		if err := s.store.Save(&next); err != nil {
+			saveErr = fmt.Errorf("save settings: %w", err)
 			return saveErr
 		}
-		if rollbackErr := s.notes.SwitchBase(oldPath); rollbackErr != nil {
-			s.logger.Printf("settings runtime rollback failed: %v", rollbackErr)
-			s.degraded = errors.Join(
-				ErrRollbackFailed,
-				saveErr,
-				fmt.Errorf("restore runtime base: %w", rollbackErr),
-			)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrRollbackFailed) {
+			s.logger.Printf("settings runtime rollback failed: %v", err)
+			s.degraded = err
 			return s.degraded
 		}
-		return saveErr
+		if saveErr != nil {
+			return err
+		}
+		return fmt.Errorf("switch runtime base: %w", err)
 	}
 
 	s.config = cloneConfig(next)
