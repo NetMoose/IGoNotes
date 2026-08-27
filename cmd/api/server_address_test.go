@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"net"
+	"net/http"
 	"testing"
 )
 
@@ -30,5 +32,62 @@ func TestLocalServerEndpointUsesLoopback(t *testing.T) {
 				t.Errorf("localServerEndpoint() port = %q, want %q", gotPort, port)
 			}
 		})
+	}
+}
+
+func TestServeLocalDoesNotSignalReadyWhenAddressIsOccupied(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer occupied.Close()
+
+	readyCalled := false
+	serveCalled := false
+	err = serveLocal(
+		occupied.Addr().String(),
+		http.NotFoundHandler(),
+		func() { readyCalled = true },
+		func(net.Listener, http.Handler) error {
+			serveCalled = true
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("serveLocal() error = nil, want bind error")
+	}
+	if readyCalled {
+		t.Error("serveLocal() called ready callback after bind failure")
+	}
+	if serveCalled {
+		t.Error("serveLocal() called serve after bind failure")
+	}
+}
+
+func TestServeLocalSignalsReadyBeforeServeAndClosesListener(t *testing.T) {
+	wantErr := errors.New("stop serving")
+	readyCalled := false
+	var listener net.Listener
+
+	err := serveLocal(
+		"127.0.0.1:0",
+		http.NotFoundHandler(),
+		func() { readyCalled = true },
+		func(gotListener net.Listener, _ http.Handler) error {
+			listener = gotListener
+			if !readyCalled {
+				t.Error("serveLocal() called serve before ready callback")
+			}
+			return wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("serveLocal() error = %v, want %v", err, wantErr)
+	}
+	if listener == nil {
+		t.Fatal("serveLocal() did not pass listener to serve")
+	}
+	if _, err := listener.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("listener.Accept() error = %v, want %v", err, net.ErrClosed)
 	}
 }

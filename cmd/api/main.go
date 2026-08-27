@@ -21,6 +21,22 @@ func localServerEndpoint(port string) (string, string) {
 	return address, "http://" + address
 }
 
+func serveLocal(
+	address string,
+	handler http.Handler,
+	ready func(),
+	serve func(net.Listener, http.Handler) error,
+) error {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	ready()
+	return serve(listener, handler)
+}
+
 func openBrowser(url string) error {
 	var cmd string
 	var args []string
@@ -109,16 +125,16 @@ func main() {
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
 
 	address, url := localServerEndpoint(*port)
-	log.Printf("Сервер запущен на %s", url)
+	if err := serveLocal(address, router, func() {
+		log.Printf("Сервер запущен на %s", url)
 
-	if !*noBrowser {
-		log.Printf("Открываем браузер: %s", url)
-		if err := openBrowser(url); err != nil {
-			log.Printf("Не удалось открыть браузер автоматически: %v", err)
+		if !*noBrowser {
+			log.Printf("Открываем браузер: %s", url)
+			if err := openBrowser(url); err != nil {
+				log.Printf("Не удалось открыть браузер автоматически: %v", err)
+			}
 		}
-	}
-
-	if err := http.ListenAndServe(address, router); err != nil {
+	}, http.Serve); err != nil {
 		log.Fatal(err)
 	}
 }
