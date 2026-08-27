@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -19,11 +20,15 @@ func TestConfigServiceSavePreservesOriginalWhenReplaceFails(t *testing.T) {
 	}
 
 	svc := NewConfigService(configPath)
-	svc.replace = func(_, _ string) error { return errors.New("replace failed") }
+	replaceErr := errors.New("replace failed")
+	svc.replace = func(_, _ string) error { return replaceErr }
 
 	err := svc.Save(&model.Config{CurrentBase: "new"})
-	if err == nil || !strings.Contains(err.Error(), "replace failed") {
-		t.Fatalf("Save() error = %v, want error containing %q", err, "replace failed")
+	if !errors.Is(err, replaceErr) {
+		t.Fatalf("Save() error = %v, want wrapped error %v", err, replaceErr)
+	}
+	if !strings.Contains(err.Error(), "replace config") {
+		t.Errorf("Save() error = %v, want context %q", err, "replace config")
 	}
 
 	got, err := os.ReadFile(configPath)
@@ -44,7 +49,15 @@ func TestConfigServiceSavePreservesOriginalWhenReplaceFails(t *testing.T) {
 }
 
 func TestConfigServiceSaveAtomicallyReplacesConfig(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.json")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	original := []byte(`{"current_base":"old"}`)
+	if err := os.WriteFile(configPath, original, 0600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	if err := os.Chmod(configPath, 0600); err != nil {
+		t.Fatalf("os.Chmod() error = %v, want nil", err)
+	}
 	setupCompleted := true
 	svc := NewConfigService(configPath)
 
@@ -64,6 +77,65 @@ func TestConfigServiceSaveAtomicallyReplacesConfig(t *testing.T) {
 	}
 	if got.SetupCompleted == nil || !*got.SetupCompleted {
 		t.Errorf("SetupCompleted = %v, want true", got.SetupCompleted)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile() error = %v, want nil", err)
+	}
+	if bytes.Equal(data, original) {
+		t.Errorf("config contents = %q, want old data replaced", data)
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("os.Stat() error = %v, want nil", err)
+	}
+	if gotMode := info.Mode().Perm(); gotMode != 0600 {
+		t.Errorf("config mode = %04o, want %04o", gotMode, os.FileMode(0600))
+	}
+
+	temporaryFiles, err := filepath.Glob(filepath.Join(dir, ".config-*.tmp"))
+	if err != nil {
+		t.Fatalf("filepath.Glob() error = %v, want nil", err)
+	}
+	if len(temporaryFiles) != 0 {
+		t.Errorf("temporary files = %v, want none", temporaryFiles)
+	}
+}
+
+func TestConfigServiceSaveCreatesConfigWithPrivatePermissions(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	svc := NewConfigService(configPath)
+
+	if err := svc.Save(&model.Config{CurrentBase: "work"}); err != nil {
+		t.Fatalf("Save() error = %v, want nil", err)
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("os.Stat() error = %v, want nil", err)
+	}
+	if gotMode := info.Mode().Perm(); gotMode != 0600 {
+		t.Errorf("config mode = %04o, want %04o", gotMode, os.FileMode(0600))
+	}
+
+	temporaryFiles, err := filepath.Glob(filepath.Join(filepath.Dir(configPath), ".config-*.tmp"))
+	if err != nil {
+		t.Fatalf("filepath.Glob() error = %v, want nil", err)
+	}
+	if len(temporaryFiles) != 0 {
+		t.Errorf("temporary files = %v, want none", temporaryFiles)
+	}
+}
+
+func TestConfigServiceSaveReportsConfigStatError(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config\x00.json")
+	svc := NewConfigService(configPath)
+
+	err := svc.Save(&model.Config{CurrentBase: "work"})
+	if err == nil || !strings.Contains(err.Error(), "stat config") {
+		t.Fatalf("Save() error = %v, want error containing %q", err, "stat config")
 	}
 }
 

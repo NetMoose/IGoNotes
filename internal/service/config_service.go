@@ -55,6 +55,14 @@ func (s *ConfigService) Save(config *model.Config) error {
 		return fmt.Errorf("create config directory: %w", err)
 	}
 
+	mode := os.FileMode(0600)
+	info, err := os.Stat(s.configPath)
+	if err == nil {
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat config: %w", err)
+	}
+
 	temporary, err := os.CreateTemp(dir, ".config-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temporary config: %w", err)
@@ -67,7 +75,7 @@ func (s *ConfigService) Save(config *model.Config) error {
 		_ = os.Remove(temporaryPath)
 	}()
 
-	if err := temporary.Chmod(0644); err != nil {
+	if err := temporary.Chmod(mode); err != nil {
 		return fmt.Errorf("set temporary config permissions: %w", err)
 	}
 	if _, err := temporary.Write(data); err != nil {
