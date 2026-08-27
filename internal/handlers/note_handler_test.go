@@ -26,6 +26,22 @@ func (handlerNoteRepository) BeginReplaceAll([]model.NoteNode) (func() error, fu
 }
 func (handlerNoteRepository) DeleteNode(string) error { return nil }
 
+type failingInitialSyncRepository struct {
+	nodes []model.NoteNode
+	err   error
+}
+
+func (r *failingInitialSyncRepository) UpsertNode(string, string, string, *string, string) error {
+	return nil
+}
+func (r *failingInitialSyncRepository) GetAllNodes() ([]model.NoteNode, error) {
+	return append([]model.NoteNode(nil), r.nodes...), nil
+}
+func (r *failingInitialSyncRepository) BeginReplaceAll([]model.NoteNode) (func() error, func() error, error, error) {
+	return nil, nil, r.err, nil
+}
+func (r *failingInitialSyncRepository) DeleteNode(string) error { return nil }
+
 func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 	t.Run("bad JSON", func(t *testing.T) {
 		handler := NewNoteHandler(nil)
@@ -85,6 +101,35 @@ func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 			t.Fatalf("response leaks filesystem error details: %q", recorder.Body.String())
 		}
 	})
+}
+
+func TestNoteHandlerGetNotesSanitizesInitialSyncFailure(t *testing.T) {
+	wantErr := errors.New("index update failed")
+	repo := &failingInitialSyncRepository{
+		nodes: []model.NoteNode{{ID: "old.md", Name: "old", Path: "old.md", Type: "file"}},
+		err:   wantErr,
+	}
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "new.md"), []byte("new"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	notes := service.NewNoteService(repo, base)
+	t.Cleanup(func() {
+		if err := notes.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v", err)
+		}
+	})
+	if err := notes.SyncFS(); !errors.Is(err, wantErr) {
+		t.Fatalf("SyncFS() error = %v, want %v", err, wantErr)
+	}
+
+	recorder := httptest.NewRecorder()
+	NewNoteHandler(notes).GetNotes(recorder, httptest.NewRequest(http.MethodGet, "/api/notes", nil))
+
+	assertAPIErrorResponse(t, recorder, http.StatusInternalServerError, model.APIError{Code: "internal_error", Message: "Internal server error"})
+	if strings.Contains(recorder.Body.String(), "old.md") || strings.Contains(recorder.Body.String(), wantErr.Error()) {
+		t.Fatalf("response exposed stale index or sync error: %q", recorder.Body.String())
+	}
 }
 
 func TestNoteHandlerMethodNotAllowedSetsAllow(t *testing.T) {

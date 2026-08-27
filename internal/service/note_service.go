@@ -54,6 +54,7 @@ type NoteService struct {
 	// baseMu is acquired before repository/SQL; repositories and scanners never call NoteService.
 	baseMu           sync.RWMutex
 	initialSyncDone  chan struct{}
+	initialSyncErr   error
 	once             sync.Once
 	scan             noteScanner
 	openRoot         func(string) (*os.Root, error)
@@ -87,9 +88,16 @@ func (s *NoteService) GetBasePath() string {
 func (s *NoteService) SyncFS() error {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
-	defer s.once.Do(func() { close(s.initialSyncDone) })
 
-	return s.replaceIndexLocked()
+	err := s.replaceIndexLocked()
+	if err == nil {
+		s.initialSyncErr = nil
+	}
+	s.once.Do(func() {
+		s.initialSyncErr = err
+		close(s.initialSyncDone)
+	})
+	return err
 }
 
 func (s *NoteService) Close() error {
@@ -212,6 +220,7 @@ func (s *NoteService) publishBaseSwitchLocked(candidate *baseSwitchCandidate) {
 	s.basePath = candidate.path
 	s.baseRoot = candidate.root
 	s.baseErr = nil
+	s.initialSyncErr = nil
 	// Publication has succeeded, so an old descriptor close error is deferred to Close.
 	if oldRoot != nil {
 		s.closeErr = errors.Join(s.closeErr, oldRoot.Close())
@@ -337,6 +346,9 @@ func (s *NoteService) GetTree() ([]model.NoteNode, error) {
 	defer s.baseMu.RUnlock()
 	if s.baseErr != nil {
 		return nil, s.baseErr
+	}
+	if s.initialSyncErr != nil {
+		return nil, s.initialSyncErr
 	}
 
 	// Получаем плоский список из БД (без полного сканирования ФС)

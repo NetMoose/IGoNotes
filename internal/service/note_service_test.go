@@ -1682,8 +1682,8 @@ func TestNoteServiceSyncFailureStillReleasesInitialTreeWait(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("GetTree() error = %v, want nil", err)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("GetTree() error = %v, want %v", err, wantErr)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("GetTree() remained blocked after failed initial SyncFS")
