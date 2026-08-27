@@ -62,7 +62,7 @@ func NewSettingsService(
 	if config.SetupCompleted == nil {
 		completed := config.BaseDir != "" || len(config.Bases) != 0 || config.CurrentBase != ""
 		config.SetupCompleted = &completed
-		if err := store.Save(&config); err != nil {
+		if err := notes.persistConfig(store, &config); err != nil {
 			return nil, fmt.Errorf("migrate setup state: %w", err)
 		}
 	}

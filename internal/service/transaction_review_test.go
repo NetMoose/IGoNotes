@@ -255,6 +255,34 @@ func TestSettingsServicePreparationRollbackFailureDegradesWithoutSave(t *testing
 	}
 }
 
+func TestNewSettingsServiceMigrationRejectsFailedRuntimeWithoutSave(t *testing.T) {
+	basePath := t.TempDir()
+	writeTestNote(t, basePath, "note.md", "content")
+	operationErr := errors.New("prepare index failed")
+	rollbackErr := errors.New("prepare rollback failed")
+	repo := &fakeNoteRepository{prepareErr: operationErr, prepareRollbackErr: rollbackErr}
+	notes := newTestNoteService(t, repo, basePath)
+	if err := notes.SyncFS(); !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("SyncFS() error = %v, want ErrRollbackFailed", err)
+	}
+	original := model.Config{
+		Bases:       []model.Base{{Name: "active", Path: basePath}},
+		CurrentBase: "active",
+	}
+	store := &fakeConfigStore{config: &original}
+
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if settings != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", settings)
+	}
+	if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+		t.Fatalf("NewSettingsService() error = %v, want fail-closed runtime errors", err)
+	}
+	if store.saveCalls != 0 || !reflect.DeepEqual(*store.config, original) {
+		t.Errorf("rejected migration changed store: saves %d config %#v", store.saveCalls, *store.config)
+	}
+}
+
 func TestSettingsServicePreparationFailureWithSuccessfulRollbackRemainsOperational(t *testing.T) {
 	oldBase := t.TempDir()
 	target := t.TempDir()

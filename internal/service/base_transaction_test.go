@@ -224,6 +224,87 @@ func TestSettingsServiceConfigOnlyPersistenceBlocksConcurrentSync(t *testing.T) 
 	}
 }
 
+func TestNewSettingsServiceMigrationBlocksConcurrentSync(t *testing.T) {
+	basePath := t.TempDir()
+	writeTestNote(t, basePath, "note.md", "content")
+	repo := &fakeNoteRepository{}
+	notes := newTestNoteService(t, repo, basePath)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("initial SyncFS() error = %v", err)
+	}
+	repo.mu.Lock()
+	repo.prepareCalls = 0
+	repo.commitCalls = 0
+	repo.mu.Unlock()
+	original := model.Config{
+		Bases:       []model.Base{{Name: "active", Path: basePath}},
+		CurrentBase: "active",
+	}
+	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
+	store := &fakeConfigStore{config: &original, saveStarted: persistStarted, saveRelease: persistRelease}
+	constructorDone := make(chan struct {
+		service *SettingsService
+		err     error
+	}, 1)
+	go func() {
+		service, err := NewSettingsService(store, notes, "", nil)
+		constructorDone <- struct {
+			service *SettingsService
+			err     error
+		}{service: service, err: err}
+	}()
+	<-persistStarted
+
+	baseLockAvailable := notes.baseMu.TryLock()
+	if baseLockAvailable {
+		notes.baseMu.Unlock()
+	}
+	syncStarted := make(chan struct{})
+	syncDone := make(chan error, 1)
+	go func() {
+		close(syncStarted)
+		syncDone <- notes.SyncFS()
+	}()
+	<-syncStarted
+	for range 10 {
+		runtime.Gosched()
+	}
+	syncCompletedEarly := false
+	select {
+	case err := <-syncDone:
+		syncCompletedEarly = true
+		t.Errorf("SyncFS() completed during setup migration: %v", err)
+	default:
+	}
+
+	close(persistRelease)
+	constructor := <-constructorDone
+	if constructor.err != nil || constructor.service == nil {
+		t.Fatalf("NewSettingsService() = %#v, %v; want service, nil", constructor.service, constructor.err)
+	}
+	if !syncCompletedEarly {
+		if err := <-syncDone; err != nil {
+			t.Fatalf("SyncFS() after migration error = %v", err)
+		}
+	}
+	if baseLockAvailable {
+		t.Error("runtime base lock was available while setup migration was blocked")
+	}
+	if store.saveCalls != 1 || store.config.SetupCompleted == nil || !*store.config.SetupCompleted {
+		t.Errorf("migration store state = saves %d config %#v", store.saveCalls, *store.config)
+	}
+	if original.SetupCompleted != nil {
+		t.Errorf("loaded config was mutated in place: %#v", original)
+	}
+	repo.mu.Lock()
+	prepareCalls, commitCalls := repo.prepareCalls, repo.commitCalls
+	repo.mu.Unlock()
+	if prepareCalls != 1 || commitCalls != 1 {
+		t.Errorf("SyncFS transaction calls = prepare %d commit %d, want 1 and 1", prepareCalls, commitCalls)
+	}
+}
+
 func TestNoteServiceBasePersistenceRollbackRetainsPinnedOldRoot(t *testing.T) {
 	parent := t.TempDir()
 	oldPath := filepath.Join(parent, "base")

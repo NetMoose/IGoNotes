@@ -175,8 +175,9 @@ func TestNewSettingsServiceMigratesLegacyConfig(t *testing.T) {
 
 func TestNewSettingsServiceMigratesStructurallyEmptyConfig(t *testing.T) {
 	store := &fakeConfigStore{config: &model.Config{}}
+	notes := newTestNoteService(t, &fakeNoteRepository{}, "")
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{}, "", nil)
+	service, err := NewSettingsService(store, notes, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -188,6 +189,33 @@ func TestNewSettingsServiceMigratesStructurallyEmptyConfig(t *testing.T) {
 	}
 	if store.config.SetupCompleted == nil || *store.config.SetupCompleted {
 		t.Errorf("persisted SetupCompleted = %v, want false", store.config.SetupCompleted)
+	}
+}
+
+func TestNewSettingsServiceMigrationRejectsClosedRuntimeWithoutSave(t *testing.T) {
+	basePath := t.TempDir()
+	original := model.Config{
+		Bases:       []model.Base{{Name: "active", Path: basePath}},
+		CurrentBase: "active",
+	}
+	store := &fakeConfigStore{config: &original}
+	notes := NewNoteService(&fakeNoteRepository{}, basePath)
+	if err := notes.Close(); err != nil {
+		t.Fatalf("NoteService.Close() error = %v", err)
+	}
+
+	service, err := NewSettingsService(store, notes, "", nil)
+	if service != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", service)
+	}
+	if !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("NewSettingsService() error = %v, want os.ErrClosed", err)
+	}
+	if !strings.HasPrefix(err.Error(), "migrate setup state: ") {
+		t.Errorf("NewSettingsService() error = %q, want migration context", err)
+	}
+	if store.saveCalls != 0 || !reflect.DeepEqual(*store.config, original) {
+		t.Errorf("rejected migration changed store: saves %d config %#v", store.saveCalls, *store.config)
 	}
 }
 
