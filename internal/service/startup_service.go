@@ -31,6 +31,12 @@ func ResolveStartupBase(configService *ConfigService, requestedBase, dataDir str
 		}
 	}
 
+	structurallyEmpty := config.BaseDir == "" && len(config.Bases) == 0 && config.CurrentBase == ""
+	setupIncomplete := config.SetupCompleted == nil || !*config.SetupCompleted
+	if structurallyEmpty && setupIncomplete && requestedBase == "" {
+		return "", nil
+	}
+
 	return selectConfiguredBase(config, requestedBase)
 }
 

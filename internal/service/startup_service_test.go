@@ -10,9 +10,179 @@ import (
 	"testing"
 
 	"IGoNotes/internal/model"
+	"IGoNotes/internal/repository"
 )
 
 func boolPointer(value bool) *bool { return &value }
+
+type countingConfigStore struct {
+	*ConfigService
+	saveCalls int
+}
+
+func (s *countingConfigStore) Save(config *model.Config) error {
+	s.saveCalls++
+	return s.ConfigService.Save(config)
+}
+
+func newProductionNoteService(t *testing.T, basePath string) *NoteService {
+	t.Helper()
+	db, err := repository.InitDB(filepath.Join(t.TempDir(), "metadata.db"))
+	if err != nil {
+		t.Fatalf("repository.InitDB() error = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("database Close() error = %v, want nil", err)
+		}
+	})
+	notes := NewNoteService(repository.NewNoteRepository(db), basePath)
+	t.Cleanup(func() {
+		if err := notes.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v, want nil", err)
+		}
+	})
+	return notes
+}
+
+func TestResolveStartupBaseAllowsStructurallyEmptyConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	original := []byte(`{}`)
+	if err := os.WriteFile(configPath, original, 0600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	dataDir := filepath.Join(root, "data")
+
+	gotPath, err := ResolveStartupBase(NewConfigService(configPath), "", dataDir)
+	if err != nil {
+		t.Fatalf("ResolveStartupBase() error = %v, want nil", err)
+	}
+	if gotPath != "" {
+		t.Errorf("ResolveStartupBase() = %q, want empty path", gotPath)
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile() error = %v, want nil", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Errorf("config changed after ResolveStartupBase()\nbefore: %s\nafter:  %s", original, after)
+	}
+	if _, err := os.Stat(dataDir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.Stat(%q) error = %v, want os.ErrNotExist", dataDir, err)
+	}
+}
+
+func TestEmptyConfigStartupCanCompleteSetup(t *testing.T) {
+	tests := []struct {
+		name string
+		mode string
+	}{
+		{name: "connect", mode: "connect"},
+		{name: "create", mode: "create"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			configPath := filepath.Join(root, "config.json")
+			if err := os.WriteFile(configPath, []byte(`{}`), 0600); err != nil {
+				t.Fatalf("os.WriteFile() error = %v, want nil", err)
+			}
+			configService := NewConfigService(configPath)
+
+			basePath, err := ResolveStartupBase(configService, "", filepath.Join(root, "data"))
+			if err != nil {
+				t.Fatalf("ResolveStartupBase() error = %v, want nil", err)
+			}
+			if basePath != "" {
+				t.Fatalf("ResolveStartupBase() = %q, want empty path", basePath)
+			}
+
+			notes := newProductionNoteService(t, basePath)
+			store := &countingConfigStore{ConfigService: configService}
+			settings, err := NewSettingsService(store, notes, "", nil)
+			if err != nil {
+				t.Fatalf("NewSettingsService() error = %v, want nil", err)
+			}
+			if settings.SetupCompleted() {
+				t.Fatal("SetupCompleted() = true, want false")
+			}
+			if store.saveCalls != 1 {
+				t.Fatalf("migration Save calls = %d, want 1", store.saveCalls)
+			}
+			migrated, err := configService.Load()
+			if err != nil {
+				t.Fatalf("Load() after migration error = %v, want nil", err)
+			}
+			if migrated.SetupCompleted == nil || *migrated.SetupCompleted {
+				t.Fatalf("migrated SetupCompleted = %v, want false", migrated.SetupCompleted)
+			}
+
+			requestPath := filepath.Join(root, "base-parent")
+			if err := os.Mkdir(requestPath, 0755); err != nil {
+				t.Fatalf("os.Mkdir() error = %v, want nil", err)
+			}
+			wantPath := requestPath
+			if tt.mode == "create" {
+				wantPath = filepath.Join(requestPath, "work")
+			}
+			response, err := settings.CompleteSetup(model.BaseMutationRequest{
+				Mode: tt.mode,
+				Name: "work",
+				Path: requestPath,
+			})
+			if err != nil {
+				t.Fatalf("CompleteSetup() error = %v, want nil", err)
+			}
+			if !settings.SetupCompleted() {
+				t.Error("SetupCompleted() = false, want true")
+			}
+			if response.BasePath != wantPath || notes.GetBasePath() != wantPath {
+				t.Errorf("runtime paths = response %q, service %q; want %q", response.BasePath, notes.GetBasePath(), wantPath)
+			}
+			if store.saveCalls != 2 {
+				t.Errorf("total Save calls = %d, want migration and setup saves", store.saveCalls)
+			}
+			if _, err := notes.GetTree(); err != nil {
+				t.Errorf("GetTree() after setup error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestExplicitIncompleteEmptyConfigStartupDoesNotMigrate(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	original := []byte(`{"setup_completed":false}`)
+	if err := os.WriteFile(configPath, original, 0600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	configService := NewConfigService(configPath)
+
+	basePath, err := ResolveStartupBase(configService, "", filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatalf("ResolveStartupBase() error = %v, want nil", err)
+	}
+	store := &countingConfigStore{ConfigService: configService}
+	settings, err := NewSettingsService(store, newProductionNoteService(t, basePath), "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v, want nil", err)
+	}
+	if settings.SetupCompleted() {
+		t.Error("SetupCompleted() = true, want false")
+	}
+	if store.saveCalls != 0 {
+		t.Errorf("migration Save calls = %d, want 0", store.saveCalls)
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile() error = %v, want nil", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Errorf("config changed during startup\nbefore: %s\nafter:  %s", original, after)
+	}
+}
 
 func TestResolveStartupBaseInitializesDefaultConfig(t *testing.T) {
 	tests := []struct {
@@ -205,6 +375,40 @@ func TestResolveStartupBaseRejectsInvalidConfig(t *testing.T) {
 		wantErrors    []string
 		wantCause     error
 	}{
+		{
+			name: "completed structurally empty config",
+			config: &model.Config{
+				SetupCompleted: boolPointer(true),
+			},
+			wantErrors: []string{"current_base", "пустым"},
+		},
+		{
+			name:          "CLI base with structurally empty config",
+			config:        &model.Config{},
+			requestedBase: "missing",
+			wantErrors:    []string{"--base", "missing", "нет настроенных баз"},
+		},
+		{
+			name: "base directory without bases",
+			config: &model.Config{
+				BaseDir: validPath,
+			},
+			wantErrors: []string{"current_base", "пустым"},
+		},
+		{
+			name: "bases without current base",
+			config: &model.Config{
+				Bases: []model.Base{{Name: "personal", Path: validPath}},
+			},
+			wantErrors: []string{"current_base", "пустым"},
+		},
+		{
+			name: "current base without bases",
+			config: &model.Config{
+				CurrentBase: "personal",
+			},
+			wantErrors: []string{"current_base", "personal", "нет настроенных баз"},
+		},
 		{
 			name: "unknown CLI base",
 			config: &model.Config{
