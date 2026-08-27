@@ -58,9 +58,9 @@ func (r *NoteRepository) GetAllNodes() ([]model.NoteNode, error) {
 }
 
 func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) error {
-	commit, rollback, err := r.BeginReplaceAll(nodes)
-	if err != nil {
-		return err
+	commit, rollback, operationErr, rollbackErr := r.BeginReplaceAll(nodes)
+	if operationErr != nil {
+		return errors.Join(operationErr, rollbackErr)
 	}
 	if err := commit(); err != nil {
 		return errors.Join(err, rollback())
@@ -68,19 +68,19 @@ func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) error {
 	return nil
 }
 
-func (r *NoteRepository) BeginReplaceAll(nodes []model.NoteNode) (commit func() error, rollback func() error, err error) {
+func (r *NoteRepository) BeginReplaceAll(nodes []model.NoteNode) (commit func() error, rollback func() error, operationErr error, rollbackErr error) {
 	tx, err := r.db.Begin()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, err, nil
 	}
 
 	if _, err := tx.Exec("DELETE FROM notes"); err != nil {
-		return nil, nil, errors.Join(err, tx.Rollback())
+		return rollbackReplacePreparation(tx, nil, err)
 	}
 
 	stmt, err := tx.Prepare("INSERT INTO notes (id, title, path, parent_id, type) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
-		return nil, nil, errors.Join(err, tx.Rollback())
+		return rollbackReplacePreparation(tx, nil, err)
 	}
 
 	for _, node := range nodes {
@@ -89,15 +89,22 @@ func (r *NoteRepository) BeginReplaceAll(nodes []model.NoteNode) (commit func() 
 			parentID = node.ParentID
 		}
 		if _, err := stmt.Exec(node.ID, node.Name, node.Path, parentID, node.Type); err != nil {
-			return nil, nil, errors.Join(err, stmt.Close(), tx.Rollback())
+			return rollbackReplacePreparation(tx, stmt, err)
 		}
 	}
 	if err := stmt.Close(); err != nil {
-		return nil, nil, errors.Join(err, tx.Rollback())
+		return nil, nil, err, tx.Rollback()
 	}
 
 	finalizer := &replaceFinalizer{tx: tx}
-	return finalizer.commit, finalizer.rollback, nil
+	return finalizer.commit, finalizer.rollback, nil, nil
+}
+
+func rollbackReplacePreparation(tx *sql.Tx, stmt *sql.Stmt, operationErr error) (func() error, func() error, error, error) {
+	if stmt != nil {
+		operationErr = errors.Join(operationErr, stmt.Close())
+	}
+	return nil, nil, operationErr, tx.Rollback()
 }
 
 type replaceFinalizer struct {

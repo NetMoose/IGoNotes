@@ -21,8 +21,8 @@ type handlerNoteRepository struct{}
 func (handlerNoteRepository) UpsertNode(string, string, string, *string, string) error { return nil }
 func (handlerNoteRepository) GetAllNodes() ([]model.NoteNode, error)                   { return nil, nil }
 func (handlerNoteRepository) ReplaceAll([]model.NoteNode) error                        { return nil }
-func (handlerNoteRepository) BeginReplaceAll([]model.NoteNode) (func() error, func() error, error) {
-	return func() error { return nil }, func() error { return nil }, nil
+func (handlerNoteRepository) BeginReplaceAll([]model.NoteNode) (func() error, func() error, error, error) {
+	return func() error { return nil }, func() error { return nil }, nil, nil
 }
 func (handlerNoteRepository) DeleteNode(string) error { return nil }
 

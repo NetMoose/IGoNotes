@@ -18,24 +18,26 @@ import (
 )
 
 type fakeNoteRepository struct {
-	mu             sync.Mutex
-	nodes          []model.NoteNode
-	prepareErr     error
-	prepareErrs    []error
-	commitErr      error
-	commitErrs     []error
-	rollbackErr    error
-	rollbackErrs   []error
-	prepareCalls   int
-	commitCalls    int
-	rollbackCalls  int
-	events         *orderedEvents
-	replaceStarted chan struct{}
-	replaceRelease <-chan struct{}
-	startedOnce    sync.Once
-	upsertStarted  chan struct{}
-	upsertRelease  <-chan struct{}
-	upsertOnce     sync.Once
+	mu                  sync.Mutex
+	nodes               []model.NoteNode
+	prepareErr          error
+	prepareErrs         []error
+	prepareRollbackErr  error
+	prepareRollbackErrs []error
+	commitErr           error
+	commitErrs          []error
+	rollbackErr         error
+	rollbackErrs        []error
+	prepareCalls        int
+	commitCalls         int
+	rollbackCalls       int
+	events              *orderedEvents
+	replaceStarted      chan struct{}
+	replaceRelease      <-chan struct{}
+	startedOnce         sync.Once
+	upsertStarted       chan struct{}
+	upsertRelease       <-chan struct{}
+	upsertOnce          sync.Once
 }
 
 func waitForPendingWriter(t *testing.T, mu *sync.RWMutex) {
@@ -84,9 +86,9 @@ func (r *fakeNoteRepository) GetAllNodes() ([]model.NoteNode, error) {
 }
 
 func (r *fakeNoteRepository) ReplaceAll(nodes []model.NoteNode) error {
-	commit, rollback, err := r.BeginReplaceAll(nodes)
-	if err != nil {
-		return err
+	commit, rollback, operationErr, rollbackErr := r.BeginReplaceAll(nodes)
+	if operationErr != nil {
+		return errors.Join(operationErr, rollbackErr)
 	}
 	if err := commit(); err != nil {
 		return errors.Join(err, rollback())
@@ -94,7 +96,7 @@ func (r *fakeNoteRepository) ReplaceAll(nodes []model.NoteNode) error {
 	return nil
 }
 
-func (r *fakeNoteRepository) BeginReplaceAll(nodes []model.NoteNode) (func() error, func() error, error) {
+func (r *fakeNoteRepository) BeginReplaceAll(nodes []model.NoteNode) (func() error, func() error, error, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.prepareCalls++
@@ -111,10 +113,10 @@ func (r *fakeNoteRepository) BeginReplaceAll(nodes []model.NoteNode) (func() err
 		err := r.prepareErrs[0]
 		r.prepareErrs = r.prepareErrs[1:]
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, err, r.nextPrepareRollbackError()
 		}
 	} else if r.prepareErr != nil {
-		return nil, nil, r.prepareErr
+		return nil, nil, r.prepareErr, r.nextPrepareRollbackError()
 	}
 	commitErr := r.commitErr
 	if len(r.commitErrs) != 0 {
@@ -132,7 +134,16 @@ func (r *fakeNoteRepository) BeginReplaceAll(nodes []model.NoteNode) (func() err
 		commitErr:   commitErr,
 		rollbackErr: rollbackErr,
 	}
-	return tx.commit, tx.rollback, nil
+	return tx.commit, tx.rollback, nil, nil
+}
+
+func (r *fakeNoteRepository) nextPrepareRollbackError() error {
+	if len(r.prepareRollbackErrs) != 0 {
+		err := r.prepareRollbackErrs[0]
+		r.prepareRollbackErrs = r.prepareRollbackErrs[1:]
+		return err
+	}
+	return r.prepareRollbackErr
 }
 
 type fakeReplaceTransaction struct {

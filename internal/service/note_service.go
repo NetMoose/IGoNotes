@@ -24,8 +24,7 @@ var (
 type noteRepository interface {
 	UpsertNode(id, title, path string, parentID *string, nodeType string) error
 	GetAllNodes() ([]model.NoteNode, error)
-	ReplaceAll([]model.NoteNode) error
-	BeginReplaceAll([]model.NoteNode) (commit func() error, rollback func() error, err error)
+	BeginReplaceAll([]model.NoteNode) (commit func() error, rollback func() error, operationErr error, rollbackErr error)
 	DeleteNode(id string) error
 }
 
@@ -118,9 +117,12 @@ func (s *NoteService) SwitchBase(target string) error {
 		return s.baseErr
 	}
 
-	candidate, err := s.prepareBaseSwitchLocked(target)
-	if err != nil {
-		return err
+	candidate, operationErr, rollbackErr := s.prepareBaseSwitchLocked(target)
+	if operationErr != nil {
+		if rollbackErr != nil {
+			return s.baseErr
+		}
+		return operationErr
 	}
 	if err := candidate.commit(); err != nil {
 		rollbackErr := candidate.rollback()
@@ -144,9 +146,12 @@ func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, ne
 		return os.ErrInvalid, nil
 	}
 
-	candidate, err := s.prepareBaseSwitchLocked(target)
-	if err != nil {
-		return fmt.Errorf("switch runtime base: %w", err), nil
+	candidate, operationErr, rollbackErr := s.prepareBaseSwitchLocked(target)
+	if operationErr != nil {
+		if rollbackErr != nil {
+			return operationErr, rollbackErr
+		}
+		return fmt.Errorf("switch runtime base: %w", operationErr), nil
 	}
 	config := cloneConfig(*next)
 	if err := store.Save(&config); err != nil {
@@ -176,7 +181,7 @@ type baseSwitchCandidate struct {
 	rollback func() error
 }
 
-func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandidate, error) {
+func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandidate, error, error) {
 	cleanTarget := ""
 	var candidate *os.Root
 	if target != "" {
@@ -184,18 +189,22 @@ func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandida
 		var err error
 		candidate, err = s.openRoot(cleanTarget)
 		if err != nil {
-			return nil, err
+			return nil, err, nil
 		}
 	}
 	nodes, err := s.scan(candidate)
 	if err != nil {
-		return nil, errors.Join(err, closeRoot(candidate))
+		return nil, errors.Join(err, closeRoot(candidate)), nil
 	}
-	commit, rollback, err := s.repo.BeginReplaceAll(nodes)
-	if err != nil {
-		return nil, errors.Join(err, closeRoot(candidate))
+	commit, rollback, operationErr, rollbackErr := s.repo.BeginReplaceAll(nodes)
+	if operationErr != nil {
+		operationErr = errors.Join(operationErr, closeRoot(candidate))
+		if rollbackErr != nil {
+			s.failClosedLocked(operationErr, fmt.Errorf("rollback note index preparation: %w", rollbackErr))
+		}
+		return nil, operationErr, rollbackErr
 	}
-	return &baseSwitchCandidate{path: cleanTarget, root: candidate, commit: commit, rollback: rollback}, nil
+	return &baseSwitchCandidate{path: cleanTarget, root: candidate, commit: commit, rollback: rollback}, nil, nil
 }
 
 func (s *NoteService) publishBaseSwitchLocked(candidate *baseSwitchCandidate) {
@@ -239,7 +248,20 @@ func (s *NoteService) replaceIndexLocked() error {
 	if err != nil {
 		return err
 	}
-	return s.repo.ReplaceAll(nodes)
+	commit, rollback, operationErr, rollbackErr := s.repo.BeginReplaceAll(nodes)
+	if operationErr != nil {
+		if rollbackErr != nil {
+			return s.failClosedLocked(operationErr, fmt.Errorf("rollback note index preparation: %w", rollbackErr))
+		}
+		return operationErr
+	}
+	if err := commit(); err != nil {
+		return s.failClosedLocked(
+			fmt.Errorf("commit note index: %w", err),
+			commitOutcomeError(rollback()),
+		)
+	}
+	return nil
 }
 
 func scanNotes(root *os.Root) ([]model.NoteNode, error) {

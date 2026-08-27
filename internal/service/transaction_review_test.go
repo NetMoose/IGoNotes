@@ -212,6 +212,122 @@ func TestNoteServiceIndexCommitFailureFailsClosedWithExactOrder(t *testing.T) {
 	assertRepositoryIDs(t, repo, "old.md")
 }
 
+func TestSettingsServicePreparationRollbackFailureDegradesWithoutSave(t *testing.T) {
+	oldBase := t.TempDir()
+	target := t.TempDir()
+	writeTestNote(t, oldBase, "old.md", "old")
+	writeTestNote(t, target, "new.md", "new")
+	operationErr := errors.New("prepare candidate failed")
+	rollbackErr := errors.New("prepare rollback failed")
+	repo := &fakeNoteRepository{
+		nodes:              []model.NoteNode{{ID: "old.md"}},
+		prepareErr:         operationErr,
+		prepareRollbackErr: rollbackErr,
+	}
+	notes := newTestNoteService(t, repo, oldBase)
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: oldBase}, {Name: "target", Path: target}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &config}
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+
+	if _, err := settings.SwitchBase("target"); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+		t.Fatalf("SwitchBase() error = %v, want operation and rollback failure", err)
+	}
+	if store.saveCalls != 0 {
+		t.Errorf("Save calls = %d, want none", store.saveCalls)
+	}
+	if _, err := notes.GetNoteContent("old.md"); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+		t.Errorf("GetNoteContent() error = %v, want fail-closed preparation errors", err)
+	}
+	if _, err := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "later", Path: t.TempDir()}); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+		t.Errorf("AddBase() after degradation error = %v, want latched preparation errors", err)
+	}
+	if store.saveCalls != 0 {
+		t.Errorf("Save calls after degraded mutation = %d, want none", store.saveCalls)
+	}
+}
+
+func TestSettingsServicePreparationFailureWithSuccessfulRollbackRemainsOperational(t *testing.T) {
+	oldBase := t.TempDir()
+	target := t.TempDir()
+	writeTestNote(t, oldBase, "old.md", "old")
+	writeTestNote(t, target, "new.md", "new")
+	operationErr := errors.New("prepare candidate failed")
+	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md"}}, prepareErr: operationErr}
+	notes := newTestNoteService(t, repo, oldBase)
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: oldBase}, {Name: "target", Path: target}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &config}
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+
+	if _, err := settings.SwitchBase("target"); !errors.Is(err, operationErr) || errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("first SwitchBase() error = %v, want operation error only", err)
+	}
+	if store.saveCalls != 0 {
+		t.Errorf("Save calls = %d, want none", store.saveCalls)
+	}
+	if content, err := notes.GetNoteContent("old.md"); err != nil || content != "old" {
+		t.Errorf("GetNoteContent() = %q, %v; want old, nil", content, err)
+	}
+	repo.mu.Lock()
+	repo.prepareErr = nil
+	repo.mu.Unlock()
+	response, err := settings.SwitchBase("target")
+	if err != nil {
+		t.Fatalf("second SwitchBase() error = %v", err)
+	}
+	if store.saveCalls != 1 || response.BasePath != target {
+		t.Errorf("Save calls/path = %d / %q, want 1 / %q", store.saveCalls, response.BasePath, target)
+	}
+}
+
+func TestNoteServiceDirectIndexPreparationRollbackFailureFailsClosed(t *testing.T) {
+	operations := []struct {
+		name string
+		call func(*NoteService, string) error
+	}{
+		{name: "sync", call: func(service *NoteService, _ string) error { return service.SyncFS() }},
+		{name: "switch", call: func(service *NoteService, target string) error { return service.SwitchBase(target) }},
+		{name: "rename index", call: func(service *NoteService, _ string) error { return service.RenameNode("old.md", "renamed") }},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			oldBase := t.TempDir()
+			target := t.TempDir()
+			writeTestNote(t, oldBase, "old.md", "old")
+			writeTestNote(t, target, "new.md", "new")
+			operationErr := errors.New("prepare index failed")
+			rollbackErr := errors.New("prepare rollback failed")
+			repo := &fakeNoteRepository{prepareErr: operationErr, prepareRollbackErr: rollbackErr}
+			notes := newTestNoteService(t, repo, oldBase)
+
+			if err := operation.call(notes, target); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+				t.Fatalf("operation error = %v, want fail-closed preparation errors", err)
+			}
+			if _, err := notes.GetTree(); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+				t.Errorf("GetTree() error = %v, want released gate and preparation errors", err)
+			}
+			if _, err := notes.GetNoteContent("old.md"); !errors.Is(err, ErrRollbackFailed) {
+				t.Errorf("GetNoteContent() error = %v, want ErrRollbackFailed", err)
+			}
+		})
+	}
+}
+
 type nilReader struct{}
 
 func (nilReader) Read([]byte) (int, error) { return 0, io.EOF }

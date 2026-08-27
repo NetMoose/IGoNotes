@@ -33,9 +33,9 @@ func TestNoteRepositoryBeginReplaceAllPreservesExactStateUntilCommit(t *testing.
 	wantTags := repositoryRows(t, db, "SELECT note_id, tag FROM tags ORDER BY note_id, tag", 2)
 	candidate := []model.NoteNode{{ID: "new.md", Name: "new", Path: "new.md", Type: "file"}}
 
-	commit, rollback, err := repo.BeginReplaceAll(candidate)
-	if err != nil {
-		t.Fatalf("BeginReplaceAll() error = %v", err)
+	commit, rollback, operationErr, rollbackErr := repo.BeginReplaceAll(candidate)
+	if operationErr != nil || rollbackErr != nil {
+		t.Fatalf("BeginReplaceAll() errors = %v, %v", operationErr, rollbackErr)
 	}
 	if err := rollback(); err != nil {
 		t.Fatalf("rollback() error = %v", err)
@@ -53,9 +53,9 @@ func TestNoteRepositoryBeginReplaceAllPreservesExactStateUntilCommit(t *testing.
 		t.Errorf("tags after rollback = %#v, want %#v", got, wantTags)
 	}
 
-	commit, rollback, err = repo.BeginReplaceAll(candidate)
-	if err != nil {
-		t.Fatalf("second BeginReplaceAll() error = %v", err)
+	commit, rollback, operationErr, rollbackErr = repo.BeginReplaceAll(candidate)
+	if operationErr != nil || rollbackErr != nil {
+		t.Fatalf("second BeginReplaceAll() errors = %v, %v", operationErr, rollbackErr)
 	}
 	if err := commit(); err != nil {
 		t.Fatalf("commit() error = %v", err)
@@ -82,9 +82,12 @@ func TestNoteRepositoryBeginReplaceAllPrepareFailurePreservesState(t *testing.T)
 		{ID: "duplicate", Name: "second", Path: "second", Type: "file"},
 	}
 
-	commit, rollback, err := repo.BeginReplaceAll(duplicate)
-	if err == nil {
-		t.Fatal("BeginReplaceAll() error = nil, want duplicate ID error")
+	commit, rollback, operationErr, rollbackErr := repo.BeginReplaceAll(duplicate)
+	if operationErr == nil {
+		t.Fatal("BeginReplaceAll() operation error = nil, want duplicate ID error")
+	}
+	if rollbackErr != nil {
+		t.Fatalf("BeginReplaceAll() rollback error = %v, want nil", rollbackErr)
 	}
 	if commit != nil || rollback != nil {
 		t.Errorf("finalizers present = %t / %t, want false / false after prepare failure", commit != nil, rollback != nil)
@@ -95,6 +98,24 @@ func TestNoteRepositoryBeginReplaceAllPrepareFailurePreservesState(t *testing.T)
 	}
 	if len(nodes) != 1 || nodes[0].ID != "old.md" {
 		t.Errorf("nodes after prepare failure = %#v, want old.md", nodes)
+	}
+}
+
+func TestNoteRepositoryBeginReplaceAllBeginFailureHasNoRollbackError(t *testing.T) {
+	repo, db := openTestNoteRepository(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	commit, rollback, operationErr, rollbackErr := repo.BeginReplaceAll(nil)
+	if operationErr == nil {
+		t.Fatal("BeginReplaceAll() operation error = nil, want closed database error")
+	}
+	if rollbackErr != nil {
+		t.Errorf("BeginReplaceAll() rollback error = %v, want nil when Begin failed", rollbackErr)
+	}
+	if commit != nil || rollback != nil {
+		t.Errorf("finalizers present = %t / %t, want false / false", commit != nil, rollback != nil)
 	}
 }
 
