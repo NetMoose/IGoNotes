@@ -53,7 +53,7 @@ ui:
 
 go:
 	mkdir -p builds
-	go build -o builds/igonotes ./cmd/api/...
+	go build -o builds/igonotes ./cmd/...
 ```
 
 ## Структура данных
