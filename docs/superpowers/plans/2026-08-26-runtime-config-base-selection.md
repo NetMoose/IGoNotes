@@ -1000,4 +1000,4 @@ Expected: каждый пункт подтверждён тестом или п�
 
 - [x] **Step 5: Выполнить полную проверку и зафиксировать документацию**
 
-Проверены отсутствие устаревших команд repository-wide grep `git grep -n -E 'go (run|build)( -o [^ ]+)? +cmd/api/main\.go' -- '*.md'`, отсутствие незавершённых Step в плане, package build и run/help, `git diff --check` и полный smoke-run `go test ./...`. Документационные исправления зафиксированы commit `docs: align startup path documentation`, а repository command fixes — commits `561892f` (`docs: fix package-level Go commands`) и `8685007` (`docs: fix root backend build command`).
+Проверены отсутствие устаревших команд repository-wide grep `git grep -n -E 'go (run|build)( -o [^ ]+)? +cmd/api/main\.go' -- '*.md'`, отсутствие незавершённых Step в плане, package build и run/help, `git diff --check` и полный smoke-run `go test ./...`. Документационные исправления зафиксированы commit `docs: align startup path documentation`, а три последовательных documentation command fixes — commits `9d667cd` (`docs: fix backend build command`), `561892f` (`docs: fix package-level Go commands`) и `8685007` (`docs: fix root backend build command`).
