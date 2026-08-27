@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -158,6 +160,108 @@ func TestNoteHandlerMethodNotAllowedSetsAllow(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNoteHandlerUploadAssetRejectsOversizedTotalRequest(t *testing.T) {
+	base := t.TempDir()
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	notes := service.NewNoteService(handlerNoteRepository{}, base)
+	t.Cleanup(func() {
+		if err := notes.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v", err)
+		}
+	})
+	body, contentType := multipartUploadBody(t, "too-large.bin", bytes.Repeat([]byte("x"), int(maxAssetRequestSize)+1024))
+	if int64(body.Len()) <= maxAssetRequestSize {
+		t.Fatalf("multipart body size = %d, want greater than %d", body.Len(), maxAssetRequestSize)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/assets", body)
+	request.Header.Set("Content-Type", contentType)
+	recorder := httptest.NewRecorder()
+
+	NewNoteHandler(notes).UploadAsset(recorder, request)
+
+	if _, err := os.Stat(filepath.Join(base, "assets")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("oversized upload created base assets, stat error = %v", err)
+	}
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("os.ReadDir(temp) error = %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("oversized upload leaked temp artifacts: %v", entries)
+	}
+	assertAPIErrorResponse(t, recorder, http.StatusBadRequest, model.APIError{Code: "file_too_large", Message: "File too large", Field: "file"})
+}
+
+func TestNoteHandlerUploadAssetSavesSmallFile(t *testing.T) {
+	base := t.TempDir()
+	notes := service.NewNoteService(handlerNoteRepository{}, base)
+	t.Cleanup(func() {
+		if err := notes.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v", err)
+		}
+	})
+	wantContent := []byte("small asset content")
+	body, contentType := multipartUploadBody(t, "small.txt", wantContent)
+	request := httptest.NewRequest(http.MethodPost, "/api/assets", body)
+	request.Header.Set("Content-Type", contentType)
+	recorder := httptest.NewRecorder()
+
+	NewNoteHandler(notes).UploadAsset(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	var response map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; body=%q", err, recorder.Body.String())
+	}
+	relPath := response["path"]
+	if relPath == "" {
+		t.Fatal("response path is empty")
+	}
+	gotContent, err := os.ReadFile(filepath.Join(base, relPath))
+	if err != nil {
+		t.Fatalf("os.ReadFile(saved asset) error = %v", err)
+	}
+	if !bytes.Equal(gotContent, wantContent) {
+		t.Errorf("saved content = %q, want %q", gotContent, wantContent)
+	}
+}
+
+func TestNoteHandlerUploadAssetRejectsMalformedMultipart(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/assets", strings.NewReader("private malformed multipart detail"))
+	request.Header.Set("Content-Type", "multipart/form-data; boundary=broken")
+	recorder := httptest.NewRecorder()
+
+	NewNoteHandler(nil).UploadAsset(recorder, request)
+
+	assertAPIErrorResponse(t, recorder, http.StatusBadRequest, model.APIError{Code: "file_too_large", Message: "File too large", Field: "file"})
+	if strings.Contains(recorder.Body.String(), "private malformed") {
+		t.Fatalf("response leaked multipart parse details: %q", recorder.Body.String())
+	}
+}
+
+func multipartUploadBody(t *testing.T, filename string, content []byte) (*bytes.Buffer, string) {
+	t.Helper()
+	body := new(bytes.Buffer)
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("multipart part Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("multipart writer Close() error = %v", err)
+	}
+	return body, writer.FormDataContentType()
 }
 
 func TestNoteHandlerGetRawFileErrors(t *testing.T) {

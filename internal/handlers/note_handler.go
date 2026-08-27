@@ -14,6 +14,9 @@ type NoteHandler struct {
 	NoteService *service.NoteService
 }
 
+// maxAssetRequestSize caps the full multipart HTTP body, including framing.
+const maxAssetRequestSize int64 = 10 << 20
+
 func NewNoteHandler(noteService *service.NoteService) *NoteHandler {
 	return &NoteHandler{NoteService: noteService}
 }
@@ -286,10 +289,17 @@ func (h *NoteHandler) UploadAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ограничиваем размер загружаемого файла (например, 10 MB)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAssetRequestSize)
+	defer r.Body.Close()
+	if err := r.ParseMultipartForm(maxAssetRequestSize); err != nil {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
 		WriteAPIError(w, http.StatusBadRequest, "file_too_large", "File too large", "file")
 		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 
 	file, header, err := r.FormFile("file")
