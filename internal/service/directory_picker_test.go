@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,18 +14,36 @@ import (
 )
 
 type recordingDirectoryPickerRunner struct {
-	result CommandResult
-	err    error
-	calls  int
-	name   string
-	args   []string
+	result        CommandResult
+	err           error
+	responses     []directoryPickerResponse
+	calls         int
+	name          string
+	args          []string
+	recordedCalls []directoryPickerCall
 }
 
 func (r *recordingDirectoryPickerRunner) Run(_ context.Context, name string, args ...string) (CommandResult, error) {
+	callIndex := r.calls
 	r.calls++
 	r.name = name
 	r.args = append([]string(nil), args...)
+	r.recordedCalls = append(r.recordedCalls, directoryPickerCall{name: name, args: append([]string(nil), args...)})
+	if callIndex < len(r.responses) {
+		response := r.responses[callIndex]
+		return response.result, response.err
+	}
 	return r.result, r.err
+}
+
+type directoryPickerResponse struct {
+	result CommandResult
+	err    error
+}
+
+type directoryPickerCall struct {
+	name string
+	args []string
 }
 
 func TestDirectoryPickerSelectDirectoryWindows(t *testing.T) {
@@ -57,7 +76,7 @@ func TestDirectoryPickerSelectDirectoryWindows(t *testing.T) {
 	})
 
 	t.Run("returns canceled only for exact marker", func(t *testing.T) {
-		runner := &recordingDirectoryPickerRunner{result: CommandResult{Output: []byte(windowsPickerCancelMarker + "\r\n")}}
+		runner := &recordingDirectoryPickerRunner{result: CommandResult{Output: []byte(directoryPickerCancelMarker + "\r\n")}}
 
 		path, err := NewDirectoryPicker(runner, "windows").SelectDirectory(context.Background())
 		if path != "" {
@@ -158,7 +177,7 @@ func TestDirectoryPickerSelectDirectoryWindows(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		runnerErr := errors.New("runner stopped")
-		runner := &recordingDirectoryPickerRunner{err: runnerErr}
+		runner := &recordingDirectoryPickerRunner{result: CommandResult{ExitCode: -1}, err: runnerErr}
 
 		path, err := NewDirectoryPicker(runner, "windows").SelectDirectory(ctx)
 		if path != "" {
@@ -170,12 +189,15 @@ func TestDirectoryPickerSelectDirectoryWindows(t *testing.T) {
 		if errors.Is(err, ErrDirectorySelectionCanceled) {
 			t.Errorf("SelectDirectory() error = %v, do not want selection cancellation", err)
 		}
+		if runner.calls != 0 {
+			t.Errorf("Run calls = %d, want 0 for pre-canceled context", runner.calls)
+		}
 	})
 
 	t.Run("does not treat marker from failed process as selection cancellation", func(t *testing.T) {
 		commandErr := errors.New("process failed")
 		runner := &recordingDirectoryPickerRunner{
-			result: CommandResult{Output: []byte(windowsPickerCancelMarker), ExitCode: 1},
+			result: CommandResult{Output: []byte(directoryPickerCancelMarker), ExitCode: 1},
 			err:    commandErr,
 		}
 
@@ -206,14 +228,18 @@ func TestDirectoryPickerSelectDirectoryUnsupported(t *testing.T) {
 }
 
 func TestDirectoryPickerSelectDirectoryNilRunner(t *testing.T) {
-	picker := NewDirectoryPicker(nil, "windows")
+	for _, goos := range []string{"windows", "darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			picker := NewDirectoryPicker(nil, goos)
 
-	path, err := picker.SelectDirectory(context.Background())
-	if path != "" {
-		t.Errorf("SelectDirectory() path = %q, want empty", path)
-	}
-	if !errors.Is(err, ErrDirectoryPickerUnavailable) {
-		t.Fatalf("SelectDirectory() error = %v, want ErrDirectoryPickerUnavailable", err)
+			path, err := picker.SelectDirectory(context.Background())
+			if path != "" {
+				t.Errorf("SelectDirectory() path = %q, want empty", path)
+			}
+			if !errors.Is(err, ErrDirectoryPickerUnavailable) {
+				t.Fatalf("SelectDirectory() error = %v, want ErrDirectoryPickerUnavailable", err)
+			}
+		})
 	}
 }
 
@@ -230,16 +256,237 @@ func TestWindowsPickerScript(t *testing.T) {
 		"FolderBrowserDialog",
 		"SelectedPath",
 		"DialogResult]::OK",
-		windowsPickerCancelMarker,
+		directoryPickerCancelMarker,
 	}
 	for _, fragment := range required {
 		if !strings.Contains(windowsPickerScript, fragment) {
 			t.Errorf("windowsPickerScript missing %q", fragment)
 		}
 	}
-	if got := strings.Count(windowsPickerScript, windowsPickerCancelMarker); got != 1 {
+	if got := strings.Count(windowsPickerScript, directoryPickerCancelMarker); got != 1 {
 		t.Errorf("windowsPickerScript cancel marker count = %d, want 1", got)
 	}
+}
+
+const wantMacOSPickerScript = `try
+    return POSIX path of (choose folder with prompt "Choose a notes directory")
+on error errorMessage number errorNumber
+    if errorNumber is -128 then
+        return "__IGONOTES_DIRECTORY_SELECTION_CANCELED__"
+    end if
+    error errorMessage number errorNumber
+end try`
+
+func TestDirectoryPickerSelectDirectoryDarwin(t *testing.T) {
+	t.Run("returns selected POSIX path and preserves spaces and trailing slash", func(t *testing.T) {
+		output := []byte(" /Volumes/Notes / \r\n")
+		originalOutput := slices.Clone(output)
+		runner := &recordingDirectoryPickerRunner{result: CommandResult{Output: output}}
+
+		got, err := NewDirectoryPicker(runner, "darwin").SelectDirectory(context.Background())
+		if err != nil {
+			t.Fatalf("SelectDirectory() error = %v, want nil", err)
+		}
+		if want := " /Volumes/Notes / "; got != want {
+			t.Errorf("SelectDirectory() = %q, want %q", got, want)
+		}
+		wantCall := directoryPickerCall{name: "osascript", args: []string{"-e", wantMacOSPickerScript}}
+		if !reflect.DeepEqual(runner.recordedCalls, []directoryPickerCall{wantCall}) {
+			t.Errorf("Run calls = %#v, want %#v", runner.recordedCalls, []directoryPickerCall{wantCall})
+		}
+		if !slices.Equal(output, originalOutput) {
+			t.Errorf("runner output mutated to %q, want %q", output, originalOutput)
+		}
+	})
+
+	t.Run("maps exact script marker to canceled", func(t *testing.T) {
+		runner := &recordingDirectoryPickerRunner{result: CommandResult{Output: []byte(directoryPickerCancelMarker + "\n")}}
+
+		path, err := NewDirectoryPicker(runner, "darwin").SelectDirectory(context.Background())
+		if path != "" {
+			t.Errorf("SelectDirectory() path = %q, want empty", path)
+		}
+		if !errors.Is(err, ErrDirectorySelectionCanceled) {
+			t.Fatalf("SelectDirectory() error = %v, want ErrDirectorySelectionCanceled", err)
+		}
+	})
+
+	t.Run("keeps osascript exit one operational", func(t *testing.T) {
+		commandErr := errors.New("exit status 1")
+		runner := &recordingDirectoryPickerRunner{
+			result: CommandResult{Output: []byte("execution error: denied\n"), ExitCode: 1},
+			err:    commandErr,
+		}
+
+		path, err := NewDirectoryPicker(runner, "darwin").SelectDirectory(context.Background())
+		if path != "" {
+			t.Errorf("SelectDirectory() path = %q, want empty", path)
+		}
+		if !errors.Is(err, commandErr) {
+			t.Fatalf("SelectDirectory() error = %v, want wrapped %v", err, commandErr)
+		}
+		if errors.Is(err, ErrDirectorySelectionCanceled) {
+			t.Errorf("SelectDirectory() error = %v, do not want cancellation", err)
+		}
+		if !strings.Contains(err.Error(), "exit code 1") {
+			t.Errorf("SelectDirectory() error = %q, want exit code", err)
+		}
+	})
+}
+
+func TestMacOSPickerScript(t *testing.T) {
+	if macOSPickerScript != wantMacOSPickerScript {
+		t.Errorf("macOSPickerScript = %q, want %q", macOSPickerScript, wantMacOSPickerScript)
+	}
+	if strings.Count(macOSPickerScript, directoryPickerCancelMarker) != 1 {
+		t.Errorf("macOSPickerScript must contain the fixed cancel marker exactly once")
+	}
+}
+
+func TestDirectoryPickerSelectDirectoryLinux(t *testing.T) {
+	zenityCall := directoryPickerCall{name: "zenity", args: []string{"--file-selection", "--directory"}}
+	kdialogCall := directoryPickerCall{name: "kdialog", args: []string{"--getexistingdirectory"}}
+
+	t.Run("returns zenity selection and preserves spaces", func(t *testing.T) {
+		runner := &recordingDirectoryPickerRunner{result: CommandResult{Output: []byte(" /home/alice/My Notes \r\n")}}
+
+		got, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if err != nil {
+			t.Fatalf("SelectDirectory() error = %v, want nil", err)
+		}
+		if want := " /home/alice/My Notes "; got != want {
+			t.Errorf("SelectDirectory() = %q, want %q", got, want)
+		}
+		if !reflect.DeepEqual(runner.recordedCalls, []directoryPickerCall{zenityCall}) {
+			t.Errorf("Run calls = %#v, want %#v", runner.recordedCalls, []directoryPickerCall{zenityCall})
+		}
+	})
+
+	t.Run("falls back to kdialog only when zenity is missing", func(t *testing.T) {
+		runner := &recordingDirectoryPickerRunner{responses: []directoryPickerResponse{
+			{result: CommandResult{ExitCode: -1}, err: fmt.Errorf("find zenity: %w", exec.ErrNotFound)},
+			{result: CommandResult{Output: []byte("/notes/from-kdialog\n")}},
+		}}
+
+		got, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if err != nil {
+			t.Fatalf("SelectDirectory() error = %v, want nil", err)
+		}
+		if got != "/notes/from-kdialog" {
+			t.Errorf("SelectDirectory() = %q, want %q", got, "/notes/from-kdialog")
+		}
+		wantCalls := []directoryPickerCall{zenityCall, kdialogCall}
+		if !reflect.DeepEqual(runner.recordedCalls, wantCalls) {
+			t.Errorf("Run calls = %#v, want %#v", runner.recordedCalls, wantCalls)
+		}
+	})
+
+	t.Run("does not fall back when zenity is canceled", func(t *testing.T) {
+		runner := &recordingDirectoryPickerRunner{
+			result: CommandResult{ExitCode: 1},
+			err:    errors.New("exit status 1"),
+		}
+
+		_, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if !errors.Is(err, ErrDirectorySelectionCanceled) {
+			t.Fatalf("SelectDirectory() error = %v, want ErrDirectorySelectionCanceled", err)
+		}
+		if runner.calls != 1 {
+			t.Errorf("Run calls = %d, want 1", runner.calls)
+		}
+	})
+
+	t.Run("maps kdialog exit one to canceled", func(t *testing.T) {
+		runner := &recordingDirectoryPickerRunner{responses: []directoryPickerResponse{
+			{result: CommandResult{ExitCode: -1}, err: exec.ErrNotFound},
+			{result: CommandResult{ExitCode: 1}, err: errors.New("exit status 1")},
+		}}
+
+		_, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if !errors.Is(err, ErrDirectorySelectionCanceled) {
+			t.Fatalf("SelectDirectory() error = %v, want ErrDirectorySelectionCanceled", err)
+		}
+		wantCalls := []directoryPickerCall{zenityCall, kdialogCall}
+		if !reflect.DeepEqual(runner.recordedCalls, wantCalls) {
+			t.Errorf("Run calls = %#v, want %#v", runner.recordedCalls, wantCalls)
+		}
+	})
+
+	t.Run("returns unavailable when both pickers are missing", func(t *testing.T) {
+		runner := &recordingDirectoryPickerRunner{responses: []directoryPickerResponse{
+			{result: CommandResult{ExitCode: -1}, err: exec.ErrNotFound},
+			{result: CommandResult{ExitCode: -1}, err: exec.ErrNotFound},
+		}}
+
+		_, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if !errors.Is(err, ErrDirectoryPickerUnavailable) {
+			t.Fatalf("SelectDirectory() error = %v, want ErrDirectoryPickerUnavailable", err)
+		}
+		if runner.calls != 2 {
+			t.Errorf("Run calls = %d, want 2", runner.calls)
+		}
+	})
+
+	t.Run("does not fall back after operational exit", func(t *testing.T) {
+		commandErr := errors.New("exit status 2")
+		runner := &recordingDirectoryPickerRunner{
+			result: CommandResult{Output: []byte("display unavailable\n"), ExitCode: 2},
+			err:    commandErr,
+		}
+
+		_, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if !errors.Is(err, commandErr) {
+			t.Fatalf("SelectDirectory() error = %v, want wrapped %v", err, commandErr)
+		}
+		if errors.Is(err, ErrDirectorySelectionCanceled) || errors.Is(err, ErrDirectoryPickerUnavailable) {
+			t.Errorf("SelectDirectory() error = %v, want operational error", err)
+		}
+		if runner.calls != 1 {
+			t.Errorf("Run calls = %d, want 1", runner.calls)
+		}
+	})
+
+	t.Run("does not fall back after non-missing start failure", func(t *testing.T) {
+		commandErr := errors.New("permission denied")
+		runner := &recordingDirectoryPickerRunner{
+			result: CommandResult{ExitCode: -1},
+			err:    commandErr,
+		}
+
+		_, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if !errors.Is(err, commandErr) {
+			t.Fatalf("SelectDirectory() error = %v, want wrapped %v", err, commandErr)
+		}
+		if runner.calls != 1 {
+			t.Errorf("Run calls = %d, want 1", runner.calls)
+		}
+	})
+
+	t.Run("rejects empty successful output", func(t *testing.T) {
+		runner := &recordingDirectoryPickerRunner{result: CommandResult{Output: []byte("\r\n")}}
+
+		_, err := NewDirectoryPicker(runner, "linux").SelectDirectory(context.Background())
+		if err == nil {
+			t.Fatal("SelectDirectory() error = nil, want operational error")
+		}
+		if errors.Is(err, ErrDirectorySelectionCanceled) || errors.Is(err, ErrDirectoryPickerUnavailable) {
+			t.Errorf("SelectDirectory() error = %v, want operational error", err)
+		}
+	})
+
+	t.Run("does not invoke a picker for pre-canceled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		runner := &recordingDirectoryPickerRunner{}
+
+		_, err := NewDirectoryPicker(runner, "linux").SelectDirectory(ctx)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SelectDirectory() error = %v, want context.Canceled", err)
+		}
+		if runner.calls != 0 {
+			t.Errorf("Run calls = %d, want 0", runner.calls)
+		}
+	})
 }
 
 func TestExecCommandRunner(t *testing.T) {

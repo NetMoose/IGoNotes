@@ -48,7 +48,7 @@ func NewDirectoryPicker(runner CommandRunner, goos string) *DirectoryPicker {
 	return &DirectoryPicker{runner: runner, goos: goos}
 }
 
-const windowsPickerCancelMarker = "__IGONOTES_DIRECTORY_SELECTION_CANCELED__"
+const directoryPickerCancelMarker = "__IGONOTES_DIRECTORY_SELECTION_CANCELED__"
 
 const windowsPickerScript = `$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -57,51 +57,127 @@ $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     [Console]::Out.Write($dialog.SelectedPath)
 } else {
-    [Console]::Out.Write('__IGONOTES_DIRECTORY_SELECTION_CANCELED__')
+    [Console]::Out.Write('` + directoryPickerCancelMarker + `')
 }`
 
+const macOSPickerScript = `try
+    return POSIX path of (choose folder with prompt "Choose a notes directory")
+on error errorMessage number errorNumber
+    if errorNumber is -128 then
+        return "` + directoryPickerCancelMarker + `"
+    end if
+    error errorMessage number errorNumber
+end try`
+
 func (p *DirectoryPicker) SelectDirectory(ctx context.Context) (string, error) {
-	if p.goos != "windows" {
+	switch p.goos {
+	case "windows", "darwin", "linux":
+	default:
 		return "", fmt.Errorf("directory picker is not supported on %s: %w", p.goos, ErrDirectoryPickerUnavailable)
 	}
 	if p.runner == nil {
 		return "", fmt.Errorf("directory picker command runner is nil: %w", ErrDirectoryPickerUnavailable)
 	}
 
+	switch p.goos {
+	case "windows":
+		path, _, err := p.runFixedCommand(
+			ctx,
+			"run Windows directory picker",
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-STA",
+			"-Command",
+			windowsPickerScript,
+		)
+		return path, err
+	case "darwin":
+		path, _, err := p.runFixedCommand(
+			ctx,
+			"run macOS directory picker",
+			"osascript",
+			"-e",
+			macOSPickerScript,
+		)
+		return path, err
+	default:
+		return p.selectLinuxDirectory(ctx)
+	}
+}
+
+func (p *DirectoryPicker) selectLinuxDirectory(ctx context.Context) (string, error) {
+	path, result, err := p.runFixedCommand(
+		ctx,
+		"run zenity directory picker",
+		"zenity",
+		"--file-selection",
+		"--directory",
+	)
+	if err == nil {
+		return path, nil
+	}
+	if ctx.Err() != nil {
+		return "", err
+	}
+	if result.ExitCode == 1 {
+		return "", ErrDirectorySelectionCanceled
+	}
+	if !errors.Is(err, ErrDirectoryPickerUnavailable) && !errors.Is(err, exec.ErrNotFound) {
+		return "", err
+	}
+
+	path, result, err = p.runFixedCommand(
+		ctx,
+		"run kdialog directory picker",
+		"kdialog",
+		"--getexistingdirectory",
+	)
+	if err != nil && result.ExitCode == 1 {
+		return "", ErrDirectorySelectionCanceled
+	}
+	return path, err
+}
+
+func (p *DirectoryPicker) runFixedCommand(
+	ctx context.Context,
+	operation string,
+	name string,
+	args ...string,
+) (string, CommandResult, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", CommandResult{ExitCode: -1}, fmt.Errorf("%s: %w", operation, ctxErr)
+	}
+
 	result, err := p.runner.Run(
 		ctx,
-		"powershell.exe",
-		"-NoProfile",
-		"-NonInteractive",
-		"-STA",
-		"-Command",
-		windowsPickerScript,
+		name,
+		args...,
 	)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", fmt.Errorf("run Windows directory picker: %w", ctxErr)
+			return "", result, fmt.Errorf("%s: %w", operation, ctxErr)
 		}
 		if errors.Is(err, exec.ErrNotFound) {
-			return "", fmt.Errorf("run Windows directory picker: %w: %w", ErrDirectoryPickerUnavailable, err)
+			return "", result, fmt.Errorf("%s: %w: %w", operation, ErrDirectoryPickerUnavailable, err)
 		}
 
 		diagnostic := strings.TrimRight(string(result.Output), "\r\n")
-		operation := "run Windows directory picker"
 		if result.ExitCode >= 0 {
 			operation = fmt.Sprintf("%s (exit code %d)", operation, result.ExitCode)
 		}
 		if diagnostic != "" {
-			return "", fmt.Errorf("%s: %w: %s", operation, err, diagnostic)
+			return "", result, fmt.Errorf("%s: %w: %s", operation, err, diagnostic)
 		}
-		return "", fmt.Errorf("%s: %w", operation, err)
+		return "", result, fmt.Errorf("%s: %w", operation, err)
 	}
 
 	path := strings.TrimRight(string(result.Output), "\r\n")
-	if path == windowsPickerCancelMarker {
-		return "", ErrDirectorySelectionCanceled
+	if path == directoryPickerCancelMarker {
+		return "", result, ErrDirectorySelectionCanceled
 	}
 	if path == "" {
-		return "", errors.New("Windows directory picker returned an empty path")
+		return "", result, fmt.Errorf("%s returned an empty path", operation)
 	}
-	return path, nil
+	return path, result, nil
 }
