@@ -447,7 +447,7 @@ func (s *NoteService) RenameNode(id, newName string) error {
 
 	newPath := filepath.Join(filepath.Dir(oldPath), newName)
 	if filepath.Clean(oldPath) == filepath.Clean(newPath) {
-		return nil
+		return s.replaceIndexLocked()
 	}
 	if destinationInfo, err := os.Stat(newPath); err == nil {
 		if !os.SameFile(info, destinationInfo) {

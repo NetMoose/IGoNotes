@@ -539,7 +539,7 @@ func TestNoteServiceRenameNodeExactPathIsNoOp(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "same.md"), []byte("same"), 0644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
-	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "same.md", Name: "same", Type: "file", Path: "same.md"}}}
+	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "stale.md", Name: "stale", Type: "file", Path: "stale.md"}}}
 	service := NewNoteService(repo, base)
 
 	if err := service.RenameNode("same.md", "same.md"); err != nil {
@@ -551,6 +551,13 @@ func TestNoteServiceRenameNodeExactPathIsNoOp(t *testing.T) {
 	}
 	if string(content) != "same" {
 		t.Errorf("content = %q, want same", content)
+	}
+	nodes, err := repo.GetAllNodes()
+	if err != nil {
+		t.Fatalf("GetAllNodes() error = %v, want nil", err)
+	}
+	if len(nodes) != 1 || nodes[0].ID != "same.md" {
+		t.Errorf("indexed nodes = %#v, want only same.md", nodes)
 	}
 }
 
