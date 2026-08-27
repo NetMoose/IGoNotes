@@ -55,18 +55,14 @@ func (r *NoteRepository) GetAllNodes() ([]model.NoteNode, error) {
 	return nodes, nil
 }
 
-func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) (err error) {
+func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	defer tx.Rollback()
 
-	if _, err = tx.Exec("DELETE FROM notes"); err != nil {
+	if _, err := tx.Exec("DELETE FROM notes"); err != nil {
 		return err
 	}
 
@@ -81,13 +77,12 @@ func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) (err error) {
 		if node.ParentID != "" {
 			parentID = node.ParentID
 		}
-		if _, err = stmt.Exec(node.ID, node.Name, node.Path, parentID, node.Type); err != nil {
+		if _, err := stmt.Exec(node.ID, node.Name, node.Path, parentID, node.Type); err != nil {
 			return err
 		}
 	}
 
-	err = tx.Commit()
-	return err
+	return tx.Commit()
 }
 
 // ClearAll удаляет все записи (полезно при полной синхронизации, если мы не отслеживаем удаления точечно)

@@ -43,14 +43,22 @@ func TestNoteRepositoryReplaceAllIsTransactional(t *testing.T) {
 		t.Fatalf("GetAllNodes() = %#v, want only new.md", nodes)
 	}
 
-	invalidNode := model.NoteNode{
-		ID:   "invalid.md",
-		Name: "invalid.md",
-		Path: "invalid.md",
-		Type: "",
+	duplicateNodes := []model.NoteNode{
+		{
+			ID:   "duplicate",
+			Name: "duplicate.md",
+			Path: "duplicate.md",
+			Type: "file",
+		},
+		{
+			ID:   "duplicate",
+			Name: "duplicate",
+			Path: "duplicate",
+			Type: "dir",
+		},
 	}
-	if err := repo.ReplaceAll([]model.NoteNode{invalidNode}); err == nil {
-		t.Fatal("ReplaceAll() error = nil, want invalid node type error")
+	if err := repo.ReplaceAll(duplicateNodes); err == nil {
+		t.Fatal("ReplaceAll() error = nil, want duplicate ID error")
 	}
 
 	nodes, err = repo.GetAllNodes()

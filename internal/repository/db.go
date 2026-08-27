@@ -28,7 +28,7 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		title TEXT NOT NULL,
 		path TEXT NOT NULL,
 		parent_id TEXT,
-		type TEXT NOT NULL CHECK(type IN ('file', 'dir')),
+		type TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
