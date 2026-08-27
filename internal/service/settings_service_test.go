@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"IGoNotes/internal/model"
@@ -60,7 +61,7 @@ func TestNewSettingsServiceMigratesLegacyConfig(t *testing.T) {
 		CurrentBase: "personal",
 	}}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -95,19 +96,31 @@ func TestNewSettingsServiceMigratesStructurallyEmptyConfig(t *testing.T) {
 
 func TestNewSettingsServicePreservesExplicitSetupState(t *testing.T) {
 	tests := []struct {
-		name      string
-		completed bool
+		name        string
+		completed   bool
+		config      model.Config
+		runtimePath string
 	}{
 		{name: "false", completed: false},
-		{name: "true", completed: true},
+		{
+			name:      "true",
+			completed: true,
+			config: model.Config{
+				Bases:       []model.Base{{Name: "personal", Path: "/notes/personal"}},
+				CurrentBase: "personal",
+			},
+			runtimePath: "/notes/personal",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			completed := tt.completed
-			store := &fakeConfigStore{config: &model.Config{SetupCompleted: &completed}}
+			config := cloneConfig(tt.config)
+			config.SetupCompleted = &completed
+			store := &fakeConfigStore{config: &config}
 
-			service, err := NewSettingsService(store, &fakeBaseRuntime{}, "", nil)
+			service, err := NewSettingsService(store, &fakeBaseRuntime{path: tt.runtimePath}, "", nil)
 			if err != nil {
 				t.Fatalf("NewSettingsService() error = %v", err)
 			}
@@ -242,6 +255,103 @@ func TestNewSettingsServiceReturnsLoadError(t *testing.T) {
 	}
 }
 
+func TestNewSettingsServiceRejectsNilConfigStore(t *testing.T) {
+	service, err := NewSettingsService(nil, &fakeBaseRuntime{}, "", nil)
+	if service != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", service)
+	}
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrInvalidConfig", err)
+	}
+	if !strings.Contains(err.Error(), "config store") {
+		t.Errorf("NewSettingsService() error = %q, want config store context", err)
+	}
+}
+
+func TestNewSettingsServiceRejectsNilBaseRuntime(t *testing.T) {
+	completed := false
+	store := &fakeConfigStore{config: &model.Config{SetupCompleted: &completed}}
+
+	service, err := NewSettingsService(store, nil, "", nil)
+	if service != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", service)
+	}
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrInvalidConfig", err)
+	}
+	if !strings.Contains(err.Error(), "base runtime") {
+		t.Errorf("NewSettingsService() error = %q, want base runtime context", err)
+	}
+}
+
+func TestNewSettingsServiceRejectsUnknownPersistedCurrentBase(t *testing.T) {
+	completed := true
+	store := &fakeConfigStore{config: &model.Config{
+		Bases:          []model.Base{{Name: "work", Path: "/notes/work"}},
+		CurrentBase:    "missing",
+		SetupCompleted: &completed,
+	}}
+
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/work"}, "", nil)
+	if service != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", service)
+	}
+	if !errors.Is(err, ErrBaseNotFound) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrBaseNotFound", err)
+	}
+	if store.saveCalls != 0 {
+		t.Errorf("Save calls = %d, want 0", store.saveCalls)
+	}
+}
+
+func TestNewSettingsServiceRejectsMismatchedPersistedCurrentBasePath(t *testing.T) {
+	completed := true
+	store := &fakeConfigStore{config: &model.Config{
+		Bases:          []model.Base{{Name: "work", Path: "/notes/work"}},
+		CurrentBase:    "work",
+		SetupCompleted: &completed,
+	}}
+
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, "", nil)
+	if service != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", service)
+	}
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrInvalidConfig", err)
+	}
+	var fieldErr *FieldError
+	if !errors.As(err, &fieldErr) {
+		t.Fatalf("NewSettingsService() error type = %T, want *FieldError", err)
+	}
+	if fieldErr.Field != "current_base" {
+		t.Errorf("FieldError.Field = %q, want current_base", fieldErr.Field)
+	}
+}
+
+func TestNewSettingsServiceAcceptsMatchingPersistedCurrentBase(t *testing.T) {
+	completed := true
+	store := &fakeConfigStore{config: &model.Config{
+		Bases:          []model.Base{{Name: "work", Path: filepath.Join("notes", "work")}},
+		CurrentBase:    "work",
+		SetupCompleted: &completed,
+	}}
+	runtime := &fakeBaseRuntime{path: filepath.Join("notes", ".", "work")}
+
+	service, err := NewSettingsService(store, runtime, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	if got := service.GetConfig().CurrentBase; got != "work" {
+		t.Errorf("CurrentBase = %q, want work", got)
+	}
+	if runtime.pathCalls != 1 {
+		t.Errorf("GetBasePath calls = %d, want 1", runtime.pathCalls)
+	}
+	if store.saveCalls != 0 {
+		t.Errorf("Save calls = %d, want 0", store.saveCalls)
+	}
+}
+
 func TestSettingsServiceGetConfigReturnsDeepSnapshot(t *testing.T) {
 	completed := true
 	store := &fakeConfigStore{config: &model.Config{
@@ -249,7 +359,7 @@ func TestSettingsServiceGetConfigReturnsDeepSnapshot(t *testing.T) {
 		CurrentBase:    "personal",
 		SetupCompleted: &completed,
 	}}
-	service, err := NewSettingsService(store, &fakeBaseRuntime{}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}

@@ -35,6 +35,13 @@ func NewSettingsService(
 	activeBaseName string,
 	logger *log.Logger,
 ) (*SettingsService, error) {
+	if store == nil {
+		return nil, fmt.Errorf("config store: %w", ErrInvalidConfig)
+	}
+	if notes == nil {
+		return nil, fmt.Errorf("base runtime: %w", ErrInvalidConfig)
+	}
+
 	loadedConfig, err := store.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load settings: %w", err)
@@ -52,18 +59,28 @@ func NewSettingsService(
 		}
 	}
 
-	if activeBaseName != "" {
-		index := baseIndex(config.Bases, activeBaseName)
-		if index < 0 {
-			return nil, fmt.Errorf("active base %q: %w", activeBaseName, ErrBaseNotFound)
+	runtimePath := notes.GetBasePath()
+	structurallyEmpty := config.BaseDir == "" && len(config.Bases) == 0 && config.CurrentBase == ""
+	setupIncomplete := config.SetupCompleted != nil && !*config.SetupCompleted
+	if !(structurallyEmpty && setupIncomplete && runtimePath == "") {
+		effectiveBaseName := config.CurrentBase
+		if activeBaseName != "" {
+			effectiveBaseName = activeBaseName
 		}
-		if filepath.Clean(config.Bases[index].Path) != filepath.Clean(notes.GetBasePath()) {
+		index := baseIndex(config.Bases, effectiveBaseName)
+		if index < 0 {
+			return nil, fmt.Errorf("current base %q: %w", effectiveBaseName, ErrBaseNotFound)
+		}
+		if filepath.Clean(config.Bases[index].Path) != filepath.Clean(runtimePath) {
 			return nil, &FieldError{
 				Kind:    ErrInvalidConfig,
 				Field:   "current_base",
-				Message: fmt.Sprintf("active base %q does not match the runtime base path", activeBaseName),
+				Message: fmt.Sprintf("current base %q does not match the runtime base path", effectiveBaseName),
 			}
 		}
+	}
+
+	if activeBaseName != "" {
 		config.CurrentBase = activeBaseName
 	}
 
