@@ -296,6 +296,183 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 	return s.responseLocked(), nil
 }
 
+func (s *SettingsService) UpdateBase(oldName string, request model.BaseUpdateRequest) (model.SettingsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.degraded != nil {
+		return model.SettingsResponse{}, s.degraded
+	}
+	index := baseIndex(s.config.Bases, oldName)
+	if index < 0 {
+		return model.SettingsResponse{}, ErrBaseNotFound
+	}
+	name := strings.TrimSpace(request.Name)
+	if name == "" {
+		return model.SettingsResponse{}, fieldError(ErrInvalidName, "name", "base name is required")
+	}
+	if err := ensureUniqueName(s.config, name, oldName); err != nil {
+		return model.SettingsResponse{}, err
+	}
+	path, err := normalizeExistingBasePath(request.Path, "path")
+	if err != nil {
+		return model.SettingsResponse{}, err
+	}
+
+	next := cloneConfig(s.config)
+	next.Bases[index].Name = name
+	next.Bases[index].Path = path
+	targetPath := ""
+	if s.config.CurrentBase == oldName {
+		next.CurrentBase = name
+		targetPath = path
+	}
+	if err := s.applyConfigLocked(next, targetPath); err != nil {
+		return model.SettingsResponse{}, err
+	}
+	return s.responseLocked(), nil
+}
+
+func (s *SettingsService) ForgetBase(name string) (model.SettingsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.degraded != nil {
+		return model.SettingsResponse{}, s.degraded
+	}
+	index := baseIndex(s.config.Bases, name)
+	if index < 0 {
+		return model.SettingsResponse{}, ErrBaseNotFound
+	}
+	if len(s.config.Bases) == 1 {
+		return model.SettingsResponse{}, ErrLastBase
+	}
+	if s.config.CurrentBase == name {
+		return model.SettingsResponse{}, ErrActiveBase
+	}
+
+	next := cloneConfig(s.config)
+	next.Bases = append(next.Bases[:index], next.Bases[index+1:]...)
+	if err := s.applyConfigLocked(next, ""); err != nil {
+		return model.SettingsResponse{}, err
+	}
+	return s.responseLocked(), nil
+}
+
+func (s *SettingsService) SwitchBase(name string) (model.SettingsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.degraded != nil {
+		return model.SettingsResponse{}, s.degraded
+	}
+	index := baseIndex(s.config.Bases, name)
+	if index < 0 {
+		return model.SettingsResponse{}, ErrBaseNotFound
+	}
+
+	next := cloneConfig(s.config)
+	next.CurrentBase = name
+	if err := s.applyConfigLocked(next, next.Bases[index].Path); err != nil {
+		return model.SettingsResponse{}, err
+	}
+	return s.responseLocked(), nil
+}
+
+func (s *SettingsService) ReplaceConfig(input model.Config) (model.SettingsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.degraded != nil {
+		return model.SettingsResponse{}, s.degraded
+	}
+	currentSetup := s.config.SetupCompleted != nil && *s.config.SetupCompleted
+	next, err := normalizeConfig(input, currentSetup)
+	if err != nil {
+		return model.SettingsResponse{}, err
+	}
+	index := baseIndex(next.Bases, next.CurrentBase)
+	if err := s.applyConfigLocked(next, next.Bases[index].Path); err != nil {
+		return model.SettingsResponse{}, err
+	}
+	return s.responseLocked(), nil
+}
+
+func normalizeConfig(input model.Config, currentSetup bool) (model.Config, error) {
+	normalized := cloneConfig(input)
+	setupCompleted := currentSetup
+	if normalized.SetupCompleted != nil {
+		if currentSetup && !*normalized.SetupCompleted {
+			return model.Config{}, fieldError(ErrSetupCannotReopen, "setup_completed", "completed setup cannot be reopened")
+		}
+		setupCompleted = *normalized.SetupCompleted
+	}
+	normalized.SetupCompleted = &setupCompleted
+
+	if len(normalized.Bases) == 0 {
+		return model.Config{}, fieldError(ErrInvalidConfig, "bases", "at least one base is required")
+	}
+	names := make(map[string]struct{}, len(normalized.Bases))
+	for index := range normalized.Bases {
+		nameField := fmt.Sprintf("bases[%d].name", index)
+		name := strings.TrimSpace(normalized.Bases[index].Name)
+		if name == "" {
+			return model.Config{}, fieldError(ErrInvalidName, nameField, "base name is required")
+		}
+		if _, exists := names[name]; exists {
+			return model.Config{}, fieldError(ErrBaseNameConflict, nameField, "base name already exists")
+		}
+		names[name] = struct{}{}
+		normalized.Bases[index].Name = name
+
+		pathField := fmt.Sprintf("bases[%d].path", index)
+		path, err := normalizeExistingBasePath(normalized.Bases[index].Path, pathField)
+		if err != nil {
+			return model.Config{}, err
+		}
+		normalized.Bases[index].Path = path
+	}
+
+	normalized.CurrentBase = strings.TrimSpace(normalized.CurrentBase)
+	if baseIndex(normalized.Bases, normalized.CurrentBase) < 0 {
+		return model.Config{}, fieldError(ErrBaseNotFound, "current_base", "current base is not configured")
+	}
+
+	normalized.BaseDir = strings.TrimSpace(normalized.BaseDir)
+	if normalized.BaseDir != "" {
+		baseDir, err := filepath.Abs(normalized.BaseDir)
+		if err != nil {
+			return model.Config{}, fieldErrorWithCause(ErrInvalidConfig, err, "base_dir", "resolve base directory")
+		}
+		normalized.BaseDir = filepath.Clean(baseDir)
+	}
+	return normalized, nil
+}
+
+func normalizeExistingBasePath(path, field string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fieldError(ErrInvalidPath, field, "base path is required")
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fieldErrorWithCause(ErrInvalidPath, err, field, "resolve base path")
+	}
+	canonicalPath, err := filepath.EvalSymlinks(filepath.Clean(absPath))
+	if err != nil {
+		return "", fieldErrorWithCause(ErrInvalidPath, err, field, "resolve base path symlinks")
+	}
+	canonicalPath = filepath.Clean(canonicalPath)
+	info, err := os.Stat(canonicalPath)
+	if err != nil {
+		return "", fieldErrorWithCause(ErrInvalidPath, err, field, "inspect base path")
+	}
+	if !info.IsDir() {
+		return "", fieldError(ErrInvalidPath, field, "base path must be an existing directory")
+	}
+	return canonicalPath, nil
+}
+
 func fieldError(kind error, field, message string) error {
 	return &FieldError{Kind: kind, Field: field, Message: message}
 }

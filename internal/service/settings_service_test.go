@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -945,6 +946,577 @@ func TestSettingsServiceAddBasePreservesCanonicalCreatedBaseAcrossParentSymlinkR
 	}
 }
 
+func TestSettingsServiceUpdateBaseMutatesConfiguredBase(t *testing.T) {
+	activePath := t.TempDir()
+	inactivePath := t.TempDir()
+	replacementPath := t.TempDir()
+	marker := filepath.Join(inactivePath, "keep.md")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	service, store, runtime, original := newConfiguredSettingsService(t, activePath, inactivePath)
+
+	response, err := service.UpdateBase("other", model.BaseUpdateRequest{Name: "  renamed  ", Path: "  " + replacementPath + "  "})
+	if err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	want := cloneConfig(original)
+	want.Bases[1].Name = "renamed"
+	want.Bases[1].Path = replacementPath
+	if !reflect.DeepEqual(service.GetConfig(), want) || !reflect.DeepEqual(*store.config, want) || !reflect.DeepEqual(response.Config, want) {
+		t.Errorf("configs = service %#v store %#v response %#v, want %#v", service.GetConfig(), *store.config, response.Config, want)
+	}
+	if response.BasePath != activePath || runtime.path != activePath || len(runtime.switchCalls) != 0 {
+		t.Errorf("runtime changed: response %q runtime %q switches %v", response.BasePath, runtime.path, runtime.switchCalls)
+	}
+	contents, readErr := os.ReadFile(marker)
+	if readErr != nil || string(contents) != "keep" {
+		t.Errorf("old base marker = %q, %v; want preserved", contents, readErr)
+	}
+	response.Config.Bases[1].Name = "caller mutation"
+	*response.Config.SetupCompleted = false
+	if !reflect.DeepEqual(service.GetConfig(), want) {
+		t.Errorf("response aliases service config: got %#v, want %#v", service.GetConfig(), want)
+	}
+}
+
+func TestSettingsServiceUpdateBaseRenamesActiveWithoutSwitchingSameCanonicalPath(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	link := filepath.Join(t.TempDir(), "active-link")
+	createSymlinkOrSkip(t, activePath, link)
+	service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+
+	response, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "renamed", Path: link})
+	if err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	want := cloneConfig(original)
+	want.Bases[0].Name = "renamed"
+	want.Bases[0].Path = activePath
+	want.CurrentBase = "renamed"
+	if !reflect.DeepEqual(response.Config, want) || !reflect.DeepEqual(*store.config, want) {
+		t.Errorf("saved response/config = %#v / %#v, want %#v", response.Config, *store.config, want)
+	}
+	if len(runtime.switchCalls) != 0 || response.BasePath != activePath {
+		t.Errorf("runtime switches/path = %v / %q, want none / %q", runtime.switchCalls, response.BasePath, activePath)
+	}
+}
+
+func TestSettingsServiceUpdateBaseSwitchesActivePathTransactionally(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	targetPath := t.TempDir()
+	service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+
+	response, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "active", Path: targetPath})
+	if err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	want := cloneConfig(original)
+	want.Bases[0].Path = targetPath
+	if !reflect.DeepEqual(response.Config, want) || response.BasePath != targetPath {
+		t.Errorf("response = %#v path %q, want %#v path %q", response.Config, response.BasePath, want, targetPath)
+	}
+	if !reflect.DeepEqual(runtime.switchCalls, []string{targetPath}) || store.saveCalls != 1 {
+		t.Errorf("calls = switches %v saves %d, want [%q] / 1", runtime.switchCalls, store.saveCalls, targetPath)
+	}
+}
+
+func TestSettingsServiceUpdateBaseRejectsInvalidRequestsWithoutMutation(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+	regularFile := filepath.Join(t.TempDir(), "notes.md")
+	if err := os.WriteFile(regularFile, []byte("notes"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	tests := []struct {
+		name    string
+		oldName string
+		request model.BaseUpdateRequest
+		kind    error
+		field   string
+		cause   error
+	}{
+		{name: "missing base", oldName: "missing", request: model.BaseUpdateRequest{Name: "new", Path: otherPath}, kind: ErrBaseNotFound},
+		{name: "empty name", oldName: "other", request: model.BaseUpdateRequest{Name: " \t", Path: otherPath}, kind: ErrInvalidName, field: "name"},
+		{name: "exact duplicate", oldName: "other", request: model.BaseUpdateRequest{Name: " active ", Path: otherPath}, kind: ErrBaseNameConflict, field: "name"},
+		{name: "missing path", oldName: "other", request: model.BaseUpdateRequest{Name: "other", Path: missing}, kind: ErrInvalidPath, field: "path", cause: os.ErrNotExist},
+		{name: "regular file", oldName: "other", request: model.BaseUpdateRequest{Name: "other", Path: regularFile}, kind: ErrInvalidPath, field: "path"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+			_, err := service.UpdateBase(tt.oldName, tt.request)
+			if !errors.Is(err, tt.kind) {
+				t.Fatalf("UpdateBase() error = %v, want %v", err, tt.kind)
+			}
+			if tt.field != "" {
+				assertFieldError(t, err, tt.field)
+			}
+			if tt.cause != nil && !errors.Is(err, tt.cause) {
+				t.Errorf("UpdateBase() error = %v, want underlying %v", err, tt.cause)
+			}
+			assertSettingsUnchanged(t, service, store, runtime, original, activePath, 0)
+		})
+	}
+}
+
+func TestSettingsServiceUpdateBaseUsesCaseSensitiveNames(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	service, _, runtime, _ := newConfiguredSettingsService(t, activePath, otherPath)
+
+	response, err := service.UpdateBase("other", model.BaseUpdateRequest{Name: "Active", Path: otherPath})
+	if err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	if got := response.Config.Bases[1].Name; got != "Active" {
+		t.Errorf("updated name = %q, want Active", got)
+	}
+	if len(runtime.switchCalls) != 0 {
+		t.Errorf("SwitchBase calls = %v, want none", runtime.switchCalls)
+	}
+}
+
+func TestSettingsServiceUpdateBasePreservesStateOnSwitchAndSaveFailures(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	targetPath := t.TempDir()
+	t.Run("switch failure", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		switchErr := errors.New("cannot index target")
+		runtime.switchErr = switchErr
+		_, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "renamed", Path: targetPath})
+		if !errors.Is(err, switchErr) {
+			t.Fatalf("UpdateBase() error = %v, want %v", err, switchErr)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 0)
+		if !reflect.DeepEqual(runtime.switchCalls, []string{targetPath}) {
+			t.Errorf("SwitchBase calls = %v, want [%q]", runtime.switchCalls, targetPath)
+		}
+	})
+	t.Run("save failure rolls back", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		saveErr := errors.New("disk full")
+		store.saveErr = saveErr
+		_, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "renamed", Path: targetPath})
+		if !errors.Is(err, saveErr) {
+			t.Fatalf("UpdateBase() error = %v, want %v", err, saveErr)
+		}
+		if !reflect.DeepEqual(runtime.switchCalls, []string{targetPath, activePath}) {
+			t.Errorf("SwitchBase calls = %v, want target then old", runtime.switchCalls)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 1)
+	})
+}
+
+func TestSettingsServiceForgetBaseValidatesAndPreservesFiles(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	marker := filepath.Join(otherPath, "keep.md")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+	response, err := service.ForgetBase("other")
+	if err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	want := cloneConfig(original)
+	want.Bases = want.Bases[:1]
+	if !reflect.DeepEqual(response.Config, want) || !reflect.DeepEqual(*store.config, want) {
+		t.Errorf("saved response/config = %#v / %#v, want %#v", response.Config, *store.config, want)
+	}
+	if len(runtime.switchCalls) != 0 || response.BasePath != activePath {
+		t.Errorf("runtime changed: switches %v path %q", runtime.switchCalls, response.BasePath)
+	}
+	contents, readErr := os.ReadFile(marker)
+	if readErr != nil || string(contents) != "keep" {
+		t.Errorf("forgotten base marker = %q, %v; want preserved", contents, readErr)
+	}
+
+	t.Run("save failure preserves config and files", func(t *testing.T) {
+		svc, saved, rt, config := newConfiguredSettingsService(t, activePath, otherPath)
+		saved.saveErr = errors.New("disk full")
+		_, err := svc.ForgetBase("other")
+		if !errors.Is(err, saved.saveErr) {
+			t.Fatalf("ForgetBase() error = %v, want %v", err, saved.saveErr)
+		}
+		assertSettingsUnchanged(t, svc, saved, rt, config, activePath, 1)
+		if _, err := os.Stat(marker); err != nil {
+			t.Errorf("Stat(marker) error = %v, want preserved file", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		base string
+		kind error
+	}{
+		{name: "missing", base: "missing", kind: ErrBaseNotFound},
+		{name: "active", base: "active", kind: ErrActiveBase},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, saved, rt, config := newConfiguredSettingsService(t, activePath, otherPath)
+			_, err := svc.ForgetBase(tc.base)
+			if !errors.Is(err, tc.kind) {
+				t.Fatalf("ForgetBase() error = %v, want %v", err, tc.kind)
+			}
+			assertSettingsUnchanged(t, svc, saved, rt, config, activePath, 0)
+		})
+	}
+
+	t.Run("last", func(t *testing.T) {
+		completed := true
+		config := model.Config{Bases: []model.Base{{Name: "active", Path: activePath}}, CurrentBase: "active", SetupCompleted: &completed}
+		store := &fakeConfigStore{config: &config}
+		runtime := &fakeBaseRuntime{path: activePath}
+		svc, err := NewSettingsService(store, runtime, "", nil)
+		if err != nil {
+			t.Fatalf("NewSettingsService() error = %v", err)
+		}
+		_, err = svc.ForgetBase("active")
+		if !errors.Is(err, ErrLastBase) {
+			t.Fatalf("ForgetBase() error = %v, want ErrLastBase", err)
+		}
+		assertSettingsUnchanged(t, svc, store, runtime, config, activePath, 0)
+	})
+}
+
+func TestSettingsServiceSwitchBaseIsTransactional(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+	response, err := service.SwitchBase("other")
+	if err != nil {
+		t.Fatalf("SwitchBase() error = %v", err)
+	}
+	want := cloneConfig(original)
+	want.CurrentBase = "other"
+	if !reflect.DeepEqual(response.Config, want) || response.BasePath != otherPath || !reflect.DeepEqual(*store.config, want) {
+		t.Errorf("response/store = %#v path %q / %#v, want %#v path %q", response.Config, response.BasePath, *store.config, want, otherPath)
+	}
+	if !reflect.DeepEqual(runtime.switchCalls, []string{otherPath}) {
+		t.Errorf("SwitchBase calls = %v, want [%q]", runtime.switchCalls, otherPath)
+	}
+}
+
+func TestSettingsServiceSwitchBaseRejectsMissingAndPreservesFailures(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	t.Run("missing", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		_, err := service.SwitchBase("missing")
+		if !errors.Is(err, ErrBaseNotFound) {
+			t.Fatalf("SwitchBase() error = %v, want ErrBaseNotFound", err)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 0)
+	})
+	t.Run("runtime failure does not save", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		runtimeErr := errors.New("cannot index")
+		runtime.switchErr = runtimeErr
+		_, err := service.SwitchBase("other")
+		if !errors.Is(err, runtimeErr) {
+			t.Fatalf("SwitchBase() error = %v, want %v", err, runtimeErr)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 0)
+	})
+	t.Run("save failure rolls runtime back", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		saveErr := errors.New("disk full")
+		store.saveErr = saveErr
+		_, err := service.SwitchBase("other")
+		if !errors.Is(err, saveErr) {
+			t.Fatalf("SwitchBase() error = %v, want %v", err, saveErr)
+		}
+		if !reflect.DeepEqual(runtime.switchCalls, []string{otherPath, activePath}) {
+			t.Errorf("SwitchBase calls = %v, want target then old", runtime.switchCalls)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 1)
+	})
+}
+
+func TestSettingsServiceRollbackFailureDegradesAllCRUDMutations(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	targetPath := t.TempDir()
+	service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+	store.saveErr = errors.New("disk full")
+	runtime.switchErrs = []error{nil, errors.New("rollback failed")}
+	_, firstErr := service.SwitchBase("other")
+	if !errors.Is(firstErr, ErrRollbackFailed) {
+		t.Fatalf("SwitchBase() error = %v, want ErrRollbackFailed", firstErr)
+	}
+	saves := store.saveCalls
+	switches := append([]string(nil), runtime.switchCalls...)
+	pathCalls := runtime.pathCalls
+	mutations := []struct {
+		name string
+		call func() error
+	}{
+		{name: "update", call: func() error {
+			_, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "active", Path: targetPath})
+			return err
+		}},
+		{name: "forget", call: func() error { _, err := service.ForgetBase("other"); return err }},
+		{name: "switch", call: func() error { _, err := service.SwitchBase("active"); return err }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			if err := mutation.call(); !errors.Is(err, ErrRollbackFailed) {
+				t.Fatalf("mutation error = %v, want degraded ErrRollbackFailed", err)
+			}
+		})
+	}
+	if store.saveCalls != saves || !reflect.DeepEqual(runtime.switchCalls, switches) || runtime.pathCalls != pathCalls {
+		t.Errorf("degraded mutations made calls: saves %d/%d switches %v/%v paths %d/%d", store.saveCalls, saves, runtime.switchCalls, switches, runtime.pathCalls, pathCalls)
+	}
+	if !reflect.DeepEqual(service.GetConfig(), original) {
+		t.Errorf("service config = %#v, want unchanged %#v", service.GetConfig(), original)
+	}
+}
+
+func TestNormalizeConfigReturnsIndependentNormalizedSnapshot(t *testing.T) {
+	firstPath := t.TempDir()
+	secondPath := t.TempDir()
+	baseDirInput := filepath.Join(t.TempDir(), "missing", "..", "bases")
+	completed := true
+	input := model.Config{
+		BaseDir: "  " + baseDirInput + "  ",
+		Bases: []model.Base{
+			{Name: "  active  ", Path: "  " + firstPath + "  ", GitURL: "active.git", AutoSync: true},
+			{Name: "Active", Path: secondPath, GitURL: "other.git"},
+		},
+		CurrentBase:    "  active  ",
+		SetupCompleted: &completed,
+	}
+
+	got, err := normalizeConfig(input, false)
+	if err != nil {
+		t.Fatalf("normalizeConfig() error = %v", err)
+	}
+	wantBaseDir, err := filepath.Abs(strings.TrimSpace(baseDirInput))
+	if err != nil {
+		t.Fatalf("filepath.Abs() error = %v", err)
+	}
+	want := model.Config{
+		BaseDir: filepath.Clean(wantBaseDir),
+		Bases: []model.Base{
+			{Name: "active", Path: firstPath, GitURL: "active.git", AutoSync: true},
+			{Name: "Active", Path: secondPath, GitURL: "other.git"},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: settingsBoolPointer(true),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("normalizeConfig() = %#v, want %#v", got, want)
+	}
+	input.Bases[0].Name = "caller changed input"
+	*input.SetupCompleted = false
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("normalized config aliases input: got %#v, want %#v", got, want)
+	}
+	got.Bases[0].Name = "caller changed result"
+	*got.SetupCompleted = false
+	if input.Bases[0].Name != "caller changed input" || *input.SetupCompleted {
+		t.Errorf("normalized result aliases input: input %#v", input)
+	}
+}
+
+func TestNormalizeConfigPreservesEffectiveSetupWhenOmitted(t *testing.T) {
+	basePath := t.TempDir()
+	for _, currentSetup := range []bool{false, true} {
+		t.Run(fmt.Sprintf("current_%t", currentSetup), func(t *testing.T) {
+			got, err := normalizeConfig(model.Config{
+				Bases:       []model.Base{{Name: "base", Path: basePath}},
+				CurrentBase: "base",
+			}, currentSetup)
+			if err != nil {
+				t.Fatalf("normalizeConfig() error = %v", err)
+			}
+			if got.SetupCompleted == nil || *got.SetupCompleted != currentSetup {
+				t.Errorf("SetupCompleted = %v, want %t", got.SetupCompleted, currentSetup)
+			}
+		})
+	}
+}
+
+func TestNormalizeConfigRejectsInvalidConfig(t *testing.T) {
+	basePath := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+	tests := []struct {
+		name         string
+		input        model.Config
+		currentSetup bool
+		kind         error
+		field        string
+		cause        error
+	}{
+		{name: "completed setup cannot reopen", input: model.Config{Bases: []model.Base{{Name: "base", Path: basePath}}, CurrentBase: "base", SetupCompleted: settingsBoolPointer(false)}, currentSetup: true, kind: ErrSetupCannotReopen, field: "setup_completed"},
+		{name: "empty bases", input: model.Config{CurrentBase: "base"}, kind: ErrInvalidConfig, field: "bases"},
+		{name: "empty name", input: model.Config{Bases: []model.Base{{Name: " \t", Path: basePath}}, CurrentBase: "base"}, kind: ErrInvalidName, field: "bases[0].name"},
+		{name: "duplicate name", input: model.Config{Bases: []model.Base{{Name: "base", Path: basePath}, {Name: " base ", Path: basePath}}, CurrentBase: "base"}, kind: ErrBaseNameConflict, field: "bases[1].name"},
+		{name: "missing base path", input: model.Config{Bases: []model.Base{{Name: "base", Path: missing}}, CurrentBase: "base"}, kind: ErrInvalidPath, field: "bases[0].path", cause: os.ErrNotExist},
+		{name: "unknown current base", input: model.Config{Bases: []model.Base{{Name: "base", Path: basePath}}, CurrentBase: " missing "}, kind: ErrBaseNotFound, field: "current_base"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := normalizeConfig(tt.input, tt.currentSetup)
+			if !errors.Is(err, tt.kind) {
+				t.Fatalf("normalizeConfig() error = %v, want %v", err, tt.kind)
+			}
+			assertFieldError(t, err, tt.field)
+			if tt.cause != nil && !errors.Is(err, tt.cause) {
+				t.Errorf("normalizeConfig() error = %v, want underlying %v", err, tt.cause)
+			}
+		})
+	}
+}
+
+func TestNormalizeConfigCanonicalizesEveryBasePath(t *testing.T) {
+	physicalPath := t.TempDir()
+	alternatePath := t.TempDir()
+	link := filepath.Join(t.TempDir(), "base-link")
+	createSymlinkOrSkip(t, physicalPath, link)
+
+	got, err := normalizeConfig(model.Config{
+		Bases:       []model.Base{{Name: "base", Path: link}, {Name: "other", Path: alternatePath}},
+		CurrentBase: "base",
+	}, false)
+	if err != nil {
+		t.Fatalf("normalizeConfig() error = %v", err)
+	}
+	if got.Bases[0].Path != physicalPath || got.Bases[1].Path != alternatePath {
+		t.Errorf("base paths = %q, %q; want %q, %q", got.Bases[0].Path, got.Bases[1].Path, physicalPath, alternatePath)
+	}
+}
+
+func TestSettingsServiceReplaceConfigAppliesNormalizedConfigWithoutUnneededSwitch(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	removedPath := t.TempDir()
+	activeLink := filepath.Join(t.TempDir(), "active-link")
+	createSymlinkOrSkip(t, activePath, activeLink)
+	baseDir := filepath.Join(t.TempDir(), "not-created", "..", "bases")
+	marker := filepath.Join(removedPath, "keep.md")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	service, store, runtime, _ := newConfiguredSettingsService(t, activePath, removedPath)
+	input := model.Config{
+		BaseDir: baseDir,
+		Bases: []model.Base{
+			{Name: "  renamed  ", Path: activeLink, GitURL: "new.git", AutoSync: true},
+			{Name: "other", Path: otherPath},
+		},
+		CurrentBase: " renamed ",
+	}
+
+	response, err := service.ReplaceConfig(input)
+	if err != nil {
+		t.Fatalf("ReplaceConfig() error = %v", err)
+	}
+	want, err := normalizeConfig(input, true)
+	if err != nil {
+		t.Fatalf("normalizeConfig() error = %v", err)
+	}
+	if !reflect.DeepEqual(response.Config, want) || !reflect.DeepEqual(*store.config, want) || !reflect.DeepEqual(service.GetConfig(), want) {
+		t.Errorf("configs = response %#v store %#v service %#v, want %#v", response.Config, *store.config, service.GetConfig(), want)
+	}
+	if len(runtime.switchCalls) != 0 || response.BasePath != activePath {
+		t.Errorf("runtime changed: switches %v path %q", runtime.switchCalls, response.BasePath)
+	}
+	contents, readErr := os.ReadFile(marker)
+	if readErr != nil || string(contents) != "keep" {
+		t.Errorf("removed config base marker = %q, %v; want preserved", contents, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Clean(baseDir)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("replacement BaseDir Stat() error = %v, want not created", statErr)
+	}
+	input.Bases[0].Name = "caller input mutation"
+	response.Config.Bases[0].Name = "caller response mutation"
+	*response.Config.SetupCompleted = false
+	if !reflect.DeepEqual(service.GetConfig(), want) || !reflect.DeepEqual(*store.config, want) {
+		t.Errorf("caller memory aliases saved config: service %#v store %#v want %#v", service.GetConfig(), *store.config, want)
+	}
+}
+
+func TestSettingsServiceReplaceConfigSwitchesChangedActivePath(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	targetPath := t.TempDir()
+	service, store, runtime, _ := newConfiguredSettingsService(t, activePath, otherPath)
+	input := model.Config{
+		Bases:       []model.Base{{Name: "new-active", Path: targetPath}, {Name: "other", Path: otherPath}},
+		CurrentBase: "new-active",
+	}
+
+	response, err := service.ReplaceConfig(input)
+	if err != nil {
+		t.Fatalf("ReplaceConfig() error = %v", err)
+	}
+	if response.BasePath != targetPath || !reflect.DeepEqual(runtime.switchCalls, []string{targetPath}) || store.saveCalls != 1 {
+		t.Errorf("runtime/save = path %q switches %v saves %d, want %q [%q] 1", response.BasePath, runtime.switchCalls, store.saveCalls, targetPath, targetPath)
+	}
+}
+
+func TestSettingsServiceReplaceConfigIsTransactional(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	targetPath := t.TempDir()
+	input := model.Config{Bases: []model.Base{{Name: "target", Path: targetPath}}, CurrentBase: "target"}
+	t.Run("switch failure does not save", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		switchErr := errors.New("cannot index")
+		runtime.switchErr = switchErr
+		_, err := service.ReplaceConfig(input)
+		if !errors.Is(err, switchErr) {
+			t.Fatalf("ReplaceConfig() error = %v, want %v", err, switchErr)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 0)
+	})
+	t.Run("save failure rolls back target then old", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		saveErr := errors.New("disk full")
+		store.saveErr = saveErr
+		_, err := service.ReplaceConfig(input)
+		if !errors.Is(err, saveErr) {
+			t.Fatalf("ReplaceConfig() error = %v, want %v", err, saveErr)
+		}
+		if !reflect.DeepEqual(runtime.switchCalls, []string{targetPath, activePath}) {
+			t.Errorf("SwitchBase calls = %v, want target then old", runtime.switchCalls)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 1)
+	})
+	t.Run("rollback failure degrades service with both causes", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		saveErr := errors.New("disk full")
+		rollbackErr := errors.New("cannot restore")
+		store.saveErr = saveErr
+		runtime.switchErrs = []error{nil, rollbackErr}
+		_, err := service.ReplaceConfig(input)
+		if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, saveErr) || !errors.Is(err, rollbackErr) {
+			t.Fatalf("ReplaceConfig() error = %v, want rollback, save, and restore causes", err)
+		}
+		if !reflect.DeepEqual(service.GetConfig(), original) {
+			t.Errorf("service config = %#v, want unchanged %#v", service.GetConfig(), original)
+		}
+		saves := store.saveCalls
+		switches := append([]string(nil), runtime.switchCalls...)
+		pathCalls := runtime.pathCalls
+		_, laterErr := service.ReplaceConfig(model.Config{})
+		if !errors.Is(laterErr, ErrRollbackFailed) {
+			t.Fatalf("later ReplaceConfig() error = %v, want degraded ErrRollbackFailed", laterErr)
+		}
+		if store.saveCalls != saves || !reflect.DeepEqual(runtime.switchCalls, switches) || runtime.pathCalls != pathCalls {
+			t.Errorf("degraded replacement made calls: saves %d/%d switches %v/%v paths %d/%d", store.saveCalls, saves, runtime.switchCalls, switches, runtime.pathCalls, pathCalls)
+		}
+	})
+}
+
 func newIncompleteSettingsService(t *testing.T) (*SettingsService, *fakeConfigStore, *fakeBaseRuntime, model.Config) {
 	t.Helper()
 	completed := false
@@ -961,6 +1533,27 @@ func newIncompleteSettingsService(t *testing.T) (*SettingsService, *fakeConfigSt
 	}
 	store := &fakeConfigStore{config: &config}
 	runtime := &fakeBaseRuntime{path: defaultPath}
+	service, err := NewSettingsService(store, runtime, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	return service, store, runtime, cloneConfig(config)
+}
+
+func newConfiguredSettingsService(t *testing.T, activePath, otherPath string) (*SettingsService, *fakeConfigStore, *fakeBaseRuntime, model.Config) {
+	t.Helper()
+	completed := true
+	config := model.Config{
+		BaseDir: filepath.Dir(activePath),
+		Bases: []model.Base{
+			{Name: "active", Path: activePath, GitURL: "active.git", AutoSync: true},
+			{Name: "other", Path: otherPath, GitURL: "other.git"},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &config}
+	runtime := &fakeBaseRuntime{path: activePath}
 	service, err := NewSettingsService(store, runtime, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
