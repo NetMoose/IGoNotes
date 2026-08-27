@@ -192,11 +192,11 @@ func createBaseDirectory(prepared preparedBase) (*createdBaseDirectory, error) {
 		}
 		return nil, fieldErrorWithCause(ErrInvalidPath, errors.Join(err, closeErr), "path", "create base path")
 	}
-	info, err := root.Stat(prepared.base.Name)
+	info, err := root.Lstat(prepared.base.Name)
 	if err != nil {
 		return nil, fieldErrorWithCause(ErrInvalidPath, errors.Join(err, root.Close()), "path", "inspect created base path")
 	}
-	if !info.IsDir() {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		closeErr := root.Close()
 		return nil, errors.Join(fieldError(ErrInvalidPath, "path", "created base path is not a directory"), closeErr)
 	}
@@ -204,15 +204,15 @@ func createBaseDirectory(prepared preparedBase) (*createdBaseDirectory, error) {
 }
 
 func (created *createdBaseDirectory) cleanup() error {
-	info, err := created.root.Stat(created.name)
+	info, err := created.root.Lstat(created.name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("refuse cleanup of created base: inspect entry: %w", err)
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("refuse cleanup of created base: entry is no longer a directory")
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refuse cleanup of created base: entry is no longer a non-symlink directory")
 	}
 	if !os.SameFile(created.info, info) {
 		return fmt.Errorf("refuse cleanup of created base: directory identity changed")

@@ -958,6 +958,62 @@ func TestSettingsServiceAddBaseRefusesCleanupOfReplacementEntry(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceAddBaseRefusesCleanupOfSymlinkToMovedOriginal(t *testing.T) {
+	parent := t.TempDir()
+	probePath := filepath.Join(parent, "symlink-probe")
+	createSymlinkOrSkip(t, ".", probePath)
+	if err := os.Remove(probePath); err != nil {
+		t.Fatalf("Remove(symlink probe) error = %v", err)
+	}
+	service, store, _, _ := newIncompleteSettingsService(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	store.saveStarted = started
+	store.saveRelease = release
+	store.saveErr = errors.New("disk full")
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
+		done <- err
+	}()
+	<-started
+
+	createdPath := filepath.Join(parent, "work")
+	movedPath := filepath.Join(parent, "moved-work")
+	markerPath := filepath.Join(createdPath, "marker")
+	if err := os.WriteFile(markerPath, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Rename(createdPath, movedPath); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+	if err := os.Symlink(filepath.Base(movedPath), createdPath); err != nil {
+		close(release)
+		<-done
+		t.Fatalf("Symlink() error after successful probe = %v", err)
+	}
+	close(release)
+
+	err := <-done
+	if !errors.Is(err, store.saveErr) {
+		t.Fatalf("AddBase() error = %v, want wrapped %v", err, store.saveErr)
+	}
+	if !strings.Contains(err.Error(), "refuse cleanup") {
+		t.Errorf("AddBase() error = %q, want cleanup refusal", err)
+	}
+	info, statErr := os.Lstat(createdPath)
+	if statErr != nil {
+		t.Fatalf("Lstat(replacement symlink) error = %v", statErr)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("replacement mode = %v, want symlink", info.Mode())
+	}
+	contents, readErr := os.ReadFile(filepath.Join(movedPath, "marker"))
+	if readErr != nil || string(contents) != "keep" {
+		t.Errorf("moved directory marker = %q, %v; want preserved", contents, readErr)
+	}
+}
+
 func TestSettingsServiceAddBaseCleanupIsAnchoredAcrossParentSymlinkRetarget(t *testing.T) {
 	physicalParent := t.TempDir()
 	alternateParent := t.TempDir()
