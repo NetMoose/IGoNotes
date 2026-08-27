@@ -152,11 +152,9 @@ func (r *NoteRepository) ClearAll() error {
 
 // DeleteNode удаляет узел из базы данных по его ID
 func (r *NoteRepository) DeleteNode(id string) error {
-	// Т.к. включены внешние ключи (теоретически, хотя мы их не включали прагмой),
-	// или просто каскадно удаляем. SQLite по умолчанию не включает foreign keys.
-	// Удалим сам узел, и все дочерние узлы (используя LIKE или рекурсивно).
-	// В простом случае, если мы удаляем директорию физически, при следующей синхронизации все очистится.
-	// Но чтобы UI реагировал сразу, удалим все, чей ID начинается с удаляемого пути.
-	_, err := r.db.Exec("DELETE FROM notes WHERE id = ? OR id LIKE ?", id, id+"/%")
+	_, err := r.db.Exec(
+		"DELETE FROM notes WHERE id = ? OR substr(id, 1, length(?) + 1) = ? || '/'",
+		id, id, id,
+	)
 	return err
 }

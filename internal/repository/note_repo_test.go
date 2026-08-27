@@ -19,6 +19,92 @@ func openTestNoteRepository(t *testing.T) (*NoteRepository, *sql.DB) {
 	return NewNoteRepository(db), db
 }
 
+func TestNoteRepositoryDeleteNodeRemovesOnlyExactNodeAndDescendants(t *testing.T) {
+	tests := []struct {
+		name      string
+		root      string
+		rootType  string
+		nodes     []string
+		remaining []string
+	}{
+		{
+			name:      "ordinary directory",
+			root:      "folder",
+			rootType:  "dir",
+			nodes:     []string{"folder", "folder/note.md", "folder/nested", "folder/nested/note.md", "folderX", "folderX/note.md", "other.md"},
+			remaining: []string{"folderX", "folderX/note.md", "other.md"},
+		},
+		{
+			name:      "ordinary file",
+			root:      "note.md",
+			nodes:     []string{"note.md", "note.md.bak", "notes.md"},
+			remaining: []string{"note.md.bak", "notes.md"},
+		},
+		{
+			name:      "percent in directory ID",
+			root:      "folder%",
+			rootType:  "dir",
+			nodes:     []string{"folder%", "folder%/note.md", "folder%/nested/note.md", "folderX", "folderX/note.md", "folderXYZ/nested.md", "other.md"},
+			remaining: []string{"folderX", "folderX/note.md", "folderXYZ/nested.md", "other.md"},
+		},
+		{
+			name:      "underscore in directory ID",
+			root:      "a_b",
+			rootType:  "dir",
+			nodes:     []string{"a_b", "a_b/note.md", "a_b/nested/note.md", "acb", "acb/note.md", "axb/nested.md", "other.md"},
+			remaining: []string{"acb", "acb/note.md", "axb/nested.md", "other.md"},
+		},
+		{
+			name:      "backslash and quote in directory ID",
+			root:      `dir\with'quote`,
+			rootType:  "dir",
+			nodes:     []string{`dir\with'quote`, `dir\with'quote/note.md`, `dir\with'quote/nested/note.md`, `dirXwith'quote`, `dirXwith'quote/note.md`, "other.md"},
+			remaining: []string{`dirXwith'quote`, `dirXwith'quote/note.md`, "other.md"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo, db := openTestNoteRepository(t)
+			defer db.Close()
+			for _, id := range test.nodes {
+				nodeType := "file"
+				if id == test.root && test.rootType != "" {
+					nodeType = test.rootType
+				}
+				if err := repo.UpsertNode(id, id, id, nil, nodeType); err != nil {
+					t.Fatalf("UpsertNode(%q) error = %v", id, err)
+				}
+			}
+
+			if err := repo.DeleteNode(test.root); err != nil {
+				t.Fatalf("DeleteNode(%q) error = %v", test.root, err)
+			}
+
+			rows := repositoryRows(t, db, "SELECT id FROM notes ORDER BY id", 1)
+			got := make([]string, len(rows))
+			for index := range rows {
+				got[index] = rows[index][0]
+			}
+			if !reflect.DeepEqual(got, test.remaining) {
+				t.Errorf("remaining IDs = %#v, want %#v", got, test.remaining)
+			}
+		})
+	}
+}
+
+func TestNoteRepositoryDeleteNodeReturnsQueryErrorUnchanged(t *testing.T) {
+	repo, db := openTestNoteRepository(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	_, wantErr := db.Exec("DELETE FROM notes")
+
+	if gotErr := repo.DeleteNode("note.md"); gotErr != wantErr {
+		t.Fatalf("DeleteNode() error = %v, want unchanged %v", gotErr, wantErr)
+	}
+}
+
 func TestNoteRepositoryBeginReplaceAllPreservesExactStateUntilCommit(t *testing.T) {
 	repo, db := openTestNoteRepository(t)
 	defer db.Close()
