@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,6 +15,11 @@ import (
 	"IGoNotes/internal/service"
 	"IGoNotes/web"
 )
+
+func localServerEndpoint(port string) (string, string) {
+	address := net.JoinHostPort("127.0.0.1", port)
+	return address, "http://" + address
+}
 
 func openBrowser(url string) error {
 	var cmd string
@@ -102,8 +108,7 @@ func main() {
 	// Маршрутизация
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
 
-	address := ":" + *port
-	url := "http://localhost" + address
+	address, url := localServerEndpoint(*port)
 	log.Printf("Сервер запущен на %s", url)
 
 	if !*noBrowser {
