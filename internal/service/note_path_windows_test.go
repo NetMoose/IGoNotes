@@ -4,6 +4,7 @@ package service
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -48,7 +49,32 @@ func TestCleanRelativeNotePathRejectsWindowsNonLocalPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cleanRelativeNotePath(%q) error = %v", path, err)
 	}
-	if want := filepath.Clean(path); got != want {
+	if want := `notes/nested/note.md`; got != want {
 		t.Errorf("cleanRelativeNotePath(%q) = %q, want %q", path, got, want)
+	}
+}
+
+func TestScanNotesUsesSlashSeparatedWindowsIDs(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "notes", "nested")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "note.md"), []byte("note"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	nodes, err := scanNotesPath(t, base)
+	if err != nil {
+		t.Fatalf("scanNotes() error = %v", err)
+	}
+	found := false
+	for _, node := range nodes {
+		if node.ID == "notes/nested/note.md" && node.Path == node.ID && node.ParentID == "notes/nested" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("scanNotes() nodes = %#v, want slash-normalized nested note", nodes)
 	}
 }

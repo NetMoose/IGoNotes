@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,6 +23,9 @@ type fakeNoteRepository struct {
 	replaceStarted chan struct{}
 	replaceRelease <-chan struct{}
 	startedOnce    sync.Once
+	upsertStarted  chan struct{}
+	upsertRelease  <-chan struct{}
+	upsertOnce     sync.Once
 }
 
 func waitForPendingWriter(t *testing.T, mu *sync.RWMutex) {
@@ -42,6 +46,12 @@ func waitForPendingWriter(t *testing.T, mu *sync.RWMutex) {
 func (r *fakeNoteRepository) UpsertNode(id, title, path string, parentID *string, nodeType string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.upsertStarted != nil {
+		r.upsertOnce.Do(func() { close(r.upsertStarted) })
+	}
+	if r.upsertRelease != nil {
+		<-r.upsertRelease
+	}
 
 	parent := ""
 	if parentID != nil {
@@ -98,7 +108,7 @@ func TestNoteServiceSwitchBasePublishesIndexedTarget(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
 	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}}
-	service := NewNoteService(repo, oldBase)
+	service := newTestNoteService(t, repo, oldBase)
 
 	targetWithDot := target + string(filepath.Separator) + "."
 	if err := service.SwitchBase(targetWithDot); err != nil {
@@ -123,8 +133,8 @@ func TestNoteServiceSwitchBaseScanFailurePreservesBaseAndIndex(t *testing.T) {
 	wantErr := errors.New("scan failed")
 	wantNodes := []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}
 	repo := &fakeNoteRepository{nodes: append([]model.NoteNode(nil), wantNodes...)}
-	service := NewNoteService(repo, oldBase)
-	service.scan = func(string) ([]model.NoteNode, error) { return nil, wantErr }
+	service := newTestNoteService(t, repo, oldBase)
+	service.scan = func(*os.Root) ([]model.NoteNode, error) { return nil, wantErr }
 
 	err := service.SwitchBase(target)
 	if !errors.Is(err, wantErr) {
@@ -148,13 +158,37 @@ func TestNoteServiceSwitchBaseRejectsNonDirectory(t *testing.T) {
 	if err := os.WriteFile(target, []byte("not a directory"), 0644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, oldBase)
+	service := newTestNoteService(t, &fakeNoteRepository{}, oldBase)
 
 	if err := service.SwitchBase(target); err == nil {
 		t.Fatal("SwitchBase() error = nil, want non-nil")
 	}
 	if got := service.GetBasePath(); got != oldBase {
 		t.Errorf("GetBasePath() = %q, want unchanged %q", got, oldBase)
+	}
+}
+
+func TestNoteServicePinsInitialOpenErrorUntilExplicitSwitch(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "missing")
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+	if err := os.Mkdir(base, 0o755); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("note"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	if err := service.SyncFS(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SyncFS() error = %v, want initial os.ErrNotExist", err)
+	}
+	if _, err := service.GetNoteContent("note.md"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("GetNoteContent() error = %v, want initial os.ErrNotExist", err)
+	}
+	if err := service.SwitchBase(base); err != nil {
+		t.Fatalf("SwitchBase() error = %v", err)
+	}
+	if content, err := service.GetNoteContent("note.md"); err != nil || content != "note" {
+		t.Errorf("GetNoteContent() after switch = %q, %v; want note, nil", content, err)
 	}
 }
 
@@ -172,7 +206,7 @@ func TestNoteServiceSwitchBaseIndexesSymlinkRootAndPublishesLogicalPath(t *testi
 		t.Fatalf("os.Symlink() error = %v, want nil", err)
 	}
 	repo := &fakeNoteRepository{}
-	service := NewNoteService(repo, oldBase)
+	service := newTestNoteService(t, repo, oldBase)
 
 	selectedPath := logicalBase + string(filepath.Separator) + "."
 	if err := service.SwitchBase(selectedPath); err != nil {
@@ -199,7 +233,7 @@ func TestNoteServiceSwitchBaseReplaceFailurePreservesBaseAndIndex(t *testing.T) 
 	wantErr := errors.New("replace failed")
 	wantNodes := []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}
 	repo := &fakeNoteRepository{nodes: append([]model.NoteNode(nil), wantNodes...), replaceErr: wantErr}
-	service := NewNoteService(repo, oldBase)
+	service := newTestNoteService(t, repo, oldBase)
 
 	err := service.SwitchBase(target)
 	if !errors.Is(err, wantErr) {
@@ -217,13 +251,388 @@ func TestNoteServiceSwitchBaseReplaceFailurePreservesBaseAndIndex(t *testing.T) 
 	}
 }
 
+func TestNoteServiceSwitchBaseClosesRejectedCandidateRoot(t *testing.T) {
+	oldBase := t.TempDir()
+	if err := os.WriteFile(filepath.Join(oldBase, "old.md"), []byte("old"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	target := t.TempDir()
+	wantErr := errors.New("replace failed")
+	service := newTestNoteService(t, &fakeNoteRepository{replaceErr: wantErr}, oldBase)
+	var candidate *os.Root
+	service.openRoot = func(name string) (*os.Root, error) {
+		root, err := os.OpenRoot(name)
+		candidate = root
+		return root, err
+	}
+
+	if err := service.SwitchBase(target); !errors.Is(err, wantErr) {
+		t.Fatalf("SwitchBase() error = %v, want %v", err, wantErr)
+	}
+	if candidate == nil {
+		t.Fatal("SwitchBase() did not open a candidate root")
+	}
+	if _, err := candidate.Stat("."); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("candidate.Stat() error = %v, want os.ErrClosed", err)
+	}
+	content, err := service.GetNoteContent("old.md")
+	if err != nil || content != "old" {
+		t.Errorf("GetNoteContent() after rejected switch = %q, %v; want old, nil", content, err)
+	}
+}
+
+func TestNoteServiceSwitchBaseLatchesOldRootCloseErrorAfterPublication(t *testing.T) {
+	oldBase := t.TempDir()
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "new.md"), []byte("new"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	service := newTestNoteService(t, &fakeNoteRepository{}, oldBase)
+	wantCloseErr := errors.New("old root close failed")
+	service.closeErr = wantCloseErr
+
+	if err := service.SwitchBase(target); err != nil {
+		t.Fatalf("SwitchBase() error = %v, want nil after publication", err)
+	}
+	if content, err := service.GetNoteContent("new.md"); err != nil || content != "new" {
+		t.Errorf("GetNoteContent() = %q, %v; want new, nil", content, err)
+	}
+	if err := service.Close(); !errors.Is(err, wantCloseErr) {
+		t.Errorf("Close() error = %v, want latched %v", err, wantCloseErr)
+	}
+}
+
+func TestNoteServiceCloseReleasesPinnedRootAndRejectsFurtherAccess(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("note"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+
+	if err := service.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := service.GetNoteContent("note.md"); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("GetNoteContent() after Close error = %v, want os.ErrClosed", err)
+	}
+	if err := service.Close(); err != nil {
+		t.Errorf("second Close() error = %v, want nil", err)
+	}
+	if err := service.SwitchBase(t.TempDir()); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("SwitchBase() after Close error = %v, want os.ErrClosed", err)
+	}
+}
+
+func TestNoteServicePinsInitialBaseRootAfterPathReplacement(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*testing.T, *NoteService, string, string)
+	}{
+		{
+			name: "get",
+			call: func(t *testing.T, service *NoteService, original, outside string) {
+				content, err := service.GetNoteContent("read.md")
+				if err != nil {
+					t.Fatalf("GetNoteContent() error = %v", err)
+				}
+				if content != "original read" {
+					t.Errorf("GetNoteContent() = %q, want original read", content)
+				}
+			},
+		},
+		{
+			name: "open raw",
+			call: func(t *testing.T, service *NoteService, original, outside string) {
+				file, _, err := service.OpenRawFile("raw.txt")
+				if err != nil {
+					t.Fatalf("OpenRawFile() error = %v", err)
+				}
+				content, readErr := io.ReadAll(file)
+				closeErr := file.Close()
+				if readErr != nil || closeErr != nil {
+					t.Fatalf("read/close errors = %v, %v", readErr, closeErr)
+				}
+				if string(content) != "original raw" {
+					t.Errorf("raw content = %q, want original raw", content)
+				}
+			},
+		},
+		{
+			name: "save",
+			call: func(t *testing.T, service *NoteService, original, outside string) {
+				if err := service.SaveNoteContent("save.md", "saved original"); err != nil {
+					t.Fatalf("SaveNoteContent() error = %v", err)
+				}
+				assertFileContent(t, filepath.Join(original, "save.md"), []byte("saved original"))
+				assertFileContent(t, filepath.Join(outside, "save.md"), []byte("outside save"))
+			},
+		},
+		{
+			name: "create",
+			call: func(t *testing.T, service *NoteService, original, outside string) {
+				if _, err := service.CreateNode("", "created", "file"); err != nil {
+					t.Fatalf("CreateNode() error = %v", err)
+				}
+				assertFileContent(t, filepath.Join(original, "created.md"), []byte("# created\n"))
+				if _, err := os.Lstat(filepath.Join(outside, "created.md")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("outside file was created, error = %v", err)
+				}
+			},
+		},
+		{
+			name: "delete",
+			call: func(t *testing.T, service *NoteService, original, outside string) {
+				if err := service.DeleteNode("delete.md"); err != nil {
+					t.Fatalf("DeleteNode() error = %v", err)
+				}
+				if _, err := os.Lstat(filepath.Join(original, "delete.md")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("original file still exists, error = %v", err)
+				}
+				assertFileContent(t, filepath.Join(outside, "delete.md"), []byte("outside delete"))
+			},
+		},
+		{
+			name: "rename",
+			call: func(t *testing.T, service *NoteService, original, outside string) {
+				if err := service.RenameNode("rename.md", "renamed"); err != nil {
+					t.Fatalf("RenameNode() error = %v", err)
+				}
+				assertFileContent(t, filepath.Join(original, "renamed.md"), []byte("original rename"))
+				assertFileContent(t, filepath.Join(outside, "rename.md"), []byte("outside rename"))
+				if _, err := os.Lstat(filepath.Join(outside, "renamed.md")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("outside file was renamed, error = %v", err)
+				}
+			},
+		},
+		{
+			name: "asset",
+			call: func(t *testing.T, service *NoteService, original, outside string) {
+				got, err := service.SaveAsset(strings.NewReader("original asset"), "upload.png")
+				if err != nil {
+					t.Fatalf("SaveAsset() error = %v", err)
+				}
+				assertFileContent(t, filepath.Join(original, filepath.FromSlash(got)), []byte("original asset"))
+				if _, err := os.Lstat(filepath.Join(outside, filepath.FromSlash(got))); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("outside asset was created, error = %v", err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, original, outside := retargetedNoteService(t)
+			test.call(t, service, original, outside)
+		})
+	}
+}
+
+func TestNoteServicePinsSelectedSymlinkTarget(t *testing.T) {
+	physical := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(physical, "note.md"), []byte("physical"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "note.md"), []byte("outside"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	logical := filepath.Join(t.TempDir(), "selected")
+	requireSymlink(t, physical, logical)
+	service := newTestNoteService(t, &fakeNoteRepository{}, logical)
+	if err := service.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	if err := os.Remove(logical); err != nil {
+		t.Fatalf("os.Remove() error = %v", err)
+	}
+	requireSymlink(t, outside, logical)
+
+	content, err := service.GetNoteContent("note.md")
+	if err != nil {
+		t.Fatalf("GetNoteContent() error = %v", err)
+	}
+	if content != "physical" {
+		t.Errorf("GetNoteContent() = %q, want physical", content)
+	}
+}
+
+func TestNoteServiceSwitchBasePublishesScannedRootIdentity(t *testing.T) {
+	oldBase := t.TempDir()
+	targetParent := t.TempDir()
+	target := filepath.Join(targetParent, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "note.md"), []byte("candidate"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "note.md"), []byte("outside"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	replaceStarted := make(chan struct{})
+	replaceRelease := make(chan struct{})
+	repo := &fakeNoteRepository{replaceStarted: replaceStarted, replaceRelease: replaceRelease}
+	service := newTestNoteService(t, repo, oldBase)
+
+	done := make(chan error, 1)
+	go func() { done <- service.SwitchBase(target) }()
+	<-replaceStarted
+	moved := filepath.Join(targetParent, "candidate-moved")
+	if err := os.Rename(target, moved); err != nil {
+		t.Fatalf("os.Rename() error = %v", err)
+	}
+	requireSymlink(t, outside, target)
+	close(replaceRelease)
+	if err := <-done; err != nil {
+		t.Fatalf("SwitchBase() error = %v", err)
+	}
+
+	content, err := service.GetNoteContent("note.md")
+	if err != nil {
+		t.Fatalf("GetNoteContent() error = %v", err)
+	}
+	if content != "candidate" {
+		t.Errorf("GetNoteContent() = %q, want candidate", content)
+	}
+}
+
+func TestNoteServiceMutationsHoldExclusiveBaseLockThroughRepository(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	repo := &fakeNoteRepository{upsertStarted: started, upsertRelease: release}
+	service := newTestNoteService(t, repo, t.TempDir())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.CreateNode("", "created", "file")
+		done <- err
+	}()
+	<-started
+
+	readLockAvailable := service.baseMu.TryRLock()
+	if readLockAvailable {
+		service.baseMu.RUnlock()
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("CreateNode() error = %v", err)
+	}
+	if readLockAvailable {
+		t.Error("base read lock was available while mutation repository phase was blocked")
+	}
+}
+
+func TestNoteServiceRenameSerializesDestinationCheckAgainstCreate(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "source.md"), []byte("source"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+	checked := make(chan struct{})
+	releaseRename := make(chan struct{})
+	service.beforeRename = func() {
+		close(checked)
+		<-releaseRename
+	}
+	createAttempting := make(chan struct{})
+	service.beforeCreateLock = func() { close(createAttempting) }
+
+	renameDone := make(chan error, 1)
+	go func() { renameDone <- service.RenameNode("source.md", "destination") }()
+	<-checked
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := service.CreateNode("", "destination", "file")
+		createDone <- err
+	}()
+	<-createAttempting
+	close(releaseRename)
+
+	if err := <-renameDone; err != nil {
+		t.Fatalf("RenameNode() error = %v", err)
+	}
+	if err := <-createDone; !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("CreateNode() error = %v, want ErrAlreadyExists", err)
+	}
+	assertFileContent(t, filepath.Join(base, "destination.md"), []byte("source"))
+}
+
+func TestNoteServiceAllowsSymlinksConfinedWithinPinnedRoot(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "target.md"), []byte("target"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(base, "target-dir"), 0o755); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	requireSymlink(t, "target.md", filepath.Join(base, "alias.md"))
+	requireSymlink(t, "target-dir", filepath.Join(base, "alias-dir"))
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+
+	content, err := service.GetNoteContent("alias.md")
+	if err != nil {
+		t.Fatalf("GetNoteContent() error = %v", err)
+	}
+	if content != "target" {
+		t.Errorf("GetNoteContent() = %q, want target", content)
+	}
+	if err := service.SaveNoteContent(filepath.Join("alias-dir", "saved.md"), "saved"); err != nil {
+		t.Fatalf("SaveNoteContent() error = %v", err)
+	}
+	assertFileContent(t, filepath.Join(base, "target-dir", "saved.md"), []byte("saved"))
+}
+
+func retargetedNoteService(t *testing.T) (*NoteService, string, string) {
+	t.Helper()
+	parent := t.TempDir()
+	base := filepath.Join(parent, "base")
+	if err := os.Mkdir(base, 0o755); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	originalFiles := map[string]string{
+		"read.md":   "original read",
+		"raw.txt":   "original raw",
+		"save.md":   "original save",
+		"delete.md": "original delete",
+		"rename.md": "original rename",
+	}
+	outsideFiles := map[string]string{
+		"read.md":   "outside read",
+		"raw.txt":   "outside raw",
+		"save.md":   "outside save",
+		"delete.md": "outside delete",
+		"rename.md": "outside rename",
+	}
+	outside := t.TempDir()
+	for name, content := range originalFiles {
+		if err := os.WriteFile(filepath.Join(base, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", name, err)
+		}
+	}
+	for name, content := range outsideFiles {
+		if err := os.WriteFile(filepath.Join(outside, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", name, err)
+		}
+	}
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+	if err := service.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	original := filepath.Join(parent, "original")
+	if err := os.Rename(base, original); err != nil {
+		t.Fatalf("os.Rename() error = %v", err)
+	}
+	requireSymlink(t, outside, base)
+	return service, original, outside
+}
+
 func TestNoteServiceSwitchBaseClearsBaseAndIndex(t *testing.T) {
 	base := t.TempDir()
 	if err := os.WriteFile(filepath.Join(base, "old.md"), []byte("old"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}}
-	service := NewNoteService(repo, base)
+	service := newTestNoteService(t, repo, base)
 
 	if err := service.SwitchBase(""); err != nil {
 		t.Fatalf("SwitchBase(empty) error = %v", err)
@@ -252,6 +661,7 @@ func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 		filepath.Join(base, "topic", "nested"),
 		filepath.Join(base, ".hidden"),
 		filepath.Join(base, "assets"),
+		filepath.Join(base, "Assets"),
 	}
 	for _, path := range paths {
 		if err := os.MkdirAll(path, 0755); err != nil {
@@ -265,6 +675,7 @@ func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 		filepath.Join("topic", "ignored.txt"):       "ignored",
 		filepath.Join(".hidden", "secret.md"):       "secret",
 		filepath.Join("assets", "image.md"):         "asset",
+		filepath.Join("Assets", "image.md"):         "case-folded asset",
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(base, name), []byte(content), 0644); err != nil {
@@ -272,7 +683,7 @@ func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 		}
 	}
 
-	nodes, err := scanNotes(base)
+	nodes, err := scanNotesPath(t, base)
 	if err != nil {
 		t.Fatalf("scanNotes() error = %v, want nil", err)
 	}
@@ -283,14 +694,14 @@ func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 	want := map[string]model.NoteNode{
 		"root.md": {ID: "root.md", Name: "root", Type: "file", Path: "root.md"},
 		"topic":   {ID: "topic", Name: "topic", Type: "dir", Path: "topic"},
-		filepath.Join("topic", "a.MD"): {
-			ID: filepath.Join("topic", "a.MD"), Name: "a", Type: "file", Path: filepath.Join("topic", "a.MD"), ParentID: "topic",
+		"topic/a.MD": {
+			ID: "topic/a.MD", Name: "a", Type: "file", Path: "topic/a.MD", ParentID: "topic",
 		},
-		filepath.Join("topic", "nested"): {
-			ID: filepath.Join("topic", "nested"), Name: "nested", Type: "dir", Path: filepath.Join("topic", "nested"), ParentID: "topic",
+		"topic/nested": {
+			ID: "topic/nested", Name: "nested", Type: "dir", Path: "topic/nested", ParentID: "topic",
 		},
-		filepath.Join("topic", "nested", "note.md"): {
-			ID: filepath.Join("topic", "nested", "note.md"), Name: "note", Type: "file", Path: filepath.Join("topic", "nested", "note.md"), ParentID: filepath.Join("topic", "nested"),
+		"topic/nested/note.md": {
+			ID: "topic/nested/note.md", Name: "note", Type: "file", Path: "topic/nested/note.md", ParentID: "topic/nested",
 		},
 	}
 	if len(byID) != len(want) {
@@ -302,7 +713,7 @@ func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 		}
 	}
 
-	empty, err := scanNotes("")
+	empty, err := scanNotes(nil)
 	if err != nil || empty != nil {
 		t.Errorf("scanNotes(empty) = %#v, %v, want nil, nil", empty, err)
 	}
@@ -317,7 +728,7 @@ func TestNoteServiceScanNotesExcludesSymlinks(t *testing.T) {
 	requireSymlink(t, outside, filepath.Join(base, "secret.md"))
 	requireSymlink(t, t.TempDir(), filepath.Join(base, "linked-dir"))
 
-	nodes, err := scanNotes(base)
+	nodes, err := scanNotesPath(t, base)
 	if err != nil {
 		t.Fatalf("scanNotes() error = %v", err)
 	}
@@ -335,7 +746,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 		}
 		requireSymlink(t, outside, filepath.Join(base, "secret.md"))
 
-		content, err := NewNoteService(&fakeNoteRepository{}, base).GetNoteContent("secret.md")
+		content, err := newTestNoteService(t, &fakeNoteRepository{}, base).GetNoteContent("secret.md")
 		if !errors.Is(err, ErrInvalidNotePath) {
 			t.Fatalf("GetNoteContent() error = %v, want ErrInvalidNotePath", err)
 		}
@@ -346,7 +757,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 
 	t.Run("save note content", func(t *testing.T) {
 		base, outside, marker := symlinkEscapeFixture(t, "linked")
-		err := NewNoteService(&fakeNoteRepository{}, base).SaveNoteContent(filepath.Join("linked", "marker.md"), "changed")
+		err := newTestNoteService(t, &fakeNoteRepository{}, base).SaveNoteContent(filepath.Join("linked", "marker.md"), "changed")
 		if !errors.Is(err, ErrInvalidNotePath) {
 			t.Fatalf("SaveNoteContent() error = %v, want ErrInvalidNotePath", err)
 		}
@@ -357,7 +768,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 		t.Run("create "+nodeType, func(t *testing.T) {
 			base, outside, marker := symlinkEscapeFixture(t, "linked")
 			repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "existing.md"}}}
-			_, err := NewNoteService(repo, base).CreateNode("linked", "created", nodeType)
+			_, err := newTestNoteService(t, repo, base).CreateNode("linked", "created", nodeType)
 			if !errors.Is(err, ErrInvalidNotePath) {
 				t.Fatalf("CreateNode() error = %v, want ErrInvalidNotePath", err)
 			}
@@ -375,7 +786,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 	t.Run("delete through parent", func(t *testing.T) {
 		base, outside, marker := symlinkEscapeFixture(t, "linked")
 		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: filepath.Join("linked", "marker.md")}}}
-		err := NewNoteService(repo, base).DeleteNode(filepath.Join("linked", "marker.md"))
+		err := newTestNoteService(t, repo, base).DeleteNode(filepath.Join("linked", "marker.md"))
 		if !errors.Is(err, ErrInvalidNotePath) {
 			t.Fatalf("DeleteNode() error = %v, want ErrInvalidNotePath", err)
 		}
@@ -386,7 +797,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 	t.Run("delete symlink entry only", func(t *testing.T) {
 		base, outside, marker := symlinkEscapeFixture(t, "linked")
 		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "linked"}}}
-		if err := NewNoteService(repo, base).DeleteNode("linked"); err != nil {
+		if err := newTestNoteService(t, repo, base).DeleteNode("linked"); err != nil {
 			t.Fatalf("DeleteNode() error = %v, want nil", err)
 		}
 		if _, err := os.Lstat(filepath.Join(base, "linked")); !errors.Is(err, os.ErrNotExist) {
@@ -437,7 +848,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 			test.setup(t, base, outside)
 			repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: test.id}}}
 
-			err := NewNoteService(repo, base).RenameNode(test.id, test.to)
+			err := newTestNoteService(t, repo, base).RenameNode(test.id, test.to)
 			if !errors.Is(err, ErrInvalidNotePath) {
 				t.Fatalf("RenameNode() error = %v, want ErrInvalidNotePath", err)
 			}
@@ -459,7 +870,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 			}
 			requireSymlink(t, outside, linkPath)
 
-			path, err := NewNoteService(&fakeNoteRepository{}, base).SaveAsset(strings.NewReader("outside write"), "upload.png")
+			path, err := newTestNoteService(t, &fakeNoteRepository{}, base).SaveAsset(strings.NewReader("outside write"), "upload.png")
 			if !errors.Is(err, ErrInvalidNotePath) {
 				t.Fatalf("SaveAsset() error = %v, want ErrInvalidNotePath", err)
 			}
@@ -474,7 +885,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 
 	t.Run("get absolute path", func(t *testing.T) {
 		base, _, _ := symlinkEscapeFixture(t, "linked")
-		path, err := NewNoteService(&fakeNoteRepository{}, base).GetAbsoluteFilePath(filepath.Join("linked", "marker.md"))
+		path, err := newTestNoteService(t, &fakeNoteRepository{}, base).GetAbsoluteFilePath(filepath.Join("linked", "marker.md"))
 		if !errors.Is(err, ErrInvalidNotePath) {
 			t.Fatalf("GetAbsoluteFilePath() error = %v, want ErrInvalidNotePath", err)
 		}
@@ -494,7 +905,7 @@ func TestNoteServiceSymlinkReplacementCannotMutateOutside(t *testing.T) {
 	}
 	linkPath := filepath.Join(base, "changing")
 	requireSymlink(t, outside, linkPath)
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	start := make(chan struct{})
 	var writers sync.WaitGroup
@@ -527,7 +938,7 @@ func TestNoteServiceSymlinkReplacementCannotMutateOutside(t *testing.T) {
 func TestNoteServiceCreateNodeUsesExclusiveCreation(t *testing.T) {
 	base := t.TempDir()
 	repo := &fakeNoteRepository{}
-	service := NewNoteService(repo, base)
+	service := newTestNoteService(t, repo, base)
 	start := make(chan struct{})
 	errs := make(chan error, 8)
 	for range cap(errs) {
@@ -564,7 +975,7 @@ func TestNoteServiceRootIOErrorsRemainDistinctFromInvalidPaths(t *testing.T) {
 	if err := os.WriteFile(baseFile, []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, baseFile)
+	service := newTestNoteService(t, &fakeNoteRepository{}, baseFile)
 	tests := []struct {
 		name string
 		call func() error
@@ -595,7 +1006,7 @@ func TestNoteServiceGetAbsoluteFilePathValidatesExistence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("note"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	got, err := service.GetAbsoluteFilePath("note.md")
 	if err != nil {
@@ -611,7 +1022,7 @@ func TestNoteServiceGetAbsoluteFilePathValidatesExistence(t *testing.T) {
 
 func TestNoteServiceSaveAssetPreservesRelativeNamingAndCollisions(t *testing.T) {
 	base := t.TempDir()
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	first, err := service.SaveAsset(strings.NewReader("first"), "upload.png")
 	if err != nil {
@@ -627,8 +1038,55 @@ func TestNoteServiceSaveAssetPreservesRelativeNamingAndCollisions(t *testing.T) 
 	if second == first || filepath.Dir(second) != filepath.Join("assets", "images") {
 		t.Errorf("SaveAsset(second) path = %q, want distinct assets/images path", second)
 	}
+	third, err := service.SaveAsset(strings.NewReader("third"), "upload.png")
+	if err != nil {
+		t.Fatalf("SaveAsset(third) error = %v", err)
+	}
+	if third == first || third == second || filepath.Dir(third) != filepath.Join("assets", "images") {
+		t.Errorf("SaveAsset(third) path = %q, want third distinct assets/images path", third)
+	}
 	assertFileContent(t, filepath.Join(base, first), []byte("first"))
 	assertFileContent(t, filepath.Join(base, second), []byte("second"))
+	assertFileContent(t, filepath.Join(base, third), []byte("third"))
+}
+
+func TestNoteServiceConcurrentAssetCollisionsProduceDistinctFiles(t *testing.T) {
+	base := t.TempDir()
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+	type result struct {
+		path    string
+		content string
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 6)
+	for i := range cap(results) {
+		content := fmt.Sprintf("content-%d", i)
+		go func() {
+			<-start
+			path, err := service.SaveAsset(strings.NewReader(content), "upload.png")
+			results <- result{path: path, content: content, err: err}
+		}()
+	}
+	close(start)
+
+	seen := make(map[string]struct{}, cap(results))
+	for range cap(results) {
+		result := <-results
+		if result.err != nil {
+			t.Errorf("SaveAsset() error = %v", result.err)
+			continue
+		}
+		if _, exists := seen[result.path]; exists {
+			t.Errorf("duplicate asset path %q", result.path)
+			continue
+		}
+		seen[result.path] = struct{}{}
+		assertFileContent(t, filepath.Join(base, filepath.FromSlash(result.path)), []byte(result.content))
+	}
+	if len(seen) != cap(results) {
+		t.Errorf("saved %d distinct assets, want %d", len(seen), cap(results))
+	}
 }
 
 func requireSymlink(t *testing.T, oldname, newname string) {
@@ -680,6 +1138,27 @@ func assertRepositoryIDs(t *testing.T, repo *fakeNoteRepository, want ...string)
 	}
 }
 
+func scanNotesPath(t *testing.T, base string) ([]model.NoteNode, error) {
+	t.Helper()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return scanNotes(root)
+}
+
+func newTestNoteService(t *testing.T, repo noteRepository, base string) *NoteService {
+	t.Helper()
+	service := NewNoteService(repo, base)
+	t.Cleanup(func() {
+		if err := service.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v", err)
+		}
+	})
+	return service
+}
+
 func TestNoteServiceRejectsLexicalTraversalWithoutTouchingOutsideFiles(t *testing.T) {
 	tests := []struct {
 		name string
@@ -725,7 +1204,7 @@ func TestNoteServiceRejectsLexicalTraversalWithoutTouchingOutsideFiles(t *testin
 			if err := os.WriteFile(outside, marker, 0o600); err != nil {
 				t.Fatalf("os.WriteFile() error = %v", err)
 			}
-			service := NewNoteService(&fakeNoteRepository{}, base)
+			service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 			err := test.call(service)
 
@@ -755,7 +1234,7 @@ func TestNoteServiceRejectsInvalidConcretePathsAndAllowsNestedPaths(t *testing.T
 	if err := os.WriteFile(filepath.Join(base, nested), []byte("nested"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	for _, path := range []string{"", ".", "..", filepath.Join("..", "outside.md"), filepath.Join(base, nested)} {
 		t.Run(path, func(t *testing.T) {
@@ -804,7 +1283,7 @@ func TestNoteServiceOpenRawFileValidatesPathsAndUnlocksOnce(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("content"), 0644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	for _, path := range []string{"", ".", filepath.Join("..", "outside"), "..", filepath.Join(base, "note.md")} {
 		t.Run(path, func(t *testing.T) {
@@ -832,7 +1311,7 @@ func TestNoteServiceOpenRawFileValidatesPathsAndUnlocksOnce(t *testing.T) {
 		t.Fatalf("second Close() error = %v, want nil", err)
 	}
 
-	emptyBase := NewNoteService(&fakeNoteRepository{}, "")
+	emptyBase := newTestNoteService(t, &fakeNoteRepository{}, "")
 	if _, _, err := emptyBase.OpenRawFile("note.md"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("OpenRawFile() with empty base error = %v, want os.ErrNotExist", err)
 	}
@@ -872,7 +1351,7 @@ func TestNoteServiceOpenRawFileRejectsEscapingSymlink(t *testing.T) {
 		}
 		t.Fatalf("os.Symlink() error = %v, want nil", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	for _, path := range []string{"escape.md", filepath.Join("escape-dir", "outside.md")} {
 		t.Run(path, func(t *testing.T) {
@@ -893,7 +1372,7 @@ func TestNoteServiceOpenRawFileKeepsOrdinaryIOErrorsDistinctFromInvalidPaths(t *
 	if err := os.WriteFile(baseFile, []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, baseFile)
+	service := newTestNoteService(t, &fakeNoteRepository{}, baseFile)
 
 	file, _, err := service.OpenRawFile("asset.txt")
 	if file != nil {
@@ -919,7 +1398,7 @@ func TestNoteServiceOpenRawFilePinsOldBaseDuringSwitch(t *testing.T) {
 			t.Fatalf("os.WriteFile(%q) error = %v, want nil", path, err)
 		}
 	}
-	service := NewNoteService(&fakeNoteRepository{}, oldBase)
+	service := newTestNoteService(t, &fakeNoteRepository{}, oldBase)
 	file, _, err := service.OpenRawFile("note.md")
 	if err != nil {
 		t.Fatalf("OpenRawFile() error = %v, want nil", err)
@@ -982,7 +1461,7 @@ func TestNoteServiceRequestDuringSwitchReadsNewBase(t *testing.T) {
 		replaceStarted: replaceStarted,
 		replaceRelease: replaceRelease,
 	}
-	service := NewNoteService(repo, oldBase)
+	service := newTestNoteService(t, repo, oldBase)
 
 	switchDone := make(chan error, 1)
 	go func() { switchDone <- service.SwitchBase(newBase) }()
@@ -1042,8 +1521,8 @@ func TestNoteServiceRequestDuringSwitchReadsNewBase(t *testing.T) {
 func TestNoteServiceSyncFailureStillReleasesInitialTreeWait(t *testing.T) {
 	wantErr := errors.New("scan failed")
 	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}}
-	service := NewNoteService(repo, t.TempDir())
-	service.scan = func(string) ([]model.NoteNode, error) { return nil, wantErr }
+	service := newTestNoteService(t, repo, t.TempDir())
+	service.scan = func(*os.Root) ([]model.NoteNode, error) { return nil, wantErr }
 
 	if err := service.SyncFS(); !errors.Is(err, wantErr) {
 		t.Fatalf("SyncFS() error = %v, want %v", err, wantErr)
@@ -1070,7 +1549,7 @@ func TestNoteServiceRenameNodeRejectsExistingDestination(t *testing.T) {
 			t.Fatalf("os.WriteFile(%q) error = %v, want nil", name, err)
 		}
 	}
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	if err := service.RenameNode("old.md", "existing"); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("RenameNode() error = %v, want ErrAlreadyExists", err)
@@ -1092,7 +1571,7 @@ func TestNoteServiceRenameNodeExactPathIsNoOp(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
 	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "stale.md", Name: "stale", Type: "file", Path: "stale.md"}}}
-	service := NewNoteService(repo, base)
+	service := newTestNoteService(t, repo, base)
 
 	if err := service.RenameNode("same.md", "same.md"); err != nil {
 		t.Fatalf("RenameNode() error = %v, want nil", err)
@@ -1118,7 +1597,7 @@ func TestNoteServiceRenameNodeAllowsCaseOnlyRename(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "Case.md"), []byte("case"), 0644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
-	service := NewNoteService(&fakeNoteRepository{}, base)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
 	if err := service.RenameNode("Case.md", "case"); err != nil {
 		t.Fatalf("RenameNode() error = %v, want nil", err)
@@ -1138,7 +1617,7 @@ func TestNoteServiceRenameNodeReplacesIndex(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
 	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}}
-	service := NewNoteService(repo, base)
+	service := newTestNoteService(t, repo, base)
 
 	if err := service.RenameNode("old.md", "renamed"); err != nil {
 		t.Fatalf("RenameNode() error = %v, want nil", err)

@@ -68,6 +68,11 @@ func main() {
 
 	// Инициализация сервисов
 	noteService := service.NewNoteService(noteRepo, basePath)
+	defer func() {
+		if err := noteService.Close(); err != nil {
+			log.Printf("Ошибка закрытия базы заметок: %v", err)
+		}
+	}()
 	settingsService, err := service.NewSettingsService(configService, noteService, *base, log.Default())
 	if err != nil {
 		log.Fatal("Ошибка инициализации сервиса настроек: ", err)
