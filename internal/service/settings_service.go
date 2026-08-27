@@ -503,7 +503,7 @@ func fieldError(kind error, field, message string) error {
 }
 
 func fieldErrorWithCause(kind, cause error, field, message string) error {
-	return &FieldError{Kind: errors.Join(kind, cause), Field: field, Message: fmt.Sprintf("%s: %v", message, cause)}
+	return &FieldError{Kind: errors.Join(kind, cause), Field: field, Message: message}
 }
 
 func cloneConfig(config model.Config) model.Config {

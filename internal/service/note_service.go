@@ -13,8 +13,11 @@ import (
 	"IGoNotes/internal/model"
 )
 
-// ErrAlreadyExists возвращается, если файл или папка с таким именем уже существует
-var ErrAlreadyExists = errors.New("file or directory already exists")
+var (
+	// ErrAlreadyExists возвращается, если файл или папка с таким именем уже существует
+	ErrAlreadyExists   = errors.New("file or directory already exists")
+	ErrInvalidNotePath = errors.New("invalid note path")
+)
 
 type noteRepository interface {
 	UpsertNode(id, title, path string, parentID *string, nodeType string) error
@@ -234,6 +237,10 @@ func (s *NoteService) GetTree() ([]model.NoteNode, error) {
 
 // GetNoteContent читает содержимое заметки с диска
 func (s *NoteService) GetNoteContent(id string) (string, error) {
+	cleanID, err := cleanRelativeNotePath(id, false)
+	if err != nil {
+		return "", err
+	}
 	if s.beforeReadLock != nil {
 		s.beforeReadLock()
 	}
@@ -245,7 +252,7 @@ func (s *NoteService) GetNoteContent(id string) (string, error) {
 	}
 
 	// id - это относительный путь к файлу
-	fullPath := filepath.Join(s.basePath, id)
+	fullPath := filepath.Join(s.basePath, cleanID)
 
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
@@ -256,35 +263,33 @@ func (s *NoteService) GetNoteContent(id string) (string, error) {
 
 // GetAbsoluteFilePath возвращает полный абсолютный путь к файлу в базе
 func (s *NoteService) GetAbsoluteFilePath(relPath string) (string, error) {
+	cleanPath, err := cleanRelativeNotePath(relPath, false)
+	if err != nil {
+		return "", err
+	}
 	s.baseMu.RLock()
 	defer s.baseMu.RUnlock()
 
 	if s.basePath == "" {
 		return "", os.ErrNotExist
 	}
-	// Очищаем путь, чтобы предотвратить path traversal
-	cleanPath := filepath.Clean(relPath)
-	fullPath := filepath.Join(s.basePath, cleanPath)
-
-	// Проверяем, что итоговый путь находится внутри basePath
-	if !strings.HasPrefix(fullPath, s.basePath) {
-		return "", os.ErrPermission
-	}
-
-	return fullPath, nil
+	return filepath.Join(s.basePath, cleanPath), nil
 }
 
 func (s *NoteService) OpenRawFile(relPath string) (*LockedFile, os.FileInfo, error) {
+	cleanPath, err := cleanRelativeNotePath(relPath, false)
+	if err != nil {
+		return nil, nil, err
+	}
 	s.baseMu.RLock()
 	if s.basePath == "" {
 		s.baseMu.RUnlock()
 		return nil, nil, os.ErrNotExist
 	}
 
-	cleanPath := filepath.Clean(relPath)
-	if filepath.IsAbs(relPath) || cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+	if err := rejectSymlinkComponents(s.basePath, cleanPath); err != nil {
 		s.baseMu.RUnlock()
-		return nil, nil, os.ErrPermission
+		return nil, nil, err
 	}
 
 	root, err := os.OpenRoot(s.basePath)
@@ -294,6 +299,9 @@ func (s *NoteService) OpenRawFile(relPath string) (*LockedFile, os.FileInfo, err
 	}
 	file, err := root.Open(cleanPath)
 	if err != nil {
+		if symlinkErr := rejectSymlinkComponents(s.basePath, cleanPath); errors.Is(symlinkErr, ErrInvalidNotePath) {
+			err = errors.Join(symlinkErr, err)
+		}
 		closeErr := root.Close()
 		s.baseMu.RUnlock()
 		return nil, nil, errors.Join(err, closeErr)
@@ -313,8 +321,48 @@ func (s *NoteService) OpenRawFile(relPath string) (*LockedFile, os.FileInfo, err
 	return &LockedFile{File: file, unlock: s.baseMu.RUnlock}, info, nil
 }
 
+func cleanRelativeNotePath(path string, allowEmpty bool) (string, error) {
+	if path == "" {
+		if allowEmpty {
+			return "", nil
+		}
+		return "", ErrInvalidNotePath
+	}
+	if filepath.IsAbs(path) {
+		return "", ErrInvalidNotePath
+	}
+
+	cleanPath := filepath.Clean(path)
+	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+		return "", ErrInvalidNotePath
+	}
+	return cleanPath, nil
+}
+
+func rejectSymlinkComponents(basePath, relPath string) error {
+	current := basePath
+	for _, component := range strings.Split(relPath, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: symlink path component %q", ErrInvalidNotePath, current)
+		}
+	}
+	return nil
+}
+
 // SaveNoteContent сохраняет содержимое заметки на диск
 func (s *NoteService) SaveNoteContent(id string, content string) error {
+	cleanID, err := cleanRelativeNotePath(id, false)
+	if err != nil {
+		return err
+	}
 	s.baseMu.RLock()
 	defer s.baseMu.RUnlock()
 
@@ -322,7 +370,7 @@ func (s *NoteService) SaveNoteContent(id string, content string) error {
 		return os.ErrNotExist
 	}
 
-	fullPath := filepath.Join(s.basePath, id)
+	fullPath := filepath.Join(s.basePath, cleanID)
 
 	// Создаем директорию, если она вдруг не существует
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
@@ -338,6 +386,10 @@ func (s *NoteService) SaveNoteContent(id string, content string) error {
 
 // CreateNode создает новый файл или папку
 func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNode, error) {
+	cleanParentID, err := cleanRelativeNotePath(parentID, true)
+	if err != nil {
+		return nil, err
+	}
 	s.baseMu.RLock()
 	defer s.baseMu.RUnlock()
 
@@ -353,8 +405,8 @@ func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNo
 	}
 
 	relPath := name
-	if parentID != "" {
-		relPath = filepath.Join(parentID, name)
+	if cleanParentID != "" {
+		relPath = filepath.Join(cleanParentID, name)
 	}
 
 	fullPath := filepath.Join(s.basePath, relPath)
@@ -369,7 +421,7 @@ func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNo
 		Name:     title,
 		Type:     nodeType,
 		Path:     relPath,
-		ParentID: parentID,
+		ParentID: cleanParentID,
 	}
 
 	// Проверяем существование файла/папки
@@ -402,8 +454,8 @@ func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNo
 
 	// Сохраняем в БД
 	var pID *string
-	if parentID != "" {
-		pID = &parentID
+	if cleanParentID != "" {
+		pID = &cleanParentID
 	}
 
 	if err := s.repo.UpsertNode(relPath, title, relPath, pID, nodeType); err != nil {
@@ -415,31 +467,39 @@ func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNo
 
 // DeleteNode удаляет файл или папку
 func (s *NoteService) DeleteNode(id string) error {
+	cleanID, err := cleanRelativeNotePath(id, false)
+	if err != nil {
+		return err
+	}
 	s.baseMu.RLock()
 	defer s.baseMu.RUnlock()
 
-	if s.basePath == "" || id == "" || id == "." {
+	if s.basePath == "" {
 		return os.ErrInvalid
 	}
 
-	fullPath := filepath.Join(s.basePath, id)
+	fullPath := filepath.Join(s.basePath, cleanID)
 	if err := os.RemoveAll(fullPath); err != nil {
 		return err
 	}
 
-	return s.repo.DeleteNode(id)
+	return s.repo.DeleteNode(cleanID)
 }
 
 // RenameNode переименовывает файл или папку
 func (s *NoteService) RenameNode(id, newName string) error {
+	cleanID, err := cleanRelativeNotePath(id, false)
+	if err != nil {
+		return err
+	}
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
 
-	if s.basePath == "" || id == "" || id == "." || newName == "" {
+	if s.basePath == "" || newName == "" {
 		return os.ErrInvalid
 	}
 
-	oldPath := filepath.Join(s.basePath, id)
+	oldPath := filepath.Join(s.basePath, cleanID)
 	info, err := os.Stat(oldPath)
 	if err != nil {
 		return err

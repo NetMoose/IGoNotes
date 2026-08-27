@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -306,6 +307,99 @@ func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 	}
 }
 
+func TestNoteServiceRejectsLexicalTraversalWithoutTouchingOutsideFiles(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*NoteService) error
+	}{
+		{name: "get note", call: func(service *NoteService) error {
+			_, err := service.GetNoteContent(filepath.Join("..", "outside.md"))
+			return err
+		}},
+		{name: "get absolute path", call: func(service *NoteService) error {
+			_, err := service.GetAbsoluteFilePath(filepath.Join("..", "outside.md"))
+			return err
+		}},
+		{name: "open raw file", call: func(service *NoteService) error {
+			file, _, err := service.OpenRawFile(filepath.Join("..", "outside.md"))
+			if file != nil {
+				_ = file.Close()
+			}
+			return err
+		}},
+		{name: "save note", call: func(service *NoteService) error {
+			return service.SaveNoteContent(filepath.Join("..", "outside.md"), "overwritten")
+		}},
+		{name: "create note", call: func(service *NoteService) error {
+			_, err := service.CreateNode(filepath.Join("..", "outside-parent"), "created", "file")
+			return err
+		}},
+		{name: "delete note", call: func(service *NoteService) error { return service.DeleteNode(filepath.Join("..", "outside.md")) }},
+		{name: "rename note", call: func(service *NoteService) error {
+			return service.RenameNode(filepath.Join("..", "outside.md"), "renamed")
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			base := filepath.Join(root, "base")
+			if err := os.Mkdir(base, 0o755); err != nil {
+				t.Fatalf("os.Mkdir() error = %v", err)
+			}
+			outside := filepath.Join(root, "outside.md")
+			marker := []byte("outside marker")
+			if err := os.WriteFile(outside, marker, 0o600); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
+			}
+			service := NewNoteService(&fakeNoteRepository{}, base)
+
+			err := test.call(service)
+
+			if !errors.Is(err, ErrInvalidNotePath) {
+				t.Errorf("operation error = %v, want ErrInvalidNotePath", err)
+			}
+			got, readErr := os.ReadFile(outside)
+			if readErr != nil {
+				t.Fatalf("outside marker was removed: %v", readErr)
+			}
+			if !bytes.Equal(got, marker) {
+				t.Errorf("outside marker = %q, want unchanged %q", got, marker)
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "outside-parent")); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("outside parent was created, stat error = %v", statErr)
+			}
+		})
+	}
+}
+
+func TestNoteServiceRejectsInvalidConcretePathsAndAllowsNestedPaths(t *testing.T) {
+	base := t.TempDir()
+	nested := filepath.Join("topic", "note.md")
+	if err := os.MkdirAll(filepath.Join(base, "topic"), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, nested), []byte("nested"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	service := NewNoteService(&fakeNoteRepository{}, base)
+
+	for _, path := range []string{"", ".", "..", filepath.Join("..", "outside.md"), filepath.Join(base, nested)} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := service.GetNoteContent(path); !errors.Is(err, ErrInvalidNotePath) {
+				t.Errorf("GetNoteContent(%q) error = %v, want ErrInvalidNotePath", path, err)
+			}
+		})
+	}
+	content, err := service.GetNoteContent(nested)
+	if err != nil {
+		t.Fatalf("GetNoteContent(%q) error = %v", nested, err)
+	}
+	if content != "nested" {
+		t.Errorf("GetNoteContent(%q) = %q, want nested", nested, content)
+	}
+}
+
 func TestNoteServiceOpenRawFileValidatesPathsAndUnlocksOnce(t *testing.T) {
 	base := t.TempDir()
 	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("content"), 0644); err != nil {
@@ -316,8 +410,8 @@ func TestNoteServiceOpenRawFileValidatesPathsAndUnlocksOnce(t *testing.T) {
 	for _, path := range []string{"", ".", filepath.Join("..", "outside"), "..", filepath.Join(base, "note.md")} {
 		t.Run(path, func(t *testing.T) {
 			file, _, err := service.OpenRawFile(path)
-			if !errors.Is(err, os.ErrPermission) {
-				t.Fatalf("OpenRawFile(%q) error = %v, want os.ErrPermission", path, err)
+			if !errors.Is(err, ErrInvalidNotePath) {
+				t.Fatalf("OpenRawFile(%q) error = %v, want ErrInvalidNotePath", path, err)
 			}
 			if file != nil {
 				t.Errorf("OpenRawFile(%q) file = %v, want nil", path, file)
@@ -362,12 +456,18 @@ func TestNoteServiceOpenRawFileValidatesPathsAndUnlocksOnce(t *testing.T) {
 
 func TestNoteServiceOpenRawFileRejectsEscapingSymlink(t *testing.T) {
 	base := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "outside.md")
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.md")
 	if err := os.WriteFile(outside, []byte("outside"), 0644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
-	link := filepath.Join(base, "escape.md")
-	if err := os.Symlink(outside, link); err != nil {
+	if err := os.Symlink(outside, filepath.Join(base, "escape.md")); err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, errors.ErrUnsupported) {
+			t.Skipf("symlink creation is not permitted: %v", err)
+		}
+		t.Fatalf("os.Symlink() error = %v, want nil", err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(base, "escape-dir")); err != nil {
 		if errors.Is(err, os.ErrPermission) || errors.Is(err, errors.ErrUnsupported) {
 			t.Skipf("symlink creation is not permitted: %v", err)
 		}
@@ -375,13 +475,37 @@ func TestNoteServiceOpenRawFileRejectsEscapingSymlink(t *testing.T) {
 	}
 	service := NewNoteService(&fakeNoteRepository{}, base)
 
-	file, _, err := service.OpenRawFile("escape.md")
+	for _, path := range []string{"escape.md", filepath.Join("escape-dir", "outside.md")} {
+		t.Run(path, func(t *testing.T) {
+			file, _, err := service.OpenRawFile(path)
+			if file != nil {
+				_ = file.Close()
+				t.Errorf("OpenRawFile() file = %v, want nil", file)
+			}
+			if !errors.Is(err, ErrInvalidNotePath) {
+				t.Fatalf("OpenRawFile() error = %v, want ErrInvalidNotePath", err)
+			}
+		})
+	}
+}
+
+func TestNoteServiceOpenRawFileKeepsOrdinaryIOErrorsDistinctFromInvalidPaths(t *testing.T) {
+	baseFile := filepath.Join(t.TempDir(), "base-file")
+	if err := os.WriteFile(baseFile, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	service := NewNoteService(&fakeNoteRepository{}, baseFile)
+
+	file, _, err := service.OpenRawFile("asset.txt")
 	if file != nil {
 		_ = file.Close()
 		t.Errorf("OpenRawFile() file = %v, want nil", file)
 	}
 	if err == nil {
-		t.Fatal("OpenRawFile() error = nil, want symlink escape rejection")
+		t.Fatal("OpenRawFile() error = nil, want non-nil")
+	}
+	if errors.Is(err, ErrInvalidNotePath) {
+		t.Fatalf("OpenRawFile() error = %v, do not want ErrInvalidNotePath", err)
 	}
 }
 

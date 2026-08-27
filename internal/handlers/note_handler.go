@@ -46,6 +46,7 @@ func (h *NoteHandler) GetNotes(w http.ResponseWriter, r *http.Request) {
 // SyncNotes обрабатывает POST /api/sync
 func (h *NoteHandler) SyncNotes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
@@ -73,7 +74,7 @@ func (h *NoteHandler) GetNote(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
 			return
 		}
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, service.ErrInvalidNotePath) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
 			return
 		}
@@ -99,7 +100,7 @@ func (h *NoteHandler) GetRawFile(w http.ResponseWriter, r *http.Request) {
 
 	file, info, err := h.NoteService.OpenRawFile(filePath)
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, service.ErrInvalidNotePath) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "path")
 			return
 		}
@@ -118,6 +119,7 @@ func (h *NoteHandler) GetRawFile(w http.ResponseWriter, r *http.Request) {
 // SaveNote обрабатывает POST /api/save
 func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
@@ -139,7 +141,7 @@ func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
 			return
 		}
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, service.ErrInvalidNotePath) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
 			return
 		}
@@ -154,6 +156,7 @@ func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 // CreateNote обрабатывает POST /api/notes
 func (h *NoteHandler) CreateNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
@@ -188,7 +191,7 @@ func (h *NoteHandler) CreateNote(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "parent_id")
 			return
 		}
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, service.ErrInvalidNotePath) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "parent_id")
 			return
 		}
@@ -203,6 +206,7 @@ func (h *NoteHandler) CreateNote(w http.ResponseWriter, r *http.Request) {
 // DeleteNote обрабатывает DELETE /api/note?id=...
 func (h *NoteHandler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", http.MethodDelete)
 		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
@@ -218,7 +222,7 @@ func (h *NoteHandler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
 			return
 		}
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, service.ErrInvalidNotePath) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
 			return
 		}
@@ -232,6 +236,7 @@ func (h *NoteHandler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 // RenameNote обрабатывает PUT /api/rename
 func (h *NoteHandler) RenameNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", http.MethodPut)
 		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
@@ -261,7 +266,7 @@ func (h *NoteHandler) RenameNote(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
 			return
 		}
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, service.ErrInvalidNotePath) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
 			return
 		}
@@ -276,6 +281,7 @@ func (h *NoteHandler) RenameNote(w http.ResponseWriter, r *http.Request) {
 // UploadAsset обрабатывает POST /api/assets
 func (h *NoteHandler) UploadAsset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -64,6 +66,51 @@ func TestWriteAPIError(t *testing.T) {
 		Message: "id is required",
 		Field:   "id",
 	})
+}
+
+func TestWriteServiceErrorDoesNotLeakServiceFieldErrorCause(t *testing.T) {
+	incomplete := false
+	store := &handlerConfigStore{config: model.Config{SetupCompleted: &incomplete}}
+	notes := service.NewNoteService(handlerNoteRepository{}, "")
+	settings, err := service.NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	missingPath := filepath.Join(t.TempDir(), "unique-private-missing-path")
+	_, serviceErr := settings.CompleteSetup(model.BaseMutationRequest{
+		Mode: "connect",
+		Name: "base",
+		Path: missingPath,
+	})
+	if !errors.Is(serviceErr, service.ErrInvalidPath) || !errors.Is(serviceErr, os.ErrNotExist) {
+		t.Fatalf("CompleteSetup() error = %v, want ErrInvalidPath and os.ErrNotExist", serviceErr)
+	}
+	recorder := httptest.NewRecorder()
+
+	writeServiceError(recorder, serviceErr)
+
+	assertAPIErrorResponse(t, recorder, http.StatusUnprocessableEntity, model.APIError{
+		Code:    "invalid_base_path",
+		Message: "resolve base path symlinks",
+		Field:   "path",
+	})
+	if body := recorder.Body.String(); strings.Contains(body, missingPath) || strings.Contains(body, "lstat") || strings.Contains(body, "no such file") {
+		t.Fatalf("response leaks service error cause: %q", body)
+	}
+}
+
+type handlerConfigStore struct {
+	config model.Config
+}
+
+func (s *handlerConfigStore) Load() (*model.Config, error) {
+	config := s.config
+	return &config, nil
+}
+
+func (s *handlerConfigStore) Save(config *model.Config) error {
+	s.config = *config
+	return nil
 }
 
 func assertAPIErrorResponse(t *testing.T, recorder *httptest.ResponseRecorder, wantStatus int, want model.APIError) {

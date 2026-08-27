@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -25,14 +24,6 @@ func (handlerNoteRepository) ReplaceAll([]model.NoteNode) error                 
 func (handlerNoteRepository) DeleteNode(string) error                                  { return nil }
 
 func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
-	t.Run("method not allowed", func(t *testing.T) {
-		handler := NewNoteHandler(nil)
-		recorder := httptest.NewRecorder()
-		handler.SyncNotes(recorder, httptest.NewRequest(http.MethodGet, "/api/sync", nil))
-
-		assertAPIErrorResponse(t, recorder, http.StatusMethodNotAllowed, model.APIError{Code: "method_not_allowed", Message: "Method not allowed"})
-	})
-
 	t.Run("bad JSON", func(t *testing.T) {
 		handler := NewNoteHandler(nil)
 		recorder := httptest.NewRecorder()
@@ -78,16 +69,47 @@ func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 	})
 
 	t.Run("internal error does not leak filesystem details", func(t *testing.T) {
-		base := t.TempDir()
+		base := filepath.Join(t.TempDir(), "not-a-directory")
+		if err := os.WriteFile(base, []byte("file"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile() error = %v", err)
+		}
 		handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base))
 		recorder := httptest.NewRecorder()
-		handler.GetNote(recorder, httptest.NewRequest(http.MethodGet, "/api/note?id=.", nil))
+		handler.GetRawFile(recorder, httptest.NewRequest(http.MethodGet, "/api/raw?path=asset.txt", nil))
 
 		assertAPIErrorResponse(t, recorder, http.StatusInternalServerError, model.APIError{Code: "internal_error", Message: "Internal server error"})
 		if strings.Contains(recorder.Body.String(), base) || strings.Contains(recorder.Body.String(), "directory") {
 			t.Fatalf("response leaks filesystem error details: %q", recorder.Body.String())
 		}
 	})
+}
+
+func TestNoteHandlerMethodNotAllowedSetsAllow(t *testing.T) {
+	handler := NewNoteHandler(nil)
+	tests := []struct {
+		name  string
+		allow string
+		call  func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "sync", allow: http.MethodPost, call: handler.SyncNotes},
+		{name: "save", allow: http.MethodPost, call: handler.SaveNote},
+		{name: "create", allow: http.MethodPost, call: handler.CreateNote},
+		{name: "delete", allow: http.MethodDelete, call: handler.DeleteNote},
+		{name: "rename", allow: http.MethodPut, call: handler.RenameNote},
+		{name: "upload", allow: http.MethodPost, call: handler.UploadAsset},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			test.call(recorder, httptest.NewRequest(http.MethodPatch, "/api/test", nil))
+
+			assertAPIErrorResponse(t, recorder, http.StatusMethodNotAllowed, model.APIError{Code: "method_not_allowed", Message: "Method not allowed"})
+			if got := recorder.Header().Get("Allow"); got != test.allow {
+				t.Errorf("Allow = %q, want %q", got, test.allow)
+			}
+		})
+	}
 }
 
 func TestNoteHandlerGetRawFileErrors(t *testing.T) {
@@ -164,18 +186,9 @@ func TestNoteHandlerGetRawFileDoesNotFollowEscapingSymlink(t *testing.T) {
 
 	handler.GetRawFile(recorder, httptest.NewRequest(http.MethodGet, "/api/raw?path=escape.txt", nil))
 
-	if recorder.Code == http.StatusOK || bytes.Contains(recorder.Body.Bytes(), secret) {
-		t.Fatalf("escaping symlink exposed outside file: status=%d body=%q", recorder.Code, recorder.Body.String())
-	}
-	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
-		t.Fatalf("Content-Type = %q, want application/json", got)
-	}
-	var apiErr model.APIError
-	if err := json.Unmarshal(recorder.Body.Bytes(), &apiErr); err != nil {
-		t.Fatalf("response is not an APIError: %v; body=%q", err, recorder.Body.String())
-	}
-	if apiErr.Code == "" || strings.Contains(apiErr.Message, outside) {
-		t.Fatalf("invalid or leaking APIError: %#v", apiErr)
+	assertAPIErrorResponse(t, recorder, http.StatusBadRequest, model.APIError{Code: "invalid_path", Message: "Invalid path", Field: "path"})
+	if bytes.Contains(recorder.Body.Bytes(), secret) || strings.Contains(recorder.Body.String(), outside) {
+		t.Fatalf("escaping symlink leaked outside details: status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }
 
