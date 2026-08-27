@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -95,7 +96,7 @@ func TestDirectoryPickerSelectDirectoryWindows(t *testing.T) {
 	})
 
 	t.Run("maps missing PowerShell to unavailable", func(t *testing.T) {
-		runner := &recordingDirectoryPickerRunner{err: exec.ErrNotFound}
+		runner := &recordingDirectoryPickerRunner{result: CommandResult{ExitCode: -1}, err: exec.ErrNotFound}
 
 		path, err := NewDirectoryPicker(runner, "windows").SelectDirectory(context.Background())
 		if path != "" {
@@ -106,6 +107,25 @@ func TestDirectoryPickerSelectDirectoryWindows(t *testing.T) {
 		}
 		if !errors.Is(err, exec.ErrNotFound) {
 			t.Errorf("SelectDirectory() error = %v, want wrapped exec.ErrNotFound", err)
+		}
+	})
+
+	t.Run("wraps launch failure without an exit code", func(t *testing.T) {
+		commandErr := errors.New("permission denied")
+		runner := &recordingDirectoryPickerRunner{
+			result: CommandResult{ExitCode: -1},
+			err:    commandErr,
+		}
+
+		path, err := NewDirectoryPicker(runner, "windows").SelectDirectory(context.Background())
+		if path != "" {
+			t.Errorf("SelectDirectory() path = %q, want empty", path)
+		}
+		if !errors.Is(err, commandErr) {
+			t.Fatalf("SelectDirectory() error = %v, want wrapped %v", err, commandErr)
+		}
+		if strings.Contains(err.Error(), "exit code") {
+			t.Errorf("SelectDirectory() error = %q, do not want unavailable exit code", err)
 		}
 	})
 
@@ -125,6 +145,9 @@ func TestDirectoryPickerSelectDirectoryWindows(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "PowerShell failed") {
 			t.Errorf("SelectDirectory() error = %q, want diagnostic output", err)
+		}
+		if !strings.Contains(err.Error(), "exit code 9") {
+			t.Errorf("SelectDirectory() error = %q, want real exit code", err)
 		}
 		if errors.Is(err, ErrDirectorySelectionCanceled) {
 			t.Errorf("SelectDirectory() error = %v, do not want cancellation sentinel", err)
@@ -195,6 +218,11 @@ func TestDirectoryPickerSelectDirectoryNilRunner(t *testing.T) {
 }
 
 func TestWindowsPickerScript(t *testing.T) {
+	const stopOnError = "$ErrorActionPreference = 'Stop'"
+	if !strings.HasPrefix(windowsPickerScript, stopOnError+"\n") {
+		t.Errorf("windowsPickerScript = %q, want %q as first statement", windowsPickerScript, stopOnError)
+	}
+
 	required := []string{
 		"[Console]::OutputEncoding",
 		"UTF8",
@@ -209,9 +237,28 @@ func TestWindowsPickerScript(t *testing.T) {
 			t.Errorf("windowsPickerScript missing %q", fragment)
 		}
 	}
+	if got := strings.Count(windowsPickerScript, windowsPickerCancelMarker); got != 1 {
+		t.Errorf("windowsPickerScript cancel marker count = %d, want 1", got)
+	}
 }
 
 func TestExecCommandRunner(t *testing.T) {
+	t.Run("returns zero exit code on success", func(t *testing.T) {
+		result, err := (ExecCommandRunner{}).Run(
+			context.Background(),
+			os.Args[0],
+			"-test.run=TestExecCommandRunnerHelperProcess",
+			"--",
+			"success",
+		)
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+		if result.ExitCode != 0 {
+			t.Errorf("Run() ExitCode = %d, want 0", result.ExitCode)
+		}
+	})
+
 	t.Run("captures combined output and exit code", func(t *testing.T) {
 		result, err := (ExecCommandRunner{}).Run(
 			context.Background(),
@@ -236,13 +283,28 @@ func TestExecCommandRunner(t *testing.T) {
 		}
 	})
 
+	t.Run("uses unavailable exit code when process does not start", func(t *testing.T) {
+		missingExecutable := filepath.Join(t.TempDir(), "missing-executable")
+
+		result, err := (ExecCommandRunner{}).Run(context.Background(), missingExecutable)
+		if err == nil {
+			t.Fatal("Run() error = nil, want start error")
+		}
+		if result.ExitCode != -1 {
+			t.Errorf("Run() ExitCode = %d, want -1", result.ExitCode)
+		}
+	})
+
 	t.Run("preserves canceled context", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		_, err := (ExecCommandRunner{}).Run(ctx, os.Args[0], "-test.run=TestExecCommandRunnerHelperProcess", "--", "success")
+		result, err := (ExecCommandRunner{}).Run(ctx, os.Args[0], "-test.run=TestExecCommandRunnerHelperProcess", "--", "success")
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Run() error = %v, want context.Canceled", err)
+		}
+		if result.ExitCode != -1 {
+			t.Errorf("Run() ExitCode = %d, want -1", result.ExitCode)
 		}
 	})
 }

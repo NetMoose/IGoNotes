@@ -26,8 +26,9 @@ type ExecCommandRunner struct{}
 
 func (ExecCommandRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
 	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	result := CommandResult{Output: output}
+	result := CommandResult{Output: output, ExitCode: -1}
 	if err == nil {
+		result.ExitCode = 0
 		return result, nil
 	}
 
@@ -49,7 +50,8 @@ func NewDirectoryPicker(runner CommandRunner, goos string) *DirectoryPicker {
 
 const windowsPickerCancelMarker = "__IGONOTES_DIRECTORY_SELECTION_CANCELED__"
 
-const windowsPickerScript = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+const windowsPickerScript = `$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -84,10 +86,14 @@ func (p *DirectoryPicker) SelectDirectory(ctx context.Context) (string, error) {
 		}
 
 		diagnostic := strings.TrimRight(string(result.Output), "\r\n")
-		if diagnostic != "" {
-			return "", fmt.Errorf("run Windows directory picker (exit code %d): %w: %s", result.ExitCode, err, diagnostic)
+		operation := "run Windows directory picker"
+		if result.ExitCode >= 0 {
+			operation = fmt.Sprintf("%s (exit code %d)", operation, result.ExitCode)
 		}
-		return "", fmt.Errorf("run Windows directory picker (exit code %d): %w", result.ExitCode, err)
+		if diagnostic != "" {
+			return "", fmt.Errorf("%s: %w: %s", operation, err, diagnostic)
+		}
+		return "", fmt.Errorf("%s: %w", operation, err)
 	}
 
 	path := strings.TrimRight(string(result.Output), "\r\n")
