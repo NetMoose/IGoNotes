@@ -80,6 +80,15 @@ func (s *NoteService) SwitchBase(target string) error {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
 
+	if target == "" {
+		if err := s.repo.ReplaceAll(nil); err != nil {
+			return err
+		}
+		s.basePath = ""
+		s.once.Do(func() { close(s.initialSyncDone) })
+		return nil
+	}
+
 	info, err := os.Stat(target)
 	if err != nil {
 		return err

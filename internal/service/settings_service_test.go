@@ -12,10 +12,12 @@ import (
 )
 
 type fakeConfigStore struct {
-	config    *model.Config
-	loadErr   error
-	saveErr   error
-	saveCalls int
+	config      *model.Config
+	loadErr     error
+	saveErr     error
+	saveCalls   int
+	saveStarted chan struct{}
+	saveRelease <-chan struct{}
 }
 
 func (f *fakeConfigStore) Load() (*model.Config, error) {
@@ -31,6 +33,12 @@ func (f *fakeConfigStore) Load() (*model.Config, error) {
 
 func (f *fakeConfigStore) Save(config *model.Config) error {
 	f.saveCalls++
+	if f.saveStarted != nil {
+		close(f.saveStarted)
+	}
+	if f.saveRelease != nil {
+		<-f.saveRelease
+	}
 	if f.saveErr != nil {
 		return f.saveErr
 	}
@@ -530,6 +538,7 @@ func TestSettingsServiceCompleteSetupRejectsInvalidRequestsWithoutMutation(t *te
 		request model.BaseMutationRequest
 		kind    error
 		field   string
+		cause   error
 	}{
 		{name: "invalid mode", request: model.BaseMutationRequest{Mode: "CREATE", Name: "work", Path: existingParent}, kind: ErrInvalidMode, field: "mode"},
 		{name: "mode is not trimmed", request: model.BaseMutationRequest{Mode: " create ", Name: "work", Path: t.TempDir()}, kind: ErrInvalidMode, field: "mode"},
@@ -539,10 +548,10 @@ func TestSettingsServiceCompleteSetupRejectsInvalidRequestsWithoutMutation(t *te
 		{name: "slash name", request: model.BaseMutationRequest{Mode: "create", Name: "a/b", Path: existingParent}, kind: ErrInvalidName, field: "name"},
 		{name: "backslash name", request: model.BaseMutationRequest{Mode: "create", Name: `a\b`, Path: existingParent}, kind: ErrInvalidName, field: "name"},
 		{name: "empty path", request: model.BaseMutationRequest{Mode: "create", Name: "work", Path: " \t"}, kind: ErrInvalidPath, field: "path"},
-		{name: "missing create parent", request: model.BaseMutationRequest{Mode: "create", Name: "work", Path: missing}, kind: ErrInvalidPath, field: "path"},
+		{name: "missing create parent", request: model.BaseMutationRequest{Mode: "create", Name: "work", Path: missing}, kind: ErrInvalidPath, field: "path", cause: os.ErrNotExist},
 		{name: "regular file create parent", request: model.BaseMutationRequest{Mode: "create", Name: "work", Path: regularFile}, kind: ErrInvalidPath, field: "path"},
 		{name: "existing create target", request: model.BaseMutationRequest{Mode: "create", Name: "work", Path: existingParent}, kind: ErrBasePathConflict, field: "path"},
-		{name: "missing connect base", request: model.BaseMutationRequest{Mode: "connect", Name: "work", Path: missing}, kind: ErrInvalidPath, field: "path"},
+		{name: "missing connect base", request: model.BaseMutationRequest{Mode: "connect", Name: "work", Path: missing}, kind: ErrInvalidPath, field: "path", cause: os.ErrNotExist},
 		{name: "regular file connect base", request: model.BaseMutationRequest{Mode: "connect", Name: "work", Path: regularFile}, kind: ErrInvalidPath, field: "path"},
 	}
 
@@ -554,6 +563,9 @@ func TestSettingsServiceCompleteSetupRejectsInvalidRequestsWithoutMutation(t *te
 			_, err := service.CompleteSetup(tt.request)
 			if !errors.Is(err, tt.kind) {
 				t.Fatalf("CompleteSetup() error = %v, want %v", err, tt.kind)
+			}
+			if tt.cause != nil && !errors.Is(err, tt.cause) {
+				t.Errorf("CompleteSetup() error = %v, want underlying %v", err, tt.cause)
 			}
 			assertFieldError(t, err, tt.field)
 			assertSettingsUnchanged(t, service, store, runtime, original, oldPath, 0)
@@ -620,6 +632,105 @@ func TestSettingsServiceCompleteSetupKeepsActiveCreatedBaseWhenRollbackFails(t *
 	assertDirectory(t, oldPath)
 	if !reflect.DeepEqual(service.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
 		t.Errorf("config changed after rollback failure: service %#v store %#v want %#v", service.GetConfig(), *store.config, original)
+	}
+}
+
+func TestSettingsServiceCompleteSetupRollbackFailureBlocksLaterMutation(t *testing.T) {
+	parent := t.TempDir()
+	service, store, runtime, original := newIncompleteSettingsService(t)
+	store.saveErr = errors.New("disk full")
+	runtime.switchErrs = []error{nil, errors.New("cannot restore metadata")}
+
+	_, firstErr := service.CompleteSetup(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
+	if !errors.Is(firstErr, ErrRollbackFailed) {
+		t.Fatalf("first CompleteSetup() error = %v, want ErrRollbackFailed", firstErr)
+	}
+	saveCalls := store.saveCalls
+	switchCalls := append([]string(nil), runtime.switchCalls...)
+	pathCalls := runtime.pathCalls
+	laterPath := t.TempDir()
+
+	_, err := service.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "later", Path: laterPath})
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("AddBase() error = %v, want latched ErrRollbackFailed", err)
+	}
+	if store.saveCalls != saveCalls || !reflect.DeepEqual(runtime.switchCalls, switchCalls) || runtime.pathCalls != pathCalls {
+		t.Errorf("degraded mutation made calls: saves %d/%d switches %v/%v paths %d/%d", store.saveCalls, saveCalls, runtime.switchCalls, switchCalls, runtime.pathCalls, pathCalls)
+	}
+	if !reflect.DeepEqual(service.GetConfig(), original) {
+		t.Errorf("service config = %#v, want unchanged %#v", service.GetConfig(), original)
+	}
+}
+
+func TestSettingsServiceCompleteSetupFromEmptyRuntimeRollsBackAndCleansCreatedBase(t *testing.T) {
+	completed := false
+	original := model.Config{SetupCompleted: &completed}
+	store := &fakeConfigStore{config: &original, saveErr: errors.New("disk full")}
+	runtime := &fakeBaseRuntime{}
+	service, err := NewSettingsService(store, runtime, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	parent := t.TempDir()
+
+	_, err = service.CompleteSetup(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
+	if !errors.Is(err, store.saveErr) {
+		t.Fatalf("CompleteSetup() error = %v, want wrapped %v", err, store.saveErr)
+	}
+	if errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("CompleteSetup() error = %v, do not want ErrRollbackFailed", err)
+	}
+	if !reflect.DeepEqual(runtime.switchCalls, []string{filepath.Join(parent, "work"), ""}) {
+		t.Errorf("SwitchBase calls = %v, want target then empty", runtime.switchCalls)
+	}
+	if runtime.path != "" {
+		t.Errorf("runtime path = %q, want empty", runtime.path)
+	}
+	assertNotExist(t, filepath.Join(parent, "work"))
+	if !reflect.DeepEqual(service.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
+		t.Errorf("config changed: service %#v store %#v want %#v", service.GetConfig(), *store.config, original)
+	}
+}
+
+func TestSettingsServiceCreateUsesCanonicalSymlinkParent(t *testing.T) {
+	physicalParent := t.TempDir()
+	alternateParent := t.TempDir()
+	link := filepath.Join(t.TempDir(), "bases")
+	createSymlinkOrSkip(t, physicalParent, link)
+	service, store, _, original := newIncompleteSettingsService(t)
+
+	response, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: link})
+	if err != nil {
+		t.Fatalf("AddBase() error = %v", err)
+	}
+	wantPath := filepath.Join(physicalParent, "work")
+	if got := response.Config.Bases[len(original.Bases)].Path; got != wantPath {
+		t.Errorf("created base path = %q, want canonical %q", got, wantPath)
+	}
+	retargetSymlink(t, link, alternateParent)
+	if got := store.config.Bases[len(original.Bases)].Path; got != wantPath {
+		t.Errorf("stored base path after retarget = %q, want stable %q", got, wantPath)
+	}
+	assertDirectory(t, wantPath)
+}
+
+func TestSettingsServiceConnectUsesCanonicalSymlinkBase(t *testing.T) {
+	physicalBase := t.TempDir()
+	alternateBase := t.TempDir()
+	link := filepath.Join(t.TempDir(), "base")
+	createSymlinkOrSkip(t, physicalBase, link)
+	service, store, _, original := newIncompleteSettingsService(t)
+
+	response, err := service.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "shared", Path: link})
+	if err != nil {
+		t.Fatalf("AddBase() error = %v", err)
+	}
+	if got := response.Config.Bases[len(original.Bases)].Path; got != physicalBase {
+		t.Errorf("connected base path = %q, want canonical %q", got, physicalBase)
+	}
+	retargetSymlink(t, link, alternateBase)
+	if got := store.config.Bases[len(original.Bases)].Path; got != physicalBase {
+		t.Errorf("stored base path after retarget = %q, want stable %q", got, physicalBase)
 	}
 }
 
@@ -775,6 +886,115 @@ func TestSettingsServiceAddBasePreservesConnectedDirectoryAfterSaveFailure(t *te
 	}
 }
 
+func TestSettingsServiceAddBaseRefusesCleanupOfReplacementEntry(t *testing.T) {
+	tests := []struct {
+		name    string
+		replace func(*testing.T, string)
+		check   func(*testing.T, string)
+	}{
+		{
+			name: "file",
+			replace: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+			},
+			check: func(t *testing.T, path string) {
+				contents, err := os.ReadFile(path)
+				if err != nil || string(contents) != "replacement" {
+					t.Errorf("replacement file = %q, %v; want preserved", contents, err)
+				}
+			},
+		},
+		{
+			name: "directory",
+			replace: func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatalf("Mkdir() error = %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "marker"), []byte("replacement"), 0o600); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+			},
+			check: func(t *testing.T, path string) {
+				contents, err := os.ReadFile(filepath.Join(path, "marker"))
+				if err != nil || string(contents) != "replacement" {
+					t.Errorf("replacement marker = %q, %v; want preserved", contents, err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			service, store, _, _ := newIncompleteSettingsService(t)
+			started := make(chan struct{})
+			release := make(chan struct{})
+			store.saveStarted = started
+			store.saveRelease = release
+			store.saveErr = errors.New("disk full")
+			done := make(chan error, 1)
+			go func() {
+				_, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
+				done <- err
+			}()
+			<-started
+			target := filepath.Join(parent, "work")
+			if err := os.Remove(target); err != nil {
+				t.Fatalf("Remove() error = %v", err)
+			}
+			tt.replace(t, target)
+			close(release)
+			err := <-done
+			if !errors.Is(err, store.saveErr) {
+				t.Fatalf("AddBase() error = %v, want wrapped %v", err, store.saveErr)
+			}
+			if !strings.Contains(err.Error(), "refuse cleanup") {
+				t.Errorf("AddBase() error = %q, want cleanup refusal", err)
+			}
+			tt.check(t, target)
+		})
+	}
+}
+
+func TestSettingsServiceAddBaseCleanupIsAnchoredAcrossParentSymlinkRetarget(t *testing.T) {
+	physicalParent := t.TempDir()
+	alternateParent := t.TempDir()
+	link := filepath.Join(t.TempDir(), "bases")
+	createSymlinkOrSkip(t, physicalParent, link)
+	service, store, _, _ := newIncompleteSettingsService(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	store.saveStarted = started
+	store.saveRelease = release
+	store.saveErr = errors.New("disk full")
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: link})
+		done <- err
+	}()
+	<-started
+	retargetSymlink(t, link, alternateParent)
+	alternateTarget := filepath.Join(alternateParent, "work")
+	if err := os.Mkdir(alternateTarget, 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(alternateTarget, "marker"), []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	close(release)
+	err := <-done
+	if !errors.Is(err, store.saveErr) {
+		t.Fatalf("AddBase() error = %v, want wrapped %v", err, store.saveErr)
+	}
+	assertNotExist(t, filepath.Join(physicalParent, "work"))
+	contents, readErr := os.ReadFile(filepath.Join(alternateTarget, "marker"))
+	if readErr != nil || string(contents) != "keep" {
+		t.Errorf("alternate replacement = %q, %v; want preserved", contents, readErr)
+	}
+}
+
 func newIncompleteSettingsService(t *testing.T) (*SettingsService, *fakeConfigStore, *fakeBaseRuntime, model.Config) {
 	t.Helper()
 	completed := false
@@ -846,4 +1066,22 @@ func assertNotExist(t *testing.T, path string) {
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Stat(%q) error = %v, want not exist", path, err)
 	}
+}
+
+func createSymlinkOrSkip(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, errors.ErrUnsupported) {
+			t.Skipf("symlink creation is not supported: %v", err)
+		}
+		t.Fatalf("Symlink() error = %v", err)
+	}
+}
+
+func retargetSymlink(t *testing.T, link, target string) {
+	t.Helper()
+	if err := os.Remove(link); err != nil {
+		t.Fatalf("Remove symlink error = %v", err)
+	}
+	createSymlinkOrSkip(t, target, link)
 }

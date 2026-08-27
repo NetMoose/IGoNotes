@@ -25,11 +25,12 @@ type BaseRuntime interface {
 type SettingsService struct {
 	// Lock ordering: SettingsService.mu precedes BaseRuntime locks. BaseRuntime
 	// implementations must not call back into SettingsService while locked.
-	mu     sync.RWMutex
-	store  ConfigStore
-	notes  BaseRuntime
-	logger *log.Logger
-	config model.Config
+	mu       sync.RWMutex
+	store    ConfigStore
+	notes    BaseRuntime
+	logger   *log.Logger
+	config   model.Config
+	degraded error
 }
 
 func NewSettingsService(
@@ -123,6 +124,12 @@ type preparedBase struct {
 	create bool
 }
 
+type createdBaseDirectory struct {
+	root *os.Root
+	name string
+	info os.FileInfo
+}
+
 func prepareBase(request model.BaseMutationRequest) (preparedBase, error) {
 	mode := request.Mode
 	name := strings.TrimSpace(request.Name)
@@ -142,27 +149,91 @@ func prepareBase(request model.BaseMutationRequest) (preparedBase, error) {
 
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return preparedBase{}, fieldError(ErrInvalidPath, "path", fmt.Sprintf("resolve base path: %v", err))
+		return preparedBase{}, fieldErrorWithCause(ErrInvalidPath, err, "path", "resolve base path")
 	}
 	absPath = filepath.Clean(absPath)
-	info, err := os.Stat(absPath)
-	if err != nil || !info.IsDir() {
+	canonicalPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return preparedBase{}, fieldErrorWithCause(ErrInvalidPath, err, "path", "resolve base path symlinks")
+	}
+	canonicalPath = filepath.Clean(canonicalPath)
+	info, err := os.Stat(canonicalPath)
+	if err != nil {
+		return preparedBase{}, fieldErrorWithCause(ErrInvalidPath, err, "path", "inspect base path")
+	}
+	if !info.IsDir() {
 		return preparedBase{}, fieldError(ErrInvalidPath, "path", "base path must be an existing directory")
 	}
 	if mode == "connect" {
-		return preparedBase{base: model.Base{Name: name, Path: absPath}}, nil
+		return preparedBase{base: model.Base{Name: name, Path: canonicalPath}}, nil
 	}
 
-	targetPath := filepath.Join(absPath, name)
+	targetPath := filepath.Join(canonicalPath, name)
 	_, err = os.Stat(targetPath)
 	switch {
 	case err == nil:
 		return preparedBase{}, fieldError(ErrBasePathConflict, "path", "base path already exists")
 	case !errors.Is(err, os.ErrNotExist):
-		return preparedBase{}, fieldError(ErrInvalidPath, "path", fmt.Sprintf("inspect base path: %v", err))
+		return preparedBase{}, fieldErrorWithCause(ErrInvalidPath, err, "path", "inspect base path")
 	default:
 		return preparedBase{base: model.Base{Name: name, Path: targetPath}, create: true}, nil
 	}
+}
+
+func createBaseDirectory(prepared preparedBase) (*createdBaseDirectory, error) {
+	root, err := os.OpenRoot(filepath.Dir(prepared.base.Path))
+	if err != nil {
+		return nil, fieldErrorWithCause(ErrInvalidPath, err, "path", "open base parent")
+	}
+	if err := root.Mkdir(prepared.base.Name, 0o755); err != nil {
+		closeErr := root.Close()
+		if errors.Is(err, os.ErrExist) {
+			return nil, fieldErrorWithCause(ErrBasePathConflict, errors.Join(err, closeErr), "path", "base path already exists")
+		}
+		return nil, fieldErrorWithCause(ErrInvalidPath, errors.Join(err, closeErr), "path", "create base path")
+	}
+	info, err := root.Stat(prepared.base.Name)
+	if err != nil {
+		return nil, fieldErrorWithCause(ErrInvalidPath, errors.Join(err, root.Close()), "path", "inspect created base path")
+	}
+	if !info.IsDir() {
+		closeErr := root.Close()
+		return nil, errors.Join(fieldError(ErrInvalidPath, "path", "created base path is not a directory"), closeErr)
+	}
+	return &createdBaseDirectory{root: root, name: prepared.base.Name, info: info}, nil
+}
+
+func (created *createdBaseDirectory) cleanup() error {
+	info, err := created.root.Stat(created.name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("refuse cleanup of created base: inspect entry: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("refuse cleanup of created base: entry is no longer a directory")
+	}
+	if !os.SameFile(created.info, info) {
+		return fmt.Errorf("refuse cleanup of created base: directory identity changed")
+	}
+	if err := created.root.Remove(created.name); err != nil {
+		return fmt.Errorf("refuse cleanup of created base: remove directory: %w", err)
+	}
+	return nil
+}
+
+func (s *SettingsService) closeCreatedBase(created *createdBaseDirectory, operationErr error) error {
+	if created == nil {
+		return operationErr
+	}
+	if closeErr := created.root.Close(); closeErr != nil {
+		if operationErr != nil {
+			return errors.Join(operationErr, fmt.Errorf("close base parent: %w", closeErr))
+		}
+		s.logger.Printf("close created base parent failed after successful mutation: %v", closeErr)
+	}
+	return operationErr
 }
 
 func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string) error {
@@ -181,11 +252,12 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 		}
 		if rollbackErr := s.notes.SwitchBase(oldPath); rollbackErr != nil {
 			s.logger.Printf("settings runtime rollback failed: %v", rollbackErr)
-			return errors.Join(
+			s.degraded = errors.Join(
 				ErrRollbackFailed,
 				saveErr,
 				fmt.Errorf("restore runtime base: %w", rollbackErr),
 			)
+			return s.degraded
 		}
 		return saveErr
 	}
@@ -198,6 +270,9 @@ func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (mode
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.degraded != nil {
+		return model.SettingsResponse{}, s.degraded
+	}
 	if s.config.SetupCompleted != nil && *s.config.SetupCompleted {
 		return model.SettingsResponse{}, ErrSetupAlreadyCompleted
 	}
@@ -206,15 +281,12 @@ func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (mode
 		return model.SettingsResponse{}, err
 	}
 
-	created := false
+	var created *createdBaseDirectory
 	if prepared.create {
-		if err := os.Mkdir(prepared.base.Path, 0o755); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				return model.SettingsResponse{}, fieldError(ErrBasePathConflict, "path", "base path already exists")
-			}
-			return model.SettingsResponse{}, fieldError(ErrInvalidPath, "path", fmt.Sprintf("create base path: %v", err))
+		created, err = createBaseDirectory(prepared)
+		if err != nil {
+			return model.SettingsResponse{}, err
 		}
-		created = true
 	}
 
 	completed := true
@@ -225,13 +297,14 @@ func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (mode
 		SetupCompleted: &completed,
 	}
 	if err := s.applyConfigLocked(next, prepared.base.Path); err != nil {
-		if created && filepath.Clean(s.notes.GetBasePath()) != filepath.Clean(prepared.base.Path) {
-			if cleanupErr := os.Remove(prepared.base.Path); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
-				return model.SettingsResponse{}, errors.Join(err, fmt.Errorf("remove created base path: %w", cleanupErr))
+		if created != nil && filepath.Clean(s.notes.GetBasePath()) != filepath.Clean(prepared.base.Path) {
+			if cleanupErr := created.cleanup(); cleanupErr != nil {
+				err = errors.Join(err, cleanupErr)
 			}
 		}
-		return model.SettingsResponse{}, err
+		return model.SettingsResponse{}, s.closeCreatedBase(created, err)
 	}
+	s.closeCreatedBase(created, nil)
 	return s.responseLocked(), nil
 }
 
@@ -248,6 +321,9 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.degraded != nil {
+		return model.SettingsResponse{}, s.degraded
+	}
 	prepared, err := prepareBase(request)
 	if err != nil {
 		return model.SettingsResponse{}, err
@@ -256,32 +332,34 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 		return model.SettingsResponse{}, err
 	}
 
-	created := false
+	var created *createdBaseDirectory
 	if prepared.create {
-		if err := os.Mkdir(prepared.base.Path, 0o755); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				return model.SettingsResponse{}, fieldError(ErrBasePathConflict, "path", "base path already exists")
-			}
-			return model.SettingsResponse{}, fieldError(ErrInvalidPath, "path", fmt.Sprintf("create base path: %v", err))
+		created, err = createBaseDirectory(prepared)
+		if err != nil {
+			return model.SettingsResponse{}, err
 		}
-		created = true
 	}
 
 	next := cloneConfig(s.config)
 	next.Bases = append(next.Bases, prepared.base)
 	if err := s.applyConfigLocked(next, ""); err != nil {
-		if created {
-			if cleanupErr := os.Remove(prepared.base.Path); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
-				return model.SettingsResponse{}, errors.Join(err, fmt.Errorf("remove created base path: %w", cleanupErr))
+		if created != nil {
+			if cleanupErr := created.cleanup(); cleanupErr != nil {
+				err = errors.Join(err, cleanupErr)
 			}
 		}
-		return model.SettingsResponse{}, err
+		return model.SettingsResponse{}, s.closeCreatedBase(created, err)
 	}
+	s.closeCreatedBase(created, nil)
 	return s.responseLocked(), nil
 }
 
 func fieldError(kind error, field, message string) error {
 	return &FieldError{Kind: kind, Field: field, Message: message}
+}
+
+func fieldErrorWithCause(kind, cause error, field, message string) error {
+	return &FieldError{Kind: errors.Join(kind, cause), Field: field, Message: fmt.Sprintf("%s: %v", message, cause)}
 }
 
 func cloneConfig(config model.Config) model.Config {

@@ -215,6 +215,35 @@ func TestNoteServiceSwitchBaseReplaceFailurePreservesBaseAndIndex(t *testing.T) 
 	}
 }
 
+func TestNoteServiceSwitchBaseClearsBaseAndIndex(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "old.md"), []byte("old"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md", Name: "old", Type: "file", Path: "old.md"}}}
+	service := NewNoteService(repo, base)
+
+	if err := service.SwitchBase(""); err != nil {
+		t.Fatalf("SwitchBase(empty) error = %v", err)
+	}
+	if got := service.GetBasePath(); got != "" {
+		t.Errorf("GetBasePath() = %q, want empty", got)
+	}
+	nodes, err := repo.GetAllNodes()
+	if err != nil {
+		t.Fatalf("GetAllNodes() error = %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Errorf("indexed nodes = %#v, want empty", nodes)
+	}
+	if _, err := service.GetNoteContent("old.md"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("GetNoteContent() error = %v, want os.ErrNotExist", err)
+	}
+	if tree, err := service.GetTree(); err != nil || len(tree) != 0 {
+		t.Errorf("GetTree() = %#v, %v; want empty", tree, err)
+	}
+}
+
 func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "assets")
 	paths := []string{
