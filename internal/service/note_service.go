@@ -48,6 +48,7 @@ type NoteService struct {
 	initialSyncDone chan struct{}
 	once            sync.Once
 	scan            noteScanner
+	beforeReadLock  func()
 }
 
 // NewNoteService создает новый экземпляр NoteService
@@ -114,24 +115,37 @@ func scanNotes(basePath string) ([]model.NoteNode, error) {
 		return nil, nil
 	}
 
+	walkRoot, err := filepath.EvalSymlinks(basePath)
+	if err != nil {
+		return nil, err
+	}
+	walkRoot = filepath.Clean(walkRoot)
+	info, err := os.Stat(walkRoot)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("base path is not a directory: %s", basePath)
+	}
+
 	var nodes []model.NoteNode
-	err := filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
 		// Пропускаем скрытые папки (.git) и assets
-		if path != basePath && info.IsDir() && (strings.HasPrefix(info.Name(), ".") || info.Name() == "assets") {
+		if path != walkRoot && info.IsDir() && (strings.HasPrefix(info.Name(), ".") || info.Name() == "assets") {
 			return filepath.SkipDir
 		}
 
 		// Игнорируем сам корень
-		if path == basePath {
+		if path == walkRoot {
 			return nil
 		}
 
 		// Вычисляем относительный путь (он же ID)
-		relPath, err := filepath.Rel(basePath, path)
+		relPath, err := filepath.Rel(walkRoot, path)
 		if err != nil {
 			return err
 		}
@@ -211,6 +225,9 @@ func (s *NoteService) GetTree() ([]model.NoteNode, error) {
 
 // GetNoteContent читает содержимое заметки с диска
 func (s *NoteService) GetNoteContent(id string) (string, error) {
+	if s.beforeReadLock != nil {
+		s.beforeReadLock()
+	}
 	s.baseMu.RLock()
 	defer s.baseMu.RUnlock()
 
@@ -261,8 +278,19 @@ func (s *NoteService) OpenRawFile(relPath string) (*LockedFile, os.FileInfo, err
 		return nil, nil, os.ErrPermission
 	}
 
-	file, err := os.Open(filepath.Join(s.basePath, cleanPath))
+	root, err := os.OpenRoot(s.basePath)
 	if err != nil {
+		s.baseMu.RUnlock()
+		return nil, nil, err
+	}
+	file, err := root.Open(cleanPath)
+	if err != nil {
+		closeErr := root.Close()
+		s.baseMu.RUnlock()
+		return nil, nil, errors.Join(err, closeErr)
+	}
+	if err := root.Close(); err != nil {
+		_ = file.Close()
 		s.baseMu.RUnlock()
 		return nil, nil, err
 	}
@@ -418,8 +446,13 @@ func (s *NoteService) RenameNode(id, newName string) error {
 	}
 
 	newPath := filepath.Join(filepath.Dir(oldPath), newName)
-	if _, err := os.Stat(newPath); err == nil {
-		return ErrAlreadyExists
+	if filepath.Clean(oldPath) == filepath.Clean(newPath) {
+		return nil
+	}
+	if destinationInfo, err := os.Stat(newPath); err == nil {
+		if !os.SameFile(info, destinationInfo) {
+			return ErrAlreadyExists
+		}
 	} else if !os.IsNotExist(err) {
 		return err
 	}

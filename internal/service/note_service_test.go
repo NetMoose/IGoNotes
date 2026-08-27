@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,21 @@ type fakeNoteRepository struct {
 	replaceStarted chan struct{}
 	replaceRelease <-chan struct{}
 	startedOnce    sync.Once
+}
+
+func waitForPendingWriter(t *testing.T, mu *sync.RWMutex) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if !mu.TryRLock() {
+			return
+		}
+		mu.RUnlock()
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not become pending")
+		}
+		runtime.Gosched()
+	}
 }
 
 func (r *fakeNoteRepository) UpsertNode(id, title, path string, parentID *string, nodeType string) error {
@@ -137,6 +153,38 @@ func TestNoteServiceSwitchBaseRejectsNonDirectory(t *testing.T) {
 	}
 	if got := service.GetBasePath(); got != oldBase {
 		t.Errorf("GetBasePath() = %q, want unchanged %q", got, oldBase)
+	}
+}
+
+func TestNoteServiceSwitchBaseIndexesSymlinkRootAndPublishesLogicalPath(t *testing.T) {
+	oldBase := t.TempDir()
+	physicalBase := t.TempDir()
+	if err := os.WriteFile(filepath.Join(physicalBase, "linked.md"), []byte("linked"), 0644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	logicalBase := filepath.Join(t.TempDir(), "selected-base")
+	if err := os.Symlink(physicalBase, logicalBase); err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, errors.ErrUnsupported) {
+			t.Skipf("symlink creation is not permitted: %v", err)
+		}
+		t.Fatalf("os.Symlink() error = %v, want nil", err)
+	}
+	repo := &fakeNoteRepository{}
+	service := NewNoteService(repo, oldBase)
+
+	selectedPath := logicalBase + string(filepath.Separator) + "."
+	if err := service.SwitchBase(selectedPath); err != nil {
+		t.Fatalf("SwitchBase() error = %v, want nil", err)
+	}
+	if got := service.GetBasePath(); got != filepath.Clean(selectedPath) {
+		t.Errorf("GetBasePath() = %q, want logical path %q", got, filepath.Clean(selectedPath))
+	}
+	nodes, err := repo.GetAllNodes()
+	if err != nil {
+		t.Fatalf("GetAllNodes() error = %v, want nil", err)
+	}
+	if len(nodes) != 1 || nodes[0].ID != "linked.md" {
+		t.Errorf("indexed nodes = %#v, want only linked.md", nodes)
 	}
 }
 
@@ -283,6 +331,31 @@ func TestNoteServiceOpenRawFileValidatesPathsAndUnlocksOnce(t *testing.T) {
 	}
 }
 
+func TestNoteServiceOpenRawFileRejectsEscapingSymlink(t *testing.T) {
+	base := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(outside, []byte("outside"), 0644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	link := filepath.Join(base, "escape.md")
+	if err := os.Symlink(outside, link); err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, errors.ErrUnsupported) {
+			t.Skipf("symlink creation is not permitted: %v", err)
+		}
+		t.Fatalf("os.Symlink() error = %v, want nil", err)
+	}
+	service := NewNoteService(&fakeNoteRepository{}, base)
+
+	file, _, err := service.OpenRawFile("escape.md")
+	if file != nil {
+		_ = file.Close()
+		t.Errorf("OpenRawFile() file = %v, want nil", file)
+	}
+	if err == nil {
+		t.Fatal("OpenRawFile() error = nil, want symlink escape rejection")
+	}
+}
+
 func TestNoteServiceOpenRawFilePinsOldBaseDuringSwitch(t *testing.T) {
 	oldBase := t.TempDir()
 	newBase := t.TempDir()
@@ -300,19 +373,14 @@ func TestNoteServiceOpenRawFilePinsOldBaseDuringSwitch(t *testing.T) {
 		t.Fatalf("OpenRawFile() error = %v, want nil", err)
 	}
 	t.Cleanup(func() { _ = file.Close() })
-
-	started := make(chan struct{})
-	switchDone := make(chan error, 1)
-	go func() {
-		close(started)
-		switchDone <- service.SwitchBase(newBase)
-	}()
-	<-started
-	select {
-	case err := <-switchDone:
-		t.Fatalf("SwitchBase() completed while raw file was open: %v", err)
-	case <-time.After(100 * time.Millisecond):
+	if service.baseMu.TryLock() {
+		service.baseMu.Unlock()
+		t.Fatal("OpenRawFile() did not retain the base read lock")
 	}
+
+	switchDone := make(chan error, 1)
+	go func() { switchDone <- service.SwitchBase(newBase) }()
+	waitForPendingWriter(t, &service.baseMu)
 
 	content, err := io.ReadAll(file)
 	if err != nil {
@@ -371,20 +439,30 @@ func TestNoteServiceRequestDuringSwitchReadsNewBase(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("SwitchBase() did not reach ReplaceAll")
 	}
+	if service.baseMu.TryRLock() {
+		service.baseMu.RUnlock()
+		t.Fatal("SwitchBase() did not retain the base write lock during replacement")
+	}
 
 	type readResult struct {
 		content string
 		err     error
 	}
+	readLockEntered := make(chan struct{})
+	service.beforeReadLock = func() { close(readLockEntered) }
 	readDone := make(chan readResult, 1)
 	go func() {
 		content, err := service.GetNoteContent("note.md")
 		readDone <- readResult{content: content, err: err}
 	}()
 	select {
-	case result := <-readDone:
-		t.Fatalf("GetNoteContent() completed during replacement: %#v", result)
-	case <-time.After(100 * time.Millisecond):
+	case <-readLockEntered:
+	case <-time.After(time.Second):
+		t.Fatal("GetNoteContent() did not reach the base read lock")
+	}
+	if service.baseMu.TryRLock() {
+		service.baseMu.RUnlock()
+		t.Fatal("base read lock unexpectedly available while switch is replacing the index")
 	}
 
 	release()
@@ -453,6 +531,45 @@ func TestNoteServiceRenameNodeRejectsExistingDestination(t *testing.T) {
 		if string(content) != want {
 			t.Errorf("content of %q = %q, want %q", name, content, want)
 		}
+	}
+}
+
+func TestNoteServiceRenameNodeExactPathIsNoOp(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "same.md"), []byte("same"), 0644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "same.md", Name: "same", Type: "file", Path: "same.md"}}}
+	service := NewNoteService(repo, base)
+
+	if err := service.RenameNode("same.md", "same.md"); err != nil {
+		t.Fatalf("RenameNode() error = %v, want nil", err)
+	}
+	content, err := os.ReadFile(filepath.Join(base, "same.md"))
+	if err != nil {
+		t.Fatalf("os.ReadFile() error = %v, want nil", err)
+	}
+	if string(content) != "same" {
+		t.Errorf("content = %q, want same", content)
+	}
+}
+
+func TestNoteServiceRenameNodeAllowsCaseOnlyRename(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "Case.md"), []byte("case"), 0644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	service := NewNoteService(&fakeNoteRepository{}, base)
+
+	if err := service.RenameNode("Case.md", "case"); err != nil {
+		t.Fatalf("RenameNode() error = %v, want nil", err)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("os.ReadDir() error = %v, want nil", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "case.md" {
+		t.Errorf("directory entries = %#v, want only case.md", entries)
 	}
 }
 
