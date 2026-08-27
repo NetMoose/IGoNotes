@@ -573,7 +573,7 @@ func TestSettingsServiceCompleteSetupRejectsInvalidRequestsWithoutMutation(t *te
 	}
 }
 
-func TestSettingsServiceCompleteSetupCleansCreatedBaseAfterSwitchFailure(t *testing.T) {
+func TestSettingsServiceCompleteSetupPreservesCreatedBaseAfterSwitchFailure(t *testing.T) {
 	parent := t.TempDir()
 	service, store, runtime, original := newIncompleteSettingsService(t)
 	oldPath := runtime.path
@@ -584,11 +584,11 @@ func TestSettingsServiceCompleteSetupCleansCreatedBaseAfterSwitchFailure(t *test
 	if !errors.Is(err, switchErr) {
 		t.Fatalf("CompleteSetup() error = %v, want wrapped %v", err, switchErr)
 	}
-	assertNotExist(t, filepath.Join(parent, "work"))
+	assertDirectory(t, filepath.Join(parent, "work"))
 	assertSettingsUnchanged(t, service, store, runtime, original, oldPath, 0)
 }
 
-func TestSettingsServiceCompleteSetupRollsBackRuntimeAndCleansCreatedBaseAfterSaveFailure(t *testing.T) {
+func TestSettingsServiceCompleteSetupRollsBackRuntimeAndPreservesCreatedBaseAfterSaveFailure(t *testing.T) {
 	parent := t.TempDir()
 	service, store, runtime, original := newIncompleteSettingsService(t)
 	oldPath := runtime.path
@@ -603,7 +603,7 @@ func TestSettingsServiceCompleteSetupRollsBackRuntimeAndCleansCreatedBaseAfterSa
 	if !reflect.DeepEqual(runtime.switchCalls, []string{target, oldPath}) {
 		t.Errorf("SwitchBase calls = %v, want [%q %q]", runtime.switchCalls, target, oldPath)
 	}
-	assertNotExist(t, target)
+	assertDirectory(t, target)
 	assertDirectory(t, oldPath)
 	assertSettingsUnchanged(t, service, store, runtime, original, oldPath, 1)
 }
@@ -662,7 +662,7 @@ func TestSettingsServiceCompleteSetupRollbackFailureBlocksLaterMutation(t *testi
 	}
 }
 
-func TestSettingsServiceCompleteSetupFromEmptyRuntimeRollsBackAndCleansCreatedBase(t *testing.T) {
+func TestSettingsServiceCompleteSetupFromEmptyRuntimeRollsBackAndPreservesCreatedBase(t *testing.T) {
 	completed := false
 	original := model.Config{SetupCompleted: &completed}
 	store := &fakeConfigStore{config: &original, saveErr: errors.New("disk full")}
@@ -686,7 +686,7 @@ func TestSettingsServiceCompleteSetupFromEmptyRuntimeRollsBackAndCleansCreatedBa
 	if runtime.path != "" {
 		t.Errorf("runtime path = %q, want empty", runtime.path)
 	}
-	assertNotExist(t, filepath.Join(parent, "work"))
+	assertDirectory(t, filepath.Join(parent, "work"))
 	if !reflect.DeepEqual(service.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
 		t.Errorf("config changed: service %#v store %#v want %#v", service.GetConfig(), *store.config, original)
 	}
@@ -841,18 +841,40 @@ func TestSettingsServiceAddBaseRejectsExactDuplicateNameWithoutMutation(t *testi
 	assertSettingsUnchanged(t, service, store, runtime, original, oldPath, 0)
 }
 
-func TestSettingsServiceAddBaseRemovesCreatedBaseAfterSaveFailure(t *testing.T) {
+func TestSettingsServiceAddBasePreservesCreatedBaseAndDataAfterSaveFailure(t *testing.T) {
 	parent := t.TempDir()
 	service, store, runtime, original := newIncompleteSettingsService(t)
 	oldPath := runtime.path
 	saveErr := errors.New("disk full")
+	started := make(chan struct{})
+	release := make(chan struct{})
 	store.saveErr = saveErr
+	store.saveStarted = started
+	store.saveRelease = release
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
+		done <- err
+	}()
+	<-started
+	target := filepath.Join(parent, "work")
+	markerPath := filepath.Join(target, "marker")
+	if err := os.WriteFile(markerPath, []byte("user data"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	close(release)
 
-	_, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
+	err := <-done
 	if !errors.Is(err, saveErr) {
 		t.Fatalf("AddBase() error = %v, want wrapped %v", err, saveErr)
 	}
-	assertNotExist(t, filepath.Join(parent, "work"))
+	if strings.Contains(err.Error(), "cleanup") {
+		t.Errorf("AddBase() error = %q, do not want cleanup error", err)
+	}
+	contents, readErr := os.ReadFile(markerPath)
+	if readErr != nil || string(contents) != "user data" {
+		t.Errorf("created base marker = %q, %v; want preserved user data", contents, readErr)
+	}
 	assertDirectory(t, oldPath)
 	assertSettingsUnchanged(t, service, store, runtime, original, oldPath, 1)
 	if len(runtime.switchCalls) != 0 {
@@ -886,135 +908,7 @@ func TestSettingsServiceAddBasePreservesConnectedDirectoryAfterSaveFailure(t *te
 	}
 }
 
-func TestSettingsServiceAddBaseRefusesCleanupOfReplacementEntry(t *testing.T) {
-	tests := []struct {
-		name    string
-		replace func(*testing.T, string)
-		check   func(*testing.T, string)
-	}{
-		{
-			name: "file",
-			replace: func(t *testing.T, path string) {
-				if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
-					t.Fatalf("WriteFile() error = %v", err)
-				}
-			},
-			check: func(t *testing.T, path string) {
-				contents, err := os.ReadFile(path)
-				if err != nil || string(contents) != "replacement" {
-					t.Errorf("replacement file = %q, %v; want preserved", contents, err)
-				}
-			},
-		},
-		{
-			name: "directory",
-			replace: func(t *testing.T, path string) {
-				if err := os.Mkdir(path, 0o755); err != nil {
-					t.Fatalf("Mkdir() error = %v", err)
-				}
-				if err := os.WriteFile(filepath.Join(path, "marker"), []byte("replacement"), 0o600); err != nil {
-					t.Fatalf("WriteFile() error = %v", err)
-				}
-			},
-			check: func(t *testing.T, path string) {
-				contents, err := os.ReadFile(filepath.Join(path, "marker"))
-				if err != nil || string(contents) != "replacement" {
-					t.Errorf("replacement marker = %q, %v; want preserved", contents, err)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			parent := t.TempDir()
-			service, store, _, _ := newIncompleteSettingsService(t)
-			started := make(chan struct{})
-			release := make(chan struct{})
-			store.saveStarted = started
-			store.saveRelease = release
-			store.saveErr = errors.New("disk full")
-			done := make(chan error, 1)
-			go func() {
-				_, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
-				done <- err
-			}()
-			<-started
-			target := filepath.Join(parent, "work")
-			if err := os.Remove(target); err != nil {
-				t.Fatalf("Remove() error = %v", err)
-			}
-			tt.replace(t, target)
-			close(release)
-			err := <-done
-			if !errors.Is(err, store.saveErr) {
-				t.Fatalf("AddBase() error = %v, want wrapped %v", err, store.saveErr)
-			}
-			if !strings.Contains(err.Error(), "refuse cleanup") {
-				t.Errorf("AddBase() error = %q, want cleanup refusal", err)
-			}
-			tt.check(t, target)
-		})
-	}
-}
-
-func TestSettingsServiceAddBaseRefusesCleanupOfSymlinkToMovedOriginal(t *testing.T) {
-	parent := t.TempDir()
-	probePath := filepath.Join(parent, "symlink-probe")
-	createSymlinkOrSkip(t, ".", probePath)
-	if err := os.Remove(probePath); err != nil {
-		t.Fatalf("Remove(symlink probe) error = %v", err)
-	}
-	service, store, _, _ := newIncompleteSettingsService(t)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	store.saveStarted = started
-	store.saveRelease = release
-	store.saveErr = errors.New("disk full")
-	done := make(chan error, 1)
-	go func() {
-		_, err := service.AddBase(model.BaseMutationRequest{Mode: "create", Name: "work", Path: parent})
-		done <- err
-	}()
-	<-started
-
-	createdPath := filepath.Join(parent, "work")
-	movedPath := filepath.Join(parent, "moved-work")
-	markerPath := filepath.Join(createdPath, "marker")
-	if err := os.WriteFile(markerPath, []byte("keep"), 0o600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-	if err := os.Rename(createdPath, movedPath); err != nil {
-		t.Fatalf("Rename() error = %v", err)
-	}
-	if err := os.Symlink(filepath.Base(movedPath), createdPath); err != nil {
-		close(release)
-		<-done
-		t.Fatalf("Symlink() error after successful probe = %v", err)
-	}
-	close(release)
-
-	err := <-done
-	if !errors.Is(err, store.saveErr) {
-		t.Fatalf("AddBase() error = %v, want wrapped %v", err, store.saveErr)
-	}
-	if !strings.Contains(err.Error(), "refuse cleanup") {
-		t.Errorf("AddBase() error = %q, want cleanup refusal", err)
-	}
-	info, statErr := os.Lstat(createdPath)
-	if statErr != nil {
-		t.Fatalf("Lstat(replacement symlink) error = %v", statErr)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Errorf("replacement mode = %v, want symlink", info.Mode())
-	}
-	contents, readErr := os.ReadFile(filepath.Join(movedPath, "marker"))
-	if readErr != nil || string(contents) != "keep" {
-		t.Errorf("moved directory marker = %q, %v; want preserved", contents, readErr)
-	}
-}
-
-func TestSettingsServiceAddBaseCleanupIsAnchoredAcrossParentSymlinkRetarget(t *testing.T) {
+func TestSettingsServiceAddBasePreservesCanonicalCreatedBaseAcrossParentSymlinkRetarget(t *testing.T) {
 	physicalParent := t.TempDir()
 	alternateParent := t.TempDir()
 	link := filepath.Join(t.TempDir(), "bases")
@@ -1044,7 +938,7 @@ func TestSettingsServiceAddBaseCleanupIsAnchoredAcrossParentSymlinkRetarget(t *t
 	if !errors.Is(err, store.saveErr) {
 		t.Fatalf("AddBase() error = %v, want wrapped %v", err, store.saveErr)
 	}
-	assertNotExist(t, filepath.Join(physicalParent, "work"))
+	assertDirectory(t, filepath.Join(physicalParent, "work"))
 	contents, readErr := os.ReadFile(filepath.Join(alternateTarget, "marker"))
 	if readErr != nil || string(contents) != "keep" {
 		t.Errorf("alternate replacement = %q, %v; want preserved", contents, readErr)
@@ -1113,14 +1007,6 @@ func assertDirectory(t *testing.T, path string) {
 	}
 	if !info.IsDir() {
 		t.Fatalf("Stat(%q).IsDir() = false, want true", path)
-	}
-}
-
-func assertNotExist(t *testing.T, path string) {
-	t.Helper()
-	_, err := os.Stat(path)
-	if !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Stat(%q) error = %v, want not exist", path, err)
 	}
 }
 
