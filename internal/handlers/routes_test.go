@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,7 +34,7 @@ func TestRouterGuardsNoteRoutesBeforeSetup(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			router.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, nil))
+			router.ServeHTTP(recorder, newLocalRouterRequest(test.method, test.path, nil))
 
 			assertAPIErrorResponse(t, recorder, http.StatusPreconditionRequired, model.APIError{
 				Code:    "setup_required",
@@ -128,7 +129,7 @@ func TestRouterLeavesSettingsAndInfoAvailableBeforeSetup(t *testing.T) {
 			router := NewRouter(NewNoteHandler(fixture.notes), fixture.handler, fixture.handler.settings, http.NotFoundHandler())
 			recorder := httptest.NewRecorder()
 
-			router.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, strings.NewReader(body)))
+			router.ServeHTTP(recorder, newLocalRouterRequest(test.method, test.path, strings.NewReader(body)))
 
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("status = %d, want %d; body = %q", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -162,7 +163,7 @@ func TestRouterRejectsUnsupportedMethodsBeforeSetup(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			router.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, nil))
+			router.ServeHTTP(recorder, newLocalRouterRequest(test.method, test.path, nil))
 
 			assertAPIErrorResponse(t, recorder, http.StatusMethodNotAllowed, model.APIError{
 				Code:    "method_not_allowed",
@@ -182,7 +183,7 @@ func TestRouterUsesLiveSetupStateAndPreservesQuery(t *testing.T) {
 
 	setup := httptest.NewRecorder()
 	setupBody := mutationJSON(t, model.BaseMutationRequest{Mode: "connect", Name: "primary", Path: basePath})
-	router.ServeHTTP(setup, httptest.NewRequest(http.MethodPost, "/api/setup", strings.NewReader(setupBody)))
+	router.ServeHTTP(setup, newLocalRouterRequest(http.MethodPost, "/api/setup", strings.NewReader(setupBody)))
 	if setup.Code != http.StatusOK {
 		t.Fatalf("setup status = %d, want %d; body = %q", setup.Code, http.StatusOK, setup.Body.String())
 	}
@@ -191,7 +192,7 @@ func TestRouterUsesLiveSetupStateAndPreservesQuery(t *testing.T) {
 	}
 
 	note := httptest.NewRecorder()
-	router.ServeHTTP(note, httptest.NewRequest(http.MethodGet, "/api/note?id=query.md&preserved=yes", nil))
+	router.ServeHTTP(note, newLocalRouterRequest(http.MethodGet, "/api/note?id=query.md&preserved=yes", nil))
 
 	var response map[string]string
 	decodeHandlerJSON(t, note, http.StatusOK, &response)
@@ -214,7 +215,7 @@ func TestRouterFallsBackToSPAForUnmatchedPaths(t *testing.T) {
 
 	for _, path := range []string{"/notes/view?note=one", "/api/not-registered?value=two"} {
 		recorder := httptest.NewRecorder()
-		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		router.ServeHTTP(recorder, newLocalRouterRequest(http.MethodGet, path, nil))
 		if recorder.Code != http.StatusTeapot {
 			t.Errorf("%s status = %d, want %d", path, recorder.Code, http.StatusTeapot)
 		}
@@ -240,6 +241,12 @@ func addRouterBase(t *testing.T, fixture settingsHandlerFixture, name string) {
 	}); err != nil {
 		t.Fatalf("SettingsService.AddBase() error = %v", err)
 	}
+}
+
+func newLocalRouterRequest(method, target string, body io.Reader) *http.Request {
+	request := httptest.NewRequest(method, target, body)
+	request.Host = "localhost:8080"
+	return request
 }
 
 func TestRouterMethodErrorsAreJSON(t *testing.T) {
