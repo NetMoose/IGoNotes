@@ -328,12 +328,12 @@ func cleanRelativeNotePath(path string, allowEmpty bool) (string, error) {
 		}
 		return "", ErrInvalidNotePath
 	}
-	if filepath.IsAbs(path) {
+	if !filepath.IsLocal(path) {
 		return "", ErrInvalidNotePath
 	}
 
 	cleanPath := filepath.Clean(path)
-	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+	if cleanPath == "." {
 		return "", ErrInvalidNotePath
 	}
 	return cleanPath, nil

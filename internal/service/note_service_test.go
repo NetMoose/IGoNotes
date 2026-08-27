@@ -400,6 +400,32 @@ func TestNoteServiceRejectsInvalidConcretePathsAndAllowsNestedPaths(t *testing.T
 	}
 }
 
+func TestCleanRelativeNotePathLocalityAndEmptyHandling(t *testing.T) {
+	for _, path := range []string{"", ".", "..", filepath.Join("..", "outside.md"), filepath.Join(string(filepath.Separator), "absolute.md")} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := cleanRelativeNotePath(path, false); !errors.Is(err, ErrInvalidNotePath) {
+				t.Errorf("cleanRelativeNotePath(%q, false) error = %v, want ErrInvalidNotePath", path, err)
+			}
+		})
+	}
+
+	if got, err := cleanRelativeNotePath("", true); err != nil || got != "" {
+		t.Errorf("cleanRelativeNotePath(empty, true) = %q, %v; want empty, nil", got, err)
+	}
+	if _, err := cleanRelativeNotePath(".", true); !errors.Is(err, ErrInvalidNotePath) {
+		t.Errorf("cleanRelativeNotePath(dot, true) error = %v, want ErrInvalidNotePath", err)
+	}
+
+	path := filepath.Join("topic", "section", "..", "note.md")
+	got, err := cleanRelativeNotePath(path, false)
+	if err != nil {
+		t.Fatalf("cleanRelativeNotePath(%q, false) error = %v", path, err)
+	}
+	if want := filepath.Clean(path); got != want {
+		t.Errorf("cleanRelativeNotePath(%q, false) = %q, want %q", path, got, want)
+	}
+}
+
 func TestNoteServiceOpenRawFileValidatesPathsAndUnlocksOnce(t *testing.T) {
 	base := t.TempDir()
 	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("content"), 0644); err != nil {
