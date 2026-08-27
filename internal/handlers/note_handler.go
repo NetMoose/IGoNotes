@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 
@@ -300,6 +301,10 @@ func (h *NoteHandler) UploadAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.MultipartForm != nil {
 		defer r.MultipartForm.RemoveAll()
+	}
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		WriteAPIError(w, http.StatusBadRequest, "file_too_large", "File too large", "file")
+		return
 	}
 
 	file, header, err := r.FormFile("file")

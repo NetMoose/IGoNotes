@@ -195,7 +195,45 @@ func TestNoteHandlerUploadAssetRejectsOversizedTotalRequest(t *testing.T) {
 	assertAPIErrorResponse(t, recorder, http.StatusBadRequest, model.APIError{Code: "file_too_large", Message: "File too large", Field: "file"})
 }
 
-func TestNoteHandlerUploadAssetSavesSmallFile(t *testing.T) {
+func TestNoteHandlerUploadAssetRejectsOversizedMultipartEpilogue(t *testing.T) {
+	base := t.TempDir()
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	notes := service.NewNoteService(handlerNoteRepository{}, base)
+	t.Cleanup(func() {
+		if err := notes.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v", err)
+		}
+	})
+	body, contentType := multipartUploadBody(t, "small-with-epilogue.txt", []byte("small content"))
+	body.Write(bytes.Repeat([]byte("private epilogue detail"), int(maxAssetRequestSize)/len("private epilogue detail")+1))
+	if int64(body.Len()) <= maxAssetRequestSize {
+		t.Fatalf("multipart body size = %d, want greater than %d", body.Len(), maxAssetRequestSize)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/assets", body)
+	request.ContentLength = -1 // Exercise the capped read path used by chunked requests.
+	request.Header.Set("Content-Type", contentType)
+	recorder := httptest.NewRecorder()
+
+	NewNoteHandler(notes).UploadAsset(recorder, request)
+
+	if _, err := os.Stat(filepath.Join(base, "assets")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("oversized epilogue created base assets, stat error = %v", err)
+	}
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("os.ReadDir(temp) error = %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("oversized epilogue leaked temp artifacts: %v", entries)
+	}
+	assertAPIErrorResponse(t, recorder, http.StatusBadRequest, model.APIError{Code: "file_too_large", Message: "File too large", Field: "file"})
+	if strings.Contains(recorder.Body.String(), "private epilogue") {
+		t.Fatalf("response leaked epilogue read details: %q", recorder.Body.String())
+	}
+}
+
+func TestNoteHandlerUploadAssetSavesSmallFileWithWhitespaceEpilogue(t *testing.T) {
 	base := t.TempDir()
 	notes := service.NewNoteService(handlerNoteRepository{}, base)
 	t.Cleanup(func() {
@@ -205,6 +243,7 @@ func TestNoteHandlerUploadAssetSavesSmallFile(t *testing.T) {
 	})
 	wantContent := []byte("small asset content")
 	body, contentType := multipartUploadBody(t, "small.txt", wantContent)
+	body.WriteString("\r\n \t\r\n")
 	request := httptest.NewRequest(http.MethodPost, "/api/assets", body)
 	request.Header.Set("Content-Type", contentType)
 	recorder := httptest.NewRecorder()
