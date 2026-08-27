@@ -143,18 +143,64 @@ func (s *NoteService) SwitchBase(target string) error {
 	return nil
 }
 
-func (s *NoteService) persistConfig(store ConfigStore, next *model.Config) error {
+func (s *NoteService) baseMatches(expectedPath string) (bool, error) {
+	s.baseMu.RLock()
+	defer s.baseMu.RUnlock()
+	if s.baseErr != nil {
+		return false, s.baseErr
+	}
+	matches, _, err := s.baseIdentityLocked(expectedPath)
+	return matches, err
+}
+
+func (s *NoteService) persistConfig(expectedPath string, store ConfigStore, next *model.Config) (bool, error) {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
 	if s.baseErr != nil {
-		return s.baseErr
+		return false, s.baseErr
 	}
 	if store == nil || next == nil {
-		return os.ErrInvalid
+		return false, os.ErrInvalid
 	}
 
+	matches, canonicalExpected, err := s.baseIdentityLocked(expectedPath)
+	if err != nil {
+		return false, err
+	}
+	if !matches {
+		return false, nil
+	}
 	config := cloneConfig(*next)
-	return store.Save(&config)
+	if err := store.Save(&config); err != nil {
+		return true, err
+	}
+	s.basePath = canonicalExpected
+	return true, nil
+}
+
+func (s *NoteService) baseIdentityLocked(expectedPath string) (bool, string, error) {
+	if expectedPath == "" {
+		return s.baseRoot == nil, "", nil
+	}
+	canonicalExpected, err := canonicalExistingDirectory(expectedPath)
+	if err != nil {
+		return false, "", err
+	}
+	expectedRoot, err := os.OpenRoot(canonicalExpected)
+	if err != nil {
+		return false, "", err
+	}
+	expectedInfo, expectedErr := expectedRoot.Stat(".")
+	var pinnedInfo fs.FileInfo
+	var pinnedErr error
+	if s.baseRoot != nil {
+		pinnedInfo, pinnedErr = s.baseRoot.Stat(".")
+	}
+	closeErr := expectedRoot.Close()
+	if err := errors.Join(expectedErr, pinnedErr, closeErr); err != nil {
+		return false, "", err
+	}
+	return s.baseRoot != nil && os.SameFile(expectedInfo, pinnedInfo), canonicalExpected, nil
 }
 
 func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, next *model.Config) (error, error) {

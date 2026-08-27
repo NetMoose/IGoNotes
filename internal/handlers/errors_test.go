@@ -25,6 +25,7 @@ func TestWriteServiceError(t *testing.T) {
 		{name: "setup required", err: fmt.Errorf("request failed: %w", service.ErrSetupRequired), status: http.StatusPreconditionRequired, want: model.APIError{Code: "setup_required", Message: "setup required"}},
 		{name: "setup already completed", err: fmt.Errorf("request failed: %w", service.ErrSetupAlreadyCompleted), status: http.StatusConflict, want: model.APIError{Code: "setup_already_completed", Message: "setup already completed"}},
 		{name: "setup cannot reopen", err: fmt.Errorf("request failed: %w", service.ErrSetupCannotReopen), status: http.StatusConflict, want: model.APIError{Code: "setup_cannot_reopen", Message: "setup cannot be reopened"}},
+		{name: "runtime path changed", err: fmt.Errorf("secret displaced path /private/base: %w", service.ErrRuntimePathChanged), status: http.StatusConflict, want: model.APIError{Code: "runtime_path_changed", Message: "runtime base path changed"}},
 		{name: "invalid config", err: fmt.Errorf("request failed: %w", service.ErrInvalidConfig), status: http.StatusUnprocessableEntity, want: model.APIError{Code: "invalid_config", Message: "invalid config"}},
 		{name: "invalid mode", err: fmt.Errorf("request failed: %w", service.ErrInvalidMode), status: http.StatusBadRequest, want: model.APIError{Code: "invalid_mode", Message: "invalid mode"}},
 		{name: "invalid name", err: fmt.Errorf("request failed: %w", service.ErrInvalidName), status: http.StatusUnprocessableEntity, want: model.APIError{Code: "invalid_base_name", Message: "invalid name"}},

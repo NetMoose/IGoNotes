@@ -15,14 +15,15 @@ import (
 type ConfigStore interface {
 	Load() (*model.Config, error)
 	// Save only persists the supplied snapshot. It must not call BaseRuntime:
-	// runtime switches invoke Save while holding the runtime base lock.
+	// runtime persistence invokes Save while holding the runtime base lock.
 	Save(*model.Config) error
 }
 
 type BaseRuntime interface {
 	GetBasePath() string
 	SwitchBase(string) error
-	persistConfig(ConfigStore, *model.Config) error
+	baseMatches(string) (bool, error)
+	persistConfig(string, ConfigStore, *model.Config) (matches bool, err error)
 	switchBaseTransaction(string, ConfigStore, *model.Config) (operationErr, rollbackErr error)
 }
 
@@ -58,28 +59,34 @@ func NewSettingsService(
 		return nil, fmt.Errorf("load settings: %w: store returned nil config", ErrInvalidConfig)
 	}
 	config := cloneConfig(*loadedConfig)
+	effectiveBaseName := config.CurrentBase
+	if activeBaseName != "" {
+		effectiveBaseName = activeBaseName
+	}
+	expectedPath, err := configuredBasePath(config, effectiveBaseName)
+	if err != nil {
+		return nil, fmt.Errorf("current base %q: %w", effectiveBaseName, err)
+	}
 
-	if config.SetupCompleted == nil {
+	migratedSetup := config.SetupCompleted == nil
+	if migratedSetup {
 		completed := config.BaseDir != "" || len(config.Bases) != 0 || config.CurrentBase != ""
 		config.SetupCompleted = &completed
-		if err := notes.persistConfig(store, &config); err != nil {
+		matches, err := notes.persistConfig(expectedPath, store, &config)
+		if err != nil {
 			return nil, fmt.Errorf("migrate setup state: %w", err)
+		}
+		if !matches {
+			return nil, fmt.Errorf("migrate setup state: %w", ErrRuntimePathChanged)
 		}
 	}
 
-	runtimePath := notes.GetBasePath()
-	structurallyEmpty := config.BaseDir == "" && len(config.Bases) == 0 && config.CurrentBase == ""
-	setupIncomplete := config.SetupCompleted != nil && !*config.SetupCompleted
-	if !(structurallyEmpty && setupIncomplete && runtimePath == "" && activeBaseName == "") {
-		effectiveBaseName := config.CurrentBase
-		if activeBaseName != "" {
-			effectiveBaseName = activeBaseName
+	if !migratedSetup {
+		matches, err := notes.baseMatches(expectedPath)
+		if err != nil {
+			return nil, fmt.Errorf("inspect current runtime base: %w", err)
 		}
-		index := baseIndex(config.Bases, effectiveBaseName)
-		if index < 0 {
-			return nil, fmt.Errorf("current base %q: %w", effectiveBaseName, ErrBaseNotFound)
-		}
-		if filepath.Clean(config.Bases[index].Path) != filepath.Clean(runtimePath) {
+		if !matches {
 			return nil, &FieldError{
 				Kind:    ErrInvalidConfig,
 				Field:   "current_base",
@@ -199,34 +206,25 @@ func createBaseDirectory(prepared preparedBase) error {
 }
 
 func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string) error {
-	if targetPath == "" {
-		if err := s.notes.persistConfig(s.store, &next); err != nil {
-			return fmt.Errorf("save settings: %w", err)
-		}
+	expectedPath, err := configuredBasePath(next, next.CurrentBase)
+	if err != nil {
+		return err
+	}
+	matches, err := s.notes.persistConfig(expectedPath, s.store, &next)
+	if err != nil {
+		return fmt.Errorf("save settings: %w", err)
+	}
+	if matches {
 		s.config = cloneConfig(next)
 		return nil
 	}
-
-	currentPath := s.notes.GetBasePath()
-	canonicalCurrent := ""
-	if currentPath != "" {
-		var err error
-		canonicalCurrent, err = canonicalExistingDirectory(currentPath)
-		if err != nil {
-			return fmt.Errorf("resolve current runtime base %q: %w", currentPath, err)
-		}
+	if targetPath == "" {
+		return ErrRuntimePathChanged
 	}
+
 	canonicalTarget, err := canonicalExistingDirectory(targetPath)
 	if err != nil {
 		return fmt.Errorf("resolve target runtime base %q: %w", targetPath, err)
-	}
-	requiresTransaction := canonicalTarget != canonicalCurrent || currentPath != canonicalTarget
-	if !requiresTransaction {
-		if err := s.notes.persistConfig(s.store, &next); err != nil {
-			return fmt.Errorf("save settings: %w", err)
-		}
-		s.config = cloneConfig(next)
-		return nil
 	}
 
 	operationErr, rollbackErr := s.notes.switchBaseTransaction(canonicalTarget, s.store, &next)
@@ -529,4 +527,15 @@ func baseIndex(bases []model.Base, name string) int {
 		}
 	}
 	return -1
+}
+
+func configuredBasePath(config model.Config, name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	index := baseIndex(config.Bases, name)
+	if index < 0 {
+		return "", ErrBaseNotFound
+	}
+	return config.Bases[index].Path, nil
 }

@@ -58,10 +58,12 @@ type fakeBaseRuntime struct {
 	pathCalls        int
 	switchCalls      []string
 	persistCalls     int
+	persistMatches   *bool
 	transactionCalls []string
 	switchErr        error
 	switchErrs       []error
 	persistErr       error
+	matchErr         error
 	events           *orderedEvents
 	commitErr        error
 }
@@ -89,12 +91,35 @@ func (f *fakeBaseRuntime) SwitchBase(path string) error {
 	return nil
 }
 
-func (f *fakeBaseRuntime) persistConfig(store ConfigStore, next *model.Config) error {
+func (f *fakeBaseRuntime) baseMatches(expectedPath string) (bool, error) {
+	f.pathCalls++
+	if f.matchErr != nil {
+		return false, f.matchErr
+	}
+	matches := filepath.Clean(f.path) == filepath.Clean(expectedPath)
+	if f.persistMatches != nil {
+		matches = *f.persistMatches
+	}
+	return matches, nil
+}
+
+func (f *fakeBaseRuntime) persistConfig(expectedPath string, store ConfigStore, next *model.Config) (bool, error) {
 	f.persistCalls++
 	if f.persistErr != nil {
-		return f.persistErr
+		return false, f.persistErr
 	}
-	return store.Save(next)
+	matches := filepath.Clean(f.path) == filepath.Clean(expectedPath)
+	if f.persistMatches != nil {
+		matches = *f.persistMatches
+	}
+	if !matches {
+		return false, nil
+	}
+	if err := store.Save(next); err != nil {
+		return true, err
+	}
+	f.path = expectedPath
+	return true, nil
 }
 
 func (f *fakeBaseRuntime) switchBaseTransaction(path string, store ConfigStore, next *model.Config) (error, error) {
@@ -255,11 +280,11 @@ func TestNewSettingsServiceRejectsCLIBaseForStructurallyEmptyConfig(t *testing.T
 	if !errors.Is(err, ErrBaseNotFound) {
 		t.Fatalf("NewSettingsService() error = %v, want ErrBaseNotFound", err)
 	}
-	if store.saveCalls != 1 {
-		t.Errorf("Save calls = %d, want 1 setup migration", store.saveCalls)
+	if store.saveCalls != 0 {
+		t.Errorf("Save calls = %d, want none before CLI base validation", store.saveCalls)
 	}
-	if store.config.SetupCompleted == nil || *store.config.SetupCompleted {
-		t.Errorf("persisted SetupCompleted = %v, want false", store.config.SetupCompleted)
+	if store.config.SetupCompleted != nil {
+		t.Errorf("persisted SetupCompleted = %v, want unchanged nil", store.config.SetupCompleted)
 	}
 }
 
@@ -1343,6 +1368,7 @@ func TestSettingsServiceSwitchBaseRejectsRuntimePathResolutionFailures(t *testin
 	t.Run("current runtime", func(t *testing.T) {
 		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
 		runtime.path = filepath.Join(t.TempDir(), "missing-current")
+		runtime.persistErr = os.ErrNotExist
 		_, err := service.SwitchBase("other")
 		if !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("SwitchBase() error = %v, want underlying os.ErrNotExist", err)

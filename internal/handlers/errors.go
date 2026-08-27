@@ -23,6 +23,7 @@ var serviceErrorMappings = []serviceErrorMapping{
 	{service.ErrSetupRequired, http.StatusPreconditionRequired, "setup_required", service.ErrSetupRequired.Error()},
 	{service.ErrSetupAlreadyCompleted, http.StatusConflict, "setup_already_completed", service.ErrSetupAlreadyCompleted.Error()},
 	{service.ErrSetupCannotReopen, http.StatusConflict, "setup_cannot_reopen", service.ErrSetupCannotReopen.Error()},
+	{service.ErrRuntimePathChanged, http.StatusConflict, "runtime_path_changed", service.ErrRuntimePathChanged.Error()},
 	{service.ErrInvalidConfig, http.StatusUnprocessableEntity, "invalid_config", service.ErrInvalidConfig.Error()},
 	{service.ErrInvalidMode, http.StatusBadRequest, "invalid_mode", service.ErrInvalidMode.Error()},
 	{service.ErrInvalidName, http.StatusUnprocessableEntity, "invalid_base_name", service.ErrInvalidName.Error()},

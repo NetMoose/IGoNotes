@@ -224,6 +224,199 @@ func TestSettingsServiceConfigOnlyPersistenceBlocksConcurrentSync(t *testing.T) 
 	}
 }
 
+func TestSettingsServiceConfigOnlyMutationsRejectReplacedActivePath(t *testing.T) {
+	operations := []struct {
+		name string
+		call func(*SettingsService, model.Config, string) error
+	}{
+		{name: "add", call: func(settings *SettingsService, _ model.Config, path string) error {
+			_, err := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: path})
+			return err
+		}},
+		{name: "forget inactive", call: func(settings *SettingsService, _ model.Config, _ string) error {
+			_, err := settings.ForgetBase("inactive")
+			return err
+		}},
+		{name: "update inactive", call: func(settings *SettingsService, _ model.Config, path string) error {
+			_, err := settings.UpdateBase("inactive", model.BaseUpdateRequest{Name: "renamed", Path: path})
+			return err
+		}},
+		{name: "replace without target", call: func(settings *SettingsService, config model.Config, _ string) error {
+			settings.mu.Lock()
+			defer settings.mu.Unlock()
+			return settings.applyConfigLocked(config, "")
+		}},
+	}
+
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			settings, store, notes, _, original, activePath, displacedPath := newSettingsWithReplacedActivePath(t)
+			mutationPath := t.TempDir()
+
+			err := operation.call(settings, cloneConfig(original), mutationPath)
+			if !errors.Is(err, ErrRuntimePathChanged) {
+				t.Fatalf("mutation error = %v, want ErrRuntimePathChanged", err)
+			}
+			if store.saveCalls != 0 || !reflect.DeepEqual(settings.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
+				t.Errorf("rejected mutation changed config: saves %d service %#v store %#v", store.saveCalls, settings.GetConfig(), *store.config)
+			}
+			if content, err := notes.GetNoteContent("note.md"); err != nil || content != "original" {
+				t.Errorf("pinned note = %q, %v; want original, nil", content, err)
+			}
+			assertFileContent(t, filepath.Join(displacedPath, "note.md"), []byte("original"))
+			assertFileContent(t, filepath.Join(activePath, "note.md"), []byte("replacement"))
+		})
+	}
+}
+
+func TestSettingsServiceExplicitActiveOperationsRebindReplacedPath(t *testing.T) {
+	operations := []struct {
+		name string
+		call func(*SettingsService, model.Config) error
+	}{
+		{name: "switch same base", call: func(settings *SettingsService, _ model.Config) error {
+			_, err := settings.SwitchBase("active")
+			return err
+		}},
+		{name: "update active", call: func(settings *SettingsService, config model.Config) error {
+			_, err := settings.UpdateBase("active", model.BaseUpdateRequest{Name: "active", Path: config.Bases[0].Path})
+			return err
+		}},
+		{name: "replace config", call: func(settings *SettingsService, config model.Config) error {
+			_, err := settings.ReplaceConfig(config)
+			return err
+		}},
+	}
+
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			settings, store, notes, repo, original, activePath, displacedPath := newSettingsWithReplacedActivePath(t)
+
+			if err := operation.call(settings, cloneConfig(original)); err != nil {
+				t.Fatalf("operation error = %v", err)
+			}
+			if store.saveCalls != 1 || !reflect.DeepEqual(settings.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
+				t.Errorf("rebind config state: saves %d service %#v store %#v", store.saveCalls, settings.GetConfig(), *store.config)
+			}
+			if content, err := notes.GetNoteContent("note.md"); err != nil || content != "replacement" {
+				t.Errorf("rebound note = %q, %v; want replacement, nil", content, err)
+			}
+			if got := notes.GetBasePath(); got != activePath {
+				t.Errorf("runtime path = %q, want %q", got, activePath)
+			}
+			assertRepositoryIDs(t, repo, "note.md", "replacement-only.md")
+			assertFileContent(t, filepath.Join(displacedPath, "note.md"), []byte("original"))
+			assertFileContent(t, filepath.Join(displacedPath, "original-only.md"), []byte("old"))
+		})
+	}
+}
+
+func TestSettingsServiceIdentitySavePublishesCanonicalPathOnlyAfterSuccess(t *testing.T) {
+	physicalPath := t.TempDir()
+	writeTestNote(t, physicalPath, "note.md", "content")
+	aliasPath := filepath.Join(t.TempDir(), "alias")
+	createSymlinkOrSkip(t, physicalPath, aliasPath)
+	completed := true
+	original := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: aliasPath}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+
+	for _, test := range []struct {
+		name    string
+		saveErr error
+	}{
+		{name: "success"},
+		{name: "save failure", saveErr: errors.New("save failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &fakeNoteRepository{}
+			notes := newTestNoteService(t, repo, aliasPath)
+			if err := notes.SyncFS(); err != nil {
+				t.Fatalf("SyncFS() error = %v", err)
+			}
+			originalRoot := notes.baseRoot
+			config := cloneConfig(original)
+			store := &fakeConfigStore{config: &config, saveErr: test.saveErr}
+			settings, err := NewSettingsService(store, notes, "", nil)
+			if err != nil {
+				t.Fatalf("NewSettingsService() error = %v", err)
+			}
+
+			_, err = settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: t.TempDir()})
+			if test.saveErr != nil {
+				if !errors.Is(err, test.saveErr) {
+					t.Fatalf("AddBase() error = %v, want %v", err, test.saveErr)
+				}
+				if got := notes.GetBasePath(); got != aliasPath {
+					t.Errorf("runtime path after failed save = %q, want alias %q", got, aliasPath)
+				}
+				if !reflect.DeepEqual(settings.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
+					t.Errorf("config changed after failed save: service %#v store %#v", settings.GetConfig(), *store.config)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("AddBase() error = %v", err)
+				}
+				if got := notes.GetBasePath(); got != physicalPath {
+					t.Errorf("runtime path after save = %q, want canonical %q", got, physicalPath)
+				}
+			}
+			if notes.baseRoot != originalRoot {
+				t.Error("identity save replaced the pinned root")
+			}
+			if content, err := notes.GetNoteContent("note.md"); err != nil || content != "content" {
+				t.Errorf("GetNoteContent() = %q, %v; want content, nil", content, err)
+			}
+			if repo.prepareCalls != 1 || repo.commitCalls != 1 {
+				t.Errorf("index transactions = prepare %d commit %d, want initial sync only", repo.prepareCalls, repo.commitCalls)
+			}
+		})
+	}
+}
+
+func newSettingsWithReplacedActivePath(t *testing.T) (*SettingsService, *fakeConfigStore, *NoteService, *fakeNoteRepository, model.Config, string, string) {
+	t.Helper()
+	parent := t.TempDir()
+	activePath := filepath.Join(parent, "active")
+	if err := os.Mkdir(activePath, 0o755); err != nil {
+		t.Fatalf("Mkdir(active) error = %v", err)
+	}
+	writeTestNote(t, activePath, "note.md", "original")
+	writeTestNote(t, activePath, "original-only.md", "old")
+	inactivePath := t.TempDir()
+	repo := &fakeNoteRepository{}
+	notes := newTestNoteService(t, repo, activePath)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	completed := true
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: activePath},
+			{Name: "inactive", Path: inactivePath},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &config}
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	displacedPath := filepath.Join(parent, "displaced")
+	if err := os.Rename(activePath, displacedPath); err != nil {
+		t.Fatalf("Rename(active, displaced) error = %v", err)
+	}
+	if err := os.Mkdir(activePath, 0o755); err != nil {
+		t.Fatalf("Mkdir(replacement) error = %v", err)
+	}
+	writeTestNote(t, activePath, "note.md", "replacement")
+	writeTestNote(t, activePath, "replacement-only.md", "new")
+	return settings, store, notes, repo, cloneConfig(config), activePath, displacedPath
+}
+
 func TestNewSettingsServiceMigrationBlocksConcurrentSync(t *testing.T) {
 	basePath := t.TempDir()
 	writeTestNote(t, basePath, "note.md", "content")
@@ -303,6 +496,84 @@ func TestNewSettingsServiceMigrationBlocksConcurrentSync(t *testing.T) {
 	if prepareCalls != 1 || commitCalls != 1 {
 		t.Errorf("SyncFS transaction calls = prepare %d commit %d, want 1 and 1", prepareCalls, commitCalls)
 	}
+}
+
+func TestNewSettingsServiceMigrationRejectsReplacedActivePath(t *testing.T) {
+	parent := t.TempDir()
+	activePath := filepath.Join(parent, "active")
+	if err := os.Mkdir(activePath, 0o755); err != nil {
+		t.Fatalf("Mkdir(active) error = %v", err)
+	}
+	writeTestNote(t, activePath, "original.md", "original")
+	notes := newTestNoteService(t, &fakeNoteRepository{}, activePath)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	displacedPath := filepath.Join(parent, "displaced")
+	if err := os.Rename(activePath, displacedPath); err != nil {
+		t.Fatalf("Rename(active, displaced) error = %v", err)
+	}
+	if err := os.Mkdir(activePath, 0o755); err != nil {
+		t.Fatalf("Mkdir(replacement) error = %v", err)
+	}
+	writeTestNote(t, activePath, "replacement.md", "replacement")
+	original := model.Config{
+		Bases:       []model.Base{{Name: "active", Path: activePath}},
+		CurrentBase: "active",
+	}
+	store := &fakeConfigStore{config: &original}
+
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if settings != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", settings)
+	}
+	if !errors.Is(err, ErrRuntimePathChanged) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrRuntimePathChanged", err)
+	}
+	if store.saveCalls != 0 || !reflect.DeepEqual(*store.config, original) {
+		t.Errorf("rejected migration changed store: saves %d config %#v", store.saveCalls, *store.config)
+	}
+	if content, err := notes.GetNoteContent("original.md"); err != nil || content != "original" {
+		t.Errorf("pinned note = %q, %v; want original, nil", content, err)
+	}
+	assertFileContent(t, filepath.Join(displacedPath, "original.md"), []byte("original"))
+	assertFileContent(t, filepath.Join(activePath, "replacement.md"), []byte("replacement"))
+}
+
+func TestNewSettingsServiceRejectsReplacedActiveIdentity(t *testing.T) {
+	parent := t.TempDir()
+	activePath := filepath.Join(parent, "active")
+	if err := os.Mkdir(activePath, 0o755); err != nil {
+		t.Fatalf("Mkdir(active) error = %v", err)
+	}
+	writeTestNote(t, activePath, "original.md", "original")
+	notes := newTestNoteService(t, &fakeNoteRepository{}, activePath)
+	displacedPath := filepath.Join(parent, "displaced")
+	if err := os.Rename(activePath, displacedPath); err != nil {
+		t.Fatalf("Rename(active, displaced) error = %v", err)
+	}
+	if err := os.Mkdir(activePath, 0o755); err != nil {
+		t.Fatalf("Mkdir(replacement) error = %v", err)
+	}
+	completed := true
+	original := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: activePath}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &original}
+
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if settings != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", settings)
+	}
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrInvalidConfig", err)
+	}
+	if store.saveCalls != 0 || !reflect.DeepEqual(*store.config, original) {
+		t.Errorf("rejected constructor changed store: saves %d config %#v", store.saveCalls, *store.config)
+	}
+	assertFileContent(t, filepath.Join(displacedPath, "original.md"), []byte("original"))
 }
 
 func TestNoteServiceBasePersistenceRollbackRetainsPinnedOldRoot(t *testing.T) {

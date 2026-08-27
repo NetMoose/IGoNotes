@@ -16,6 +16,7 @@ var (
 	ErrActiveBase            = errors.New("active base")
 	ErrLastBase              = errors.New("last base")
 	ErrRollbackFailed        = errors.New("rollback failed")
+	ErrRuntimePathChanged    = errors.New("runtime base path changed")
 )
 
 type FieldError struct {
