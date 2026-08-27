@@ -95,6 +95,7 @@ func (s *NoteService) SyncFS() error {
 func (s *NoteService) Close() error {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
+	s.once.Do(func() { close(s.initialSyncDone) })
 
 	if s.baseRoot == nil {
 		err := s.closeErr
@@ -582,6 +583,10 @@ func (s *NoteService) RenameNode(id, newName string) error {
 	if s.basePath == "" || newName == "" {
 		return os.ErrInvalid
 	}
+	sourceEntry, err := s.baseRoot.Lstat(rootPath(cleanID))
+	if err != nil {
+		return normalizeRootError(err)
+	}
 	info, err := s.baseRoot.Stat(rootPath(cleanID))
 	if err != nil {
 		return normalizeRootError(err)
@@ -600,8 +605,13 @@ func (s *NoteService) RenameNode(id, newName string) error {
 	if cleanID == newPath {
 		return s.replaceIndexLocked()
 	}
-	if destinationInfo, err := s.baseRoot.Stat(rootPath(newPath)); err == nil {
-		if !os.SameFile(info, destinationInfo) {
+	if destinationEntry, err := s.baseRoot.Lstat(rootPath(newPath)); err == nil {
+		if destinationEntry.Mode()&os.ModeSymlink != 0 {
+			if _, err := s.baseRoot.Stat(rootPath(newPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return normalizeRootError(err)
+			}
+		}
+		if !os.SameFile(sourceEntry, destinationEntry) {
 			return ErrAlreadyExists
 		}
 	} else if !os.IsNotExist(err) {

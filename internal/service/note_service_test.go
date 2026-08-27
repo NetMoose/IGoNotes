@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -323,6 +324,21 @@ func TestNoteServiceCloseReleasesPinnedRootAndRejectsFurtherAccess(t *testing.T)
 	}
 }
 
+func TestNoteServiceCloseBeforeInitialSyncReleasesTreeWait(t *testing.T) {
+	service := newTestNoteService(t, &fakeNoteRepository{}, t.TempDir())
+	if err := service.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case <-service.initialSyncDone:
+	default:
+		t.Fatal("Close() did not release the initial tree wait")
+	}
+	if _, err := service.GetTree(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("GetTree() error = %v, want os.ErrClosed", err)
+	}
+}
+
 func TestNoteServicePinsInitialBaseRootAfterPathReplacement(t *testing.T) {
 	tests := []struct {
 		name string
@@ -557,6 +573,29 @@ func TestNoteServiceRenameSerializesDestinationCheckAgainstCreate(t *testing.T) 
 	assertFileContent(t, filepath.Join(base, "destination.md"), []byte("source"))
 }
 
+func TestNoteServiceRenameSymlinkAliasRejectsTargetEntry(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target.md")
+	alias := filepath.Join(base, "alias.md")
+	want := []byte("target content")
+	if err := os.WriteFile(target, want, 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	requireSymlink(t, "target.md", alias)
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+
+	if err := service.RenameNode("alias.md", "target.md"); !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("RenameNode() error = %v, want ErrAlreadyExists", err)
+	}
+	assertFileContent(t, target, want)
+	info, err := os.Lstat(alias)
+	if err != nil {
+		t.Errorf("os.Lstat(alias) error = %v", err)
+	} else if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("alias mode = %v, want symlink", info.Mode())
+	}
+}
+
 func TestNoteServiceAllowsSymlinksConfinedWithinPinnedRoot(t *testing.T) {
 	base := t.TempDir()
 	if err := os.WriteFile(filepath.Join(base, "target.md"), []byte("target"), 0o600); err != nil {
@@ -785,13 +824,13 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 
 	t.Run("delete through parent", func(t *testing.T) {
 		base, outside, marker := symlinkEscapeFixture(t, "linked")
-		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: filepath.Join("linked", "marker.md")}}}
+		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: path.Join("linked", "marker.md")}}}
 		err := newTestNoteService(t, repo, base).DeleteNode(filepath.Join("linked", "marker.md"))
 		if !errors.Is(err, ErrInvalidNotePath) {
 			t.Fatalf("DeleteNode() error = %v, want ErrInvalidNotePath", err)
 		}
 		assertFileContent(t, filepath.Join(outside, "marker.md"), marker)
-		assertRepositoryIDs(t, repo, filepath.Join("linked", "marker.md"))
+		assertRepositoryIDs(t, repo, path.Join("linked", "marker.md"))
 	})
 
 	t.Run("delete symlink entry only", func(t *testing.T) {
@@ -818,7 +857,7 @@ func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
 			setup: func(t *testing.T, base, outside string) {
 				requireSymlink(t, outside, filepath.Join(base, "linked"))
 			},
-			id: filepath.Join("linked", "marker.md"), to: "renamed",
+			id: path.Join("linked", "marker.md"), to: "renamed",
 		},
 		{
 			name: "source",
@@ -1028,21 +1067,21 @@ func TestNoteServiceSaveAssetPreservesRelativeNamingAndCollisions(t *testing.T) 
 	if err != nil {
 		t.Fatalf("SaveAsset(first) error = %v", err)
 	}
-	if want := filepath.Join("assets", "images", "upload.png"); first != want {
+	if want := path.Join("assets", "images", "upload.png"); first != want {
 		t.Errorf("SaveAsset(first) path = %q, want %q", first, want)
 	}
 	second, err := service.SaveAsset(strings.NewReader("second"), "upload.png")
 	if err != nil {
 		t.Fatalf("SaveAsset(second) error = %v", err)
 	}
-	if second == first || filepath.Dir(second) != filepath.Join("assets", "images") {
+	if second == first || path.Dir(second) != path.Join("assets", "images") {
 		t.Errorf("SaveAsset(second) path = %q, want distinct assets/images path", second)
 	}
 	third, err := service.SaveAsset(strings.NewReader("third"), "upload.png")
 	if err != nil {
 		t.Fatalf("SaveAsset(third) error = %v", err)
 	}
-	if third == first || third == second || filepath.Dir(third) != filepath.Join("assets", "images") {
+	if third == first || third == second || path.Dir(third) != path.Join("assets", "images") {
 		t.Errorf("SaveAsset(third) path = %q, want third distinct assets/images path", third)
 	}
 	assertFileContent(t, filepath.Join(base, first), []byte("first"))
@@ -1273,7 +1312,7 @@ func TestCleanRelativeNotePathLocalityAndEmptyHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cleanRelativeNotePath(%q, false) error = %v", path, err)
 	}
-	if want := filepath.Clean(path); got != want {
+	if want := "topic/note.md"; got != want {
 		t.Errorf("cleanRelativeNotePath(%q, false) = %q, want %q", path, got, want)
 	}
 }
