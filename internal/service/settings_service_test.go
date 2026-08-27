@@ -94,6 +94,24 @@ func TestNewSettingsServiceMigratesStructurallyEmptyConfig(t *testing.T) {
 	}
 }
 
+func TestNewSettingsServiceRejectsCLIBaseForStructurallyEmptyConfig(t *testing.T) {
+	store := &fakeConfigStore{config: &model.Config{}}
+
+	service, err := NewSettingsService(store, &fakeBaseRuntime{}, "missing", nil)
+	if service != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", service)
+	}
+	if !errors.Is(err, ErrBaseNotFound) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrBaseNotFound", err)
+	}
+	if store.saveCalls != 1 {
+		t.Errorf("Save calls = %d, want 1 setup migration", store.saveCalls)
+	}
+	if store.config.SetupCompleted == nil || *store.config.SetupCompleted {
+		t.Errorf("persisted SetupCompleted = %v, want false", store.config.SetupCompleted)
+	}
+}
+
 func TestNewSettingsServicePreservesExplicitSetupState(t *testing.T) {
 	tests := []struct {
 		name        string

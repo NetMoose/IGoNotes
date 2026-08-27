@@ -62,7 +62,7 @@ func NewSettingsService(
 	runtimePath := notes.GetBasePath()
 	structurallyEmpty := config.BaseDir == "" && len(config.Bases) == 0 && config.CurrentBase == ""
 	setupIncomplete := config.SetupCompleted != nil && !*config.SetupCompleted
-	if !(structurallyEmpty && setupIncomplete && runtimePath == "") {
+	if !(structurallyEmpty && setupIncomplete && runtimePath == "" && activeBaseName == "") {
 		effectiveBaseName := config.CurrentBase
 		if activeBaseName != "" {
 			effectiveBaseName = activeBaseName
