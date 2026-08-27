@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -292,6 +293,150 @@ func TestSettingsServicePreparationFailureWithSuccessfulRollbackRemainsOperation
 	}
 	if store.saveCalls != 1 || response.BasePath != target {
 		t.Errorf("Save calls/path = %d / %q, want 1 / %q", store.saveCalls, response.BasePath, target)
+	}
+}
+
+func TestSettingsServiceConfigOnlyMutationsRejectFailedRuntimeWithoutSave(t *testing.T) {
+	operations := []struct {
+		name string
+		call func(*SettingsService, model.Config, string) error
+	}{
+		{name: "add", call: func(settings *SettingsService, _ model.Config, path string) error {
+			_, err := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: path})
+			return err
+		}},
+		{name: "forget inactive", call: func(settings *SettingsService, _ model.Config, _ string) error {
+			_, err := settings.ForgetBase("inactive")
+			return err
+		}},
+		{name: "update inactive", call: func(settings *SettingsService, _ model.Config, path string) error {
+			_, err := settings.UpdateBase("inactive", model.BaseUpdateRequest{Name: "renamed", Path: path})
+			return err
+		}},
+		{name: "replace without runtime switch", call: func(settings *SettingsService, config model.Config, _ string) error {
+			_, err := settings.ReplaceConfig(config)
+			return err
+		}},
+		{name: "switch current base", call: func(settings *SettingsService, _ model.Config, _ string) error {
+			_, err := settings.SwitchBase("active")
+			return err
+		}},
+	}
+
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			activePath := t.TempDir()
+			inactivePath := t.TempDir()
+			mutationPath := t.TempDir()
+			writeTestNote(t, activePath, "old.md", "old")
+			operationErr := errors.New("prepare index failed")
+			rollbackErr := errors.New("prepare rollback failed")
+			repo := &fakeNoteRepository{prepareErr: operationErr, prepareRollbackErr: rollbackErr}
+			notes := newTestNoteService(t, repo, activePath)
+			completed := true
+			config := model.Config{
+				Bases: []model.Base{
+					{Name: "active", Path: activePath},
+					{Name: "inactive", Path: inactivePath},
+				},
+				CurrentBase:    "active",
+				SetupCompleted: &completed,
+			}
+			store := &fakeConfigStore{config: &config}
+			settings, err := NewSettingsService(store, notes, "", nil)
+			if err != nil {
+				t.Fatalf("NewSettingsService() error = %v", err)
+			}
+			if err := notes.SyncFS(); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+				t.Fatalf("SyncFS() error = %v, want fail-closed preparation errors", err)
+			}
+
+			err = operation.call(settings, cloneConfig(config), mutationPath)
+			if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+				t.Fatalf("mutation error = %v, want runtime preparation and rollback errors", err)
+			}
+			if store.saveCalls != 0 {
+				t.Errorf("Save calls = %d, want none", store.saveCalls)
+			}
+			if !reflect.DeepEqual(settings.GetConfig(), config) || !reflect.DeepEqual(*store.config, config) {
+				t.Errorf("config changed after rejected mutation: service %#v store %#v", settings.GetConfig(), *store.config)
+			}
+		})
+	}
+}
+
+func TestSettingsServiceConfigOnlyMutationRejectsClosedRuntimeWithoutSave(t *testing.T) {
+	activePath := t.TempDir()
+	addedPath := t.TempDir()
+	notes := NewNoteService(&fakeNoteRepository{}, activePath)
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: activePath}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &config}
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	if err := notes.Close(); err != nil {
+		t.Fatalf("NoteService.Close() error = %v", err)
+	}
+
+	if _, err := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: addedPath}); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("AddBase() error = %v, want os.ErrClosed", err)
+	}
+	if store.saveCalls != 0 || !reflect.DeepEqual(settings.GetConfig(), config) {
+		t.Errorf("closed runtime mutation changed state: saves %d config %#v", store.saveCalls, settings.GetConfig())
+	}
+}
+
+func TestSettingsServiceConfigStoreRollbackSentinelDoesNotPoisonRuntime(t *testing.T) {
+	activePath := t.TempDir()
+	addedPath := t.TempDir()
+	writeTestNote(t, activePath, "note.md", "content")
+	repo := &fakeNoteRepository{}
+	notes := newTestNoteService(t, repo, activePath)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	originalRoot := notes.baseRoot
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: activePath}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	storeErr := fmt.Errorf("write config: %w", ErrRollbackFailed)
+	store := &fakeConfigStore{config: &config, saveErr: storeErr}
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	request := model.BaseMutationRequest{Mode: "connect", Name: "added", Path: addedPath}
+
+	if _, err := settings.AddBase(request); !errors.Is(err, storeErr) {
+		t.Fatalf("first AddBase() error = %v, want %v", err, storeErr)
+	}
+	store.saveErr = nil
+	if _, err := settings.AddBase(request); err != nil {
+		t.Fatalf("second AddBase() error = %v", err)
+	}
+	if store.saveCalls != 2 {
+		t.Errorf("Save calls = %d, want 2", store.saveCalls)
+	}
+	if content, err := notes.GetNoteContent("note.md"); err != nil || content != "content" {
+		t.Errorf("GetNoteContent() = %q, %v; want content, nil", content, err)
+	}
+	if notes.baseRoot != originalRoot || notes.GetBasePath() != activePath {
+		t.Errorf("runtime changed after config saves: root %p/%p path %q", notes.baseRoot, originalRoot, notes.GetBasePath())
+	}
+	repo.mu.Lock()
+	prepareCalls, commitCalls := repo.prepareCalls, repo.commitCalls
+	repo.mu.Unlock()
+	if prepareCalls != 1 || commitCalls != 1 {
+		t.Errorf("index transactions = prepare %d commit %d, want initial sync only", prepareCalls, commitCalls)
 	}
 }
 

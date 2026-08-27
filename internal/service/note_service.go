@@ -143,6 +143,20 @@ func (s *NoteService) SwitchBase(target string) error {
 	return nil
 }
 
+func (s *NoteService) persistConfig(store ConfigStore, next *model.Config) error {
+	s.baseMu.Lock()
+	defer s.baseMu.Unlock()
+	if s.baseErr != nil {
+		return s.baseErr
+	}
+	if store == nil || next == nil {
+		return os.ErrInvalid
+	}
+
+	config := cloneConfig(*next)
+	return store.Save(&config)
+}
+
 func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, next *model.Config) (error, error) {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()

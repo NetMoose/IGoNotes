@@ -57,9 +57,11 @@ type fakeBaseRuntime struct {
 	path             string
 	pathCalls        int
 	switchCalls      []string
+	persistCalls     int
 	transactionCalls []string
 	switchErr        error
 	switchErrs       []error
+	persistErr       error
 	events           *orderedEvents
 	commitErr        error
 }
@@ -85,6 +87,14 @@ func (f *fakeBaseRuntime) SwitchBase(path string) error {
 	}
 	f.path = path
 	return nil
+}
+
+func (f *fakeBaseRuntime) persistConfig(store ConfigStore, next *model.Config) error {
+	f.persistCalls++
+	if f.persistErr != nil {
+		return f.persistErr
+	}
+	return store.Save(next)
 }
 
 func (f *fakeBaseRuntime) switchBaseTransaction(path string, store ConfigStore, next *model.Config) (error, error) {
@@ -178,6 +188,32 @@ func TestNewSettingsServiceMigratesStructurallyEmptyConfig(t *testing.T) {
 	}
 	if store.config.SetupCompleted == nil || *store.config.SetupCompleted {
 		t.Errorf("persisted SetupCompleted = %v, want false", store.config.SetupCompleted)
+	}
+}
+
+func TestSettingsServiceEmptyHealthyRuntimePersistsConfigOnlyMutation(t *testing.T) {
+	completed := false
+	config := model.Config{SetupCompleted: &completed}
+	store := &fakeConfigStore{config: &config}
+	notes := newTestNoteService(t, &fakeNoteRepository{}, "")
+	service, err := NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	basePath := t.TempDir()
+
+	response, err := service.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "first", Path: basePath})
+	if err != nil {
+		t.Fatalf("AddBase() error = %v", err)
+	}
+	if store.saveCalls != 1 {
+		t.Errorf("Save calls = %d, want 1", store.saveCalls)
+	}
+	if response.BasePath != "" || notes.GetBasePath() != "" {
+		t.Errorf("runtime path changed: response %q service %q", response.BasePath, notes.GetBasePath())
+	}
+	if len(response.Config.Bases) != 1 || response.Config.Bases[0].Path != basePath {
+		t.Errorf("persisted config = %#v, want added base %q", response.Config, basePath)
 	}
 }
 
@@ -837,6 +873,28 @@ func TestSettingsServiceAddBaseCreatesAndAppendsWithoutSwitching(t *testing.T) {
 	*response.Config.SetupCompleted = true
 	if !reflect.DeepEqual(service.GetConfig(), want) {
 		t.Errorf("response aliases service config: got %#v, want %#v", service.GetConfig(), want)
+	}
+}
+
+func TestSettingsServiceRuntimeHealthErrorDoesNotLatchDegradedState(t *testing.T) {
+	service, store, runtime, original := newIncompleteSettingsService(t)
+	healthCause := errors.New("runtime index state is uncertain")
+	healthErr := errors.Join(ErrRollbackFailed, healthCause)
+	runtime.persistErr = healthErr
+	request := model.BaseMutationRequest{Mode: "connect", Name: "later", Path: t.TempDir()}
+
+	if _, err := service.AddBase(request); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, healthCause) {
+		t.Fatalf("first AddBase() error = %v, want runtime health error", err)
+	}
+	if store.saveCalls != 0 || !reflect.DeepEqual(service.GetConfig(), original) {
+		t.Errorf("failed health check changed state: saves %d config %#v", store.saveCalls, service.GetConfig())
+	}
+	runtime.persistErr = nil
+	if _, err := service.AddBase(request); err != nil {
+		t.Fatalf("second AddBase() error = %v", err)
+	}
+	if runtime.persistCalls != 2 || store.saveCalls != 1 {
+		t.Errorf("persistence calls = runtime %d store %d, want 2 and 1", runtime.persistCalls, store.saveCalls)
 	}
 }
 

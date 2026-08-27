@@ -146,6 +146,84 @@ func TestNoteServiceBasePersistencePublishesOnlyAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceConfigOnlyPersistenceBlocksConcurrentSync(t *testing.T) {
+	activePath := t.TempDir()
+	addedPath := t.TempDir()
+	writeTestNote(t, activePath, "note.md", "content")
+	repo := &fakeNoteRepository{}
+	notes := newTestNoteService(t, repo, activePath)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("initial SyncFS() error = %v", err)
+	}
+	repo.mu.Lock()
+	repo.prepareCalls = 0
+	repo.commitCalls = 0
+	repo.mu.Unlock()
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: activePath}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
+	store := &fakeConfigStore{config: &config, saveStarted: persistStarted, saveRelease: persistRelease}
+	settings, err := NewSettingsService(store, notes, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	persistDone := make(chan error, 1)
+	go func() {
+		_, err := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: addedPath})
+		persistDone <- err
+	}()
+	<-persistStarted
+
+	baseLockAvailable := notes.baseMu.TryLock()
+	if baseLockAvailable {
+		notes.baseMu.Unlock()
+	}
+	syncStarted := make(chan struct{})
+	syncDone := make(chan error, 1)
+	go func() {
+		close(syncStarted)
+		syncDone <- notes.SyncFS()
+	}()
+	<-syncStarted
+	for range 10 {
+		runtime.Gosched()
+	}
+	syncCompletedEarly := false
+	select {
+	case err := <-syncDone:
+		syncCompletedEarly = true
+		t.Errorf("SyncFS() completed during config persistence: %v", err)
+	default:
+	}
+
+	close(persistRelease)
+	if err := <-persistDone; err != nil {
+		t.Fatalf("AddBase() error = %v", err)
+	}
+	if !syncCompletedEarly {
+		if err := <-syncDone; err != nil {
+			t.Fatalf("SyncFS() after persistence error = %v", err)
+		}
+	}
+	if baseLockAvailable {
+		t.Error("runtime base lock was available while config persistence was blocked")
+	}
+	if store.saveCalls != 1 {
+		t.Errorf("Save calls = %d, want 1", store.saveCalls)
+	}
+	repo.mu.Lock()
+	prepareCalls, commitCalls := repo.prepareCalls, repo.commitCalls
+	repo.mu.Unlock()
+	if prepareCalls != 1 || commitCalls != 1 {
+		t.Errorf("SyncFS transaction calls = prepare %d commit %d, want 1 and 1", prepareCalls, commitCalls)
+	}
+}
+
 func TestNoteServiceBasePersistenceRollbackRetainsPinnedOldRoot(t *testing.T) {
 	parent := t.TempDir()
 	oldPath := filepath.Join(parent, "base")

@@ -22,6 +22,7 @@ type ConfigStore interface {
 type BaseRuntime interface {
 	GetBasePath() string
 	SwitchBase(string) error
+	persistConfig(ConfigStore, *model.Config) error
 	switchBaseTransaction(string, ConfigStore, *model.Config) (operationErr, rollbackErr error)
 }
 
@@ -199,7 +200,7 @@ func createBaseDirectory(prepared preparedBase) error {
 
 func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string) error {
 	if targetPath == "" {
-		if err := s.store.Save(&next); err != nil {
+		if err := s.notes.persistConfig(s.store, &next); err != nil {
 			return fmt.Errorf("save settings: %w", err)
 		}
 		s.config = cloneConfig(next)
@@ -221,7 +222,7 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 	}
 	requiresTransaction := canonicalTarget != canonicalCurrent || currentPath != canonicalTarget
 	if !requiresTransaction {
-		if err := s.store.Save(&next); err != nil {
+		if err := s.notes.persistConfig(s.store, &next); err != nil {
 			return fmt.Errorf("save settings: %w", err)
 		}
 		s.config = cloneConfig(next)
