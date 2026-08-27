@@ -996,8 +996,12 @@ Expected: каждый пункт подтверждён тестом или п�
 
 - [x] **Step 4: Синхронизировать команды запуска и описание путей**
 
-Пользовательский пример запуска больше не подставляет ненастроенное имя базы, а executable-команды в `README.md`, `docs` и `site/docs` используют пакет `./cmd/api`. Флаг `--base` описан только как выбор имени из существующего `config.json`. Спецификация фиксирует семантический путь `~/.igonotes`, разрешение home через `os.UserHomeDir()` и понятную ошибку для недоступного или пустого home. Исторический snippet Task 5 помечен как заменённый этой задачей.
+Пользовательский пример запуска больше не подставляет ненастроенное имя базы, а Go executable-команды в `README.md`, `docs` и `site/docs` используют пакет `./cmd/api`. Флаг `--base` описан только как выбор имени из существующего `config.json`. Спецификация фиксирует семантический путь `~/.igonotes`, разрешение home через `os.UserHomeDir()` и понятную ошибку для недоступного или пустого home. Исторический snippet Task 5 помечен как заменённый этой задачей.
 
 - [x] **Step 5: Выполнить полную проверку и зафиксировать документацию**
 
 Проверены отсутствие устаревших команд repository-wide grep `git grep -n -E 'go (run|build)( -o [^ ]+)? +cmd/api/main\.go' -- '*.md'`, отсутствие незавершённых Step в плане, package build и run/help, `git diff --check` и полный smoke-run `go test ./...`. Документационные исправления зафиксированы commit `docs: align startup path documentation`, а три последовательных documentation command fixes — commits `9d667cd` (`docs: fix backend build command`), `561892f` (`docs: fix package-level Go commands`) и `8685007` (`docs: fix root backend build command`).
+
+- [x] **Step 6: Задокументировать prerequisite встроенного frontend для clean checkout**
+
+Active command sections в `README.md`, `docs/developer.md`, `site/docs/user.md` и `site/docs/developer.md` обновлены так, чтобы перед Go build/run существовал `web/dist`: пользовательский flow использует `make all` и `builds/igonotes`, а development flow явно выполняет `npm install` и `npm run build` в `web`. На clean archive выполнен `make all` и проверено создание `builds/igonotes`; исправления зафиксированы commit `docs: document embedded frontend build prerequisite`.

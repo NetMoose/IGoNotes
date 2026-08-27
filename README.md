@@ -45,9 +45,11 @@ IGoNotes/
 # Клонирование
 # Убедитесь, что вы находитесь в ветке develop
 
-go mod tidy
+# Полная сборка frontend и backend
+make all
 
-go run ./cmd/api
+# Запуск собранного приложения
+./builds/igonotes
 ```
 
 Сервер запустится на `http://localhost:8080`.

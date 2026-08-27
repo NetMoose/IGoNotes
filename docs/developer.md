@@ -20,29 +20,23 @@
 ## Запуск и сборка
 
 ```bash
-# Установка зависимостей
-go mod tidy
+# Сборка frontend, необходимого для go:embed
+cd web
+npm install
+npm run build
+cd ..
 
-# Запуск сервера
+# Запуск backend для разработки
 go run ./cmd/api --port 8080
-
-# Сборка бинарника
-go build -o igonotes ./cmd/api
 ```
 
-Рекомендуемая команда сборки:
+Для полной сборки frontend и бинарника используйте корневой `Makefile`:
 
-```Bash
-make build
+```bash
+make all
 ```
 
-Где `Makefile` содержит:
-
-```makefile
-build:
-    npm run build  # если используется JS-сборка
-    go build -o igonotes ./cmd/api
-```
+Цель `all: ui go` сначала выполняет `cd web && npm install && npm run build`, затем создаёт бинарник `builds/igonotes` командой `go build -o builds/igonotes ./cmd/...`.
 
 ## Фронтенд: сборка и внедрение
 
