@@ -12,6 +12,8 @@ import (
 	"IGoNotes/internal/model"
 )
 
+func boolPointer(value bool) *bool { return &value }
+
 func TestResolveStartupBaseInitializesDefaultConfig(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -63,10 +65,19 @@ func TestResolveStartupBaseInitializesDefaultConfig(t *testing.T) {
 					Path:     wantPath,
 					AutoSync: false,
 				}},
-				CurrentBase: "default",
+				CurrentBase:    "default",
+				SetupCompleted: boolPointer(false),
 			}
 			if !reflect.DeepEqual(gotConfig, wantConfig) {
 				t.Errorf("saved config = %#v, want %#v", gotConfig, wantConfig)
+			}
+
+			serialized, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatalf("os.ReadFile() error = %v, want nil", err)
+			}
+			if !bytes.Contains(serialized, []byte(`"setup_completed": false`)) {
+				t.Errorf("saved config = %s, want setup_completed false", serialized)
 			}
 		})
 	}
