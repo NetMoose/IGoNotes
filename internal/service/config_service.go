@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -56,8 +57,17 @@ func (s *ConfigService) Save(config *model.Config) error {
 	return os.WriteFile(s.configPath, data, 0644)
 }
 
-// Exists проверяет, существует ли файл конфигурации
-func (s *ConfigService) Exists() bool {
-	_, err := os.Stat(s.configPath)
-	return !os.IsNotExist(err)
+// NeedsInitialization сообщает, отсутствует ли файл конфигурации или является пустым.
+func (s *ConfigService) NeedsInitialization() (bool, error) {
+	info, err := os.Stat(s.configPath)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("путь конфигурации %q не является обычным файлом", s.configPath)
+	}
+	return info.Size() == 0, nil
 }

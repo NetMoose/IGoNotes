@@ -20,29 +20,23 @@
 ## Запуск и сборка
 
 ```bash
-# Установка зависимостей
-go mod tidy
+# Сборка frontend, необходимого для go:embed
+cd web
+npm install
+npm run build
+cd ..
 
-# Запуск сервера
-go run cmd/api/main.go --port 8080 --base mynotes
-
-# Сборка бинарника
-go build -o igonotes cmd/api/main.go
+# Запуск backend для разработки
+go run ./cmd/api --port 8080
 ```
 
-Рекомендуемая команда сборки:
+Для полной сборки frontend и бинарника используйте корневой `Makefile`:
 
-```Bash
-make build
+```bash
+make all
 ```
 
-Где `Makefile` содержит:
-
-```makefile
-build:
-    npm run build  # если используется JS-сборка
-    go build -o igonotes .
-```
+Цель `all: ui go` сначала выполняет `cd web && npm install && npm run build`, затем создаёт бинарник `builds/igonotes` командой `go build -o builds/igonotes ./cmd/...`.
 
 ## Фронтенд: сборка и внедрение
 
@@ -76,11 +70,12 @@ var staticFiles embed.FS
 ```
 
 ```
-~/.config/igonotes/
-└── config.json
+<os.UserConfigDir()>/
+└── igonotes/
+    └── config.json
 ```
 
-- Конфигурация приложения: `~/.config/igonotes/config.json` (XDG-совместимо)
+- Конфигурация приложения: `<os.UserConfigDir()>/igonotes/config.json`, где `os.UserConfigDir()` предоставляет системный каталог конфигурации. В Linux каталог конфигурации приложения — `$XDG_CONFIG_HOME/igonotes`, если `XDG_CONFIG_HOME` задана; иначе `~/.config/igonotes`.
 - BoltDB с метаданными: `~/.igonotes/metadata.db`
 - Каждая база может иметь `.git/`, если включена синхронизация
 
@@ -127,9 +122,9 @@ var staticFiles embed.FS
 
 Поддерживаемые флаги:
 
-- `--config` — путь к конфигурации (по умолчанию `~/.config/igonotes`)
+- `--config` — каталог конфигурации (по умолчанию `<os.UserConfigDir()>/igonotes`)
 - `--port` — порт сервера (по умолчанию 8080)
-- `--base` — имя базы для открытия
+- `--base` — имя уже настроенной базы, присутствующее в `config.json`
 - `--no-browser` — не открывать браузер автоматически
 
 ## Документация

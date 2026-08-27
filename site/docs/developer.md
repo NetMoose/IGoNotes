@@ -23,14 +23,21 @@ layout: default
 ## Запуск и сборка
 
 ```bash
-# Установка зависимостей
-go mod tidy
+# Сборка frontend, необходимого для go:embed
+cd web
+npm install
+npm run build
+cd ..
 
-# Запуск сервера
-go run cmd/api/main.go
+# Запуск backend для разработки
+go run ./cmd/api
+```
 
-# Сборка бинарника
-go build -o igonotes cmd/api/main.go
+Для полной сборки frontend и бинарника:
+
+```bash
+make all
+./builds/igonotes
 ```
 
 ## Работа с Git

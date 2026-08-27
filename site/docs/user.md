@@ -15,7 +15,8 @@ layout: default
    ```
 3. Запустите сервер:
    ```bash
-   go run cmd/api/main.go
+   make all
+   ./builds/igonotes
    ```
 4. Приложение автоматически откроет браузер с интерфейсом. Если этого не произошло — перейдите по адресу [http://localhost:8080](http://localhost:8080).
 
