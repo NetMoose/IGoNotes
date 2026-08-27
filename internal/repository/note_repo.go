@@ -2,6 +2,7 @@ package repository
 
 import (
 	"database/sql"
+
 	"IGoNotes/internal/model"
 )
 
@@ -43,15 +44,50 @@ func (r *NoteRepository) GetAllNodes() ([]model.NoteNode, error) {
 		if err := rows.Scan(&node.ID, &node.Name, &node.Path, &node.Type, &parentID); err != nil {
 			return nil, err
 		}
-		
+
 		if parentID.Valid {
 			node.ParentID = parentID.String
 		}
-		
+
 		nodes = append(nodes, node)
 	}
 
 	return nodes, nil
+}
+
+func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) (err error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.Exec("DELETE FROM notes"); err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO notes (id, title, path, parent_id, type) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, node := range nodes {
+		var parentID any
+		if node.ParentID != "" {
+			parentID = node.ParentID
+		}
+		if _, err = stmt.Exec(node.ID, node.Name, node.Path, parentID, node.Type); err != nil {
+			return err
+		}
+	}
+
+	err = tx.Commit()
+	return err
 }
 
 // ClearAll удаляет все записи (полезно при полной синхронизации, если мы не отслеживаем удаления точечно)
@@ -70,4 +106,3 @@ func (r *NoteRepository) DeleteNode(id string) error {
 	_, err := r.db.Exec("DELETE FROM notes WHERE id = ? OR id LIKE ?", id, id+"/%")
 	return err
 }
-
