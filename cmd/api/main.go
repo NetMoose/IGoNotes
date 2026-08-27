@@ -68,6 +68,10 @@ func main() {
 
 	// Инициализация сервисов
 	noteService := service.NewNoteService(noteRepo, basePath)
+	settingsService, err := service.NewSettingsService(configService, noteService, *base, log.Default())
+	if err != nil {
+		log.Fatal("Ошибка инициализации сервиса настроек: ", err)
+	}
 
 	// Запускаем первичную синхронизацию базы с диском при старте программы
 	go func() {
@@ -81,7 +85,7 @@ func main() {
 
 	// Создаем обработчики
 	noteHandler := handlers.NewNoteHandler(noteService)
-	configHandler := handlers.NewConfigHandler(configService)
+	settingsHandler := handlers.NewSettingsHandler(settingsService)
 
 	// Инициализация статики (фронтенд)
 	distFS, err := web.GetDistFS()
@@ -91,43 +95,7 @@ func main() {
 	spaHandler := handlers.NewSPAHandler(distFS)
 
 	// Маршрутизация
-	http.HandleFunc("/api/info", noteHandler.GetInfo)
-
-	http.HandleFunc("/api/notes", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			noteHandler.CreateNote(w, r)
-		} else {
-			noteHandler.GetNotes(w, r)
-		}
-	})
-
-	http.HandleFunc("/api/note", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			noteHandler.DeleteNote(w, r)
-		} else {
-			noteHandler.GetNote(w, r)
-		}
-	})
-
-	http.HandleFunc("/api/sync", noteHandler.SyncNotes)
-
-	http.HandleFunc("/api/raw", noteHandler.GetRawFile)
-
-	http.HandleFunc("/api/save", noteHandler.SaveNote)
-	http.HandleFunc("/api/rename", noteHandler.RenameNote)
-	http.HandleFunc("/api/assets", noteHandler.UploadAsset)
-
-	// API для работы с конфигурацией
-	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" {
-			configHandler.GetConfig(w, r)
-		} else {
-			configHandler.SaveConfig(w, r)
-		}
-	})
-
-	// Фронтенд (обрабатывает все остальные запросы)
-	http.Handle("/", spaHandler)
+	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
 
 	address := ":" + *port
 	url := "http://localhost" + address
@@ -140,7 +108,7 @@ func main() {
 		}
 	}
 
-	if err := http.ListenAndServe(address, nil); err != nil {
+	if err := http.ListenAndServe(address, router); err != nil {
 		log.Fatal(err)
 	}
 }
