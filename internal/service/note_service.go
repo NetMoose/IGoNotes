@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,49 +128,44 @@ func scanNotes(basePath string) ([]model.NoteNode, error) {
 		return nil, nil
 	}
 
-	walkRoot, err := filepath.EvalSymlinks(basePath)
+	root, err := os.OpenRoot(basePath)
 	if err != nil {
 		return nil, err
-	}
-	walkRoot = filepath.Clean(walkRoot)
-	info, err := os.Stat(walkRoot)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("base path is not a directory: %s", basePath)
 	}
 
 	var nodes []model.NoteNode
-	err = filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+	err = fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
 		// Пропускаем скрытые папки (.git) и assets
-		if path != walkRoot && info.IsDir() && (strings.HasPrefix(info.Name(), ".") || info.Name() == "assets") {
-			return filepath.SkipDir
+		if path != "." && entry.IsDir() && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "assets") {
+			return fs.SkipDir
 		}
 
 		// Игнорируем сам корень
-		if path == walkRoot {
+		if path == "." {
+			return nil
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 
 		// Вычисляем относительный путь (он же ID)
-		relPath, err := filepath.Rel(walkRoot, path)
-		if err != nil {
-			return err
-		}
+		relPath := filepath.FromSlash(path)
 
 		// Мы обрабатываем только папки и .md файлы
-		isDir := info.IsDir()
-		if !isDir && !strings.HasSuffix(strings.ToLower(info.Name()), ".md") {
+		isDir := entry.IsDir()
+		if !isDir && !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
 			return nil
 		}
 
 		id := relPath
-		title := info.Name()
+		title := entry.Name()
 		if !isDir {
 			title = strings.TrimSuffix(title, filepath.Ext(title)) // Убираем .md
 		}
@@ -194,7 +190,7 @@ func scanNotes(basePath string) ([]model.NoteNode, error) {
 		})
 		return nil
 	})
-	return nodes, err
+	return nodes, errors.Join(err, root.Close())
 }
 
 // GetTree возвращает иерархическое дерево заметок
@@ -251,17 +247,23 @@ func (s *NoteService) GetNoteContent(id string) (string, error) {
 		return "", os.ErrNotExist
 	}
 
-	// id - это относительный путь к файлу
-	fullPath := filepath.Join(s.basePath, cleanID)
-
-	data, err := os.ReadFile(fullPath)
+	root, err := os.OpenRoot(s.basePath)
 	if err != nil {
 		return "", err
+	}
+	defer root.Close()
+	if err := rejectRootSymlinkComponents(root, cleanID, false); err != nil {
+		return "", err
+	}
+
+	data, err := root.ReadFile(cleanID)
+	if err != nil {
+		return "", normalizeRootError(root, cleanID, false, err)
 	}
 	return string(data), nil
 }
 
-// GetAbsoluteFilePath возвращает полный абсолютный путь к файлу в базе
+// GetAbsoluteFilePath возвращает информационный полный путь, не являющийся безопасным дескриптором файла.
 func (s *NoteService) GetAbsoluteFilePath(relPath string) (string, error) {
 	cleanPath, err := cleanRelativeNotePath(relPath, false)
 	if err != nil {
@@ -272,6 +274,17 @@ func (s *NoteService) GetAbsoluteFilePath(relPath string) (string, error) {
 
 	if s.basePath == "" {
 		return "", os.ErrNotExist
+	}
+	root, err := os.OpenRoot(s.basePath)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	if err := rejectRootSymlinkComponents(root, cleanPath, false); err != nil {
+		return "", err
+	}
+	if _, err := root.Stat(cleanPath); err != nil {
+		return "", normalizeRootError(root, cleanPath, false, err)
 	}
 	return filepath.Join(s.basePath, cleanPath), nil
 }
@@ -287,21 +300,19 @@ func (s *NoteService) OpenRawFile(relPath string) (*LockedFile, os.FileInfo, err
 		return nil, nil, os.ErrNotExist
 	}
 
-	if err := rejectSymlinkComponents(s.basePath, cleanPath); err != nil {
-		s.baseMu.RUnlock()
-		return nil, nil, err
-	}
-
 	root, err := os.OpenRoot(s.basePath)
 	if err != nil {
 		s.baseMu.RUnlock()
 		return nil, nil, err
 	}
+	if err := rejectRootSymlinkComponents(root, cleanPath, false); err != nil {
+		closeErr := root.Close()
+		s.baseMu.RUnlock()
+		return nil, nil, errors.Join(err, closeErr)
+	}
 	file, err := root.Open(cleanPath)
 	if err != nil {
-		if symlinkErr := rejectSymlinkComponents(s.basePath, cleanPath); errors.Is(symlinkErr, ErrInvalidNotePath) {
-			err = errors.Join(symlinkErr, err)
-		}
+		err = normalizeRootError(root, cleanPath, false, err)
 		closeErr := root.Close()
 		s.baseMu.RUnlock()
 		return nil, nil, errors.Join(err, closeErr)
@@ -339,14 +350,21 @@ func cleanRelativeNotePath(path string, allowEmpty bool) (string, error) {
 	return cleanPath, nil
 }
 
-func rejectSymlinkComponents(basePath, relPath string) error {
-	current := basePath
-	for _, component := range strings.Split(relPath, string(filepath.Separator)) {
+func rejectRootSymlinkComponents(root *os.Root, relPath string, allowFinal bool) error {
+	components := strings.Split(relPath, string(filepath.Separator))
+	if allowFinal {
+		components = components[:len(components)-1]
+	}
+	current := ""
+	for _, component := range components {
 		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
+		info, err := root.Lstat(current)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
+			}
+			if isRootEscapeError(err) {
+				return fmt.Errorf("%w: %v", ErrInvalidNotePath, err)
 			}
 			return err
 		}
@@ -355,6 +373,41 @@ func rejectSymlinkComponents(basePath, relPath string) error {
 		}
 	}
 	return nil
+}
+
+func normalizeRootError(root *os.Root, relPath string, allowFinal bool, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isRootEscapeError(err) {
+		return fmt.Errorf("%w: %v", ErrInvalidNotePath, err)
+	}
+	if symlinkErr := rejectRootSymlinkComponents(root, relPath, allowFinal); errors.Is(symlinkErr, ErrInvalidNotePath) {
+		return errors.Join(symlinkErr, err)
+	}
+	return err
+}
+
+func isRootEscapeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err.Error() == "path escapes from parent" {
+		return true
+	}
+	type singleUnwrapper interface{ Unwrap() error }
+	if wrapped, ok := err.(singleUnwrapper); ok && isRootEscapeError(wrapped.Unwrap()) {
+		return true
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if wrapped, ok := err.(multiUnwrapper); ok {
+		for _, nested := range wrapped.Unwrap() {
+			if isRootEscapeError(nested) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // SaveNoteContent сохраняет содержимое заметки на диск
@@ -370,15 +423,21 @@ func (s *NoteService) SaveNoteContent(id string, content string) error {
 		return os.ErrNotExist
 	}
 
-	fullPath := filepath.Join(s.basePath, cleanID)
-
-	// Создаем директорию, если она вдруг не существует
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+	root, err := os.OpenRoot(s.basePath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := rejectRootSymlinkComponents(root, cleanID, false); err != nil {
 		return err
 	}
 
-	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
-		return err
+	parent := filepath.Dir(cleanID)
+	if err := root.MkdirAll(parent, 0755); err != nil {
+		return normalizeRootError(root, parent, false, err)
+	}
+	if err := root.WriteFile(cleanID, []byte(content), 0644); err != nil {
+		return normalizeRootError(root, cleanID, false, err)
 	}
 
 	return nil
@@ -409,8 +468,6 @@ func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNo
 		relPath = filepath.Join(cleanParentID, name)
 	}
 
-	fullPath := filepath.Join(s.basePath, relPath)
-
 	title := name
 	if nodeType == "file" {
 		title = strings.TrimSuffix(name, filepath.Ext(name))
@@ -424,31 +481,52 @@ func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNo
 		ParentID: cleanParentID,
 	}
 
+	root, err := os.OpenRoot(s.basePath)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if err := rejectRootSymlinkComponents(root, relPath, false); err != nil {
+		return nil, err
+	}
+
 	// Проверяем существование файла/папки
-	if _, err := os.Stat(fullPath); err == nil {
+	if info, err := root.Stat(relPath); err == nil {
 		// Объект уже существует. Возвращаем его данные и специальную ошибку.
 		// Если это папка, а хотели создать файл (или наоборот), мы просто вернем как есть, UI разберется.
-		info, _ := os.Stat(fullPath)
 		if info.IsDir() {
 			node.Type = "dir"
 		} else {
 			node.Type = "file"
 		}
 		return node, ErrAlreadyExists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, normalizeRootError(root, relPath, false, err)
 	}
 
 	// Создаем физически
+	parent := filepath.Dir(relPath)
+	if err := root.MkdirAll(parent, 0755); err != nil {
+		return nil, normalizeRootError(root, parent, false, err)
+	}
 	if nodeType == "dir" {
-		if err := os.MkdirAll(fullPath, 0755); err != nil {
-			return nil, err
+		if err := root.Mkdir(relPath, 0755); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return node, ErrAlreadyExists
+			}
+			return nil, normalizeRootError(root, relPath, false, err)
 		}
 	} else {
-		// Убедимся что папка существует
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-			return nil, err
+		file, err := root.OpenFile(relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return node, ErrAlreadyExists
+			}
+			return nil, normalizeRootError(root, relPath, false, err)
 		}
-		if err := os.WriteFile(fullPath, []byte("# "+strings.TrimSuffix(name, ".md")+"\n"), 0644); err != nil {
-			return nil, err
+		_, writeErr := file.WriteString("# " + strings.TrimSuffix(name, ".md") + "\n")
+		if closeErr := file.Close(); writeErr != nil || closeErr != nil {
+			return nil, errors.Join(writeErr, closeErr)
 		}
 	}
 
@@ -478,9 +556,16 @@ func (s *NoteService) DeleteNode(id string) error {
 		return os.ErrInvalid
 	}
 
-	fullPath := filepath.Join(s.basePath, cleanID)
-	if err := os.RemoveAll(fullPath); err != nil {
+	root, err := os.OpenRoot(s.basePath)
+	if err != nil {
 		return err
+	}
+	defer root.Close()
+	if err := rejectRootSymlinkComponents(root, cleanID, true); err != nil {
+		return err
+	}
+	if err := root.RemoveAll(cleanID); err != nil {
+		return normalizeRootError(root, cleanID, true, err)
 	}
 
 	return s.repo.DeleteNode(cleanID)
@@ -499,10 +584,17 @@ func (s *NoteService) RenameNode(id, newName string) error {
 		return os.ErrInvalid
 	}
 
-	oldPath := filepath.Join(s.basePath, cleanID)
-	info, err := os.Stat(oldPath)
+	root, err := os.OpenRoot(s.basePath)
 	if err != nil {
 		return err
+	}
+	defer root.Close()
+	if err := rejectRootSymlinkComponents(root, cleanID, false); err != nil {
+		return err
+	}
+	info, err := root.Stat(cleanID)
+	if err != nil {
+		return normalizeRootError(root, cleanID, false, err)
 	}
 
 	isDir := info.IsDir()
@@ -514,20 +606,23 @@ func (s *NoteService) RenameNode(id, newName string) error {
 		newName += ".md"
 	}
 
-	newPath := filepath.Join(filepath.Dir(oldPath), newName)
-	if filepath.Clean(oldPath) == filepath.Clean(newPath) {
+	newPath := filepath.Join(filepath.Dir(cleanID), newName)
+	if cleanID == newPath {
 		return s.replaceIndexLocked()
 	}
-	if destinationInfo, err := os.Stat(newPath); err == nil {
+	if err := rejectRootSymlinkComponents(root, newPath, false); err != nil {
+		return err
+	}
+	if destinationInfo, err := root.Stat(newPath); err == nil {
 		if !os.SameFile(info, destinationInfo) {
 			return ErrAlreadyExists
 		}
 	} else if !os.IsNotExist(err) {
-		return err
+		return normalizeRootError(root, newPath, false, err)
 	}
 
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return err
+	if err := root.Rename(cleanID, newPath); err != nil {
+		return normalizeRootError(root, cleanID, false, err)
 	}
 
 	// Синхронизируем ФС с БД, чтобы обновились все пути (особенно важно для папок, т.к. пути детей меняются)
@@ -543,9 +638,17 @@ func (s *NoteService) SaveAsset(file io.Reader, originalFilename string) (string
 		return "", os.ErrNotExist
 	}
 
-	assetsDir := filepath.Join(s.basePath, "assets", "images")
-	if err := os.MkdirAll(assetsDir, 0755); err != nil {
+	root, err := os.OpenRoot(s.basePath)
+	if err != nil {
 		return "", err
+	}
+	defer root.Close()
+	assetsDir := filepath.Join("assets", "images")
+	if err := rejectRootSymlinkComponents(root, assetsDir, false); err != nil {
+		return "", err
+	}
+	if err := root.MkdirAll(assetsDir, 0755); err != nil {
+		return "", normalizeRootError(root, assetsDir, false, err)
 	}
 
 	ext := filepath.Ext(originalFilename)
@@ -557,22 +660,24 @@ func (s *NoteService) SaveAsset(file io.Reader, originalFilename string) (string
 	}
 
 	filename := base + ext
-	fullPath := filepath.Join(assetsDir, filename)
-
-	// Если файл с таким именем уже существует, добавляем таймстемп
-	if _, err := os.Stat(fullPath); err == nil {
+	relPath := filepath.Join(assetsDir, filename)
+	outFile, err := root.OpenFile(relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if errors.Is(err, os.ErrExist) {
 		filename = fmt.Sprintf("%s_%d%s", base, time.Now().Unix(), ext)
-		fullPath = filepath.Join(assetsDir, filename)
+		relPath = filepath.Join(assetsDir, filename)
+		outFile, err = root.OpenFile(relPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	}
-
-	outFile, err := os.Create(fullPath)
 	if err != nil {
-		return "", err
+		if errors.Is(err, os.ErrExist) {
+			return "", ErrAlreadyExists
+		}
+		return "", normalizeRootError(root, relPath, false, err)
 	}
-	defer outFile.Close()
 
-	if _, err := io.Copy(outFile, file); err != nil {
-		return "", err
+	_, writeErr := io.Copy(outFile, file)
+	closeErr := outFile.Close()
+	if writeErr != nil || closeErr != nil {
+		return "", errors.Join(writeErr, closeErr)
 	}
 
 	// Возвращаем относительный путь

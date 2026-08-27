@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -304,6 +305,378 @@ func TestNoteServiceScanNotesBuildsPureFilteredIndex(t *testing.T) {
 	empty, err := scanNotes("")
 	if err != nil || empty != nil {
 		t.Errorf("scanNotes(empty) = %#v, %v, want nil, nil", empty, err)
+	}
+}
+
+func TestNoteServiceScanNotesExcludesSymlinks(t *testing.T) {
+	base := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.md")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	requireSymlink(t, outside, filepath.Join(base, "secret.md"))
+	requireSymlink(t, t.TempDir(), filepath.Join(base, "linked-dir"))
+
+	nodes, err := scanNotes(base)
+	if err != nil {
+		t.Fatalf("scanNotes() error = %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Errorf("scanNotes() = %#v, want no symlink nodes", nodes)
+	}
+}
+
+func TestNoteServiceRejectsSymlinkEscapes(t *testing.T) {
+	t.Run("get note content", func(t *testing.T) {
+		base := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "secret.md")
+		if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile() error = %v", err)
+		}
+		requireSymlink(t, outside, filepath.Join(base, "secret.md"))
+
+		content, err := NewNoteService(&fakeNoteRepository{}, base).GetNoteContent("secret.md")
+		if !errors.Is(err, ErrInvalidNotePath) {
+			t.Fatalf("GetNoteContent() error = %v, want ErrInvalidNotePath", err)
+		}
+		if content != "" {
+			t.Errorf("GetNoteContent() content = %q, want empty", content)
+		}
+	})
+
+	t.Run("save note content", func(t *testing.T) {
+		base, outside, marker := symlinkEscapeFixture(t, "linked")
+		err := NewNoteService(&fakeNoteRepository{}, base).SaveNoteContent(filepath.Join("linked", "marker.md"), "changed")
+		if !errors.Is(err, ErrInvalidNotePath) {
+			t.Fatalf("SaveNoteContent() error = %v, want ErrInvalidNotePath", err)
+		}
+		assertFileContent(t, filepath.Join(outside, "marker.md"), marker)
+	})
+
+	for _, nodeType := range []string{"file", "dir"} {
+		t.Run("create "+nodeType, func(t *testing.T) {
+			base, outside, marker := symlinkEscapeFixture(t, "linked")
+			repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "existing.md"}}}
+			_, err := NewNoteService(repo, base).CreateNode("linked", "created", nodeType)
+			if !errors.Is(err, ErrInvalidNotePath) {
+				t.Fatalf("CreateNode() error = %v, want ErrInvalidNotePath", err)
+			}
+			if _, err := os.Lstat(filepath.Join(outside, "created")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("outside directory was created, error = %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(outside, "created.md")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("outside note was created, error = %v", err)
+			}
+			assertFileContent(t, filepath.Join(outside, "marker.md"), marker)
+			assertRepositoryIDs(t, repo, "existing.md")
+		})
+	}
+
+	t.Run("delete through parent", func(t *testing.T) {
+		base, outside, marker := symlinkEscapeFixture(t, "linked")
+		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: filepath.Join("linked", "marker.md")}}}
+		err := NewNoteService(repo, base).DeleteNode(filepath.Join("linked", "marker.md"))
+		if !errors.Is(err, ErrInvalidNotePath) {
+			t.Fatalf("DeleteNode() error = %v, want ErrInvalidNotePath", err)
+		}
+		assertFileContent(t, filepath.Join(outside, "marker.md"), marker)
+		assertRepositoryIDs(t, repo, filepath.Join("linked", "marker.md"))
+	})
+
+	t.Run("delete symlink entry only", func(t *testing.T) {
+		base, outside, marker := symlinkEscapeFixture(t, "linked")
+		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "linked"}}}
+		if err := NewNoteService(repo, base).DeleteNode("linked"); err != nil {
+			t.Fatalf("DeleteNode() error = %v, want nil", err)
+		}
+		if _, err := os.Lstat(filepath.Join(base, "linked")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("symlink entry still exists, error = %v", err)
+		}
+		assertFileContent(t, filepath.Join(outside, "marker.md"), marker)
+		assertRepositoryIDs(t, repo)
+	})
+
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string, string)
+		id    string
+		to    string
+	}{
+		{
+			name: "parent",
+			setup: func(t *testing.T, base, outside string) {
+				requireSymlink(t, outside, filepath.Join(base, "linked"))
+			},
+			id: filepath.Join("linked", "marker.md"), to: "renamed",
+		},
+		{
+			name: "source",
+			setup: func(t *testing.T, base, outside string) {
+				requireSymlink(t, filepath.Join(outside, "marker.md"), filepath.Join(base, "source.md"))
+			},
+			id: "source.md", to: "renamed",
+		},
+		{
+			name: "destination",
+			setup: func(t *testing.T, base, outside string) {
+				if err := os.WriteFile(filepath.Join(base, "source.md"), []byte("local"), 0o600); err != nil {
+					t.Fatalf("os.WriteFile() error = %v", err)
+				}
+				requireSymlink(t, filepath.Join(outside, "marker.md"), filepath.Join(base, "destination.md"))
+			},
+			id: "source.md", to: "destination",
+		},
+	} {
+		t.Run("rename "+test.name, func(t *testing.T) {
+			base := t.TempDir()
+			outside := t.TempDir()
+			marker := []byte("outside marker")
+			if err := os.WriteFile(filepath.Join(outside, "marker.md"), marker, 0o600); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
+			}
+			test.setup(t, base, outside)
+			repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: test.id}}}
+
+			err := NewNoteService(repo, base).RenameNode(test.id, test.to)
+			if !errors.Is(err, ErrInvalidNotePath) {
+				t.Fatalf("RenameNode() error = %v, want ErrInvalidNotePath", err)
+			}
+			assertFileContent(t, filepath.Join(outside, "marker.md"), marker)
+			if _, err := os.Lstat(filepath.Join(outside, "renamed.md")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("outside file was renamed, error = %v", err)
+			}
+			assertRepositoryIDs(t, repo, test.id)
+		})
+	}
+
+	for _, link := range []string{"assets", filepath.Join("assets", "images")} {
+		t.Run("save asset through "+link, func(t *testing.T) {
+			base := t.TempDir()
+			outside := t.TempDir()
+			linkPath := filepath.Join(base, link)
+			if err := os.MkdirAll(filepath.Dir(linkPath), 0o755); err != nil {
+				t.Fatalf("os.MkdirAll() error = %v", err)
+			}
+			requireSymlink(t, outside, linkPath)
+
+			path, err := NewNoteService(&fakeNoteRepository{}, base).SaveAsset(strings.NewReader("outside write"), "upload.png")
+			if !errors.Is(err, ErrInvalidNotePath) {
+				t.Fatalf("SaveAsset() error = %v, want ErrInvalidNotePath", err)
+			}
+			if path != "" {
+				t.Errorf("SaveAsset() path = %q, want empty", path)
+			}
+			if entries, err := os.ReadDir(outside); err != nil || len(entries) != 0 {
+				t.Errorf("outside entries = %#v, %v; want empty", entries, err)
+			}
+		})
+	}
+
+	t.Run("get absolute path", func(t *testing.T) {
+		base, _, _ := symlinkEscapeFixture(t, "linked")
+		path, err := NewNoteService(&fakeNoteRepository{}, base).GetAbsoluteFilePath(filepath.Join("linked", "marker.md"))
+		if !errors.Is(err, ErrInvalidNotePath) {
+			t.Fatalf("GetAbsoluteFilePath() error = %v, want ErrInvalidNotePath", err)
+		}
+		if path != "" {
+			t.Errorf("GetAbsoluteFilePath() path = %q, want empty", path)
+		}
+	})
+}
+
+func TestNoteServiceSymlinkReplacementCannotMutateOutside(t *testing.T) {
+	base := t.TempDir()
+	outside := t.TempDir()
+	markerPath := filepath.Join(outside, "marker.md")
+	marker := []byte("outside marker")
+	if err := os.WriteFile(markerPath, marker, 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	linkPath := filepath.Join(base, "changing")
+	requireSymlink(t, outside, linkPath)
+	service := NewNoteService(&fakeNoteRepository{}, base)
+
+	start := make(chan struct{})
+	var writers sync.WaitGroup
+	for range 4 {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			<-start
+			for range 300 {
+				_ = service.SaveNoteContent(filepath.Join("changing", "marker.md"), "changed")
+			}
+		}()
+	}
+	close(start)
+	for range 300 {
+		_ = os.RemoveAll(linkPath)
+		if err := os.Mkdir(linkPath, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			t.Fatalf("os.Mkdir() error = %v", err)
+		}
+		_ = os.RemoveAll(linkPath)
+		if err := os.Symlink(outside, linkPath); err != nil && !errors.Is(err, os.ErrExist) {
+			t.Fatalf("os.Symlink() error = %v", err)
+		}
+	}
+	writers.Wait()
+
+	assertFileContent(t, markerPath, marker)
+}
+
+func TestNoteServiceCreateNodeUsesExclusiveCreation(t *testing.T) {
+	base := t.TempDir()
+	repo := &fakeNoteRepository{}
+	service := NewNoteService(repo, base)
+	start := make(chan struct{})
+	errs := make(chan error, 8)
+	for range cap(errs) {
+		go func() {
+			<-start
+			_, err := service.CreateNode("", "race", "file")
+			errs <- err
+		}()
+	}
+	close(start)
+
+	created := 0
+	conflicts := 0
+	for range cap(errs) {
+		err := <-errs
+		switch {
+		case err == nil:
+			created++
+		case errors.Is(err, ErrAlreadyExists):
+			conflicts++
+		default:
+			t.Errorf("CreateNode() error = %v, want nil or ErrAlreadyExists", err)
+		}
+	}
+	if created != 1 || conflicts != cap(errs)-1 {
+		t.Errorf("CreateNode() results = %d created, %d conflicts; want 1, %d", created, conflicts, cap(errs)-1)
+	}
+	assertFileContent(t, filepath.Join(base, "race.md"), []byte("# race\n"))
+	assertRepositoryIDs(t, repo, "race.md")
+}
+
+func TestNoteServiceRootIOErrorsRemainDistinctFromInvalidPaths(t *testing.T) {
+	baseFile := filepath.Join(t.TempDir(), "base-file")
+	if err := os.WriteFile(baseFile, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	service := NewNoteService(&fakeNoteRepository{}, baseFile)
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{name: "get", call: func() error { _, err := service.GetNoteContent("note.md"); return err }},
+		{name: "absolute", call: func() error { _, err := service.GetAbsoluteFilePath("note.md"); return err }},
+		{name: "save", call: func() error { return service.SaveNoteContent("note.md", "content") }},
+		{name: "create", call: func() error { _, err := service.CreateNode("", "note", "file"); return err }},
+		{name: "delete", call: func() error { return service.DeleteNode("note.md") }},
+		{name: "rename", call: func() error { return service.RenameNode("note.md", "renamed") }},
+		{name: "asset", call: func() error { _, err := service.SaveAsset(strings.NewReader("image"), "image.png"); return err }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.call()
+			if err == nil {
+				t.Fatal("operation error = nil, want ordinary I/O error")
+			}
+			if errors.Is(err, ErrInvalidNotePath) {
+				t.Fatalf("operation error = %v, do not want ErrInvalidNotePath", err)
+			}
+		})
+	}
+}
+
+func TestNoteServiceGetAbsoluteFilePathValidatesExistence(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("note"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	service := NewNoteService(&fakeNoteRepository{}, base)
+
+	got, err := service.GetAbsoluteFilePath("note.md")
+	if err != nil {
+		t.Fatalf("GetAbsoluteFilePath() error = %v", err)
+	}
+	if want := filepath.Join(base, "note.md"); got != want {
+		t.Errorf("GetAbsoluteFilePath() = %q, want %q", got, want)
+	}
+	if _, err := service.GetAbsoluteFilePath("missing.md"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("GetAbsoluteFilePath(missing) error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestNoteServiceSaveAssetPreservesRelativeNamingAndCollisions(t *testing.T) {
+	base := t.TempDir()
+	service := NewNoteService(&fakeNoteRepository{}, base)
+
+	first, err := service.SaveAsset(strings.NewReader("first"), "upload.png")
+	if err != nil {
+		t.Fatalf("SaveAsset(first) error = %v", err)
+	}
+	if want := filepath.Join("assets", "images", "upload.png"); first != want {
+		t.Errorf("SaveAsset(first) path = %q, want %q", first, want)
+	}
+	second, err := service.SaveAsset(strings.NewReader("second"), "upload.png")
+	if err != nil {
+		t.Fatalf("SaveAsset(second) error = %v", err)
+	}
+	if second == first || filepath.Dir(second) != filepath.Join("assets", "images") {
+		t.Errorf("SaveAsset(second) path = %q, want distinct assets/images path", second)
+	}
+	assertFileContent(t, filepath.Join(base, first), []byte("first"))
+	assertFileContent(t, filepath.Join(base, second), []byte("second"))
+}
+
+func requireSymlink(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := os.Symlink(oldname, newname); err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, errors.ErrUnsupported) {
+			t.Skipf("symlink creation is not permitted: %v", err)
+		}
+		t.Fatalf("os.Symlink() error = %v", err)
+	}
+}
+
+func symlinkEscapeFixture(t *testing.T, linkName string) (base, outside string, marker []byte) {
+	t.Helper()
+	base = t.TempDir()
+	outside = t.TempDir()
+	marker = []byte("outside marker")
+	if err := os.WriteFile(filepath.Join(outside, "marker.md"), marker, 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	requireSymlink(t, outside, filepath.Join(base, linkName))
+	return base, outside, marker
+}
+
+func assertFileContent(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("content of %q = %q, want %q", path, got, want)
+	}
+}
+
+func assertRepositoryIDs(t *testing.T, repo *fakeNoteRepository, want ...string) {
+	t.Helper()
+	nodes, err := repo.GetAllNodes()
+	if err != nil {
+		t.Fatalf("GetAllNodes() error = %v", err)
+	}
+	if len(nodes) != len(want) {
+		t.Fatalf("repository nodes = %#v, want IDs %q", nodes, want)
+	}
+	for i, id := range want {
+		if nodes[i].ID != id {
+			t.Errorf("repository node %d ID = %q, want %q", i, nodes[i].ID, id)
+		}
 	}
 }
 
