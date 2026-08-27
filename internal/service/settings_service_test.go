@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"IGoNotes/internal/model"
@@ -19,6 +20,7 @@ type fakeConfigStore struct {
 	saveCalls   int
 	saveStarted chan struct{}
 	saveRelease <-chan struct{}
+	events      *orderedEvents
 }
 
 func (f *fakeConfigStore) Load() (*model.Config, error) {
@@ -34,6 +36,9 @@ func (f *fakeConfigStore) Load() (*model.Config, error) {
 
 func (f *fakeConfigStore) Save(config *model.Config) error {
 	f.saveCalls++
+	if f.events != nil {
+		f.events.record("save")
+	}
 	if f.saveStarted != nil {
 		close(f.saveStarted)
 	}
@@ -54,6 +59,7 @@ type fakeBaseRuntime struct {
 	switchCalls []string
 	switchErr   error
 	switchErrs  []error
+	events      *orderedEvents
 }
 
 func (f *fakeBaseRuntime) GetBasePath() string {
@@ -63,6 +69,9 @@ func (f *fakeBaseRuntime) GetBasePath() string {
 
 func (f *fakeBaseRuntime) SwitchBase(path string) error {
 	f.switchCalls = append(f.switchCalls, path)
+	if f.events != nil {
+		f.events.record("switch:" + path)
+	}
 	if len(f.switchErrs) != 0 {
 		err := f.switchErrs[0]
 		f.switchErrs = f.switchErrs[1:]
@@ -74,6 +83,23 @@ func (f *fakeBaseRuntime) SwitchBase(path string) error {
 	}
 	f.path = path
 	return nil
+}
+
+type orderedEvents struct {
+	mu     sync.Mutex
+	values []string
+}
+
+func (e *orderedEvents) record(value string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.values = append(e.values, value)
+}
+
+func (e *orderedEvents) snapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.values...)
 }
 
 func TestNewSettingsServiceMigratesLegacyConfig(t *testing.T) {
@@ -1099,6 +1125,9 @@ func TestSettingsServiceUpdateBasePreservesStateOnSwitchAndSaveFailures(t *testi
 	})
 	t.Run("save failure rolls back", func(t *testing.T) {
 		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		events := &orderedEvents{}
+		store.events = events
+		runtime.events = events
 		saveErr := errors.New("disk full")
 		store.saveErr = saveErr
 		_, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "renamed", Path: targetPath})
@@ -1108,7 +1137,118 @@ func TestSettingsServiceUpdateBasePreservesStateOnSwitchAndSaveFailures(t *testi
 		if !reflect.DeepEqual(runtime.switchCalls, []string{targetPath, activePath}) {
 			t.Errorf("SwitchBase calls = %v, want target then old", runtime.switchCalls)
 		}
+		wantEvents := []string{"switch:" + targetPath, "save", "switch:" + activePath}
+		if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
+			t.Errorf("events = %v, want %v", got, wantEvents)
+		}
 		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 1)
+	})
+}
+
+func TestSettingsServiceUpdateBaseDoesNotSwitchReverseRuntimeSymlinkAlias(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	activeLink := filepath.Join(t.TempDir(), "active-link")
+	createSymlinkOrSkip(t, activePath, activeLink)
+	service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+	runtime.path = activeLink
+
+	response, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "renamed", Path: activePath})
+	if err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	want := cloneConfig(original)
+	want.Bases[0].Name = "renamed"
+	want.CurrentBase = "renamed"
+	if !reflect.DeepEqual(response.Config, want) || !reflect.DeepEqual(*store.config, want) {
+		t.Errorf("saved response/config = %#v / %#v, want %#v", response.Config, *store.config, want)
+	}
+	if len(runtime.switchCalls) != 0 {
+		t.Errorf("SwitchBase calls = %v, want none for canonical alias", runtime.switchCalls)
+	}
+}
+
+func TestSettingsServiceUpdateBaseRollsBackToCapturedCanonicalRuntimePath(t *testing.T) {
+	oldPath := t.TempDir()
+	otherPath := t.TempDir()
+	targetPath := t.TempDir()
+	retargetPath := t.TempDir()
+	oldLink := filepath.Join(t.TempDir(), "old-link")
+	createSymlinkOrSkip(t, oldPath, oldLink)
+	service, store, runtime, original := newConfiguredSettingsService(t, oldPath, otherPath)
+	runtime.path = oldLink
+	store.saveErr = errors.New("disk full")
+	store.saveStarted = make(chan struct{})
+	release := make(chan struct{})
+	store.saveRelease = release
+	events := &orderedEvents{}
+	store.events = events
+	runtime.events = events
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "active", Path: targetPath})
+		done <- err
+	}()
+	<-store.saveStarted
+	retargetSymlink(t, oldLink, retargetPath)
+	close(release)
+
+	err := <-done
+	if !errors.Is(err, store.saveErr) {
+		t.Fatalf("UpdateBase() error = %v, want %v", err, store.saveErr)
+	}
+	wantEvents := []string{"switch:" + targetPath, "save", "switch:" + oldPath}
+	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
+		t.Errorf("events = %v, want %v", got, wantEvents)
+	}
+	if runtime.path != oldPath {
+		t.Errorf("runtime path = %q, want captured canonical old path %q", runtime.path, oldPath)
+	}
+	if runtime.path == retargetPath {
+		t.Errorf("runtime rolled back through retargeted symlink to %q", retargetPath)
+	}
+	if !reflect.DeepEqual(service.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
+		t.Errorf("config changed: service %#v store %#v want %#v", service.GetConfig(), *store.config, original)
+	}
+}
+
+func TestSettingsServiceSwitchBaseRejectsRuntimePathResolutionFailures(t *testing.T) {
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	t.Run("current runtime", func(t *testing.T) {
+		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		runtime.path = filepath.Join(t.TempDir(), "missing-current")
+		_, err := service.SwitchBase("other")
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("SwitchBase() error = %v, want underlying os.ErrNotExist", err)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, original, runtime.path, 0)
+		if len(runtime.switchCalls) != 0 {
+			t.Errorf("SwitchBase calls = %v, want none", runtime.switchCalls)
+		}
+	})
+	t.Run("target runtime", func(t *testing.T) {
+		missingTarget := filepath.Join(t.TempDir(), "missing-target")
+		completed := true
+		config := model.Config{
+			Bases:          []model.Base{{Name: "active", Path: activePath}, {Name: "other", Path: missingTarget}},
+			CurrentBase:    "active",
+			SetupCompleted: &completed,
+		}
+		store := &fakeConfigStore{config: &config}
+		runtime := &fakeBaseRuntime{path: activePath}
+		service, err := NewSettingsService(store, runtime, "", nil)
+		if err != nil {
+			t.Fatalf("NewSettingsService() error = %v", err)
+		}
+		_, err = service.SwitchBase("other")
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("SwitchBase() error = %v, want underlying os.ErrNotExist", err)
+		}
+		assertSettingsUnchanged(t, service, store, runtime, config, activePath, 0)
+		if len(runtime.switchCalls) != 0 {
+			t.Errorf("SwitchBase calls = %v, want none", runtime.switchCalls)
+		}
 	})
 }
 
@@ -1226,6 +1366,9 @@ func TestSettingsServiceSwitchBaseRejectsMissingAndPreservesFailures(t *testing.
 	})
 	t.Run("save failure rolls runtime back", func(t *testing.T) {
 		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		events := &orderedEvents{}
+		store.events = events
+		runtime.events = events
 		saveErr := errors.New("disk full")
 		store.saveErr = saveErr
 		_, err := service.SwitchBase("other")
@@ -1234,6 +1377,10 @@ func TestSettingsServiceSwitchBaseRejectsMissingAndPreservesFailures(t *testing.
 		}
 		if !reflect.DeepEqual(runtime.switchCalls, []string{otherPath, activePath}) {
 			t.Errorf("SwitchBase calls = %v, want target then old", runtime.switchCalls)
+		}
+		wantEvents := []string{"switch:" + otherPath, "save", "switch:" + activePath}
+		if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
+			t.Errorf("events = %v, want %v", got, wantEvents)
 		}
 		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 1)
 	})
@@ -1342,6 +1489,42 @@ func TestNormalizeConfigPreservesEffectiveSetupWhenOmitted(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNormalizeConfigBaseDirAbsFailureIsInvalidPath(t *testing.T) {
+	basePath := t.TempDir()
+	deadCWD := filepath.Join(t.TempDir(), "removed-cwd")
+	if err := os.Mkdir(deadCWD, 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	t.Chdir(deadCWD)
+	if err := os.Remove(deadCWD); err != nil {
+		t.Skipf("cannot remove current directory on this platform: %v", err)
+	}
+	_, absErr := filepath.Abs("relative-base-dir")
+	if absErr == nil {
+		t.Skip("filepath.Abs does not fail from a removed current directory on this platform")
+	}
+	underlying := errors.Unwrap(absErr)
+	if underlying == nil {
+		underlying = absErr
+	}
+
+	_, err := normalizeConfig(model.Config{
+		BaseDir:     "relative-base-dir",
+		Bases:       []model.Base{{Name: "base", Path: basePath}},
+		CurrentBase: "base",
+	}, false)
+	if !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("normalizeConfig() error = %v, want ErrInvalidPath", err)
+	}
+	if errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("normalizeConfig() error = %v, do not want ErrInvalidConfig", err)
+	}
+	if !errors.Is(err, underlying) {
+		t.Errorf("normalizeConfig() error = %v, want underlying %v", err, underlying)
+	}
+	assertFieldError(t, err, "base_dir")
 }
 
 func TestNormalizeConfigRejectsInvalidConfig(t *testing.T) {
@@ -1480,6 +1663,9 @@ func TestSettingsServiceReplaceConfigIsTransactional(t *testing.T) {
 	})
 	t.Run("save failure rolls back target then old", func(t *testing.T) {
 		service, store, runtime, original := newConfiguredSettingsService(t, activePath, otherPath)
+		events := &orderedEvents{}
+		store.events = events
+		runtime.events = events
 		saveErr := errors.New("disk full")
 		store.saveErr = saveErr
 		_, err := service.ReplaceConfig(input)
@@ -1488,6 +1674,10 @@ func TestSettingsServiceReplaceConfigIsTransactional(t *testing.T) {
 		}
 		if !reflect.DeepEqual(runtime.switchCalls, []string{targetPath, activePath}) {
 			t.Errorf("SwitchBase calls = %v, want target then old", runtime.switchCalls)
+		}
+		wantEvents := []string{"switch:" + targetPath, "save", "switch:" + activePath}
+		if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
+			t.Errorf("events = %v, want %v", got, wantEvents)
 		}
 		assertSettingsUnchanged(t, service, store, runtime, original, activePath, 1)
 	})
@@ -1515,6 +1705,82 @@ func TestSettingsServiceReplaceConfigIsTransactional(t *testing.T) {
 			t.Errorf("degraded replacement made calls: saves %d/%d switches %v/%v paths %d/%d", store.saveCalls, saves, runtime.switchCalls, switches, runtime.pathCalls, pathCalls)
 		}
 	})
+}
+
+func TestSettingsServiceConcurrentTask7MutationsAreSerialized(t *testing.T) {
+	activePath := t.TempDir()
+	targetPath := t.TempDir()
+	editablePath := t.TempDir()
+	forgottenPath := t.TempDir()
+	completed := true
+	original := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: activePath},
+			{Name: "target", Path: targetPath},
+			{Name: "editable", Path: editablePath},
+			{Name: "forgotten", Path: forgottenPath},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &original}
+	runtime := &fakeBaseRuntime{path: activePath}
+	service, err := NewSettingsService(store, runtime, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 3)
+	var wg sync.WaitGroup
+	calls := []func() error{
+		func() error {
+			_, err := service.UpdateBase("editable", model.BaseUpdateRequest{Name: "edited", Path: editablePath})
+			return err
+		},
+		func() error {
+			_, err := service.ForgetBase("forgotten")
+			return err
+		},
+		func() error {
+			_, err := service.SwitchBase("target")
+			return err
+		},
+	}
+	for _, call := range calls {
+		call := call
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- call()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent mutation error = %v", err)
+		}
+	}
+
+	want := cloneConfig(original)
+	want.Bases = []model.Base{
+		{Name: "active", Path: activePath},
+		{Name: "target", Path: targetPath},
+		{Name: "edited", Path: editablePath},
+	}
+	want.CurrentBase = "target"
+	if !reflect.DeepEqual(service.GetConfig(), want) || !reflect.DeepEqual(*store.config, want) {
+		t.Errorf("configs = service %#v store %#v, want %#v", service.GetConfig(), *store.config, want)
+	}
+	if runtime.path != targetPath || !reflect.DeepEqual(runtime.switchCalls, []string{targetPath}) {
+		t.Errorf("runtime = path %q switches %v, want %q [%q]", runtime.path, runtime.switchCalls, targetPath, targetPath)
+	}
+	if store.saveCalls != len(calls) {
+		t.Errorf("Save calls = %d, want %d", store.saveCalls, len(calls))
+	}
 }
 
 func newIncompleteSettingsService(t *testing.T) (*SettingsService, *fakeConfigStore, *fakeBaseRuntime, model.Config) {

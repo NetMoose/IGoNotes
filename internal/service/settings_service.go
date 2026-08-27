@@ -195,10 +195,27 @@ func createBaseDirectory(prepared preparedBase) error {
 }
 
 func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string) error {
-	oldPath := s.notes.GetBasePath()
-	switched := targetPath != "" && filepath.Clean(targetPath) != filepath.Clean(oldPath)
+	oldPath := ""
+	canonicalTarget := ""
+	switched := false
+	if targetPath != "" {
+		currentPath := s.notes.GetBasePath()
+		if currentPath != "" {
+			var err error
+			oldPath, err = canonicalExistingDirectory(currentPath)
+			if err != nil {
+				return fmt.Errorf("resolve current runtime base %q: %w", currentPath, err)
+			}
+		}
+		var err error
+		canonicalTarget, err = canonicalExistingDirectory(targetPath)
+		if err != nil {
+			return fmt.Errorf("resolve target runtime base %q: %w", targetPath, err)
+		}
+		switched = canonicalTarget != oldPath
+	}
 	if switched {
-		if err := s.notes.SwitchBase(targetPath); err != nil {
+		if err := s.notes.SwitchBase(canonicalTarget); err != nil {
 			return fmt.Errorf("switch runtime base: %w", err)
 		}
 	}
@@ -442,7 +459,7 @@ func normalizeConfig(input model.Config, currentSetup bool) (model.Config, error
 	if normalized.BaseDir != "" {
 		baseDir, err := filepath.Abs(normalized.BaseDir)
 		if err != nil {
-			return model.Config{}, fieldErrorWithCause(ErrInvalidConfig, err, "base_dir", "resolve base directory")
+			return model.Config{}, fieldErrorWithCause(ErrInvalidPath, err, "base_dir", "resolve base directory")
 		}
 		normalized.BaseDir = filepath.Clean(baseDir)
 	}
@@ -454,21 +471,29 @@ func normalizeExistingBasePath(path, field string) (string, error) {
 	if path == "" {
 		return "", fieldError(ErrInvalidPath, field, "base path is required")
 	}
-	absPath, err := filepath.Abs(path)
+	canonicalPath, err := canonicalExistingDirectory(path)
 	if err != nil {
 		return "", fieldErrorWithCause(ErrInvalidPath, err, field, "resolve base path")
 	}
+	return canonicalPath, nil
+}
+
+func canonicalExistingDirectory(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute path: %w", err)
+	}
 	canonicalPath, err := filepath.EvalSymlinks(filepath.Clean(absPath))
 	if err != nil {
-		return "", fieldErrorWithCause(ErrInvalidPath, err, field, "resolve base path symlinks")
+		return "", fmt.Errorf("resolve path symlinks: %w", err)
 	}
 	canonicalPath = filepath.Clean(canonicalPath)
 	info, err := os.Stat(canonicalPath)
 	if err != nil {
-		return "", fieldErrorWithCause(ErrInvalidPath, err, field, "inspect base path")
+		return "", fmt.Errorf("inspect path: %w", err)
 	}
 	if !info.IsDir() {
-		return "", fieldError(ErrInvalidPath, field, "base path must be an existing directory")
+		return "", fmt.Errorf("path %q is not a directory", canonicalPath)
 	}
 	return canonicalPath, nil
 }
