@@ -90,13 +90,12 @@ func (s *NoteService) SyncFS() error {
 	defer s.baseMu.Unlock()
 
 	err := s.replaceIndexLocked()
-	if err == nil {
-		s.initialSyncErr = nil
+	if err != nil {
+		s.once.Do(func() {
+			s.initialSyncErr = err
+			close(s.initialSyncDone)
+		})
 	}
-	s.once.Do(func() {
-		s.initialSyncErr = err
-		close(s.initialSyncDone)
-	})
 	return err
 }
 
@@ -220,11 +219,15 @@ func (s *NoteService) publishBaseSwitchLocked(candidate *baseSwitchCandidate) {
 	s.basePath = candidate.path
 	s.baseRoot = candidate.root
 	s.baseErr = nil
-	s.initialSyncErr = nil
 	// Publication has succeeded, so an old descriptor close error is deferred to Close.
 	if oldRoot != nil {
 		s.closeErr = errors.Join(s.closeErr, oldRoot.Close())
 	}
+	s.publishCompleteIndexLocked()
+}
+
+func (s *NoteService) publishCompleteIndexLocked() {
+	s.initialSyncErr = nil
 	s.once.Do(func() { close(s.initialSyncDone) })
 }
 
@@ -270,6 +273,7 @@ func (s *NoteService) replaceIndexLocked() error {
 			commitOutcomeError(rollback()),
 		)
 	}
+	s.publishCompleteIndexLocked()
 	return nil
 }
 

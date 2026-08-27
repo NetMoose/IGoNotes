@@ -225,3 +225,71 @@ func TestNoteServiceInitialSyncFailureReleasesAllTreeWaiters(t *testing.T) {
 		}
 	}
 }
+
+func TestNoteServiceRenameReindexRecoversInitialReadiness(t *testing.T) {
+	tests := []struct {
+		name    string
+		newName string
+		wantID  string
+	}{
+		{name: "renamed", newName: "renamed", wantID: "renamed.md"},
+		{name: "same name", newName: "note.md", wantID: "note.md"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			writeTestNote(t, base, "note.md", "note")
+			initialErr := errors.New("initial scan failed")
+			repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md", Name: "old", Path: "old.md", Type: "file"}}}
+			notes := newTestNoteService(t, repo, base)
+			notes.scan = func(*os.Root) ([]model.NoteNode, error) { return nil, initialErr }
+			if err := notes.SyncFS(); !errors.Is(err, initialErr) {
+				t.Fatalf("SyncFS() error = %v, want %v", err, initialErr)
+			}
+			reindexErr := errors.New("reindex scan failed")
+			notes.scan = func(*os.Root) ([]model.NoteNode, error) { return nil, reindexErr }
+			if err := notes.RenameNode("note.md", "note.md"); !errors.Is(err, reindexErr) {
+				t.Fatalf("failed RenameNode() error = %v, want %v", err, reindexErr)
+			}
+			if _, err := notes.GetTree(); !errors.Is(err, initialErr) {
+				t.Fatalf("GetTree() after failed reindex error = %v, want retained %v", err, initialErr)
+			}
+
+			replaceStarted := make(chan struct{})
+			replaceRelease := make(chan struct{})
+			repo.replaceStarted = replaceStarted
+			repo.replaceRelease = replaceRelease
+			notes.scan = scanNotes
+			renameDone := make(chan error, 1)
+			go func() { renameDone <- notes.RenameNode("note.md", test.newName) }()
+			<-replaceStarted
+
+			waiterStarted := make(chan struct{})
+			treeDone := make(chan struct {
+				tree []model.NoteNode
+				err  error
+			}, 1)
+			go func() {
+				close(waiterStarted)
+				tree, err := notes.GetTree()
+				treeDone <- struct {
+					tree []model.NoteNode
+					err  error
+				}{tree: tree, err: err}
+			}()
+			<-waiterStarted
+			close(replaceRelease)
+
+			if err := <-renameDone; err != nil {
+				t.Fatalf("RenameNode() error = %v", err)
+			}
+			result := <-treeDone
+			if result.err != nil {
+				t.Fatalf("GetTree() after rename reindex error = %v", result.err)
+			}
+			if len(result.tree) != 1 || result.tree[0].ID != test.wantID {
+				t.Fatalf("GetTree() after rename reindex = %#v, want only %s", result.tree, test.wantID)
+			}
+		})
+	}
+}
