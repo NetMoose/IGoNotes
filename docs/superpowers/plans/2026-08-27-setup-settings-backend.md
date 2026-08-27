@@ -1368,20 +1368,17 @@ func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (mode
 		CurrentBase: prepared.base.Name, SetupCompleted: &completed,
 	}
 	if err := s.applyConfigLocked(next, prepared.base.Path); err != nil {
-		if prepared.created && filepath.Clean(s.notes.GetBasePath()) != filepath.Clean(prepared.base.Path) {
-			if removeErr := os.Remove(prepared.base.Path); removeErr != nil {
-				return model.SettingsResponse{}, fmt.Errorf("%v; remove new base rollback: %w", err, removeErr)
-			}
-		}
+		// The created directory is intentionally preserved: path-based cleanup
+		// cannot atomically prove that the entry was not replaced by user data.
 		return model.SettingsResponse{}, err
 	}
 	return s.responseLocked(), nil
 }
 ```
 
-- [ ] **Step 5: Написать RED/GREEN tests `AddBase` и cleanup**
+- [ ] **Step 5: Написать RED/GREEN tests `AddBase` и сохранности каталогов**
 
-Тесты должны проверить create и connect append без switch, case-sensitive duplicate name, сохранение `current_base`, cleanup только нового пустого create target при Save failure и сохранность подключённого каталога при той же ошибке.
+Тесты должны проверить create и connect append без switch, case-sensitive duplicate name, сохранение `current_base`, сохранность нового create target при Save failure и сохранность подключённого каталога при той же ошибке. Автоматический cleanup запрещён: между проверкой identity и удалением path существует TOCTOU-окно, в котором пользовательский объект может заменить созданный каталог.
 
 Реализация:
 
@@ -1404,11 +1401,7 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 	next := cloneConfig(s.config)
 	next.Bases = append(next.Bases, prepared.base)
 	if err := s.applyConfigLocked(next, ""); err != nil {
-		if prepared.created {
-			if removeErr := os.Remove(prepared.base.Path); removeErr != nil {
-				return model.SettingsResponse{}, fmt.Errorf("%v; remove new base rollback: %w", err, removeErr)
-			}
-		}
+		// Preserve the created directory after failure; never delete by path.
 		return model.SettingsResponse{}, err
 	}
 	return s.responseLocked(), nil
@@ -1417,7 +1410,7 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 
 Run: `go test ./internal/service -run 'TestSettingsService(CompleteSetup|AddBase)' -v`
 
-Expected: PASS для create/connect, validation, no-switch и cleanup scenarios.
+Expected: PASS для create/connect, validation, no-switch и directory-preservation scenarios.
 
 - [ ] **Step 6: Зафиксировать setup и add**
 
