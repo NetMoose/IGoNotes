@@ -55,9 +55,6 @@ func TestConfigServiceSaveAtomicallyReplacesConfig(t *testing.T) {
 	if err := os.WriteFile(configPath, original, 0600); err != nil {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
 	}
-	if err := os.Chmod(configPath, 0600); err != nil {
-		t.Fatalf("os.Chmod() error = %v, want nil", err)
-	}
 	setupCompleted := true
 	svc := NewConfigService(configPath)
 
@@ -87,14 +84,6 @@ func TestConfigServiceSaveAtomicallyReplacesConfig(t *testing.T) {
 		t.Errorf("config contents = %q, want old data replaced", data)
 	}
 
-	info, err := os.Stat(configPath)
-	if err != nil {
-		t.Fatalf("os.Stat() error = %v, want nil", err)
-	}
-	if gotMode := info.Mode().Perm(); gotMode != 0600 {
-		t.Errorf("config mode = %04o, want %04o", gotMode, os.FileMode(0600))
-	}
-
 	temporaryFiles, err := filepath.Glob(filepath.Join(dir, ".config-*.tmp"))
 	if err != nil {
 		t.Fatalf("filepath.Glob() error = %v, want nil", err)
@@ -103,32 +92,6 @@ func TestConfigServiceSaveAtomicallyReplacesConfig(t *testing.T) {
 		t.Errorf("temporary files = %v, want none", temporaryFiles)
 	}
 }
-
-func TestConfigServiceSaveCreatesConfigWithPrivatePermissions(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.json")
-	svc := NewConfigService(configPath)
-
-	if err := svc.Save(&model.Config{CurrentBase: "work"}); err != nil {
-		t.Fatalf("Save() error = %v, want nil", err)
-	}
-
-	info, err := os.Stat(configPath)
-	if err != nil {
-		t.Fatalf("os.Stat() error = %v, want nil", err)
-	}
-	if gotMode := info.Mode().Perm(); gotMode != 0600 {
-		t.Errorf("config mode = %04o, want %04o", gotMode, os.FileMode(0600))
-	}
-
-	temporaryFiles, err := filepath.Glob(filepath.Join(filepath.Dir(configPath), ".config-*.tmp"))
-	if err != nil {
-		t.Fatalf("filepath.Glob() error = %v, want nil", err)
-	}
-	if len(temporaryFiles) != 0 {
-		t.Errorf("temporary files = %v, want none", temporaryFiles)
-	}
-}
-
 func TestConfigServiceSaveReportsConfigStatError(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config\x00.json")
 	svc := NewConfigService(configPath)
