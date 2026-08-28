@@ -18,8 +18,15 @@ vi.mock('./api.js', async (importOriginal) => {
   }
 })
 
-import { getNotes } from './api.js'
+import {
+  createNote,
+  deleteNote,
+  getNotes,
+  renameNote,
+  syncNotes,
+} from './api.js'
 import NotesWorkspace from './NotesWorkspace.svelte'
+import NotesWorkspaceHost from '../test/NotesWorkspaceHost.svelte'
 
 function workspaceProps(overrides = {}) {
   return {
@@ -46,6 +53,10 @@ async function renderWorkspace(overrides = {}) {
 describe('NotesWorkspace', () => {
   beforeEach(() => {
     vi.mocked(getNotes).mockReset().mockResolvedValue([])
+    vi.mocked(syncNotes).mockReset()
+    vi.mocked(createNote).mockReset()
+    vi.mocked(renameNote).mockReset()
+    vi.mocked(deleteNote).mockReset().mockResolvedValue(null)
   })
 
   it('shows the empty workspace, base path, and available settings action', async () => {
@@ -56,13 +67,52 @@ describe('NotesWorkspace', () => {
     const basePath = screen.getByTitle('Текущая база заметок')
     expect(basePath).toHaveTextContent('/notes/work')
     const settings = screen.getByRole('button', { name: 'Открыть настройки' })
-    expect(settings).toHaveAttribute('title', 'Открыть настройки')
+    expect(settings).toHaveAttribute('title', 'Настройки')
     expect(settings).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Сохранить' })).toBeDisabled()
 
     await user.click(settings)
 
     expect(props.onOpenSettings).toHaveBeenCalledOnce()
+  })
+
+  it('forwards a selected file from the real sidebar', async () => {
+    const user = userEvent.setup()
+    const note = {
+      id: 'topic/note.md',
+      name: 'note.md',
+      type: 'file',
+      parent_id: 'topic',
+    }
+    vi.mocked(getNotes).mockResolvedValue([note])
+    const { props } = await renderWorkspace()
+
+    await user.click(screen.getByRole('button', { name: 'note.md' }))
+
+    expect(props.onSelectNote).toHaveBeenCalledOnce()
+    expect(props.onSelectNote).toHaveBeenCalledWith(note)
+  })
+
+  it('forwards a deleted file id from the real sidebar and modal', async () => {
+    const user = userEvent.setup()
+    const note = {
+      id: 'topic/note.md',
+      name: 'note.md',
+      type: 'file',
+      parent_id: 'topic',
+    }
+    vi.mocked(getNotes).mockResolvedValue([note])
+    const { props } = await renderWorkspace()
+    await user.click(screen.getByRole('button', { name: 'note.md' }))
+    await user.click(screen.getByRole('button', { name: 'Удалить выбранное' }))
+
+    await user.click(screen.getByRole('button', { name: 'Удалить' }))
+
+    expect(deleteNote).toHaveBeenCalledOnce()
+    expect(deleteNote).toHaveBeenCalledWith(note.id)
+    expect(props.onDeleteNote).toHaveBeenCalledOnce()
+    expect(props.onDeleteNote).toHaveBeenCalledWith(note.id)
+    await waitFor(() => expect(getNotes).toHaveBeenCalledTimes(2))
   })
 
   it.each([
@@ -107,6 +157,21 @@ describe('NotesWorkspace', () => {
     await user.click(save)
 
     expect(props.onSave).toHaveBeenCalledOnce()
+  })
+
+  it('binds editor changes back to parent state', async () => {
+    const user = userEvent.setup()
+    render(NotesWorkspaceHost)
+    await waitFor(() => expect(getNotes).toHaveBeenCalledOnce())
+
+    const editor = screen.getByLabelText('Markdown')
+    expect(editor).toHaveValue('# Parent')
+    expect(screen.getByLabelText('Parent markdown')).toHaveTextContent('# Parent')
+
+    await user.clear(editor)
+    await user.type(editor, '# Updated')
+
+    expect(screen.getByLabelText('Parent markdown')).toHaveTextContent('# Updated')
   })
 
   it('shows the no-note placeholder only without an active note', async () => {

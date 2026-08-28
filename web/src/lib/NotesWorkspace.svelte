@@ -16,11 +16,11 @@
 </script>
 
 <div class="flex flex-col h-screen w-full bg-white text-gray-800 font-sans overflow-hidden">
-  <div class="flex-1 flex flex-col sm:flex-row overflow-hidden min-h-0">
+  <div class="flex-1 flex overflow-hidden">
     <Sidebar onSelect={onSelectNote} onDelete={onDeleteNote} />
 
     <main class="flex-1 flex flex-col h-full overflow-hidden min-w-0">
-      <header class="bg-white border-b border-gray-200 px-4 py-2 flex flex-wrap items-center justify-between gap-4 shrink-0 min-h-14">
+      <header class="bg-white border-b border-gray-200 px-4 py-2 flex items-center justify-between shrink-0 h-14">
         <div class="min-w-0">
           <div class="font-semibold text-gray-800 truncate">
             {activeNote ? activeNote.name : 'Выберите заметку'}
@@ -49,8 +49,8 @@
             onclick={onOpenSettings}
             disabled={saveStatus === 'saving'}
             aria-label="Открыть настройки"
-            title="Открыть настройки"
-            class="p-1.5 text-gray-500 rounded-md hover:text-blue-600 hover:bg-blue-50 disabled:opacity-50 transition-colors cursor-pointer"
+            title="Настройки"
+            class="rounded-md p-2 text-gray-500 transition-colors hover:bg-gray-100 hover:text-blue-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:opacity-50"
           >
             <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.4 15a1.7 1.7 0 00.34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 00-1.88-.34 1.7 1.7 0 00-1.03 1.56V21h-4v-.08A1.7 1.7 0 008.97 19.4a1.7 1.7 0 00-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 004.6 15a1.7 1.7 0 00-1.52-1H3v-4h.08A1.7 1.7 0 004.6 8.97a1.7 1.7 0 00-.34-1.88l-.06-.06L7.03 4.2l.06.06A1.7 1.7 0 008.97 4.6 1.7 1.7 0 0010 3.08V3h4v.08a1.7 1.7 0 001.03 1.52 1.7 1.7 0 001.88-.34l.06-.06 2.83 2.83-.06.06a1.7 1.7 0 00-.34 1.88A1.7 1.7 0 0020.92 10H21v4h-.08A1.7 1.7 0 0019.4 15z"></path></svg>
           </button>
@@ -66,7 +66,7 @@
         </div>
       </header>
 
-      <div class="flex-1 overflow-hidden min-h-0">
+      <div class="flex-1 overflow-hidden">
         {#if activeNote}
           <Editor noteId={activeNote.id} bind:content />
         {:else}
