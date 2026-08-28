@@ -10,6 +10,7 @@
   import { marked } from 'marked';
   import { markedHighlight } from 'marked-highlight';
   import hljs from 'highlight.js';
+  import { uploadAsset } from './api.js';
 
   marked.use(markedHighlight({
     langPrefix: 'hljs language-',
@@ -174,16 +175,8 @@
       changes: { from: pos, insert: placeholder }
     });
 
-    const formData = new FormData();
-    formData.append('file', file);
-
     try {
-      const res = await fetch('/api/assets', {
-        method: 'POST',
-        body: formData
-      });
-      if (!res.ok) throw new Error('Upload failed');
-      const data = await res.json();
+      const data = await uploadAsset(file);
       
       const docStr = editorView.state.doc.toString();
       const searchIndex = docStr.indexOf(placeholder);

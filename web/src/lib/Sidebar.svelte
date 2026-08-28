@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import Modal from './Modal.svelte';
+  import { getNotes, syncNotes, createNote, renameNote, deleteNote } from './api.js';
 
   let { onSelect, onDelete } = $props();
 
@@ -9,6 +10,7 @@
   let activeName = $state(""); // имя выбранного узла для переименования
   let activeFolderId = $state(null); // корень по умолчанию (null вместо "")
   let isRefreshing = $state(false);
+  let operationError = $state("");
   
   // Храним ID открытых папок для восстановления после обновления дерева
   let openFolders = new Set();
@@ -38,22 +40,20 @@
   }
 
   async function loadTree() {
+    operationError = "";
     isRefreshing = true;
     try {
-      const res = await fetch('/api/notes');
-      if (res.ok) {
-        const newNodes = await res.json();
-        
-        // Убедимся, что текущая активная папка (куда добавляем файлы) тоже будет открыта
-        if (activeFolderId) {
-          openFolders.add(activeFolderId);
-        }
-        
-        restoreOpenState(newNodes);
-        nodes = newNodes;
+      const newNodes = await getNotes();
+
+      // Убедимся, что текущая активная папка (куда добавляем файлы) тоже будет открыта
+      if (activeFolderId) {
+        openFolders.add(activeFolderId);
       }
+
+      restoreOpenState(newNodes);
+      nodes = newNodes;
     } catch (err) {
-      console.error("Ошибка при загрузке дерева заметок:", err);
+      operationError = err instanceof Error ? err.message : "Ошибка при загрузке дерева заметок";
     } finally {
       // Искусственная задержка для визуального эффекта спиннера, если ответ пришел мгновенно
       setTimeout(() => isRefreshing = false, 300);
@@ -61,14 +61,13 @@
   }
 
   async function syncTree() {
+    operationError = "";
     isRefreshing = true;
     try {
-      const res = await fetch('/api/sync', { method: 'POST' });
-      if (res.ok) {
-        await loadTree();
-      }
+      await syncNotes();
+      await loadTree();
     } catch (err) {
-      console.error("Ошибка при синхронизации дерева:", err);
+      operationError = err instanceof Error ? err.message : "Ошибка при синхронизации дерева";
       isRefreshing = false;
     }
   }
@@ -110,83 +109,67 @@
 
   async function confirmCreate() {
     if (!createName.trim()) return;
+    operationError = "";
     createError = "";
     
     try {
-      const res = await fetch('/api/notes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          parent_id: activeFolderId || "",
-          name: createName.trim(),
-          type: createType
-        })
+      await createNote({
+        parent_id: activeFolderId || "",
+        name: createName.trim(),
+        type: createType
       });
 
-      if (res.ok) {
-        showCreateModal = false;
-        loadTree();
-      } else if (res.status === 409) {
+      showCreateModal = false;
+      loadTree();
+    } catch (err) {
+      operationError = err instanceof Error ? err.message : "Произошла ошибка при создании";
+      if (err?.status === 409) {
         createError = createType === 'dir' 
           ? `Папка "${createName.trim()}" уже существует.` 
           : `Файл "${createName.trim()}" уже существует.`;
       }
-    } catch (err) {
-      console.error(err);
-      createError = "Произошла ошибка при создании";
     }
   }
 
   async function confirmRename() {
+    operationError = "";
     if (!renameValue.trim() || renameValue === activeName) {
       showRenameModal = false;
       return;
     }
     
     try {
-      const res = await fetch('/api/rename', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: activeId,
-          new_name: renameValue.trim()
-        })
-      });
-      if (res.ok) {
-        showRenameModal = false;
-        
-        // Сбросим текущее выделение, так как ID поменялся
-        // Можно также было бы попытаться обновить activeId, но сброс проще и надежнее
-        if (onDelete) onDelete(activeId); // это очистит редактор в App.svelte
-        activeId = null;
-        activeName = "";
-        
-        loadTree();
-      }
+      await renameNote(activeId, renameValue.trim());
+      showRenameModal = false;
+
+      // Сбросим текущее выделение, так как ID поменялся
+      // Можно также было бы попытаться обновить activeId, но сброс проще и надежнее
+      if (onDelete) onDelete(activeId); // это очистит редактор в App.svelte
+      activeId = null;
+      activeName = "";
+
+      loadTree();
     } catch (err) {
-      console.error(err);
+      operationError = err instanceof Error ? err.message : "Произошла ошибка при переименовании";
     }
   }
 
   async function confirmDelete() {
     if (!activeId) return;
+    operationError = "";
 
     try {
-      const res = await fetch(`/api/note?id=${encodeURIComponent(activeId)}`, {
-        method: 'DELETE'
-      });
-      if (res.ok) {
-        if (onDelete) onDelete(activeId);
-        // Если удаляем папку, её тоже надо удалить из списка открытых
-        openFolders.delete(activeId);
-        activeId = null;
-        activeFolderId = null; // Сбрасываем активную папку на корень
-        activeName = "";
-        showDeleteModal = false;
-        loadTree();
-      }
+      await deleteNote(activeId);
+      if (onDelete) onDelete(activeId);
+      // Если удаляем папку, её тоже надо удалить из списка открытых
+      openFolders.delete(activeId);
+      activeId = null;
+      activeFolderId = null; // Сбрасываем активную папку на корень
+      activeName = "";
+      showDeleteModal = false;
+      loadTree();
     } catch (err) {
-      console.error(err);
+      operationError = err instanceof Error ? err.message : "Произошла ошибка при удалении";
     }
   }
 
@@ -199,7 +182,7 @@
   }
 </script>
 
-<aside class="w-72 bg-gray-50 border-r border-gray-200 flex flex-col h-full shrink-0">
+<aside class="w-full h-56 sm:w-72 sm:h-full bg-gray-50 border-r border-gray-200 flex flex-col shrink-0">
   <div class="p-3 border-b border-gray-200 bg-gray-100 flex flex-col gap-2">
     <div class="flex justify-between items-center mb-1">
       <h2 class="font-semibold text-gray-700 text-sm uppercase tracking-wider">База заметок</h2>
@@ -207,6 +190,9 @@
         <svg class="w-4 h-4 {isRefreshing ? 'animate-spin' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
       </button>
     </div>
+    {#if operationError}
+      <p role="alert" class="text-xs text-red-600">{operationError}</p>
+    {/if}
     <div class="flex gap-1.5 justify-between">
       <button onclick={() => openCreateModal('file')} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-gray-600 hover:text-blue-600 hover:bg-blue-50 transition-colors shadow-sm cursor-pointer" title="Создать новую заметку">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>
@@ -229,7 +215,7 @@
     {/if}
   </div>
   
-  <div class="flex-1 overflow-y-auto p-2 text-sm text-gray-700" onclick={handleContainerClick} role="presentation">
+  <div class="flex-1 overflow-y-auto p-2 text-sm text-gray-700" onclick={handleContainerClick} role="presentation" aria-busy={isRefreshing}>
     {#snippet treeNode(node)}
       <li class="py-0.5">
         <button type="button" class="w-full flex items-center gap-1 cursor-pointer hover:bg-gray-200 p-1.5 rounded transition-colors text-left {activeId === node.id ? 'bg-blue-100 text-blue-800' : ''}" 
@@ -292,6 +278,7 @@
   show={showDeleteModal} 
   title="Удалить выбранный элемент?"
   confirmText="Удалить"
+  danger={true}
   onConfirm={confirmDelete}
   onCancel={() => showDeleteModal = false}
 />
