@@ -170,25 +170,85 @@ describe('frontend API client', () => {
     })
   })
 
-  it('updates an encoded base, switches base, and refreshes config after each mutation', async () => {
-    const updated = configFixture('renamed', '/notes/renamed')
-    const switched = configFixture('next')
+  it.each([
+    {
+      name: 'updateConfig',
+      call: () => updateConfig(configFixture('personal', '/tmp/personal')),
+      path: '/api/config',
+      method: 'PUT',
+      body: configFixture('personal', '/tmp/personal'),
+    },
+    {
+      name: 'completeSetup',
+      call: () => completeSetup({ mode: 'create', name: 'team', path: '/notes/team' }),
+      path: '/api/setup',
+      method: 'POST',
+      body: { mode: 'create', name: 'team', path: '/notes/team' },
+    },
+    {
+      name: 'createBase',
+      call: () => createBase({ mode: 'connect', name: 'shared', path: '/notes/shared' }),
+      path: '/api/bases',
+      method: 'POST',
+      body: { mode: 'connect', name: 'shared', path: '/notes/shared' },
+    },
+    {
+      name: 'updateBase',
+      call: () => updateBase('old/name', { name: 'renamed', path: '/notes/renamed' }),
+      path: '/api/bases?name=old%2Fname',
+      method: 'PUT',
+      body: { name: 'renamed', path: '/notes/renamed' },
+    },
+    {
+      name: 'forgetBase',
+      call: () => forgetBase('team/shared'),
+      path: '/api/bases?name=team%2Fshared',
+      method: 'DELETE',
+    },
+    {
+      name: 'switchBase',
+      call: () => switchBase('next'),
+      path: '/api/bases/switch',
+      method: 'POST',
+      body: { name: 'next' },
+    },
+  ])('$name returns the committed config without a refresh', async ({ call, path, method, body }) => {
+    const committed = configFixture(`${method.toLowerCase()}-result`)
     fetchMock
-      .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse(updated))
-      .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse(switched))
+      .mockResolvedValueOnce(jsonResponse({ config: committed, base_path: '/committed/base' }))
+      .mockRejectedValueOnce(new Error('hypothetical refresh failed'))
 
-    await expect(updateBase('old/name', { name: 'renamed', path: '/notes' })).resolves.toEqual(updated)
-    await expect(switchBase('next')).resolves.toEqual(switched)
+    await expect(call()).resolves.toEqual(committed)
 
-    expectJSONRequest(fetchMock, 0, '/api/bases?name=old%2Fname', 'PUT', {
-      name: 'renamed',
-      path: '/notes',
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    if (body === undefined) {
+      const request = requestAt(fetchMock)
+      expect(request).toMatchObject({ path, options: { method } })
+      expect(request.options.body).toBeUndefined()
+      expect(request.options.headers.has('Content-Type')).toBe(false)
+    } else {
+      expectJSONRequest(fetchMock, 0, path, method, body)
+    }
+  })
+
+  it.each([
+    ['JSON null', null],
+    ['an array payload', []],
+    ['a missing config', { base_path: '/notes/work' }],
+    ['a null config', { config: null, base_path: '/notes/work' }],
+    ['an array config', { config: [], base_path: '/notes/work' }],
+    ['a primitive config', { config: 'invalid', base_path: '/notes/work' }],
+  ])('rejects a successful settings mutation response with %s', async (_case, payload) => {
+    fetchMock.mockResolvedValue(jsonResponse(payload))
+
+    await expect(switchBase('work')).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 200,
+      code: 'invalid_response',
+      field: '',
+      message: 'Приложение вернуло некорректный JSON',
     })
-    expect(requestAt(fetchMock, 1)).toMatchObject({ path: '/api/config', options: { method: 'GET' } })
-    expectJSONRequest(fetchMock, 2, '/api/bases/switch', 'POST', { name: 'next' })
-    expect(requestAt(fetchMock, 3)).toMatchObject({ path: '/api/config', options: { method: 'GET' } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('normalizes network failures and supplies a fallback message', async () => {
@@ -223,21 +283,6 @@ describe('frontend API client', () => {
     })
   })
 
-  it('sends the complete config without mutation and returns refreshed config', async () => {
-    const config = configFixture('personal', '/tmp/personal')
-    const original = structuredClone(config)
-    const refreshed = structuredClone(config)
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ ignored: true }))
-      .mockResolvedValueOnce(jsonResponse(refreshed))
-
-    await expect(updateConfig(config)).resolves.toEqual(refreshed)
-
-    expect(config).toEqual(original)
-    expectJSONRequest(fetchMock, 0, '/api/config', 'PUT', original)
-    expect(requestAt(fetchMock, 1)).toMatchObject({ path: '/api/config', options: { method: 'GET' } })
-  })
-
   it('rejects malformed JSON from a successful response as invalid_response', async () => {
     fetchMock.mockResolvedValue(response('{broken', 200))
 
@@ -248,35 +293,6 @@ describe('frontend API client', () => {
       field: '',
       message: 'Приложение вернуло некорректный JSON',
     })
-  })
-
-  it('creates, completes setup, and forgets bases before refreshing config', async () => {
-    const draft = { mode: 'create', name: 'team', path: '/notes' }
-    const created = configFixture('team', '/notes/team')
-    const completed = configFixture('team', '/notes/team')
-    const forgotten = configFixture('personal', '/notes/personal')
-    fetchMock
-      .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse(created))
-      .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse(completed))
-      .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse(forgotten))
-
-    await expect(createBase(draft)).resolves.toEqual(created)
-    await expect(completeSetup(draft)).resolves.toEqual(completed)
-    await expect(forgetBase('team/shared')).resolves.toEqual(forgotten)
-
-    expectJSONRequest(fetchMock, 0, '/api/bases', 'POST', draft)
-    expect(requestAt(fetchMock, 1).path).toBe('/api/config')
-    expectJSONRequest(fetchMock, 2, '/api/setup', 'POST', draft)
-    expect(requestAt(fetchMock, 3).path).toBe('/api/config')
-    expect(requestAt(fetchMock, 4)).toMatchObject({
-      path: '/api/bases?name=team%2Fshared',
-      options: { method: 'DELETE' },
-    })
-    expect(requestAt(fetchMock, 4).options.body).toBeUndefined()
-    expect(requestAt(fetchMock, 5).path).toBe('/api/config')
   })
 
   it('gets info, an encoded note, and the notes tree from exact paths', async () => {

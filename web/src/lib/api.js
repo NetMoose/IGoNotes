@@ -83,8 +83,22 @@ function jsonBody(value) {
 }
 
 async function mutateConfig(path, options) {
-  await request(path, options)
-  return getConfig()
+  const { status, payload } = await requestWithStatus(path, options)
+  if (
+    payload === null
+    || typeof payload !== 'object'
+    || Array.isArray(payload)
+    || payload.config === null
+    || typeof payload.config !== 'object'
+    || Array.isArray(payload.config)
+  ) {
+    throw new ApiError({
+      status,
+      code: 'invalid_response',
+      message: 'Приложение вернуло некорректный JSON',
+    })
+  }
+  return payload.config
 }
 
 export function getConfig() {
