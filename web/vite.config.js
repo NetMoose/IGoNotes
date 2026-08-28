@@ -5,4 +5,13 @@ import tailwindcss from '@tailwindcss/vite'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [tailwindcss(), svelte()],
+  resolve: {
+    conditions: ['browser'],
+  },
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./vitest-setup.js'],
+    clearMocks: true,
+    restoreMocks: true,
+  },
 })
