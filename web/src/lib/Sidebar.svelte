@@ -1,9 +1,9 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import Modal from './Modal.svelte';
-  import { getNotes, syncNotes, createNote, renameNote, deleteNote } from './api.js';
+  import { getNotes, syncNotes, createNote } from './api.js';
 
-  let { onSelect, onDelete } = $props();
+  let { onSelect, onRename, onDelete } = $props();
 
   let nodes = $state([]);
   let activeId = $state(null);
@@ -203,13 +203,12 @@
     mutationBusy = true;
     
     try {
-      await renameNote(activeId, renameValue.trim());
+      await onRename(activeId, renameValue.trim());
       if (!mounted) return;
       showRenameModal = false;
 
       // Сбросим текущее выделение, так как ID поменялся
       // Можно также было бы попытаться обновить activeId, но сброс проще и надежнее
-      if (onDelete) onDelete(activeId); // это очистит редактор в App.svelte
       activeId = null;
       activeName = "";
 
@@ -231,9 +230,8 @@
     deleteError = "";
 
     try {
-      await deleteNote(activeId);
+      await onDelete(activeId);
       if (!mounted) return;
-      if (onDelete) onDelete(activeId);
       // Если удаляем папку, её тоже надо удалить из списка открытых
       openFolders.delete(activeId);
       activeId = null;

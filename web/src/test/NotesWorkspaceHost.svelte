@@ -11,6 +11,7 @@
   basePath="/notes/work"
   error=""
   onSelectNote={() => {}}
+  onRenameNote={() => {}}
   onDeleteNote={() => {}}
   onSave={() => {}}
   onOpenSettings={() => {}}

@@ -112,6 +112,17 @@ function fileNode(name) {
   }
 }
 
+function folderNode(id, children = []) {
+  const parts = id.split('/')
+  return {
+    id,
+    name: parts.at(-1),
+    type: 'dir',
+    parent_id: parts.slice(0, -1).join('/'),
+    children,
+  }
+}
+
 describe('App setup gate', () => {
   beforeEach(() => {
     setEditorFlush()
@@ -804,6 +815,188 @@ describe('App setup gate', () => {
     )
     expect(within(screen.getByRole('main')).getByText('a.md')).toBeVisible()
     expect(screen.getByLabelText('Markdown')).toHaveValue('# A from upload')
+  })
+
+  it('saves a dirty active note at its old id before renaming and closes it only after rename completes', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const renameRequest = deferred()
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(renameNote).mockReturnValue(renameRequest.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.clear(textarea)
+    await user.type(textarea, '# Renamed draft')
+    await user.click(screen.getByRole('button', { name: 'Переименовать выбранное' }))
+    const dialog = screen.getByRole('dialog')
+    const input = within(dialog).getByRole('textbox')
+    await user.clear(input)
+    await user.type(input, 'renamed.md')
+    await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
+
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Renamed draft'))
+    await waitFor(() => expect(renameNote).toHaveBeenCalledWith(note.id, 'renamed.md'))
+    expect(saveNote.mock.invocationCallOrder[0]).toBeLessThan(renameNote.mock.invocationCallOrder[0])
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Renamed draft')
+    expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toHaveAttribute('aria-busy', 'true')
+
+    renameRequest.resolve(null)
+    await renameRequest.promise
+
+    expect(await screen.findByText('Выберите заметку')).toBeVisible()
+    expect(screen.queryByLabelText('Markdown')).not.toBeInTheDocument()
+  })
+
+  it('waits for an ancestor deletion upload and its resulting save before deleting and closing the descendant', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const topic = folderNode('topic', [note])
+    const uploadRequest = deferred()
+    const saveRequest = deferred()
+    const flush = vi.fn()
+      .mockReturnValueOnce(uploadRequest.promise)
+      .mockReturnValueOnce(undefined)
+    setEditorFlush(flush)
+    vi.mocked(getNotes).mockResolvedValue([topic])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(saveNote).mockReturnValue(saveRequest.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'topic' }))
+    await user.click(screen.getByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.click(screen.getByRole('button', { name: 'topic' }))
+    await user.click(screen.getByRole('button', { name: 'Удалить выбранное' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Удалить' }))
+
+    await waitFor(() => expect(flush).toHaveBeenCalledOnce())
+    expect(deleteNote).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Original')
+
+    await fireEvent.input(textarea, { target: { value: '# Uploaded image' } })
+    uploadRequest.resolve()
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Uploaded image'))
+    expect(deleteNote).not.toHaveBeenCalled()
+
+    saveRequest.resolve(null)
+    await saveRequest.promise
+    await waitFor(() => expect(deleteNote).toHaveBeenCalledWith(topic.id))
+    expect(flush).toHaveBeenCalledTimes(2)
+    expect(await screen.findByText('Выберите заметку')).toBeVisible()
+  })
+
+  it.each([
+    ['rename', renameNote],
+    ['delete', deleteNote],
+  ])('does not %s an affected note when its flush fails', async (operation, request) => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(saveNote).mockRejectedValue(new Error('Диск недоступен'))
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.clear(textarea)
+    await user.type(textarea, '# Keep me')
+
+    if (operation === 'rename') {
+      await user.click(screen.getByRole('button', { name: 'Переименовать выбранное' }))
+      const dialog = screen.getByRole('dialog')
+      const input = within(dialog).getByRole('textbox')
+      await user.clear(input)
+      await user.type(input, 'renamed.md')
+      await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
+    } else {
+      await user.click(screen.getByRole('button', { name: 'Удалить выбранное' }))
+      await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Удалить' }))
+    }
+
+    expect(await within(screen.getByRole('main')).findByRole('alert')).toHaveTextContent(
+      /^Не удалось сохранить заметку: Диск недоступен$/,
+    )
+    expect(request).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Keep me')
+    expect(within(screen.getByRole('main')).getByText('draft.md')).toBeVisible()
+    expect(screen.getByRole('dialog')).toBeVisible()
+  })
+
+  it.each(['rename', 'delete'])('closes a clean active descendant after ancestor %s', async (operation) => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const topic = folderNode('topic', [note])
+    vi.mocked(getNotes).mockResolvedValue([topic])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'topic' }))
+    await user.click(screen.getByRole('button', { name: 'draft.md' }))
+    await screen.findByLabelText('Markdown')
+    await user.click(screen.getByRole('button', { name: 'topic' }))
+
+    if (operation === 'rename') {
+      await user.click(screen.getByRole('button', { name: 'Переименовать выбранное' }))
+      const dialog = screen.getByRole('dialog')
+      const input = within(dialog).getByRole('textbox')
+      await user.clear(input)
+      await user.type(input, 'renamed-topic')
+      await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
+      await waitFor(() => expect(renameNote).toHaveBeenCalledWith(topic.id, 'renamed-topic'))
+    } else {
+      await user.click(screen.getByRole('button', { name: 'Удалить выбранное' }))
+      await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Удалить' }))
+      await waitFor(() => expect(deleteNote).toHaveBeenCalledWith(topic.id))
+    }
+
+    expect(await screen.findByText('Выберите заметку')).toBeVisible()
+    expect(screen.queryByLabelText('Markdown')).not.toBeInTheDocument()
+  })
+
+  it.each(['rename', 'delete'])('does not flush or close a segment-prefix sibling during unrelated %s', async (operation) => {
+    const user = userEvent.setup()
+    const note = {
+      id: 'topic-archive/note.md',
+      name: 'note.md',
+      type: 'file',
+      parent_id: 'topic-archive',
+    }
+    const topic = folderNode('topic')
+    const archive = folderNode('topic-archive', [note])
+    const flush = vi.fn()
+    setEditorFlush(flush)
+    vi.mocked(getNotes).mockResolvedValue([topic, archive])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Archive' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'topic-archive' }))
+    await user.click(screen.getByRole('button', { name: 'note.md' }))
+    await screen.findByLabelText('Markdown')
+    flush.mockClear()
+    vi.mocked(saveNote).mockClear()
+    await user.click(screen.getByRole('button', { name: 'topic' }))
+
+    if (operation === 'rename') {
+      await user.click(screen.getByRole('button', { name: 'Переименовать выбранное' }))
+      const dialog = screen.getByRole('dialog')
+      const input = within(dialog).getByRole('textbox')
+      await user.clear(input)
+      await user.type(input, 'renamed-topic')
+      await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
+      await waitFor(() => expect(renameNote).toHaveBeenCalledWith(topic.id, 'renamed-topic'))
+    } else {
+      await user.click(screen.getByRole('button', { name: 'Удалить выбранное' }))
+      await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Удалить' }))
+      await waitFor(() => expect(deleteNote).toHaveBeenCalledWith(topic.id))
+    }
+
+    expect(flush).not.toHaveBeenCalled()
+    expect(saveNote).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Archive')
+    expect(within(screen.getByRole('main')).getByText('note.md')).toBeVisible()
   })
 
   it('manually saves unchanged content and catches save errors in the UI', async () => {

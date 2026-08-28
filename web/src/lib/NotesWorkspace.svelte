@@ -10,6 +10,7 @@
     error = '',
     transitioning = false,
     onSelectNote,
+    onRenameNote,
     onDeleteNote,
     onSave,
     onOpenSettings,
@@ -34,7 +35,11 @@
   class="flex flex-col h-screen w-full bg-white text-gray-800 font-sans overflow-hidden"
 >
   <div class="flex-1 flex overflow-hidden">
-    <Sidebar onSelect={(...args) => runAfterUploads(onSelectNote, ...args)} onDelete={onDeleteNote} />
+    <Sidebar
+      onSelect={(...args) => runAfterUploads(onSelectNote, ...args)}
+      onRename={onRenameNote}
+      onDelete={onDeleteNote}
+    />
 
     <main class="flex-1 flex flex-col h-full overflow-hidden min-w-0">
       <header class="bg-white border-b border-gray-200 px-4 py-2 flex items-center justify-between shrink-0 h-14">

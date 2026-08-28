@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte'
 
-  import { getConfig, getNote, saveNote, switchBase } from './lib/api.js'
+  import { deleteNote, getConfig, getNote, renameNote, saveNote, switchBase } from './lib/api.js'
   import { openSettingsSafely, switchBaseSafely } from './lib/app-transitions.js'
   import { activeBase } from './lib/base-draft.js'
   import NotesWorkspace from './lib/NotesWorkspace.svelte'
@@ -246,8 +246,38 @@
     await flushPendingSave()
   }
 
-  function handleDeleted(id) {
-    if (activeNote?.id === id) resetEditorState()
+  function affectsActiveNote(id) {
+    const activeId = activeNote?.id
+    return activeId === id || activeId?.startsWith(`${id}/`)
+  }
+
+  async function mutateNote(id, request) {
+    if (!affectsActiveNote(id)) return request()
+
+    const transition = beginTransition()
+    transitionError = ''
+
+    try {
+      try {
+        await flushWorkspace()
+      } catch (error) {
+        if (mounted && saveStatus !== 'error') showSaveError(error)
+        throw error
+      }
+
+      await request()
+      if (mounted) resetEditorState()
+    } finally {
+      endTransition(transition)
+    }
+  }
+
+  function renameNode(id, newName) {
+    return mutateNote(id, () => renameNote(id, newName))
+  }
+
+  function deleteNode(id) {
+    return mutateNote(id, () => deleteNote(id))
   }
 
   async function saveNow() {
@@ -358,7 +388,8 @@
       {transitioning}
       error={transitionError}
       onSelectNote={loadNote}
-      onDeleteNote={handleDeleted}
+      onRenameNote={renameNode}
+      onDeleteNote={deleteNode}
       onSave={saveNow}
       onOpenSettings={openSettings}
     />

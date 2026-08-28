@@ -58,6 +58,7 @@ function workspaceProps(overrides = {}) {
     basePath: '/notes/work',
     error: '',
     onSelectNote: vi.fn(),
+    onRenameNote: vi.fn(),
     onDeleteNote: vi.fn(),
     onSave: vi.fn(),
     onOpenSettings: vi.fn(),
@@ -248,8 +249,9 @@ describe('NotesWorkspace', () => {
     expect(props.onSave).toHaveBeenCalledOnce()
   })
 
-  it('forwards a deleted file id from the real sidebar and modal', async () => {
+  it('forwards and awaits deletion instead of owning the API request', async () => {
     const user = userEvent.setup()
+    const request = deferred()
     const note = {
       id: 'topic/note.md',
       name: 'note.md',
@@ -257,16 +259,49 @@ describe('NotesWorkspace', () => {
       parent_id: 'topic',
     }
     vi.mocked(getNotes).mockResolvedValue([note])
-    const { props } = await renderWorkspace()
+    const { props } = await renderWorkspace({ onDeleteNote: vi.fn(() => request.promise) })
     await user.click(screen.getByRole('button', { name: 'note.md' }))
     await user.click(screen.getByRole('button', { name: 'Удалить выбранное' }))
+    const dialog = screen.getByRole('dialog')
+    await user.click(within(dialog).getByRole('button', { name: 'Удалить' }))
 
-    await user.click(screen.getByRole('button', { name: 'Удалить' }))
-
-    expect(deleteNote).toHaveBeenCalledOnce()
-    expect(deleteNote).toHaveBeenCalledWith(note.id)
     expect(props.onDeleteNote).toHaveBeenCalledOnce()
     expect(props.onDeleteNote).toHaveBeenCalledWith(note.id)
+    expect(deleteNote).not.toHaveBeenCalled()
+    expect(within(dialog).getByRole('button', { name: 'Удалить' })).toHaveAttribute('aria-busy', 'true')
+    expect(getNotes).toHaveBeenCalledOnce()
+
+    request.resolve(null)
+    await request.promise
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    await waitFor(() => expect(getNotes).toHaveBeenCalledTimes(2))
+  })
+
+  it('forwards and awaits rename instead of owning the API request', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    const note = fileNode('note.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    const { props } = await renderWorkspace({ onRenameNote: vi.fn(() => request.promise) })
+    await user.click(screen.getByRole('button', { name: 'note.md' }))
+    await user.click(screen.getByRole('button', { name: 'Переименовать выбранное' }))
+    const dialog = screen.getByRole('dialog')
+    const input = within(dialog).getByRole('textbox')
+    await user.clear(input)
+    await user.type(input, 'renamed.md')
+    await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
+
+    expect(props.onRenameNote).toHaveBeenCalledOnce()
+    expect(props.onRenameNote).toHaveBeenCalledWith(note.id, 'renamed.md')
+    expect(renameNote).not.toHaveBeenCalled()
+    expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toHaveAttribute('aria-busy', 'true')
+    expect(getNotes).toHaveBeenCalledOnce()
+
+    request.resolve(null)
+    await request.promise
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     await waitFor(() => expect(getNotes).toHaveBeenCalledTimes(2))
   })
 
@@ -333,8 +368,8 @@ describe('NotesWorkspace', () => {
     const user = userEvent.setup()
     const note = fileNode('note.md')
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(renameNote).mockRejectedValue(new ApiError({ message: 'Не удалось переименовать' }))
-    await renderWorkspace()
+    const onRenameNote = vi.fn().mockRejectedValue(new ApiError({ message: 'Не удалось переименовать' }))
+    await renderWorkspace({ onRenameNote })
     await user.click(screen.getByRole('button', { name: 'note.md' }))
     await user.click(screen.getByTitle('Переименовать выбранное'))
     const dialog = screen.getByRole('dialog')
@@ -345,6 +380,8 @@ describe('NotesWorkspace', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
 
     expect(await within(dialog).findByRole('alert')).toHaveTextContent('Не удалось переименовать')
+    expect(onRenameNote).toHaveBeenCalledWith(note.id, 'renamed.md')
+    expect(renameNote).not.toHaveBeenCalled()
     expect(input).toBeEnabled()
     expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toBeEnabled()
     expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toHaveAttribute('aria-busy', 'false')
@@ -356,22 +393,22 @@ describe('NotesWorkspace', () => {
     const request = deferred()
     const unhandled = vi.fn((event) => event.preventDefault())
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(deleteNote).mockReturnValue(request.promise)
     window.addEventListener('unhandledrejection', unhandled)
 
     try {
-      const { props, unmount } = await renderWorkspace()
+      const onDeleteNote = vi.fn(() => request.promise)
+      const { unmount } = await renderWorkspace({ onDeleteNote })
       await user.click(screen.getByRole('button', { name: 'note.md' }))
       await user.click(screen.getByTitle('Удалить выбранное'))
       await user.click(screen.getByRole('button', { name: 'Удалить' }))
-      expect(deleteNote).toHaveBeenCalledOnce()
+      expect(onDeleteNote).toHaveBeenCalledOnce()
+      expect(deleteNote).not.toHaveBeenCalled()
 
       unmount()
       request.resolve(null)
       await request.promise
       await tick()
 
-      expect(props.onDeleteNote).not.toHaveBeenCalled()
       expect(getNotes).toHaveBeenCalledOnce()
       expect(unhandled).not.toHaveBeenCalled()
     } finally {
