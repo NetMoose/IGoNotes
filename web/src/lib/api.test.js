@@ -170,13 +170,18 @@ describe('frontend API client', () => {
     })
   })
 
+  const updateConfigInput = configFixture('personal', '/tmp/personal')
+  const originalUpdateConfigInput = structuredClone(updateConfigInput)
+
   it.each([
     {
       name: 'updateConfig',
-      call: () => updateConfig(configFixture('personal', '/tmp/personal')),
+      call: () => updateConfig(updateConfigInput),
       path: '/api/config',
       method: 'PUT',
-      body: configFixture('personal', '/tmp/personal'),
+      body: updateConfigInput,
+      callerInput: updateConfigInput,
+      originalInput: originalUpdateConfigInput,
     },
     {
       name: 'completeSetup',
@@ -212,7 +217,14 @@ describe('frontend API client', () => {
       method: 'POST',
       body: { name: 'next' },
     },
-  ])('$name returns the committed config without a refresh', async ({ call, path, method, body }) => {
+  ])('$name returns the committed config without a refresh', async ({
+    call,
+    path,
+    method,
+    body,
+    callerInput,
+    originalInput,
+  }) => {
     const committed = configFixture(`${method.toLowerCase()}-result`)
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ config: committed, base_path: '/committed/base' }))
@@ -229,6 +241,9 @@ describe('frontend API client', () => {
     } else {
       expectJSONRequest(fetchMock, 0, path, method, body)
     }
+    if (callerInput !== undefined) {
+      expect(callerInput).toEqual(originalInput)
+    }
   })
 
   it.each([
@@ -244,7 +259,9 @@ describe('frontend API client', () => {
   ])('rejects a successful settings mutation response with %s', async (_case, payload) => {
     fetchMock.mockResolvedValue(jsonResponse(payload))
 
-    await expect(switchBase('work')).rejects.toMatchObject({
+    const promise = switchBase('work')
+    await expect(promise).rejects.toBeInstanceOf(ApiError)
+    await expect(promise).rejects.toMatchObject({
       name: 'ApiError',
       status: 200,
       code: 'invalid_response',
