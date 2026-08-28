@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte'
+import { render, screen, waitFor, within } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -28,6 +28,25 @@ async function renderEditor() {
 
 function imageFile(name) {
   return new File(['image'], name, { type: 'image/png' })
+}
+
+const focusClasses = [
+  'focus-visible:outline-2',
+  'focus-visible:outline-offset-2',
+  'focus-visible:outline-blue-600',
+]
+
+function expectEditorFocusClasses(editor) {
+  const controls = [
+    ...within(editor).queryAllByRole('button'),
+    ...editor.querySelectorAll('input[type="text"], input[type="url"]'),
+  ].filter((control) => control.matches(':not([disabled])'))
+
+  expect(controls.length).toBeGreaterThan(0)
+  for (const control of controls) {
+    expect(control).toHaveClass(...focusClasses)
+    expect(control).not.toHaveClass('focus:outline-none', 'focus-visible:outline-none')
+  }
 }
 
 describe('Editor image uploads', () => {
@@ -161,7 +180,25 @@ describe('Editor image uploads', () => {
     for (const name of names) {
       const button = screen.getByRole('button', { name })
       expect(button).toHaveAttribute('title', name)
+      expect(button).toHaveAttribute('aria-label', name)
       expect(button.querySelector('svg')).toHaveAttribute('aria-hidden', 'true')
     }
+  })
+
+  it('gives every visible Editor control an explicit keyboard focus outline', async () => {
+    const user = userEvent.setup()
+    const { container } = await renderEditor()
+    const editor = container.firstElementChild
+
+    expectEditorFocusClasses(editor)
+
+    for (const menu of ['Заголовок', 'Блок кода']) {
+      await user.click(within(editor).getByRole('button', { name: menu }))
+      expectEditorFocusClasses(editor)
+      await user.click(within(editor).getByRole('button', { name: menu }))
+    }
+
+    await user.click(within(editor).getByRole('button', { name: 'Ссылка' }))
+    expectEditorFocusClasses(editor)
   })
 })

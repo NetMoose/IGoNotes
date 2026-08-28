@@ -121,6 +121,28 @@ describe('Modal', () => {
     expect(props.onCancel).toHaveBeenCalledOnce()
   })
 
+  it('moves focus to the dialog when pending work disables every control', async () => {
+    const props = modalProps({ input: true, confirmText: 'Сохранить' })
+    const { rerender } = render(Modal, props)
+    const dialog = screen.getByRole('dialog')
+    const input = screen.getByRole('textbox')
+    const cancel = screen.getByRole('button', { name: 'Отмена' })
+    const confirm = screen.getByRole('button', { name: 'Сохранить' })
+    await waitFor(() => expect(input).toHaveFocus())
+    confirm.focus()
+    expect(confirm).toHaveFocus()
+
+    await rerender({ ...props, busy: true })
+
+    expect(input).toBeDisabled()
+    expect(cancel).toBeDisabled()
+    expect(confirm).toBeDisabled()
+    expect(dialog).toHaveAttribute('tabindex', '-1')
+    await waitFor(() => expect(dialog).toHaveFocus())
+    await fireEvent.keyDown(dialog, { key: 'Tab' })
+    expect(dialog).toHaveFocus()
+  })
+
   it('confirms once for an available non-composing input Enter', async () => {
     const props = modalProps({ input: true })
     const { rerender } = render(Modal, props)
@@ -185,6 +207,45 @@ describe('Modal', () => {
         result.unmount()
         trigger.remove()
         preservedInert.remove()
+      }
+    },
+  )
+
+  it.each(['close', 'unmount'])(
+    'inerts every ancestor sibling and restores exact prior state on %s',
+    async (settlement) => {
+      const bodySibling = document.createElement('button')
+      const outer = document.createElement('div')
+      const preservedSibling = document.createElement('div')
+      const modalBranch = document.createElement('div')
+      const innerSibling = document.createElement('button')
+      const target = document.createElement('div')
+      preservedSibling.setAttribute('inert', 'preserved')
+      document.body.append(bodySibling, outer)
+      outer.append(preservedSibling, modalBranch)
+      modalBranch.append(innerSibling, target)
+      const props = modalProps()
+      const result = render(Modal, { target, props })
+
+      try {
+        await waitFor(() => expect(screen.getByRole('dialog')).toBeVisible())
+        expect(bodySibling).toHaveAttribute('inert')
+        expect(preservedSibling).toHaveAttribute('inert')
+        expect(innerSibling).toHaveAttribute('inert')
+
+        if (settlement === 'close') {
+          await result.rerender({ ...props, show: false })
+        } else {
+          result.unmount()
+        }
+
+        expect(bodySibling).not.toHaveAttribute('inert')
+        expect(preservedSibling).toHaveAttribute('inert', 'preserved')
+        expect(innerSibling).not.toHaveAttribute('inert')
+      } finally {
+        result.unmount()
+        outer.remove()
+        bodySibling.remove()
       }
     },
   )

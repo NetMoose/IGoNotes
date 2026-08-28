@@ -66,24 +66,32 @@
     let inputElement = $state();
     let cancelButton = $state();
     let confirmButton = $state();
+    let dialogElement = $state();
+
+    $effect(() => {
+        if (!busy || !dialogElement) return;
+
+        const frame = requestAnimationFrame(() => {
+            if (!dialogElement?.isConnected) return;
+            const focused = document.activeElement;
+            if (!dialogElement.contains(focused) || focused.matches(':disabled')) {
+                dialogElement.focus();
+            }
+        });
+
+        return () => cancelAnimationFrame(frame);
+    });
 
     function backgroundElements(overlay) {
         const elements = new Set();
-        const parent = overlay.parentElement;
-        if (parent) {
+        let branch = overlay;
+        while (branch.parentElement) {
+            const parent = branch.parentElement;
             for (const sibling of parent.children) {
-                if (sibling !== overlay) elements.add(sibling);
+                if (sibling !== branch) elements.add(sibling);
             }
-        }
-
-        let bodyBranch = overlay;
-        while (bodyBranch.parentElement && bodyBranch.parentElement !== document.body) {
-            bodyBranch = bodyBranch.parentElement;
-        }
-        if (bodyBranch.parentElement === document.body) {
-            for (const sibling of document.body.children) {
-                if (sibling !== bodyBranch) elements.add(sibling);
-            }
+            if (parent === document.body) break;
+            branch = parent;
         }
         return [...elements];
     }
@@ -180,6 +188,7 @@
 {#if show}
 <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="presentation">
     <div
+        bind:this={dialogElement}
         use:manageDialog
         class="w-full max-w-sm rounded-lg bg-white p-5 shadow-lg"
         role="dialog"

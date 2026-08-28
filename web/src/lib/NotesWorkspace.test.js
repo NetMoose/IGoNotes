@@ -124,6 +124,27 @@ describe('NotesWorkspace', () => {
     }
   })
 
+  it('gives every real Sidebar button an explicit keyboard focus outline', async () => {
+    const user = userEvent.setup()
+    vi.mocked(getNotes).mockResolvedValue([fileNode('note.md')])
+    const { container } = await renderWorkspace()
+    const sidebar = container.querySelector('aside')
+    const expectedClasses = [
+      'focus-visible:outline-2',
+      'focus-visible:outline-offset-2',
+      'focus-visible:outline-blue-600',
+    ]
+
+    for (const button of within(sidebar).getAllByRole('button')) {
+      expect(button).toHaveClass(...expectedClasses)
+    }
+
+    await user.click(within(sidebar).getByRole('button', { name: 'note.md' }))
+    for (const button of within(sidebar).getAllByRole('button')) {
+      expect(button).toHaveClass(...expectedClasses)
+    }
+  })
+
   it('locks the workspace while a transition is pending', async () => {
     const { container, props, rerender } = await renderWorkspace({ transitioning: true })
     const root = container.firstElementChild

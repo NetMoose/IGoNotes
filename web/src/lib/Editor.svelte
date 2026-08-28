@@ -466,23 +466,24 @@
     <!-- Левая часть: форматирование Markdown -->
     <div class="flex items-center gap-0.5">
       {#if mode === 'edit'}
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Жирный" onclick={() => applyFormat('**', '**')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Жирный" aria-label="Жирный" onclick={() => applyFormat('**', '**')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"></path><path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"></path></svg>
         </button>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Курсив" onclick={() => applyFormat('*', '*')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Курсив" aria-label="Курсив" onclick={() => applyFormat('*', '*')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="19" y1="4" x2="10" y2="4"></line><line x1="14" y1="20" x2="5" y2="20"></line><line x1="15" y1="4" x2="9" y2="20"></line></svg>
         </button>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Зачеркнутый" onclick={() => applyFormat('~~', '~~')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Зачеркнутый" aria-label="Зачеркнутый" onclick={() => applyFormat('~~', '~~')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"></line><path d="M16 6C16 6 14.5 4 12 4C9.5 4 8 6 8 6"></path><path d="M8 18C8 18 9.5 20 12 20C14.5 20 16 18 16 18"></path></svg>
         </button>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Подчеркнутый" onclick={() => applyFormat('<u>', '</u>')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Подчеркнутый" aria-label="Подчеркнутый" onclick={() => applyFormat('<u>', '</u>')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"></path><line x1="4" y1="21" x2="20" y2="21"></line></svg>
         </button>
         <div class="w-px h-4 bg-gray-300 mx-1"></div>
         <div class="relative">
           <button 
-            class="p-1.5 rounded-md transition-colors {showHeadingMenu ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-blue-600 hover:bg-blue-50'}" 
-            title="Заголовок" 
+            class="p-1.5 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 {showHeadingMenu ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-blue-600 hover:bg-blue-50'}"
+            title="Заголовок"
+            aria-label="Заголовок"
             onclick={(e) => { e.stopPropagation(); showHeadingMenu = !showHeadingMenu; }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h16M4 18V6M20 18V6"></path></svg>
           </button>
@@ -491,7 +492,7 @@
             <div class="absolute top-full left-0 mt-1 bg-white border border-gray-200 shadow-lg rounded-md py-1 z-10 w-32 flex flex-col">
               {#each [1, 2, 3, 4, 5] as level}
                 <button 
-                  class="text-left px-3 py-1.5 text-sm hover:bg-blue-50 text-gray-700 transition-colors"
+                  class="text-left px-3 py-1.5 text-sm hover:bg-blue-50 text-gray-700 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
                   onclick={() => insertHeading(level)}>
                   H{level} Заголовок
                 </button>
@@ -499,13 +500,14 @@
             </div>
           {/if}
         </div>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Цитата" onclick={() => applyFormat('> ', '')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Цитата" aria-label="Цитата" onclick={() => applyFormat('> ', '')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2 1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z"></path><path d="M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z"></path></svg>
         </button>
         <div class="relative">
           <button 
-            class="p-1.5 rounded-md transition-colors {showCodeMenu ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-blue-600 hover:bg-blue-50'}" 
-            title="Блок кода" 
+            class="p-1.5 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 {showCodeMenu ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-blue-600 hover:bg-blue-50'}"
+            title="Блок кода"
+            aria-label="Блок кода"
             onclick={(e) => { e.stopPropagation(); showCodeMenu = !showCodeMenu; }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
           </button>
@@ -514,7 +516,7 @@
             <div class="absolute top-full left-0 mt-1 bg-white border border-gray-200 shadow-lg rounded-md py-1 z-10 w-40 flex flex-col">
               {#each codeLanguages as lang}
                 <button 
-                  class="text-left px-3 py-1.5 text-sm hover:bg-blue-50 text-gray-700 transition-colors"
+                  class="text-left px-3 py-1.5 text-sm hover:bg-blue-50 text-gray-700 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
                   onclick={() => insertCodeBlock(lang.val)}>
                   {lang.label}
                 </button>
@@ -522,23 +524,24 @@
             </div>
           {/if}
         </div>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Инлайн код" onclick={() => applyFormat('`', '`')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Инлайн код" aria-label="Инлайн код" onclick={() => applyFormat('`', '`')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
         </button>
         <div class="w-px h-4 bg-gray-300 mx-1"></div>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Список" onclick={() => applyFormat('- ', '')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Список" aria-label="Список" onclick={() => applyFormat('- ', '')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
         </button>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Нумерованный список" onclick={() => applyFormat('1. ', '')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Нумерованный список" aria-label="Нумерованный список" onclick={() => applyFormat('1. ', '')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="10" y1="6" x2="21" y2="6"></line><line x1="10" y1="12" x2="21" y2="12"></line><line x1="10" y1="18" x2="21" y2="18"></line><path d="M4 6h1v4"></path><path d="M4 10h2"></path><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"></path></svg>
         </button>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Чекбокс" onclick={() => applyFormat('- [ ] ', '')}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Чекбокс" aria-label="Чекбокс" onclick={() => applyFormat('- [ ] ', '')}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
         </button>
         <div class="relative">
           <button 
-            class="p-1.5 rounded-md transition-colors {showTableMenu ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-blue-600 hover:bg-blue-50'}" 
-            title="Таблица" 
+            class="p-1.5 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 {showTableMenu ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-blue-600 hover:bg-blue-50'}"
+            title="Таблица"
+            aria-label="Таблица"
             onclick={(e) => { e.stopPropagation(); showTableMenu = !showTableMenu; }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="3" y1="15" x2="21" y2="15"></line><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line></svg>
           </button>
@@ -567,11 +570,11 @@
           {/if}
         </div>
         <div class="w-px h-4 bg-gray-300 mx-1"></div>
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Ссылка" onclick={handleLinkClick}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Ссылка" aria-label="Ссылка" onclick={handleLinkClick}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
         </button>
         <input type="file" accept="image/*" class="hidden" bind:this={fileInput} onchange={handleFileInput} />
-        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors" title="Вставить картинку" onclick={handleToolbarImage}>
+        <button class="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Вставить картинку" aria-label="Вставить картинку" onclick={handleToolbarImage}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline>
           </svg>
@@ -582,14 +585,16 @@
     <!-- Правая часть: переключатели режима -->
     <div class="flex gap-1 bg-gray-200/50 p-0.5 rounded-lg border border-gray-200 ml-auto">
       <button 
-        class="p-1.5 rounded-md transition-colors {mode === 'edit' ? 'bg-white text-blue-700 shadow-sm cursor-default' : 'text-gray-500 hover:text-gray-800 cursor-pointer'}"
+        class="p-1.5 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 {mode === 'edit' ? 'bg-white text-blue-700 shadow-sm cursor-default' : 'text-gray-500 hover:text-gray-800 cursor-pointer'}"
         title="Режим редактора"
+        aria-label="Режим редактора"
         onclick={() => mode = 'edit'}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
       </button>
       <button 
-        class="p-1.5 rounded-md transition-colors {mode === 'preview' ? 'bg-white text-blue-700 shadow-sm cursor-default' : 'text-gray-500 hover:text-gray-800 cursor-pointer'}"
+        class="p-1.5 rounded-md transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 {mode === 'preview' ? 'bg-white text-blue-700 shadow-sm cursor-default' : 'text-gray-500 hover:text-gray-800 cursor-pointer'}"
         title="Предварительный просмотр"
+        aria-label="Предварительный просмотр"
         onclick={() => mode = 'preview'}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
       </button>
@@ -632,7 +637,7 @@
                     use:focusInput
                     type="text" 
                     bind:value={linkText} 
-                    class="w-full border border-gray-300 rounded px-3 py-2 focus:outline-none focus:border-blue-500" 
+                    class="w-full border border-gray-300 rounded px-3 py-2 focus:border-blue-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
                     placeholder="Текст ссылки"
                     onkeydown={(e) => e.key === 'Enter' && insertLink()}
                 />
@@ -644,15 +649,15 @@
                     id="link-url-input"
                     type="url" 
                     bind:value={linkUrl} 
-                    class="w-full border border-gray-300 rounded px-3 py-2 focus:outline-none focus:border-blue-500" 
+                    class="w-full border border-gray-300 rounded px-3 py-2 focus:border-blue-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
                     placeholder="https://"
                     onkeydown={(e) => e.key === 'Enter' && insertLink()}
                 />
             </div>
 
             <div class="flex justify-end gap-2 mt-6">
-                <button onclick={() => showLinkModal = false} class="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded cursor-pointer transition-colors">Отмена</button>
-                <button onclick={insertLink} class="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 cursor-pointer transition-colors">Ок</button>
+                <button onclick={() => showLinkModal = false} class="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600">Отмена</button>
+                <button onclick={insertLink} class="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600">Ок</button>
             </div>
         </div>
     </div>
