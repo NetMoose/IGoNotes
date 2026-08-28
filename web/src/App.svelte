@@ -95,6 +95,18 @@
 
   async function loadNote(node) {
     const token = ++noteRequestToken
+    transitionError = ''
+
+    try {
+      await flushPendingSave()
+    } catch (error) {
+      if (mounted && token === noteRequestToken && saveStatus !== 'error') {
+        showSaveError(error)
+      }
+      return
+    }
+
+    if (!mounted || token !== noteRequestToken) return
 
     try {
       const note = await getNote(node.id)
@@ -123,7 +135,11 @@
 
   async function persistCurrentNote() {
     if (!activeNote) return
-    if (savePromise) return savePromise
+    if (savePromise) {
+      await savePromise
+      if (!mounted || !activeNote || !dirty) return
+      return persistCurrentNote()
+    }
 
     const operationNoteId = activeNote.id
     const operation = (async () => {
@@ -189,8 +205,11 @@
 
   async function openSettings() {
     try {
-      await openSettingsSafely(flushPendingSave, () => {
-        if (mounted) screen = 'settings'
+      await openSettingsSafely({
+        flush: flushPendingSave,
+        open: () => {
+          if (mounted) screen = 'settings'
+        },
       })
     } catch (error) {
       showSaveError(error)
@@ -198,10 +217,15 @@
   }
 
   async function openBase(name) {
-    await switchBaseSafely(name, flushPendingSave, switchBase, (savedConfig) => {
-      if (!mounted) return
-      applyConfig(savedConfig)
-      screen = 'editor'
+    await switchBaseSafely({
+      name,
+      flush: flushPendingSave,
+      switchRequest: switchBase,
+      commit: (savedConfig) => {
+        if (!mounted) return
+        applyConfig(savedConfig)
+        screen = 'editor'
+      },
     })
   }
 

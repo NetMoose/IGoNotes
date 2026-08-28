@@ -8,7 +8,7 @@ describe('app transitions', () => {
     const flush = vi.fn(async () => order.push('flush'))
     const open = vi.fn(() => order.push('open'))
 
-    await openSettingsSafely(flush, open)
+    await openSettingsSafely({ flush, open })
 
     expect(order).toEqual(['flush', 'open'])
   })
@@ -17,7 +17,10 @@ describe('app transitions', () => {
     const error = new Error('save failed')
     const open = vi.fn()
 
-    await expect(openSettingsSafely(() => Promise.reject(error), open)).rejects.toBe(error)
+    await expect(openSettingsSafely({
+      flush: () => Promise.reject(error),
+      open,
+    })).rejects.toBe(error)
     expect(open).not.toHaveBeenCalled()
   })
 
@@ -31,7 +34,12 @@ describe('app transitions', () => {
     })
     const commit = vi.fn((savedConfig) => order.push(`commit:${savedConfig.current_base}`))
 
-    await expect(switchBaseSafely('work', flush, switchRequest, commit)).resolves.toBeUndefined()
+    await expect(switchBaseSafely({
+      name: 'work',
+      flush,
+      switchRequest,
+      commit,
+    })).resolves.toBeUndefined()
 
     expect(order).toEqual(['flush', 'switch:work', 'commit:work'])
   })
@@ -42,7 +50,12 @@ describe('app transitions', () => {
     const commit = vi.fn()
 
     await expect(
-      switchBaseSafely('work', () => Promise.reject(error), switchRequest, commit),
+      switchBaseSafely({
+        name: 'work',
+        flush: () => Promise.reject(error),
+        switchRequest,
+        commit,
+      }),
     ).rejects.toBe(error)
     expect(switchRequest).not.toHaveBeenCalled()
     expect(commit).not.toHaveBeenCalled()
@@ -53,7 +66,12 @@ describe('app transitions', () => {
     const commit = vi.fn()
 
     await expect(
-      switchBaseSafely('work', vi.fn(), () => Promise.reject(error), commit),
+      switchBaseSafely({
+        name: 'work',
+        flush: vi.fn(),
+        switchRequest: () => Promise.reject(error),
+        commit,
+      }),
     ).rejects.toBe(error)
     expect(commit).not.toHaveBeenCalled()
   })
