@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import Modal from './Modal.svelte';
   import { getNotes, syncNotes, createNote, renameNote, deleteNote } from './api.js';
 
@@ -11,6 +11,10 @@
   let activeFolderId = $state(null); // корень по умолчанию (null вместо "")
   let isRefreshing = $state(false);
   let operationError = $state("");
+  let mutationBusy = $state(false);
+  let mounted = false;
+  let loadGeneration = 0;
+  let refreshTimer = null;
   
   // Храним ID открытых папок для восстановления после обновления дерева
   let openFolders = new Set();
@@ -22,9 +26,11 @@
   let createError = $state("");
 
   let showDeleteModal = $state(false);
+  let deleteError = $state("");
 
   let showRenameModal = $state(false);
   let renameValue = $state("");
+  let renameError = $state("");
   
   function restoreOpenState(nodeList) {
     for (let node of nodeList) {
@@ -39,11 +45,42 @@
     }
   }
 
-  async function loadTree() {
+  function clearRefreshTimer() {
+    if (refreshTimer !== null) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
+  function startRefresh() {
+    const generation = ++loadGeneration;
+    clearRefreshTimer();
     operationError = "";
     isRefreshing = true;
+    return generation;
+  }
+
+  function isCurrentLoad(generation) {
+    return mounted && generation === loadGeneration;
+  }
+
+  function finishRefresh(generation) {
+    if (!isCurrentLoad(generation)) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      if (isCurrentLoad(generation)) isRefreshing = false;
+    }, 300);
+  }
+
+  async function loadTree() {
+    if (!mounted) return;
+    const generation = startRefresh();
     try {
       const newNodes = await getNotes();
+      if (!isCurrentLoad(generation)) return;
+      if (!Array.isArray(newNodes)) {
+        throw new Error("Приложение вернуло некорректное дерево заметок");
+      }
 
       // Убедимся, что текущая активная папка (куда добавляем файлы) тоже будет открыта
       if (activeFolderId) {
@@ -52,28 +89,37 @@
 
       restoreOpenState(newNodes);
       nodes = newNodes;
+      finishRefresh(generation);
     } catch (err) {
+      if (!isCurrentLoad(generation)) return;
       operationError = err instanceof Error ? err.message : "Ошибка при загрузке дерева заметок";
-    } finally {
-      // Искусственная задержка для визуального эффекта спиннера, если ответ пришел мгновенно
-      setTimeout(() => isRefreshing = false, 300);
+      isRefreshing = false;
     }
   }
 
   async function syncTree() {
-    operationError = "";
-    isRefreshing = true;
+    if (!mounted) return;
+    const generation = startRefresh();
     try {
       await syncNotes();
-      await loadTree();
+      if (!isCurrentLoad(generation)) return;
+      loadTree();
     } catch (err) {
+      if (!isCurrentLoad(generation)) return;
       operationError = err instanceof Error ? err.message : "Ошибка при синхронизации дерева";
       isRefreshing = false;
     }
   }
 
   onMount(() => {
+    mounted = true;
     loadTree();
+  });
+
+  onDestroy(() => {
+    mounted = false;
+    loadGeneration++;
+    clearRefreshTimer();
   });
 
   function handleSelect(node, e) {
@@ -104,11 +150,19 @@
   function openRenameModal() {
     if (!activeId) return;
     renameValue = activeName;
+    renameError = "";
     showRenameModal = true;
   }
 
+  function openDeleteModal() {
+    if (!activeId) return;
+    deleteError = "";
+    showDeleteModal = true;
+  }
+
   async function confirmCreate() {
-    if (!createName.trim()) return;
+    if (mutationBusy || !createName.trim()) return;
+    mutationBusy = true;
     operationError = "";
     createError = "";
     
@@ -119,27 +173,38 @@
         type: createType
       });
 
+      if (!mounted) return;
       showCreateModal = false;
       loadTree();
     } catch (err) {
-      operationError = err instanceof Error ? err.message : "Произошла ошибка при создании";
+      if (!mounted) return;
+      const message = err instanceof Error ? err.message : "Произошла ошибка при создании";
+      operationError = message;
       if (err?.status === 409) {
         createError = createType === 'dir' 
           ? `Папка "${createName.trim()}" уже существует.` 
           : `Файл "${createName.trim()}" уже существует.`;
+      } else {
+        createError = message;
       }
+    } finally {
+      if (mounted) mutationBusy = false;
     }
   }
 
   async function confirmRename() {
+    if (mutationBusy) return;
     operationError = "";
+    renameError = "";
     if (!renameValue.trim() || renameValue === activeName) {
       showRenameModal = false;
       return;
     }
+    mutationBusy = true;
     
     try {
       await renameNote(activeId, renameValue.trim());
+      if (!mounted) return;
       showRenameModal = false;
 
       // Сбросим текущее выделение, так как ID поменялся
@@ -150,16 +215,24 @@
 
       loadTree();
     } catch (err) {
-      operationError = err instanceof Error ? err.message : "Произошла ошибка при переименовании";
+      if (!mounted) return;
+      const message = err instanceof Error ? err.message : "Произошла ошибка при переименовании";
+      operationError = message;
+      renameError = message;
+    } finally {
+      if (mounted) mutationBusy = false;
     }
   }
 
   async function confirmDelete() {
-    if (!activeId) return;
+    if (mutationBusy || !activeId) return;
+    mutationBusy = true;
     operationError = "";
+    deleteError = "";
 
     try {
       await deleteNote(activeId);
+      if (!mounted) return;
       if (onDelete) onDelete(activeId);
       // Если удаляем папку, её тоже надо удалить из списка открытых
       openFolders.delete(activeId);
@@ -169,7 +242,12 @@
       showDeleteModal = false;
       loadTree();
     } catch (err) {
-      operationError = err instanceof Error ? err.message : "Произошла ошибка при удалении";
+      if (!mounted) return;
+      const message = err instanceof Error ? err.message : "Произошла ошибка при удалении";
+      operationError = message;
+      deleteError = message;
+    } finally {
+      if (mounted) mutationBusy = false;
     }
   }
 
@@ -203,7 +281,7 @@
       <button onclick={openRenameModal} disabled={!activeId} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-gray-600 hover:text-blue-600 hover:bg-blue-50 disabled:opacity-50 disabled:hover:text-gray-600 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer" title="Переименовать выбранное">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
       </button>
-      <button onclick={() => showDeleteModal = true} disabled={!activeId} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:hover:text-red-500 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer" title="Удалить выбранное">
+      <button onclick={openDeleteModal} disabled={!activeId} class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:hover:text-red-500 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer" title="Удалить выбранное">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
       </button>
     </div>
@@ -259,6 +337,8 @@
   input={true}
   bind:inputValue={createName}
   error={createError}
+  busy={mutationBusy}
+  confirmDisabled={!createName.trim()}
   confirmText="Создать"
   onConfirm={confirmCreate}
   onCancel={() => showCreateModal = false}
@@ -269,6 +349,9 @@
   title="Переименовать"
   input={true}
   bind:inputValue={renameValue}
+  error={renameError}
+  busy={mutationBusy}
+  confirmDisabled={!renameValue.trim() || renameValue === activeName}
   confirmText="Сохранить"
   onConfirm={confirmRename}
   onCancel={() => showRenameModal = false}
@@ -278,6 +361,8 @@
   show={showDeleteModal} 
   title="Удалить выбранный элемент?"
   confirmText="Удалить"
+  error={deleteError}
+  busy={mutationBusy}
   danger={true}
   onConfirm={confirmDelete}
   onCancel={() => showDeleteModal = false}

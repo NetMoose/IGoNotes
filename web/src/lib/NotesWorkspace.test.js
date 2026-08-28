@@ -1,5 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/svelte'
+import { render, screen, waitFor, within } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
+import { tick } from 'svelte'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('./Editor.svelte', async () => ({
@@ -19,6 +20,7 @@ vi.mock('./api.js', async (importOriginal) => {
 })
 
 import {
+  ApiError,
   createNote,
   deleteNote,
   getNotes,
@@ -27,6 +29,25 @@ import {
 } from './api.js'
 import NotesWorkspace from './NotesWorkspace.svelte'
 import NotesWorkspaceHost from '../test/NotesWorkspaceHost.svelte'
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+function fileNode(name) {
+  return {
+    id: `topic/${name}`,
+    name,
+    type: 'file',
+    parent_id: 'topic',
+  }
+}
 
 function workspaceProps(overrides = {}) {
   return {
@@ -53,7 +74,7 @@ async function renderWorkspace(overrides = {}) {
 describe('NotesWorkspace', () => {
   beforeEach(() => {
     vi.mocked(getNotes).mockReset().mockResolvedValue([])
-    vi.mocked(syncNotes).mockReset()
+    vi.mocked(syncNotes).mockReset().mockResolvedValue(null)
     vi.mocked(createNote).mockReset()
     vi.mocked(renameNote).mockReset()
     vi.mocked(deleteNote).mockReset().mockResolvedValue(null)
@@ -113,6 +134,116 @@ describe('NotesWorkspace', () => {
     expect(props.onDeleteNote).toHaveBeenCalledOnce()
     expect(props.onDeleteNote).toHaveBeenCalledWith(note.id)
     await waitFor(() => expect(getNotes).toHaveBeenCalledTimes(2))
+  })
+
+  it('keeps the newest tree when an older load settles last', async () => {
+    const user = userEvent.setup()
+    const initialLoad = deferred()
+    const oldNote = fileNode('old.md')
+    const newNote = fileNode('new.md')
+    vi.mocked(getNotes)
+      .mockReturnValueOnce(initialLoad.promise)
+      .mockResolvedValueOnce([newNote])
+    render(NotesWorkspace, workspaceProps())
+    await waitFor(() => expect(getNotes).toHaveBeenCalledOnce())
+
+    await user.click(screen.getByTitle('Обновить дерево (Синхронизировать с диском)'))
+
+    expect(syncNotes).toHaveBeenCalledOnce()
+    expect(await screen.findByRole('button', { name: 'new.md' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'old.md' })).not.toBeInTheDocument()
+
+    initialLoad.resolve([oldNote])
+    await initialLoad.promise
+    await tick()
+
+    expect(screen.getByRole('button', { name: 'new.md' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'old.md' })).not.toBeInTheDocument()
+  })
+
+  it('allows only one pending create and disables its dialog controls', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    const unhandled = vi.fn((event) => event.preventDefault())
+    vi.mocked(createNote).mockReturnValue(request.promise)
+    window.addEventListener('unhandledrejection', unhandled)
+
+    try {
+      await renderWorkspace()
+      await user.click(screen.getByTitle('Создать новую заметку'))
+      const dialog = screen.getByRole('dialog')
+      const input = within(dialog).getByRole('textbox')
+      const confirm = within(dialog).getByRole('button', { name: 'Создать' })
+      await user.type(input, 'new.md')
+
+      await user.dblClick(confirm)
+
+      expect(createNote).toHaveBeenCalledOnce()
+      expect(input).toBeDisabled()
+      expect(confirm).toBeDisabled()
+      expect(confirm).toHaveAttribute('aria-busy', 'true')
+      await user.keyboard('{Enter}')
+      expect(createNote).toHaveBeenCalledOnce()
+
+      request.resolve(null)
+      await request.promise
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      request.resolve(null)
+      window.removeEventListener('unhandledrejection', unhandled)
+    }
+  })
+
+  it('shows a rename failure inside the dialog and enables retry', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('note.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(renameNote).mockRejectedValue(new ApiError({ message: 'Не удалось переименовать' }))
+    await renderWorkspace()
+    await user.click(screen.getByRole('button', { name: 'note.md' }))
+    await user.click(screen.getByTitle('Переименовать выбранное'))
+    const dialog = screen.getByRole('dialog')
+    const input = within(dialog).getByRole('textbox')
+    await user.clear(input)
+    await user.type(input, 'renamed.md')
+
+    await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
+
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Не удалось переименовать')
+    expect(input).toBeEnabled()
+    expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toBeEnabled()
+    expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toHaveAttribute('aria-busy', 'false')
+  })
+
+  it('does not continue a pending deletion after unmount', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('note.md')
+    const request = deferred()
+    const unhandled = vi.fn((event) => event.preventDefault())
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(deleteNote).mockReturnValue(request.promise)
+    window.addEventListener('unhandledrejection', unhandled)
+
+    try {
+      const { props, unmount } = await renderWorkspace()
+      await user.click(screen.getByRole('button', { name: 'note.md' }))
+      await user.click(screen.getByTitle('Удалить выбранное'))
+      await user.click(screen.getByRole('button', { name: 'Удалить' }))
+      expect(deleteNote).toHaveBeenCalledOnce()
+
+      unmount()
+      request.resolve(null)
+      await request.promise
+      await tick()
+
+      expect(props.onDeleteNote).not.toHaveBeenCalled()
+      expect(getNotes).toHaveBeenCalledOnce()
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      request.resolve(null)
+      window.removeEventListener('unhandledrejection', unhandled)
+    }
   })
 
   it.each([
