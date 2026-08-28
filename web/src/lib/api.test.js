@@ -33,6 +33,15 @@ function jsonResponse(body, status = 200) {
   return response(JSON.stringify(body), status)
 }
 
+function configFixture(name = 'work', path = `/notes/${name}`) {
+  return {
+    base_dir: '/notes',
+    bases: [{ name, path, auto_sync: false }],
+    current_base: name,
+    setup_completed: true,
+  }
+}
+
 function requestAt(fetchMock, index = 0) {
   const [path, options] = fetchMock.mock.calls[index]
   return { path, options }
@@ -73,7 +82,7 @@ describe('frontend API client', () => {
   })
 
   it('gets and decodes config using a Headers instance', async () => {
-    const config = { active_base: 'work', bases: [{ name: 'work' }] }
+    const config = configFixture()
     fetchMock.mockResolvedValue(jsonResponse(config))
 
     await expect(getConfig()).resolves.toEqual(config)
@@ -87,15 +96,15 @@ describe('frontend API client', () => {
 
   it('preserves a structured 409 API error', async () => {
     fetchMock.mockResolvedValue(jsonResponse({
-      code: 'name_conflict',
+      code: 'base_name_conflict',
       message: 'База уже существует',
       field: 'name',
     }, 409))
 
-    await expect(createBase({ name: 'work' })).rejects.toMatchObject({
+    await expect(createBase({ mode: 'create', name: 'work', path: '/notes/work' })).rejects.toMatchObject({
       name: 'ApiError',
       status: 409,
-      code: 'name_conflict',
+      code: 'base_name_conflict',
       field: 'name',
       message: 'База уже существует',
     })
@@ -114,9 +123,21 @@ describe('frontend API client', () => {
     })
   })
 
+  it('rejects a successful directory picker response without a non-empty path', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ path: '' }))
+
+    const promise = selectDirectory()
+    await expect(promise).rejects.toBeInstanceOf(ApiError)
+    await expect(promise).rejects.toMatchObject({
+      status: 200,
+      code: 'invalid_response',
+      message: 'Приложение вернуло некорректный JSON',
+    })
+  })
+
   it('keeps a directory picker 501 response as a typed error', async () => {
     fetchMock.mockResolvedValue(jsonResponse({
-      code: 'not_supported',
+      code: 'directory_picker_unavailable',
       message: 'Выбор каталога не поддерживается',
     }, 501))
 
@@ -124,14 +145,14 @@ describe('frontend API client', () => {
     await expect(promise).rejects.toBeInstanceOf(ApiError)
     await expect(promise).rejects.toMatchObject({
       status: 501,
-      code: 'not_supported',
+      code: 'directory_picker_unavailable',
       message: 'Выбор каталога не поддерживается',
     })
   })
 
   it('updates an encoded base, switches base, and refreshes config after each mutation', async () => {
-    const updated = { active_base: 'old/name' }
-    const switched = { active_base: 'next' }
+    const updated = configFixture('renamed', '/notes/renamed')
+    const switched = configFixture('next')
     fetchMock
       .mockResolvedValueOnce(response('', 204))
       .mockResolvedValueOnce(jsonResponse(updated))
@@ -183,13 +204,9 @@ describe('frontend API client', () => {
   })
 
   it('sends the complete config without mutation and returns refreshed config', async () => {
-    const config = {
-      active_base: 'personal',
-      bases: [{ name: 'personal', path: '/tmp/personal' }],
-      git: { enabled: false },
-    }
+    const config = configFixture('personal', '/tmp/personal')
     const original = structuredClone(config)
-    const refreshed = { ...config, saved: true }
+    const refreshed = structuredClone(config)
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ ignored: true }))
       .mockResolvedValueOnce(jsonResponse(refreshed))
@@ -214,18 +231,21 @@ describe('frontend API client', () => {
   })
 
   it('creates, completes setup, and forgets bases before refreshing config', async () => {
-    const draft = { name: 'team', path: '/notes/team' }
+    const draft = { mode: 'create', name: 'team', path: '/notes/team' }
+    const created = configFixture('team', '/notes/team')
+    const completed = configFixture('team', '/notes/team')
+    const forgotten = configFixture('personal', '/notes/personal')
     fetchMock
       .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse({ step: 'created' }))
+      .mockResolvedValueOnce(jsonResponse(created))
       .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse({ step: 'complete' }))
+      .mockResolvedValueOnce(jsonResponse(completed))
       .mockResolvedValueOnce(response('', 204))
-      .mockResolvedValueOnce(jsonResponse({ step: 'forgotten' }))
+      .mockResolvedValueOnce(jsonResponse(forgotten))
 
-    await createBase(draft)
-    await completeSetup(draft)
-    await forgetBase('team/shared')
+    await expect(createBase(draft)).resolves.toEqual(created)
+    await expect(completeSetup(draft)).resolves.toEqual(completed)
+    await expect(forgetBase('team/shared')).resolves.toEqual(forgotten)
 
     expectJSONRequest(fetchMock, 0, '/api/bases', 'POST', draft)
     expect(requestAt(fetchMock, 1).path).toBe('/api/config')
@@ -256,13 +276,28 @@ describe('frontend API client', () => {
     ])
   })
 
-  it('wraps note mutations and normalizes empty successes to null', async () => {
-    fetchMock.mockResolvedValue(response('', 204))
+  it('wraps note mutations and decodes their handler responses', async () => {
+    const saved = { status: 'saved' }
+    const synced = { status: 'ok' }
+    const created = {
+      id: 'topic/new.md',
+      name: 'new.md',
+      type: 'file',
+      path: 'topic/new.md',
+      parent_id: 'topic',
+    }
+    const renamed = { status: 'renamed' }
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(saved))
+      .mockResolvedValueOnce(jsonResponse(synced))
+      .mockResolvedValueOnce(jsonResponse(created))
+      .mockResolvedValueOnce(jsonResponse(renamed))
+      .mockResolvedValueOnce(response('', 200))
 
-    await expect(saveNote('topic/note.md', '# Updated')).resolves.toBeNull()
-    await expect(syncNotes()).resolves.toBeNull()
-    await expect(createNote({ parent: 'topic', name: 'new.md', type: 'file' })).resolves.toBeNull()
-    await expect(renameNote('topic/old.md', 'new.md')).resolves.toBeNull()
+    await expect(saveNote('topic/note.md', '# Updated')).resolves.toEqual(saved)
+    await expect(syncNotes()).resolves.toEqual(synced)
+    await expect(createNote({ parent_id: 'topic', name: 'new.md', type: 'file' })).resolves.toEqual(created)
+    await expect(renameNote('topic/old.md', 'new.md')).resolves.toEqual(renamed)
     await expect(deleteNote('topic/new note.md')).resolves.toBeNull()
 
     expectJSONRequest(fetchMock, 0, '/api/save', 'POST', {
@@ -272,7 +307,7 @@ describe('frontend API client', () => {
     expect(requestAt(fetchMock, 1)).toMatchObject({ path: '/api/sync', options: { method: 'POST' } })
     expect(requestAt(fetchMock, 1).options.body).toBeUndefined()
     expectJSONRequest(fetchMock, 2, '/api/notes', 'POST', {
-      parent: 'topic',
+      parent_id: 'topic',
       name: 'new.md',
       type: 'file',
     })
@@ -284,6 +319,7 @@ describe('frontend API client', () => {
       path: '/api/note?id=topic%2Fnew%20note.md',
       options: { method: 'DELETE' },
     })
+    expect(requestAt(fetchMock, 4).options.body).toBeUndefined()
   })
 
   it('uploads the same file as multipart data without setting Content-Type', async () => {

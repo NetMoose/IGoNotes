@@ -129,7 +129,22 @@ export function switchBase(name) {
 
 export async function selectDirectory() {
   const result = await request('/api/system/select-directory', { method: 'POST' })
-  return result?.path ?? null
+  if (result === null) {
+    return null
+  }
+  if (
+    typeof result !== 'object'
+    || Array.isArray(result)
+    || typeof result.path !== 'string'
+    || result.path.length === 0
+  ) {
+    throw new ApiError({
+      status: 200,
+      code: 'invalid_response',
+      message: 'Приложение вернуло некорректный JSON',
+    })
+  }
+  return result.path
 }
 
 export function getInfo() {
