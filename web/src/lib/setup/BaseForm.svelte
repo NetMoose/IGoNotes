@@ -47,6 +47,7 @@
   let previousMode = getInitialModeProp()
   let previousPath = getInitialPath()
   let formElement
+  let generalErrorElement = $state()
   let focusHandle
   let focusToken = 0
   let active = true
@@ -69,7 +70,9 @@
       focusHandle = undefined
       if (!active || token !== focusToken || !formElement) return
       const fieldId = `${formId}-${field}`
-      const target = Array.from(formElement.elements).find((element) => element.id === fieldId)
+      const target = field === 'general-error'
+        ? generalErrorElement
+        : Array.from(formElement.elements).find((element) => element.id === fieldId)
       target?.focus()
     }
     if (typeof requestAnimationFrame === 'function') {
@@ -109,6 +112,7 @@
       scheduleFocus(backendField)
     } else {
       generalError = nextApiError.message
+      scheduleFocus('general-error')
     }
   })
 
@@ -177,7 +181,7 @@
             value="create"
             bind:group={selectedMode}
             disabled={busy}
-            class="size-4 border-slate-300 text-blue-600 focus-visible:ring-blue-500"
+            class="size-4 border-slate-300 text-blue-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
           />
           Создать новую
         </label>
@@ -188,7 +192,7 @@
             value="connect"
             bind:group={selectedMode}
             disabled={busy}
-            class="size-4 border-slate-300 text-blue-600 focus-visible:ring-blue-500"
+            class="size-4 border-slate-300 text-blue-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
           />
           Подключить существующую
         </label>
@@ -206,7 +210,7 @@
       disabled={busy}
       aria-invalid={clientErrors.name ? 'true' : undefined}
       aria-describedby={clientErrors.name ? `${formId}-name-error` : undefined}
-      class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus-visible:border-blue-500 focus-visible:ring-2 focus-visible:ring-blue-500/30 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
+      class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900 shadow-sm transition placeholder:text-slate-400 focus-visible:border-blue-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
     />
     {#if clientErrors.name}
       <p id={`${formId}-name-error`} class="text-sm text-red-600">{clientErrors.name}</p>
@@ -233,17 +237,22 @@
         id={`${formId}-git-url`}
         type="url"
         disabled
-        class="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-slate-500"
+        class="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-slate-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
       />
     </div>
     <label class="flex cursor-not-allowed items-start gap-3 text-sm text-slate-500">
-      <input type="checkbox" disabled class="mt-0.5 size-4 rounded border-slate-300" />
+      <input type="checkbox" disabled class="mt-0.5 size-4 rounded border-slate-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" />
       <span>Автосинхронизация будет доступна позже</span>
     </label>
   </div>
 
   {#if generalError}
-    <div role="alert" class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+    <div
+      bind:this={generalErrorElement}
+      role="alert"
+      tabindex="-1"
+      class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
+    >
       {generalError}
     </div>
   {/if}
@@ -254,7 +263,7 @@
         type="button"
         onclick={onCancel}
         disabled={busy}
-        class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+        class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
       >
         Отмена
       </button>
@@ -263,7 +272,7 @@
       type="submit"
       disabled={busy}
       aria-busy={busy ? 'true' : 'false'}
-      class="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+      class="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
     >
       {submitLabel}
     </button>

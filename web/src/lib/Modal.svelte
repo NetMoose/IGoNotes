@@ -178,10 +178,10 @@
 </script>
 
 {#if show}
-<div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" role="presentation">
+<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="presentation">
     <div
         use:manageDialog
-        class="bg-white rounded-lg shadow-lg w-96 p-5"
+        class="w-full max-w-sm rounded-lg bg-white p-5 shadow-lg"
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -202,7 +202,7 @@
                 id={inputId}
                 type="text" 
                 bind:value={inputValue} 
-                class="w-full border border-gray-300 rounded px-3 py-2 mb-2 focus:outline-none focus:border-blue-500" 
+                class="mb-2 w-full rounded border border-gray-300 px-3 py-2 focus:border-blue-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
                 aria-invalid={error ? 'true' : undefined}
                 aria-describedby={error ? errorId : undefined}
                 disabled={busy}
@@ -214,15 +214,15 @@
             <p id={errorId} role="alert" class="text-sm text-red-600 mb-4">{error}</p>
         {/if}
 
-        <div class="flex justify-end gap-2">
-            <button bind:this={cancelButton} type="button" onclick={onCancel} disabled={busy} class="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 disabled:opacity-50 rounded cursor-pointer transition-colors">{cancelText}</button>
+        <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <button bind:this={cancelButton} type="button" onclick={onCancel} disabled={busy} class="cursor-pointer rounded px-4 py-2 text-sm text-gray-600 transition-colors hover:bg-gray-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:opacity-50">{cancelText}</button>
             <button
                 bind:this={confirmButton}
                 type="button"
                 onclick={onConfirm}
                 disabled={busy || confirmDisabled}
                 aria-busy={busy}
-                class="px-4 py-2 text-sm {danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'} text-white rounded disabled:opacity-50 cursor-pointer transition-colors"
+                class="cursor-pointer rounded px-4 py-2 text-sm text-white transition-colors {danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'} focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:opacity-50"
             >{confirmText}</button>
         </div>
     </div>

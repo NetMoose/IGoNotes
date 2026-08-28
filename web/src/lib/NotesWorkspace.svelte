@@ -76,7 +76,7 @@
             type="button"
             onclick={(...args) => runAfterUploads(onSave, ...args)}
             disabled={!activeNote || saveStatus === 'saving'}
-            class="px-4 py-1.5 bg-blue-600 text-white font-medium text-sm rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors shadow-sm cursor-pointer"
+            class="px-4 py-1.5 bg-blue-600 text-white font-medium text-sm rounded-md hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:opacity-50 transition-colors shadow-sm cursor-pointer"
           >
             Сохранить
           </button>

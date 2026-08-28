@@ -99,6 +99,31 @@ describe('NotesWorkspace', () => {
     expect(props.onOpenSettings).toHaveBeenCalledOnce()
   })
 
+  it('exposes explicit names and decorative SVGs for icon-only controls', async () => {
+    const user = userEvent.setup()
+    vi.mocked(getNotes).mockResolvedValue([fileNode('note.md')])
+    await renderWorkspace()
+    const controls = [
+      ['Открыть настройки', 'Открыть настройки'],
+      ['Обновить дерево (Синхронизировать с диском)', 'Обновить дерево (Синхронизировать с диском)'],
+      ['Создать новую заметку', 'Создать новую заметку'],
+      ['Создать новую папку', 'Создать новую папку'],
+      ['Переименовать выбранное', 'Переименовать выбранное'],
+      ['Удалить выбранное', 'Удалить выбранное'],
+    ]
+
+    for (const [name, label] of controls) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toHaveAttribute('aria-label', label)
+      expect(button.querySelector('svg')).toHaveAttribute('aria-hidden', 'true')
+    }
+
+    await user.click(screen.getByRole('button', { name: 'note.md' }))
+    for (const icon of document.querySelectorAll('aside svg')) {
+      expect(icon).toHaveAttribute('aria-hidden', 'true')
+    }
+  })
+
   it('locks the workspace while a transition is pending', async () => {
     const { container, props, rerender } = await renderWorkspace({ transitioning: true })
     const root = container.firstElementChild

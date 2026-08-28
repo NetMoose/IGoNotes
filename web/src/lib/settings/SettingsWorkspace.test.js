@@ -121,6 +121,17 @@ describe('SettingsWorkspace', () => {
     expect(screen.getAllByText('Автосинхронизация выключена')).toHaveLength(2)
   })
 
+  it('uses responsive horizontal-to-sidebar settings navigation', () => {
+    renderWorkspace()
+
+    const tablist = screen.getByRole('tablist', { name: 'Разделы настроек' })
+    expect(tablist).toHaveClass('flex', 'overflow-x-auto', 'md:flex-col')
+    expect(tablist).not.toHaveClass('grid-cols-2', 'md:grid-cols-1')
+    for (const tab of screen.getAllByRole('tab')) {
+      expect(tab).toHaveClass('shrink-0')
+    }
+  })
+
   it('keeps only Edit actions when there is one active base', () => {
     renderWorkspace({ config: oneBaseConfig })
     const card = baseArticle('personal')
@@ -237,6 +248,48 @@ describe('SettingsWorkspace', () => {
     const heading = screen.getByRole('heading', { name: 'Базы заметок' })
     await waitFor(() => expect(heading).toHaveFocus())
     expect(heading).toHaveAttribute('tabindex', '-1')
+  })
+
+  it('names the Forget dialog exactly and Escape restores the Forget trigger', async () => {
+    const user = userEvent.setup()
+    renderWorkspace()
+    const trigger = within(baseArticle('work')).getByRole('button', { name: 'Забыть' })
+
+    await user.click(trigger)
+
+    const dialog = screen.getByRole('dialog', { name: 'Забыть базу work?' })
+    expect(dialog).toHaveAttribute('aria-modal', 'true')
+    await waitFor(() => expect(
+      within(dialog).getByRole('button', { name: 'Забыть базу' }),
+    ).toHaveFocus())
+    await user.keyboard('{Escape}')
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(trigger).toHaveFocus())
+  })
+
+  it('keeps a pending Forget modal locked and calls the API once', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    vi.mocked(forgetBase).mockReturnValue(request.promise)
+    renderWorkspace()
+    await user.click(within(baseArticle('work')).getByRole('button', { name: 'Забыть' }))
+    const dialog = screen.getByRole('dialog', { name: 'Забыть базу work?' })
+    const cancel = within(dialog).getByRole('button', { name: 'Отмена' })
+    const confirm = within(dialog).getByRole('button', { name: 'Забыть базу' })
+
+    await fireEvent.click(confirm)
+    await fireEvent.click(confirm)
+
+    expect(forgetBase).toHaveBeenCalledOnce()
+    expect(cancel).toBeDisabled()
+    expect(confirm).toBeDisabled()
+    expect(confirm).toHaveAttribute('aria-busy', 'true')
+    await fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(screen.getByRole('dialog', { name: 'Забыть базу work?' })).toBeInTheDocument()
+
+    request.resolve(oneBaseConfig)
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
   })
 
   it('closes to a workspace alert when an add config callback rejects', async () => {

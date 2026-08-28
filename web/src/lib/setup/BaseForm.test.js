@@ -32,9 +32,15 @@ describe('BaseForm', () => {
 
     await user.click(screen.getByRole('button', { name: 'Продолжить' }))
 
-    expect(screen.getByText('Введите имя базы')).toBeVisible()
-    expect(screen.getByText('Укажите каталог')).toBeVisible()
-    await waitFor(() => expect(screen.getByLabelText('Имя базы')).toHaveFocus())
+    const nameError = screen.getByText('Введите имя базы')
+    const pathError = screen.getByText('Укажите каталог')
+    const name = screen.getByLabelText('Имя базы')
+    const path = screen.getByLabelText('Родительский каталог')
+    expect(nameError).toBeVisible()
+    expect(pathError).toBeVisible()
+    expect(name).toHaveAttribute('aria-describedby', nameError.id)
+    expect(path).toHaveAttribute('aria-describedby', pathError.id)
+    await waitFor(() => expect(name).toHaveFocus())
     expect(props.onSubmit).not.toHaveBeenCalled()
   })
 
@@ -198,5 +204,19 @@ describe('BaseForm', () => {
       'aria-describedby',
       expect.stringContaining(notice.id),
     )
+  })
+
+  it('focuses a newly received general API alert', async () => {
+    const props = formProps()
+    const { rerender } = render(BaseForm, props)
+
+    await rerender({
+      ...props,
+      apiError: new ApiError({ message: 'Не удалось сохранить базу' }),
+    })
+
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveAttribute('tabindex', '-1')
+    await waitFor(() => expect(alert).toHaveFocus())
   })
 })

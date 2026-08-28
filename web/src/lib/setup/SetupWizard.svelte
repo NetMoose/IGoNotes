@@ -16,6 +16,7 @@
   let active = true
   let headingElement = $state()
   let detailsElement = $state()
+  let generalErrorElement = $state()
   let existingNames = $derived(
     Array.isArray(config?.bases)
       ? config.bases.map((base) => base?.name).filter((name) => typeof name === 'string')
@@ -93,6 +94,8 @@
         generalError = error instanceof Error && error.message
           ? error.message
           : 'Не удалось завершить настройку'
+        await tick()
+        if (active) generalErrorElement?.focus()
       }
       return
     }
@@ -158,7 +161,7 @@
               type="button"
               aria-label="Создать новую"
               onclick={() => selectMode('create')}
-              class="group rounded-2xl border border-slate-200 p-6 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-500 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+              class="group rounded-2xl border border-slate-200 p-6 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-500 hover:shadow-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
             >
               <span class="block text-lg font-bold text-slate-900 group-hover:text-blue-700">Создать новую</span>
               <span class="mt-2 block text-sm leading-6 text-slate-600">
@@ -169,7 +172,7 @@
               type="button"
               aria-label="Подключить существующую"
               onclick={() => selectMode('connect')}
-              class="group rounded-2xl border border-slate-200 p-6 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-500 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+              class="group rounded-2xl border border-slate-200 p-6 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-500 hover:shadow-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
             >
               <span class="block text-lg font-bold text-slate-900 group-hover:text-blue-700">Подключить существующую</span>
               <span class="mt-2 block text-sm leading-6 text-slate-600">
@@ -197,7 +200,7 @@
             type="button"
             onclick={backToModes}
             disabled={busy}
-            class="mb-6 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            class="mb-6 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Назад
           </button>
@@ -251,7 +254,12 @@
           {/if}
 
           {#if generalError}
-            <div role="alert" class="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            <div
+              bind:this={generalErrorElement}
+              role="alert"
+              tabindex="-1"
+              class="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
+            >
               {generalError}
             </div>
           {/if}
@@ -261,7 +269,7 @@
               type="button"
               onclick={() => changeStep(2)}
               disabled={busy}
-              class="rounded-lg border border-slate-300 bg-white px-5 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              class="rounded-lg border border-slate-300 bg-white px-5 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Назад
             </button>
@@ -270,7 +278,7 @@
               onclick={finish}
               disabled={busy}
               aria-busy={busy ? 'true' : 'false'}
-              class="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              class="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Завершить настройку
             </button>

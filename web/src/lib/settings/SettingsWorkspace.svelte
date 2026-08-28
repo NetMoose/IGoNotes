@@ -219,7 +219,7 @@
         type="button"
         onclick={onBack}
         disabled={busyAction !== ''}
-        class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+        class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
       >
         Назад к заметкам
       </button>
@@ -228,7 +228,7 @@
 
   <main class="mx-auto grid max-w-7xl md:grid-cols-[15rem_minmax(0,1fr)]">
     <nav class="border-b border-slate-200 bg-white p-4 md:min-h-[calc(100vh-73px)] md:border-b-0 md:border-r md:p-6" aria-label="Настройки">
-      <div role="tablist" aria-label="Разделы настроек" class="grid grid-cols-2 gap-2 md:sticky md:top-6 md:grid-cols-1">
+      <div role="tablist" aria-label="Разделы настроек" class="flex gap-2 overflow-x-auto md:sticky md:top-6 md:flex-col">
         <button
           id="settings-bases-tab"
           type="button"
@@ -236,7 +236,7 @@
           aria-selected="true"
           aria-current="page"
           aria-controls="settings-bases-panel"
-          class="rounded-lg bg-blue-50 px-3 py-2 text-left text-sm font-semibold text-blue-700"
+          class="shrink-0 whitespace-nowrap rounded-lg bg-blue-50 px-3 py-2 text-left text-sm font-semibold text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 md:w-full"
         >
           Базы заметок
         </button>
@@ -248,7 +248,7 @@
           aria-disabled="true"
           tabindex="-1"
           disabled
-          class="cursor-not-allowed rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-400"
+          class="shrink-0 cursor-not-allowed whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 md:w-full"
         >
           Git, скоро
         </button>
@@ -277,7 +277,7 @@
             type="button"
             onclick={showAdd}
             disabled={busyAction !== ''}
-            class="shrink-0 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            class="shrink-0 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Добавить базу
           </button>
@@ -351,7 +351,7 @@
 
   <Modal
     show={pendingForget !== null}
-    title={pendingForget ? `Забыть базу «${pendingForget.name}»?` : 'Забыть базу?'}
+    title={pendingForget ? `Забыть базу ${pendingForget.name}?` : 'Забыть базу?'}
     description="Каталог и файлы останутся на диске"
     confirmText="Забыть базу"
     danger={true}

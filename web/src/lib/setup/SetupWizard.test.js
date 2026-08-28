@@ -65,6 +65,53 @@ describe('SetupWizard', () => {
     expect(document.querySelector('.cm-editor')).not.toBeInTheDocument()
   })
 
+  it('uses one main landmark and keeps focus and current-step semantics in sync', async () => {
+    const user = userEvent.setup()
+    renderWizard()
+
+    expect(screen.getAllByRole('main')).toHaveLength(1)
+    const initialHeading = screen.getByRole('heading', { name: 'Настройте первую базу' })
+    await waitFor(() => expect(initialHeading).toHaveFocus())
+    expect(screen.getByText('1')).toHaveAttribute('aria-current', 'step')
+    expect(screen.getByText('2')).not.toHaveAttribute('aria-current')
+    expect(screen.getByText('3')).not.toHaveAttribute('aria-current')
+
+    await openDetails(user, 'Создать новую')
+    const detailsHeading = screen.getByRole('heading', { name: 'Укажите имя и каталог' })
+    await waitFor(() => expect(detailsHeading).toHaveFocus())
+    expect(screen.getByText('1')).not.toHaveAttribute('aria-current')
+    expect(screen.getByText('2')).toHaveAttribute('aria-current', 'step')
+
+    await enterDetails(user, {
+      name: 'work',
+      path: '/home/user/notes',
+      pathLabel: 'Родительский каталог',
+    })
+    const reviewHeading = screen.getByRole('heading', { name: 'Проверьте настройки' })
+    await waitFor(() => expect(reviewHeading).toHaveFocus())
+    expect(screen.getByText('2')).not.toHaveAttribute('aria-current')
+    expect(screen.getByText('3')).toHaveAttribute('aria-current', 'step')
+
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    await waitFor(() => expect(
+      screen.getByRole('heading', { name: 'Укажите имя и каталог' }),
+    ).toHaveFocus())
+    expect(screen.getByText('2')).toHaveAttribute('aria-current', 'step')
+  })
+
+  it.each([
+    ['Создать новую', 'Родительский каталог'],
+    ['Подключить существующую', 'Каталог существующей базы'],
+  ])('labels the name and path controls in %s mode', async (mode, pathLabel) => {
+    const user = userEvent.setup()
+    renderWizard()
+
+    await openDetails(user, mode)
+
+    expect(screen.getByLabelText('Имя базы')).toBeInTheDocument()
+    expect(screen.getByLabelText(pathLabel)).toBeInTheDocument()
+  })
+
   it('reviews a create draft with the resolved base path', async () => {
     const user = userEvent.setup()
     renderWizard()
@@ -163,7 +210,10 @@ describe('SetupWizard', () => {
     await user.click(screen.getByRole('button', { name: 'Завершить настройку' }))
 
     expect(screen.getByRole('heading', { name: 'Проверьте настройки' })).toBeVisible()
-    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось завершить настройку')
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Не удалось завершить настройку')
+    expect(alert).toHaveAttribute('tabindex', '-1')
+    await waitFor(() => expect(alert).toHaveFocus())
   })
 
   it('completes once and protects a pending finish from repeated clicks', async () => {
@@ -195,6 +245,7 @@ describe('SetupWizard', () => {
     })
     expect(finish).toBeDisabled()
     expect(finish).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('button', { name: 'Назад' })).toBeDisabled()
 
     request.resolve(savedConfig)
     await waitFor(() => expect(props.onComplete).toHaveBeenCalledOnce())

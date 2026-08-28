@@ -136,4 +136,32 @@ describe('Editor image uploads', () => {
       request.resolve({ path: 'assets/images/pending.png' })
     }
   })
+
+  it('keeps toolbar icon buttons named and their SVGs decorative', async () => {
+    await renderEditor()
+    const names = [
+      'Жирный',
+      'Курсив',
+      'Зачеркнутый',
+      'Подчеркнутый',
+      'Заголовок',
+      'Цитата',
+      'Блок кода',
+      'Инлайн код',
+      'Список',
+      'Нумерованный список',
+      'Чекбокс',
+      'Таблица',
+      'Ссылка',
+      'Вставить картинку',
+      'Режим редактора',
+      'Предварительный просмотр',
+    ]
+
+    for (const name of names) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toHaveAttribute('title', name)
+      expect(button.querySelector('svg')).toHaveAttribute('aria-hidden', 'true')
+    }
+  })
 })

@@ -202,4 +202,21 @@ describe('Modal', () => {
     expect(confirm).toHaveClass('bg-blue-600')
     expect(confirm).not.toHaveClass('bg-red-600')
   })
+
+  it('stacks actions primary-first on narrow screens and gives controls focus outlines', () => {
+    render(Modal, modalProps({ input: true, confirmText: 'Продолжить' }))
+    const input = screen.getByRole('textbox')
+    const cancel = screen.getByRole('button', { name: 'Отмена' })
+    const confirm = screen.getByRole('button', { name: 'Продолжить' })
+
+    expect(confirm.parentElement).toHaveClass('flex-col-reverse', 'sm:flex-row')
+    for (const control of [input, cancel, confirm]) {
+      expect(control).toHaveClass(
+        'focus-visible:outline-2',
+        'focus-visible:outline-offset-2',
+        'focus-visible:outline-blue-600',
+      )
+      expect(control).not.toHaveClass('focus-visible:outline-none')
+    }
+  })
 })
