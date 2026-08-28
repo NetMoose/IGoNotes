@@ -76,6 +76,61 @@ describe('BaseForm', () => {
     expect(nameInput).toHaveValue('work')
     expect(pathInput).toHaveValue('/home/user/notes')
     await waitFor(() => expect(pathInput).toHaveFocus())
+
+    await user.type(pathInput, '/updated')
+
+    expect(screen.queryByText('Каталог не найден')).not.toBeInTheDocument()
+    expect(pathInput).not.toHaveAttribute('aria-invalid')
+    expect(nameInput).toHaveValue('work')
+    expect(pathInput).toHaveValue('/home/user/notes/updated')
+  })
+
+  it('adopts a changed mode prop without resetting the current draft', async () => {
+    const user = userEvent.setup()
+    const props = formProps({ showMode: true })
+    const { rerender } = render(BaseForm, props)
+    await user.type(screen.getByLabelText('Имя базы'), 'team/shared')
+    await user.type(screen.getByLabelText('Родительский каталог'), '/home/user/notes')
+
+    await rerender({ ...props, mode: 'connect' })
+
+    expect(screen.getByRole('radio', { name: 'Подключить существующую' })).toBeChecked()
+    expect(screen.getByLabelText('Имя базы')).toHaveValue('team/shared')
+    expect(screen.getByLabelText('Каталог существующей базы')).toHaveValue('/home/user/notes')
+
+    await user.click(screen.getByRole('button', { name: 'Продолжить' }))
+
+    expect(screen.queryByText('Имя новой базы не может быть точкой и содержать / или \\')).not.toBeInTheDocument()
+    expect(props.onSubmit).toHaveBeenCalledOnce()
+    expect(props.onSubmit).toHaveBeenCalledWith({
+      mode: 'connect',
+      name: 'team/shared',
+      path: '/home/user/notes',
+    })
+  })
+
+  it('does not focus a replacement form from stale scheduled work', async () => {
+    const user = userEvent.setup()
+    let scheduledFocus
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback) => {
+      scheduledFocus = callback
+      return 1
+    }))
+
+    try {
+      const first = render(BaseForm, formProps())
+      await user.click(screen.getByRole('button', { name: 'Продолжить' }))
+      expect(scheduledFocus).toBeTypeOf('function')
+      first.unmount()
+
+      render(BaseForm, formProps())
+      const replacementName = screen.getByLabelText('Имя базы')
+      scheduledFocus()
+
+      expect(replacementName).not.toHaveFocus()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('submits edit fields without mode and disables controls while busy', async () => {

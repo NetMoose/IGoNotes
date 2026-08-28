@@ -1,4 +1,6 @@
 <script>
+  import { onDestroy } from 'svelte'
+
   import { normalizeBaseDraft, validateBaseDraft } from '../base-draft.js'
   import DirectoryField from './DirectoryField.svelte'
 
@@ -29,6 +31,10 @@
     return initialPath
   }
 
+  function getInitialModeProp() {
+    return mode
+  }
+
   let selectedMode = $state(getInitialMode())
   let name = $state(getInitialName())
   let path = $state(getInitialPath())
@@ -38,15 +44,45 @@
   let previousApiError
   let backendField = ''
   let backendMessage = ''
+  let previousMode = getInitialModeProp()
+  let previousPath = getInitialPath()
+  let formElement
+  let focusHandle
+  let focusToken = 0
+  let active = true
+
+  function cancelScheduledFocus() {
+    focusToken += 1
+    if (focusHandle === undefined) return
+    if (typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(focusHandle)
+    } else {
+      clearTimeout(focusHandle)
+    }
+    focusHandle = undefined
+  }
 
   function scheduleFocus(field) {
-    const focus = () => document.getElementById(`${formId}-${field}`)?.focus()
+    cancelScheduledFocus()
+    const token = focusToken
+    const focus = () => {
+      focusHandle = undefined
+      if (!active || token !== focusToken || !formElement) return
+      const fieldId = `${formId}-${field}`
+      const target = Array.from(formElement.elements).find((element) => element.id === fieldId)
+      target?.focus()
+    }
     if (typeof requestAnimationFrame === 'function') {
-      requestAnimationFrame(focus)
+      focusHandle = requestAnimationFrame(focus)
     } else {
-      setTimeout(focus, 0)
+      focusHandle = setTimeout(focus, 0)
     }
   }
+
+  onDestroy(() => {
+    active = false
+    cancelScheduledFocus()
+  })
 
   function clearBackendFieldError() {
     if (!backendField || clientErrors[backendField] !== backendMessage) return
@@ -74,6 +110,22 @@
     } else {
       generalError = nextApiError.message
     }
+  })
+
+  $effect(() => {
+    const nextMode = mode
+    if (nextMode === previousMode) return
+    previousMode = nextMode
+    if (['create', 'connect', 'edit'].includes(nextMode)) {
+      selectedMode = nextMode
+    }
+  })
+
+  $effect(() => {
+    const nextPath = path
+    if (nextPath === previousPath) return
+    previousPath = nextPath
+    clearFieldError('path')
   })
 
   function clearFieldError(field) {
@@ -113,7 +165,7 @@
   }
 </script>
 
-<form id={formId} class="space-y-6" onsubmit={submit} novalidate>
+<form bind:this={formElement} id={formId} class="space-y-6" onsubmit={submit} novalidate>
   {#if showMode}
     <fieldset class="space-y-3" disabled={busy}>
       <legend class="text-sm font-semibold text-slate-900">Способ добавления базы</legend>

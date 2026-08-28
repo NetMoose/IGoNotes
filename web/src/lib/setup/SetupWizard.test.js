@@ -38,7 +38,7 @@ function renderWizard(overrides = {}) {
 
 async function openDetails(user, mode) {
   await user.click(screen.getByRole('button', { name: mode }))
-  await screen.findByRole('heading', { name: 'Параметры базы' })
+  await screen.findByRole('heading', { name: 'Укажите имя и каталог' })
 }
 
 async function enterDetails(user, { name, path, pathLabel }) {
@@ -109,6 +109,23 @@ describe('SetupWizard', () => {
     expect(screen.getByLabelText('Родительский каталог')).toHaveValue('/home/user/notes')
   })
 
+  it('returns from details without an internal cancel button and preserves the draft mode', async () => {
+    const user = userEvent.setup()
+    renderWizard()
+    await openDetails(user, 'Подключить существующую')
+    await user.type(screen.getByLabelText('Имя базы'), 'work')
+    await user.type(screen.getByLabelText('Каталог существующей базы'), '/srv/existing')
+
+    expect(screen.queryByRole('button', { name: 'Отмена' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+
+    expect(screen.getByRole('heading', { name: 'Настройте первую базу' })).toBeVisible()
+    await openDetails(user, 'Подключить существующую')
+    expect(screen.getByLabelText('Имя базы')).toHaveValue('work')
+    expect(screen.getByLabelText('Каталог существующей базы')).toHaveValue('/srv/existing')
+    expect(screen.queryByRole('button', { name: 'Отмена' })).not.toBeInTheDocument()
+  })
+
   it('returns a field API error to the form without losing the other field', async () => {
     const user = userEvent.setup()
     vi.mocked(completeSetup).mockRejectedValue(new ApiError({
@@ -125,7 +142,7 @@ describe('SetupWizard', () => {
 
     await user.click(screen.getByRole('button', { name: 'Завершить настройку' }))
 
-    expect(await screen.findByRole('heading', { name: 'Параметры базы' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Укажите имя и каталог' })).toBeVisible()
     expect(screen.getByText('База с таким именем уже добавлена')).toBeVisible()
     expect(screen.getByLabelText('Родительский каталог')).toHaveValue('/home/user/notes')
   })
@@ -184,13 +201,52 @@ describe('SetupWizard', () => {
     expect(props.onComplete).toHaveBeenCalledWith(savedConfig)
   })
 
+  it.each(['resolve', 'reject'])(
+    'ignores a pending completion %s after unmount',
+    async (settlement) => {
+      const user = userEvent.setup()
+      const request = deferred()
+      const onComplete = vi.fn()
+      const unhandled = vi.fn((event) => event.preventDefault())
+      vi.mocked(completeSetup).mockReturnValue(request.promise)
+      window.addEventListener('unhandledrejection', unhandled)
+
+      try {
+        const { unmount } = renderWizard({ onComplete })
+        await openDetails(user, 'Создать новую')
+        await enterDetails(user, {
+          name: 'work',
+          path: '/home/user/notes',
+          pathLabel: 'Родительский каталог',
+        })
+        await user.click(screen.getByRole('button', { name: 'Завершить настройку' }))
+        expect(completeSetup).toHaveBeenCalledOnce()
+
+        unmount()
+        if (settlement === 'resolve') {
+          request.resolve({ ...firstRunConfig, setup_completed: true })
+        } else {
+          request.reject(new ApiError({ message: 'Поздняя ошибка' }))
+        }
+        await request.promise.catch(() => {})
+        await Promise.resolve()
+
+        expect(onComplete).not.toHaveBeenCalled()
+        expect(unhandled).not.toHaveBeenCalled()
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      } finally {
+        window.removeEventListener('unhandledrejection', unhandled)
+      }
+    },
+  )
+
   it('moves focus to the heading after each step transition', async () => {
     const user = userEvent.setup()
     renderWizard()
 
     await openDetails(user, 'Создать новую')
     await waitFor(() => expect(
-      screen.getByRole('heading', { name: 'Параметры базы' }),
+      screen.getByRole('heading', { name: 'Укажите имя и каталог' }),
     ).toHaveFocus())
 
     await enterDetails(user, {

@@ -1,5 +1,5 @@
 <script>
-  import { onMount, tick } from 'svelte'
+  import { onDestroy, onMount, tick } from 'svelte'
 
   import { ApiError, completeSetup } from '../api.js'
   import { normalizeBaseDraft, resolveBasePath } from '../base-draft.js'
@@ -13,6 +13,9 @@
   let apiError = $state(null)
   let generalError = $state('')
   let completed = false
+  let active = true
+  let headingElement = $state()
+  let detailsElement = $state()
   let existingNames = $derived(
     Array.isArray(config?.bases)
       ? config.bases.map((base) => base?.name).filter((name) => typeof name === 'string')
@@ -23,14 +26,19 @@
 
   async function focusHeading() {
     await tick()
-    document.getElementById('setup-title')?.focus()
+    if (active) headingElement?.focus()
   }
 
   onMount(() => {
     focusHeading()
   })
 
+  onDestroy(() => {
+    active = false
+  })
+
   async function changeStep(nextStep) {
+    if (!active) return
     step = nextStep
     await focusHeading()
   }
@@ -49,17 +57,32 @@
     await changeStep(3)
   }
 
+  async function backToModes() {
+    if (!active) return
+    const nameInput = detailsElement?.querySelector('input[id="setup-base-name"]')
+    const pathInput = detailsElement?.querySelector('input[id="setup-base-path"]')
+    draft = {
+      ...draft,
+      name: nameInput?.value ?? draft.name,
+      path: pathInput?.value ?? draft.path,
+    }
+    apiError = null
+    generalError = ''
+    await changeStep(1)
+  }
+
   async function finish() {
-    if (busy || completed) return
+    if (!active || busy || completed) return
 
     busy = true
     apiError = null
     generalError = ''
+    let saved
     try {
-      const saved = await completeSetup(normalizeBaseDraft(draft))
-      completed = true
-      onComplete(saved)
+      saved = await completeSetup(normalizeBaseDraft(draft))
     } catch (error) {
+      if (!active) return
+      busy = false
       if (
         error instanceof ApiError
         && (error.field === 'name' || error.field === 'path')
@@ -71,8 +94,17 @@
           ? error.message
           : 'Не удалось завершить настройку'
       }
-    } finally {
-      busy = false
+      return
+    }
+
+    if (!active) return
+    busy = false
+    completed = true
+    try {
+      onComplete(saved)
+    } catch (error) {
+      if (active) completed = false
+      throw error
     }
   }
 </script>
@@ -110,6 +142,7 @@
         <div class="my-auto">
           <p class="text-sm font-semibold uppercase tracking-wider text-blue-600">Шаг 1 из 3</p>
           <h1
+            bind:this={headingElement}
             id="setup-title"
             tabindex="-1"
             class="mt-2 text-3xl font-bold tracking-tight text-slate-950 outline-none sm:text-4xl"
@@ -146,18 +179,28 @@
           </div>
         </div>
       {:else if step === 2}
-        <div class="my-auto w-full max-w-2xl">
+        <div bind:this={detailsElement} class="my-auto w-full max-w-2xl">
           <p class="text-sm font-semibold uppercase tracking-wider text-blue-600">Шаг 2 из 3</p>
           <h1
+            bind:this={headingElement}
             id="setup-title"
             tabindex="-1"
             class="mt-2 text-3xl font-bold tracking-tight text-slate-950 outline-none"
           >
-            Параметры базы
+            Укажите имя и каталог
           </h1>
           <p class="mb-8 mt-3 text-slate-600">
             Укажите понятное имя и каталог для хранения заметок.
           </p>
+
+          <button
+            type="button"
+            onclick={backToModes}
+            disabled={busy}
+            class="mb-6 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Назад
+          </button>
 
           <BaseForm
             formId="setup-base"
@@ -169,13 +212,13 @@
             {busy}
             {apiError}
             onSubmit={review}
-            onCancel={() => changeStep(1)}
           />
         </div>
       {:else}
         <div class="my-auto w-full max-w-2xl">
           <p class="text-sm font-semibold uppercase tracking-wider text-blue-600">Шаг 3 из 3</p>
           <h1
+            bind:this={headingElement}
             id="setup-title"
             tabindex="-1"
             class="mt-2 text-3xl font-bold tracking-tight text-slate-950 outline-none"
