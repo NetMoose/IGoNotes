@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/svelte'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
 import { tick } from 'svelte'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -30,6 +30,7 @@ vi.mock('./lib/api.js', async (importOriginal) => {
 })
 
 import App from './App.svelte'
+import { setEditorFlush } from './test/EditorStub.svelte'
 import {
   completeSetup,
   createBase,
@@ -109,6 +110,7 @@ function fileNode(name) {
 
 describe('App setup gate', () => {
   beforeEach(() => {
+    setEditorFlush()
     for (const mock of apiMocks) vi.mocked(mock).mockReset()
     vi.mocked(getConfig).mockResolvedValue(completedConfig)
     vi.mocked(completeSetup).mockResolvedValue(completedConfig)
@@ -220,6 +222,27 @@ describe('App setup gate', () => {
 
     expect(saveNote).toHaveBeenCalledOnce()
     expect(saveNote).toHaveBeenCalledWith(note.id, '# Loaded')
+  })
+
+  it('flushes same-note edits without refetching stale content', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('a.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# A' })
+      .mockResolvedValueOnce({ content: '# Stale A' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'a.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.clear(textarea)
+    await user.type(textarea, '# A latest')
+    await user.click(screen.getByRole('button', { name: 'a.md' }))
+
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# A latest'))
+    await tick()
+    expect(getNote).toHaveBeenCalledOnce()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# A latest')
   })
 
   it('flushes changed markdown before opening settings and cancels the debounce save', async () => {
@@ -491,6 +514,35 @@ describe('App setup gate', () => {
     }
   })
 
+  it('locks the notes workspace while a note transition is pending', async () => {
+    const user = userEvent.setup()
+    const noteA = fileNode('a.md')
+    const noteB = fileNode('b.md')
+    const loadB = deferred()
+    vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
+    vi.mocked(getNote).mockImplementation((id) => (
+      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+    ))
+
+    const { container } = render(App)
+    await user.click(await screen.findByRole('button', { name: 'a.md' }))
+    await screen.findByLabelText('Markdown')
+    await user.click(screen.getByRole('button', { name: 'b.md' }))
+    await waitFor(() => expect(getNote).toHaveBeenCalledWith(noteB.id))
+    const workspace = container.firstElementChild.firstElementChild
+
+    expect(workspace).toHaveProperty('inert', true)
+    expect(workspace).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# A')
+
+    loadB.resolve({ content: '# B' })
+    await loadB.promise
+    await waitFor(() => expect(screen.getByLabelText('Markdown')).toHaveValue('# B'))
+
+    expect(workspace).toHaveProperty('inert', false)
+    expect(workspace).toHaveAttribute('aria-busy', 'false')
+  })
+
   it('keeps the active note when its save fails during note navigation', async () => {
     const initialUser = userEvent.setup()
     const noteA = fileNode('a.md')
@@ -665,6 +717,89 @@ describe('App setup gate', () => {
       vi.clearAllTimers()
       vi.useRealTimers()
     }
+  })
+
+  it('waits for a late upload and its note save before applying the target note', async () => {
+    const user = userEvent.setup()
+    const noteA = fileNode('a.md')
+    const noteB = fileNode('b.md')
+    const loadB = deferred()
+    const lateUpload = deferred()
+    const saveA = deferred()
+    const flush = vi.fn()
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(lateUpload.promise)
+    setEditorFlush(flush)
+    vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
+    vi.mocked(getNote).mockImplementation((id) => (
+      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+    ))
+    vi.mocked(saveNote).mockReturnValue(saveA.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'a.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.click(screen.getByRole('button', { name: 'b.md' }))
+    await waitFor(() => expect(getNote).toHaveBeenCalledWith(noteB.id))
+    expect(flush).toHaveBeenCalledTimes(3)
+
+    loadB.resolve({ content: '# B' })
+    await loadB.promise
+    await waitFor(() => expect(flush).toHaveBeenCalledTimes(4))
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# A')
+
+    await fireEvent.input(textarea, { target: { value: '# A from upload' } })
+    lateUpload.resolve()
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A from upload'))
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# A from upload')
+
+    saveA.resolve(null)
+    await saveA.promise
+    await waitFor(() => expect(screen.getByLabelText('Markdown')).toHaveValue('# B'))
+    expect(saveNote).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the active note when a late upload note save fails', async () => {
+    const user = userEvent.setup()
+    const noteA = fileNode('a.md')
+    const noteB = fileNode('b.md')
+    const loadB = deferred()
+    const lateUpload = deferred()
+    const saveA = deferred()
+    const flush = vi.fn()
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(lateUpload.promise)
+    setEditorFlush(flush)
+    vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
+    vi.mocked(getNote).mockImplementation((id) => (
+      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+    ))
+    vi.mocked(saveNote).mockReturnValue(saveA.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'a.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.click(screen.getByRole('button', { name: 'b.md' }))
+    await waitFor(() => expect(getNote).toHaveBeenCalledWith(noteB.id))
+    loadB.resolve({ content: '# B' })
+    await loadB.promise
+    await waitFor(() => expect(flush).toHaveBeenCalledTimes(4))
+
+    await fireEvent.input(textarea, { target: { value: '# A from upload' } })
+    lateUpload.resolve()
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A from upload'))
+    saveA.reject(new Error('Диск недоступен'))
+    await saveA.promise.catch(() => {})
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /^Не удалось сохранить заметку: Диск недоступен$/,
+    )
+    expect(within(screen.getByRole('main')).getByText('a.md')).toBeVisible()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# A from upload')
   })
 
   it('manually saves unchanged content and catches save errors in the UI', async () => {

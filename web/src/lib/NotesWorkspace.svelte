@@ -8,6 +8,7 @@
     saveStatus = 'idle',
     basePath = '',
     error = '',
+    transitioning = false,
     onSelectNote,
     onDeleteNote,
     onSave,
@@ -16,14 +17,22 @@
 
   let editor = $state();
 
+  export function flushPendingUploads() {
+    return editor?.flushPendingUploads?.();
+  }
+
   function runAfterUploads(callback, ...args) {
-    const uploads = editor?.flushPendingUploads?.();
+    const uploads = flushPendingUploads();
     if (!uploads) return callback(...args);
     return Promise.resolve(uploads).then(() => callback(...args));
   }
 </script>
 
-<div class="flex flex-col h-screen w-full bg-white text-gray-800 font-sans overflow-hidden">
+<div
+  inert={transitioning}
+  aria-busy={transitioning ? 'true' : 'false'}
+  class="flex flex-col h-screen w-full bg-white text-gray-800 font-sans overflow-hidden"
+>
   <div class="flex-1 flex overflow-hidden">
     <Sidebar onSelect={(...args) => runAfterUploads(onSelectNote, ...args)} onDelete={onDeleteNote} />
 

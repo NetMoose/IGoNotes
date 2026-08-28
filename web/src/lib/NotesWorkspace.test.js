@@ -99,6 +99,19 @@ describe('NotesWorkspace', () => {
     expect(props.onOpenSettings).toHaveBeenCalledOnce()
   })
 
+  it('locks the workspace while a transition is pending', async () => {
+    const { container, props, rerender } = await renderWorkspace({ transitioning: true })
+    const root = container.firstElementChild
+
+    expect(root).toHaveProperty('inert', true)
+    expect(root).toHaveAttribute('aria-busy', 'true')
+
+    await rerender({ ...props, transitioning: false })
+
+    expect(root).toHaveProperty('inert', false)
+    expect(root).toHaveAttribute('aria-busy', 'false')
+  })
+
   it('forwards a selected file from the real sidebar', async () => {
     const user = userEvent.setup()
     const note = {
@@ -137,6 +150,23 @@ describe('NotesWorkspace', () => {
 
     await waitFor(() => expect(props.onSelectNote).toHaveBeenCalledOnce())
     expect(props.onSelectNote).toHaveBeenCalledWith(note)
+  })
+
+  it('exposes editor upload flushing through the workspace instance', async () => {
+    const request = deferred()
+    const flush = vi.fn(() => request.promise)
+    setEditorFlush(flush)
+    const { component } = await renderWorkspace({
+      activeNote: fileNode('current.md'),
+      content: '# Current',
+    })
+
+    const pending = component.flushPendingUploads()
+
+    expect(flush).toHaveBeenCalledOnce()
+    expect(pending).toBe(request.promise)
+    request.resolve()
+    await pending
   })
 
   it('waits for editor uploads before opening settings', async () => {

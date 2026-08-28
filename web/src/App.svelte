@@ -17,11 +17,15 @@
   let saveStatus = $state('idle')
   let transitionError = $state('')
   let dirty = $state(false)
+  let transitioning = $state(false)
+  let notesWorkspace = $state()
 
   let saveTimer = null
   let statusTimer = null
   let savePromise = null
   let statusGeneration = 0
+  let transitionCount = 0
+  let transitionGeneration = 0
   let ignoreNextChange = false
   let mounted = false
   let loadToken = 0
@@ -44,6 +48,25 @@
     statusTimer = null
   }
 
+  function beginTransition() {
+    const generation = transitionGeneration
+    transitionCount += 1
+    transitioning = true
+    return generation
+  }
+
+  function endTransition(generation) {
+    if (generation !== transitionGeneration) return
+    transitionCount = Math.max(0, transitionCount - 1)
+    transitioning = transitionCount > 0
+  }
+
+  function resetTransitionState() {
+    transitionGeneration += 1
+    transitionCount = 0
+    transitioning = false
+  }
+
   function applyConfig(savedConfig) {
     const previous = activeBase(config)
     const current = activeBase(savedConfig)
@@ -58,6 +81,7 @@
 
   function resetEditorState() {
     noteRequestToken += 1
+    resetTransitionState()
     clearSaveTimer()
     clearStatusTimer()
     activeNote = null
@@ -95,49 +119,56 @@
 
   async function loadNote(node) {
     const token = ++noteRequestToken
+    const transition = beginTransition()
     transitionError = ''
 
     try {
-      await flushPendingSave()
-    } catch (error) {
-      if (mounted && token === noteRequestToken && saveStatus !== 'error') {
-        showSaveError(error)
+      try {
+        await flushWorkspace()
+      } catch (error) {
+        if (mounted && token === noteRequestToken && saveStatus !== 'error') {
+          showSaveError(error)
+        }
+        return
       }
-      return
-    }
 
-    if (!mounted || token !== noteRequestToken) return
-
-    let note
-    try {
-      note = await getNote(node.id)
-    } catch (error) {
       if (!mounted || token !== noteRequestToken) return
-      transitionError = errorMessage(error, 'Не удалось загрузить заметку')
-      return
-    }
+      if (activeNote?.id === node.id) return
 
-    if (!mounted || token !== noteRequestToken) return
-
-    try {
-      await flushPendingSave()
-    } catch (error) {
-      if (mounted && token === noteRequestToken && saveStatus !== 'error') {
-        showSaveError(error)
+      let note
+      try {
+        note = await getNote(node.id)
+      } catch (error) {
+        if (!mounted || token !== noteRequestToken) return
+        transitionError = errorMessage(error, 'Не удалось загрузить заметку')
+        return
       }
-      return
+
+      if (!mounted || token !== noteRequestToken) return
+
+      try {
+        await flushEditorUploads()
+        await flushPendingSave()
+      } catch (error) {
+        if (mounted && token === noteRequestToken && saveStatus !== 'error') {
+          showSaveError(error)
+        }
+        return
+      }
+
+      if (!mounted || token !== noteRequestToken) return
+
+      clearSaveTimer()
+      clearStatusTimer()
+      activeNote = node
+      ignoreNextChange = true
+      markdownContent = typeof note?.content === 'string' ? note.content : ''
+      dirty = false
+      saveStatus = 'idle'
+      transitionError = ''
+    } finally {
+      endTransition(transition)
     }
-
-    if (!mounted || token !== noteRequestToken) return
-
-    clearSaveTimer()
-    clearStatusTimer()
-    activeNote = node
-    ignoreNextChange = true
-    markdownContent = typeof note?.content === 'string' ? note.content : ''
-    dirty = false
-    saveStatus = 'idle'
-    transitionError = ''
   }
 
   function showSaveError(error) {
@@ -202,6 +233,19 @@
     if (dirty) await persistCurrentNote()
   }
 
+  async function flushEditorUploads() {
+    if (!mounted) return
+    const uploads = notesWorkspace?.flushPendingUploads?.()
+    if (uploads) await uploads
+  }
+
+  async function flushWorkspace() {
+    await flushEditorUploads()
+    await flushPendingSave()
+    await flushEditorUploads()
+    await flushPendingSave()
+  }
+
   function handleDeleted(id) {
     if (activeNote?.id === id) resetEditorState()
   }
@@ -218,15 +262,18 @@
   }
 
   async function openSettings() {
+    const transition = beginTransition()
     try {
       await openSettingsSafely({
-        flush: flushPendingSave,
+        flush: flushWorkspace,
         open: () => {
           if (mounted) screen = 'settings'
         },
       })
     } catch (error) {
       showSaveError(error)
+    } finally {
+      endTransition(transition)
     }
   }
 
@@ -270,6 +317,7 @@
       mounted = false
       loadToken += 1
       noteRequestToken += 1
+      resetTransitionState()
       clearSaveTimer()
       clearStatusTimer()
     }
@@ -302,10 +350,12 @@
     <SetupWizard {config} onComplete={finishSetup} />
   {:else if screen === 'editor'}
     <NotesWorkspace
+      bind:this={notesWorkspace}
       {activeNote}
       bind:content={markdownContent}
       {saveStatus}
       {basePath}
+      {transitioning}
       error={transitionError}
       onSelectNote={loadNote}
       onDeleteNote={handleDeleted}
