@@ -17,7 +17,7 @@ IGoNotes — это CLI-приложение на Go, которое при за
 - [x] Подсветка синтаксиса в блоках кода (как в редакторе, так и в режиме превью) с выбором языка
 - [x] Автосохранение (debounce 2 секунды)
 - [x] Использование **SQLite** (`modernc.org/sqlite`) для метаданных (структура дерева, теги)
-- [x] Файлы Markdown хранятся в файловой системе: `~/.igonotes/bases/<база>/<тема>/notes/...`
+- [x] Markdown-файлы хранятся непосредственно внутри корня каждой настроенной базы, выбранного или созданного пользователем
 - [x] Загрузка и отображение изображений (Paste, Drag & Drop), хранятся в `assets/images/`
 - [x] Статус-бар внизу окна с отображением текущей директории базы заметок
 - [x] Оформление интерфейса на **Tailwind CSS v4**
@@ -59,24 +59,20 @@ go:
 ## Структура данных
 
 ```text
-~/.igonotes/
-└── bases/
-    └── <название_базы>/
-        ├── <тема_1>/
-        │   └── notes/
-        │       ├── note1.md
-        │       └── subtopic/
-        │           └── note2.md
-        └── assets/
-            └── images/
-                └── Paste image 20260714150000.png
+<configured base root>/
+├── note.md
+├── nested/
+│   └── another-note.md
+└── assets/
+    └── images/
+        └── Paste image 20260714150000.png
 
 <os.UserConfigDir()>/
 └── igonotes/
     └── config.json
 ```
 
-- Конфигурация приложения: `<os.UserConfigDir()>/igonotes/config.json`
+- Конфигурация приложения по умолчанию: `<os.UserConfigDir()>/igonotes/config.json`; флаг `--config` переопределяет каталог конфигурации
 - В Linux каталог конфигурации приложения — `$XDG_CONFIG_HOME/igonotes`, если `XDG_CONFIG_HOME` задана; иначе `~/.config/igonotes`
 - SQLite с метаданными: `~/.igonotes/metadata.db`
 

@@ -46,7 +46,7 @@ make all
 
 Перед настройками и переключением ожидающие загрузки и изменения заметки сохраняются; ошибка блокирует переход. Забывание изменяет только конфигурацию и не удаляет файлы.
 
-Общий `web/src/lib/api.js` предоставляет именованные wrappers и типизированный `ApiError` с полями `status`, `code`, `message` и `field`. Vitest component/module tests находятся в `web/src/**/*.test.js` и покрывают `App`, редактор, setup, настройки и API.
+Общий `web/src/lib/api.js` предоставляет именованные wrappers и типизированный `ApiError` с полями `status`, `code`, `message` и `field`. Vitest 4, jsdom и Testing Library запускают component/module tests из `web/src/**/*.test.js`, которые покрывают `App`, редактор, setup, настройки и API.
 
 ## REST API
 

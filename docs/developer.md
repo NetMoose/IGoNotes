@@ -62,7 +62,7 @@ make all
 
 Все HTTP-вызовы frontend собраны в `web/src/lib/api.js`. Класс `ApiError` сохраняет `status`, `code`, `message` и `field`; именованные wrappers покрывают заметки, конфигурацию, setup, базы и системный выбор каталога.
 
-Vitest и Testing Library проверяют компоненты и frontend-модули в файлах `web/src/**/*.test.js`, включая `App`, редактор, setup, настройки и API wrappers.
+Vitest 4, jsdom и Testing Library проверяют компоненты и frontend-модули в файлах `web/src/**/*.test.js`, включая `App`, редактор, setup, настройки и API wrappers.
 
 ## REST API
 
