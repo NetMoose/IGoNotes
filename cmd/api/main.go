@@ -113,6 +113,8 @@ func main() {
 	// Создаем обработчики
 	noteHandler := handlers.NewNoteHandler(noteService)
 	settingsHandler := handlers.NewSettingsHandler(settingsService)
+	directoryPicker := service.NewDirectoryPicker(service.ExecCommandRunner{}, runtime.GOOS)
+	systemHandler := handlers.NewSystemHandler(directoryPicker)
 
 	// Инициализация статики (фронтенд)
 	distFS, err := web.GetDistFS()
@@ -123,6 +125,7 @@ func main() {
 
 	// Маршрутизация
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
+	registerSystemRoutes(router, systemHandler)
 
 	address, url := localServerEndpoint(*port)
 	if err := serveLocal(address, router, func() {
