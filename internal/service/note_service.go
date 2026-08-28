@@ -755,8 +755,7 @@ func (s *NoteService) RenameNode(id, newName string) error {
 	if s.basePath == "" || newName == "" {
 		return os.ErrInvalid
 	}
-	sourceEntry, err := s.baseRoot.Lstat(rootPath(cleanID))
-	if err != nil {
+	if _, err := s.baseRoot.Lstat(rootPath(cleanID)); err != nil {
 		return normalizeRootError(err)
 	}
 	info, err := s.baseRoot.Stat(rootPath(cleanID))
@@ -783,19 +782,25 @@ func (s *NoteService) RenameNode(id, newName string) error {
 				return normalizeRootError(err)
 			}
 		}
-		if !os.SameFile(sourceEntry, destinationEntry) {
-			return ErrAlreadyExists
-		}
+		return ErrAlreadyExists
 	} else if !os.IsNotExist(err) {
 		return normalizeRootError(err)
 	}
-	// baseMu excludes in-process mutations; os.Root has no portable atomic no-replace rename.
+	parent, err := s.baseRoot.Open(rootPath(path.Dir(cleanID)))
+	if err != nil {
+		return normalizeRootError(err)
+	}
+	defer parent.Close()
+
 	if s.beforeRename != nil {
 		s.beforeRename()
 	}
 
-	if err := s.baseRoot.Rename(rootPath(cleanID), rootPath(newPath)); err != nil {
-		return normalizeRootError(err)
+	if err := renameNoReplace(parent, path.Base(cleanID), path.Base(newPath)); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return ErrAlreadyExists
+		}
+		return fmt.Errorf("rename %q to %q: %w", cleanID, newPath, err)
 	}
 
 	// Синхронизируем ФС с БД, чтобы обновились все пути (особенно важно для папок, т.к. пути детей меняются)

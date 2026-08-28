@@ -1713,6 +1713,54 @@ func TestNoteServiceRenameNodeRejectsExistingDestination(t *testing.T) {
 	}
 }
 
+func TestNoteServiceRenameNodeRejectsDestinationCreatedAfterCheck(t *testing.T) {
+	base := t.TempDir()
+	source := filepath.Join(base, "source.md")
+	destination := filepath.Join(base, "destination.md")
+	if err := os.WriteFile(source, []byte("source"), 0644); err != nil {
+		t.Fatalf("os.WriteFile(source) error = %v, want nil", err)
+	}
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+	service.beforeRename = func() {
+		if err := os.WriteFile(destination, []byte("destination"), 0644); err != nil {
+			t.Fatalf("os.WriteFile(destination) error = %v, want nil", err)
+		}
+	}
+
+	if err := service.RenameNode("source.md", "destination"); !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("RenameNode() error = %v, want ErrAlreadyExists", err)
+	}
+	for name, want := range map[string]string{source: "source", destination: "destination"} {
+		content, err := os.ReadFile(name)
+		if err != nil {
+			t.Errorf("os.ReadFile(%q) error = %v, want nil", name, err)
+			continue
+		}
+		if string(content) != want {
+			t.Errorf("content of %q = %q, want %q", name, content, want)
+		}
+	}
+}
+
+func TestNoteServiceRenameNodeRejectsHardLinkAlias(t *testing.T) {
+	base := t.TempDir()
+	source := filepath.Join(base, "source.md")
+	destination := filepath.Join(base, "destination.md")
+	if err := os.WriteFile(source, []byte("source"), 0644); err != nil {
+		t.Fatalf("os.WriteFile(source) error = %v, want nil", err)
+	}
+	if err := os.Link(source, destination); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	service := newTestNoteService(t, &fakeNoteRepository{}, base)
+
+	if err := service.RenameNode("source.md", "destination"); !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("RenameNode() error = %v, want ErrAlreadyExists", err)
+	}
+	assertFileContent(t, source, []byte("source"))
+	assertFileContent(t, destination, []byte("source"))
+}
+
 func TestNoteServiceRenameNodeExactPathIsNoOp(t *testing.T) {
 	base := t.TempDir()
 	if err := os.WriteFile(filepath.Join(base, "same.md"), []byte("same"), 0644); err != nil {
@@ -1740,14 +1788,33 @@ func TestNoteServiceRenameNodeExactPathIsNoOp(t *testing.T) {
 	}
 }
 
-func TestNoteServiceRenameNodeAllowsCaseOnlyRename(t *testing.T) {
+func TestNoteServiceRenameNodeHandlesCaseOnlyRename(t *testing.T) {
 	base := t.TempDir()
-	if err := os.WriteFile(filepath.Join(base, "Case.md"), []byte("case"), 0644); err != nil {
+	source := filepath.Join(base, "Case.md")
+	destination := filepath.Join(base, "case.md")
+	if err := os.WriteFile(source, []byte("case"), 0644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v, want nil", err)
+	}
+	sourceInfo, err := os.Lstat(source)
+	if err != nil {
+		t.Fatalf("os.Lstat(source) error = %v, want nil", err)
+	}
+	destinationInfo, destinationErr := os.Lstat(destination)
+	caseAlias := destinationErr == nil && os.SameFile(sourceInfo, destinationInfo)
+	if destinationErr != nil && !errors.Is(destinationErr, os.ErrNotExist) {
+		t.Fatalf("os.Lstat(destination) error = %v", destinationErr)
 	}
 	service := newTestNoteService(t, &fakeNoteRepository{}, base)
 
-	if err := service.RenameNode("Case.md", "case"); err != nil {
+	err = service.RenameNode("Case.md", "case")
+	if caseAlias {
+		if !errors.Is(err, ErrAlreadyExists) {
+			t.Fatalf("RenameNode() error = %v, want ErrAlreadyExists", err)
+		}
+		assertFileContent(t, source, []byte("case"))
+		return
+	}
+	if err != nil {
 		t.Fatalf("RenameNode() error = %v, want nil", err)
 	}
 	entries, err := os.ReadDir(base)
