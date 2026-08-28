@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte'
+import { render, screen, waitFor, within } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
 import { tick } from 'svelte'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -63,6 +63,11 @@ const completedConfig = {
   ],
   current_base: 'personal',
   setup_completed: true,
+}
+
+const workConfig = {
+  ...completedConfig,
+  current_base: 'work',
 }
 
 const apiMocks = [
@@ -215,6 +220,248 @@ describe('App setup gate', () => {
 
     expect(saveNote).toHaveBeenCalledOnce()
     expect(saveNote).toHaveBeenCalledWith(note.id, '# Loaded')
+  })
+
+  it('flushes changed markdown before opening settings and cancels the debounce save', async () => {
+    const initialUser = userEvent.setup()
+    const note = fileNode('draft.md')
+    const saveRequest = deferred()
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(saveNote).mockReturnValue(saveRequest.promise)
+
+    render(App)
+    await initialUser.click(await screen.findByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+
+    vi.useFakeTimers()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    try {
+      await user.clear(textarea)
+      await user.type(textarea, '# Changed')
+      await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+
+      expect(saveNote).toHaveBeenCalledOnce()
+      expect(saveNote).toHaveBeenCalledWith(note.id, '# Changed')
+      expect(screen.queryByRole('heading', { name: 'Базы заметок' })).not.toBeInTheDocument()
+
+      saveRequest.resolve(null)
+      await saveRequest.promise
+      await vi.advanceTimersByTimeAsync(0)
+      await tick()
+
+      expect(screen.getByRole('heading', { name: 'Базы заметок' })).toBeVisible()
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(saveNote).toHaveBeenCalledOnce()
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the editor open and reports a failed settings flush', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(saveNote).mockRejectedValue(new Error('Диск недоступен'))
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.clear(textarea)
+    await user.type(textarea, '# Changed')
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /^Не удалось сохранить заметку: Диск недоступен$/,
+    )
+    expect(screen.getByText('Ошибка сохранения')).toBeVisible()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Changed')
+    expect(screen.queryByRole('heading', { name: 'Базы заметок' })).not.toBeInTheDocument()
+  })
+
+  it('flushes before switching bases and remounts an empty editor workspace', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(switchBase).mockResolvedValue(workConfig)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.clear(textarea)
+    await user.type(textarea, '# Work in progress')
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    const workCard = screen.getByRole('article', { name: 'База work' })
+    await user.click(within(workCard).getByRole('button', { name: 'Открыть' }))
+
+    expect(await screen.findByText('Выберите заметку')).toBeVisible()
+    expect(saveNote).toHaveBeenCalledWith(note.id, '# Work in progress')
+    expect(switchBase).toHaveBeenCalledWith('work')
+    expect(saveNote.mock.invocationCallOrder[0]).toBeLessThan(switchBase.mock.invocationCallOrder[0])
+    expect(screen.queryByLabelText('Markdown')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Сохранить' })).toBeDisabled()
+    expect(screen.getByTitle('Текущая база заметок')).toHaveTextContent(/^\/srv\/work$/)
+    await waitFor(() => expect(getNotes).toHaveBeenCalledTimes(2))
+  })
+
+  it('keeps settings and the previous config when switching bases fails', async () => {
+    const user = userEvent.setup()
+    vi.mocked(switchBase).mockRejectedValue(new Error('База занята'))
+
+    render(App)
+    await screen.findByText('Выберите заметку')
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    const workCard = screen.getByRole('article', { name: 'База work' })
+    await user.click(within(workCard).getByRole('button', { name: 'Открыть' }))
+
+    expect(await within(workCard).findByRole('alert')).toHaveTextContent(/^База занята$/)
+    expect(screen.getByRole('heading', { name: 'Базы заметок' })).toBeVisible()
+    expect(screen.getByRole('article', { name: 'База personal' })).toHaveTextContent('Текущая')
+
+    await user.click(screen.getByRole('button', { name: 'Назад к заметкам' }))
+    expect(await screen.findByTitle('Текущая база заметок')).toHaveTextContent(/^\/notes\/personal$/)
+  })
+
+  it('resets the active note when settings changes the active base path', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const movedConfig = {
+      ...completedConfig,
+      bases: [
+        { ...completedConfig.bases[0], path: '/mnt/personal' },
+        completedConfig.bases[1],
+      ],
+    }
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(updateBase).mockResolvedValue(movedConfig)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await screen.findByLabelText('Markdown')
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    const personalCard = screen.getByRole('article', { name: 'База personal' })
+    await user.click(within(personalCard).getByRole('button', { name: 'Изменить' }))
+    const path = screen.getByLabelText('Каталог существующей базы')
+    await user.clear(path)
+    await user.type(path, '/mnt/personal')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+
+    expect(updateBase).toHaveBeenCalledWith('personal', {
+      name: 'personal',
+      path: '/mnt/personal',
+    })
+    expect(await screen.findByRole('heading', { name: 'Базы заметок' })).toBeVisible()
+    expect(screen.getByRole('article', { name: 'База personal' })).toHaveTextContent('/mnt/personal')
+
+    await user.click(screen.getByRole('button', { name: 'Назад к заметкам' }))
+    expect(await screen.findByText('Выберите заметку')).toBeVisible()
+    expect(screen.queryByLabelText('Markdown')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Сохранить' })).toBeDisabled()
+    expect(screen.getByTitle('Текущая база заметок')).toHaveTextContent(/^\/mnt\/personal$/)
+  })
+
+  it('debounces changed markdown for exactly two seconds', async () => {
+    const initialUser = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+
+    render(App)
+    await initialUser.click(await screen.findByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+
+    vi.useFakeTimers()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    try {
+      await user.clear(textarea)
+      await user.type(textarea, '# Debounced')
+
+      expect(saveNote).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1999)
+      expect(saveNote).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(saveNote).toHaveBeenCalledOnce()
+      expect(saveNote).toHaveBeenCalledWith(note.id, '# Debounced')
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('serializes a newer edit behind a pending save and flushes it only once', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const firstSave = deferred()
+    const secondSave = deferred()
+    let inFlight = 0
+    let maxInFlight = 0
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(saveNote).mockImplementation(() => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      const request = saveNote.mock.calls.length === 1 ? firstSave : secondSave
+      return request.promise.finally(() => {
+        inFlight -= 1
+      })
+    })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+    await user.clear(textarea)
+    await user.type(textarea, '# First')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    expect(saveNote).toHaveBeenCalledTimes(1)
+
+    await user.clear(textarea)
+    await user.type(textarea, '# Latest')
+    expect(saveNote).toHaveBeenCalledTimes(1)
+    expect(maxInFlight).toBe(1)
+
+    firstSave.resolve(null)
+    await waitFor(() => expect(saveNote).toHaveBeenCalledTimes(2))
+    expect(saveNote).toHaveBeenNthCalledWith(2, note.id, '# Latest')
+    expect(maxInFlight).toBe(1)
+
+    secondSave.resolve(null)
+    await waitFor(() => expect(screen.getByText('Сохранено')).toBeVisible())
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+
+    expect(await screen.findByRole('heading', { name: 'Базы заметок' })).toBeVisible()
+    expect(saveNote).toHaveBeenCalledTimes(2)
+  })
+
+  it('manually saves unchanged content and catches save errors in the UI', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const unhandled = vi.fn((event) => event.preventDefault())
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(saveNote).mockRejectedValue(new Error('Нет места'))
+    window.addEventListener('unhandledrejection', unhandled)
+
+    try {
+      render(App)
+      await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+      await screen.findByLabelText('Markdown')
+      await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+
+      expect(saveNote).toHaveBeenCalledOnce()
+      expect(saveNote).toHaveBeenCalledWith(note.id, '# Original')
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        /^Не удалось сохранить заметку: Нет места$/,
+      )
+      expect(screen.getByText('Ошибка сохранения')).toBeVisible()
+      await Promise.resolve()
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('unhandledrejection', unhandled)
+    }
   })
 
   it('opens settings and returns directly to the editor', async () => {

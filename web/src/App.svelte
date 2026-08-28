@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
 
   import { getConfig, getNote, saveNote, switchBase } from './lib/api.js'
+  import { openSettingsSafely, switchBaseSafely } from './lib/app-transitions.js'
   import { activeBase } from './lib/base-draft.js'
   import NotesWorkspace from './lib/NotesWorkspace.svelte'
   import SettingsWorkspace from './lib/settings/SettingsWorkspace.svelte'
@@ -15,16 +16,19 @@
   let basePath = $state('')
   let saveStatus = $state('idle')
   let transitionError = $state('')
+  let dirty = $state(false)
 
   let saveTimer = null
   let statusTimer = null
+  let savePromise = null
+  let statusGeneration = 0
   let ignoreNextChange = false
   let mounted = false
   let loadToken = 0
   let noteRequestToken = 0
 
   function errorMessage(error, fallback) {
-    return error instanceof Error && error.message ? error.message : fallback
+    return typeof error?.message === 'string' && error.message ? error.message : fallback
   }
 
   function clearSaveTimer() {
@@ -34,14 +38,21 @@
   }
 
   function clearStatusTimer() {
+    statusGeneration += 1
     if (statusTimer === null) return
     clearTimeout(statusTimer)
     statusTimer = null
   }
 
   function applyConfig(savedConfig) {
-    config = savedConfig
+    const previous = activeBase(config)
     const current = activeBase(savedConfig)
+
+    if (previous?.name !== current?.name || previous?.path !== current?.path) {
+      resetEditorState()
+    }
+
+    config = savedConfig
     basePath = typeof current?.path === 'string' ? current.path : ''
   }
 
@@ -50,10 +61,11 @@
     clearSaveTimer()
     clearStatusTimer()
     activeNote = null
+    ignoreNextChange = true
     markdownContent = ''
+    dirty = false
     saveStatus = 'idle'
     transitionError = ''
-    ignoreNextChange = false
   }
 
   async function loadApplication() {
@@ -93,6 +105,7 @@
       activeNote = node
       ignoreNextChange = true
       markdownContent = typeof note?.content === 'string' ? note.content : ''
+      dirty = false
       saveStatus = 'idle'
       transitionError = ''
     } catch (error) {
@@ -101,31 +114,62 @@
     }
   }
 
-  async function saveCurrentNote() {
-    if (!activeNote) return
-
-    const noteId = activeNote.id
-    const content = markdownContent
-    clearSaveTimer()
+  function showSaveError(error) {
+    if (!mounted) return
     clearStatusTimer()
-    saveStatus = 'saving'
-    transitionError = ''
+    saveStatus = 'error'
+    transitionError = `Не удалось сохранить заметку: ${errorMessage(error, 'Неизвестная ошибка')}`
+  }
+
+  async function persistCurrentNote() {
+    if (!activeNote) return
+    if (savePromise) return savePromise
+
+    const operationNoteId = activeNote.id
+    const operation = (async () => {
+      while (mounted && activeNote?.id === operationNoteId && dirty) {
+        const noteId = activeNote.id
+        const content = markdownContent
+        clearSaveTimer()
+        clearStatusTimer()
+        saveStatus = 'saving'
+        transitionError = ''
+
+        try {
+          await saveNote(noteId, content)
+        } catch (error) {
+          showSaveError(error)
+          throw error
+        }
+
+        if (!mounted || activeNote?.id !== noteId) return
+        if (markdownContent !== content) continue
+
+        dirty = false
+        saveStatus = 'saved'
+        const generation = statusGeneration
+        statusTimer = setTimeout(() => {
+          statusTimer = null
+          if (mounted && generation === statusGeneration && activeNote?.id === noteId) {
+            saveStatus = 'idle'
+          }
+        }, 3000)
+      }
+    })()
+
+    savePromise = operation
 
     try {
-      await saveNote(noteId, content)
-      if (!mounted) return
-      saveStatus = 'saved'
-      statusTimer = setTimeout(() => {
-        statusTimer = null
-        if (mounted) saveStatus = 'idle'
-      }, 3000)
-    } catch (error) {
-      if (mounted) {
-        saveStatus = 'error'
-        transitionError = errorMessage(error, 'Не удалось сохранить заметку')
-      }
-      throw error
+      await operation
+    } finally {
+      if (savePromise === operation) savePromise = null
     }
+  }
+
+  async function flushPendingSave() {
+    clearSaveTimer()
+    if (savePromise) await savePromise
+    if (dirty) await persistCurrentNote()
   }
 
   function handleDeleted(id) {
@@ -133,19 +177,32 @@
   }
 
   async function saveNow() {
-    await saveCurrentNote()
+    if (!activeNote) return
+    dirty = true
+    transitionError = ''
+    try {
+      await flushPendingSave()
+    } catch (error) {
+      showSaveError(error)
+    }
   }
 
-  function openSettings() {
-    screen = 'settings'
+  async function openSettings() {
+    try {
+      await openSettingsSafely(flushPendingSave, () => {
+        if (mounted) screen = 'settings'
+      })
+    } catch (error) {
+      showSaveError(error)
+    }
   }
 
   async function openBase(name) {
-    const savedConfig = await switchBase(name)
-    if (!mounted) return
-    applyConfig(savedConfig)
-    resetEditorState()
-    screen = 'editor'
+    await switchBaseSafely(name, flushPendingSave, switchBase, (savedConfig) => {
+      if (!mounted) return
+      applyConfig(savedConfig)
+      screen = 'editor'
+    })
   }
 
   $effect(() => {
@@ -158,10 +215,11 @@
     }
 
     if (currentNote) {
+      dirty = true
       clearSaveTimer()
       saveTimer = setTimeout(() => {
         saveTimer = null
-        void saveCurrentNote().catch(() => {})
+        void persistCurrentNote().catch(showSaveError)
       }, 2000)
     }
   })
