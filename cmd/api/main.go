@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,6 +15,27 @@ import (
 	"IGoNotes/internal/service"
 	"IGoNotes/web"
 )
+
+func localServerEndpoint(port string) (string, string) {
+	address := net.JoinHostPort("127.0.0.1", port)
+	return address, "http://" + address
+}
+
+func serveLocal(
+	address string,
+	handler http.Handler,
+	ready func(),
+	serve func(net.Listener, http.Handler) error,
+) error {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	ready()
+	return serve(listener, handler)
+}
 
 func openBrowser(url string) error {
 	var cmd string
@@ -68,6 +90,15 @@ func main() {
 
 	// Инициализация сервисов
 	noteService := service.NewNoteService(noteRepo, basePath)
+	defer func() {
+		if err := noteService.Close(); err != nil {
+			log.Printf("Ошибка закрытия базы заметок: %v", err)
+		}
+	}()
+	settingsService, err := service.NewSettingsService(configService, noteService, *base, log.Default())
+	if err != nil {
+		log.Fatal("Ошибка инициализации сервиса настроек: ", err)
+	}
 
 	// Запускаем первичную синхронизацию базы с диском при старте программы
 	go func() {
@@ -81,7 +112,9 @@ func main() {
 
 	// Создаем обработчики
 	noteHandler := handlers.NewNoteHandler(noteService)
-	configHandler := handlers.NewConfigHandler(configService)
+	settingsHandler := handlers.NewSettingsHandler(settingsService)
+	directoryPicker := service.NewDirectoryPicker(service.ExecCommandRunner{}, runtime.GOOS)
+	systemHandler := handlers.NewSystemHandler(directoryPicker)
 
 	// Инициализация статики (фронтенд)
 	distFS, err := web.GetDistFS()
@@ -91,56 +124,20 @@ func main() {
 	spaHandler := handlers.NewSPAHandler(distFS)
 
 	// Маршрутизация
-	http.HandleFunc("/api/info", noteHandler.GetInfo)
+	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
+	registerSystemRoutes(router, systemHandler)
 
-	http.HandleFunc("/api/notes", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			noteHandler.CreateNote(w, r)
-		} else {
-			noteHandler.GetNotes(w, r)
+	address, url := localServerEndpoint(*port)
+	if err := serveLocal(address, router, func() {
+		log.Printf("Сервер запущен на %s", url)
+
+		if !*noBrowser {
+			log.Printf("Открываем браузер: %s", url)
+			if err := openBrowser(url); err != nil {
+				log.Printf("Не удалось открыть браузер автоматически: %v", err)
+			}
 		}
-	})
-
-	http.HandleFunc("/api/note", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			noteHandler.DeleteNote(w, r)
-		} else {
-			noteHandler.GetNote(w, r)
-		}
-	})
-
-	http.HandleFunc("/api/sync", noteHandler.SyncNotes)
-
-	http.HandleFunc("/api/raw", noteHandler.GetRawFile)
-
-	http.HandleFunc("/api/save", noteHandler.SaveNote)
-	http.HandleFunc("/api/rename", noteHandler.RenameNote)
-	http.HandleFunc("/api/assets", noteHandler.UploadAsset)
-
-	// API для работы с конфигурацией
-	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" {
-			configHandler.GetConfig(w, r)
-		} else {
-			configHandler.SaveConfig(w, r)
-		}
-	})
-
-	// Фронтенд (обрабатывает все остальные запросы)
-	http.Handle("/", spaHandler)
-
-	address := ":" + *port
-	url := "http://localhost" + address
-	log.Printf("Сервер запущен на %s", url)
-
-	if !*noBrowser {
-		log.Printf("Открываем браузер: %s", url)
-		if err := openBrowser(url); err != nil {
-			log.Printf("Не удалось открыть браузер автоматически: %v", err)
-		}
-	}
-
-	if err := http.ListenAndServe(address, nil); err != nil {
+	}, http.Serve); err != nil {
 		log.Fatal(err)
 	}
 }

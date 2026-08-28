@@ -40,7 +40,7 @@ func (h *SPAHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Если файл не найден (например, это SPA роут типа /settings), 
+	// Если файл не найден (например, это SPA роут типа /settings),
 	// отдаем index.html
 	r.URL.Path = "/"
 	http.FileServer(http.FS(h.staticFS)).ServeHTTP(w, r)

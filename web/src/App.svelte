@@ -1,131 +1,404 @@
 <script>
-  import { onMount } from 'svelte';
-  import Sidebar from './lib/Sidebar.svelte';
-  import Editor from './lib/Editor.svelte';
+  import { onMount } from 'svelte'
 
-  let activeNote = $state(null);
-  let markdownContent = $state('');
-  let basePath = $state('');
-  
-  // Переменные для debounce
-  let saveTimer = null;
-  let saveStatus = $state('idle'); // 'idle', 'saving', 'saved', 'error'
-  let statusTimer = null;
-  let ignoreNextChange = false;
+  import { deleteNote, getConfig, getNote, renameNote, saveNote, switchBase } from './lib/api.js'
+  import { openSettingsSafely, switchBaseSafely } from './lib/app-transitions.js'
+  import { activeBase } from './lib/base-draft.js'
+  import NotesWorkspace from './lib/NotesWorkspace.svelte'
+  import SettingsWorkspace from './lib/settings/SettingsWorkspace.svelte'
+  import SetupWizard from './lib/setup/SetupWizard.svelte'
 
-  onMount(async () => {
-    try {
-      const res = await fetch('/api/info');
-      if (res.ok) {
-        const data = await res.json();
-        basePath = data.base_path;
-      }
-    } catch (e) {
-      console.error("Failed to load app info:", e);
+  let screen = $state('loading')
+  let config = $state(null)
+  let loadError = $state('')
+  let activeNote = $state(null)
+  let markdownContent = $state('')
+  let basePath = $state('')
+  let saveStatus = $state('idle')
+  let transitionError = $state('')
+  let dirty = $state(false)
+  let transitioning = $state(false)
+  let notesWorkspace = $state()
+
+  let saveTimer = null
+  let statusTimer = null
+  let savePromise = null
+  let statusGeneration = 0
+  let transitionCount = 0
+  let transitionGeneration = 0
+  let ignoreNextChange = false
+  let mounted = false
+  let loadToken = 0
+  let noteRequestToken = 0
+
+  function errorMessage(error, fallback) {
+    return typeof error?.message === 'string' && error.message ? error.message : fallback
+  }
+
+  function clearSaveTimer() {
+    if (saveTimer === null) return
+    clearTimeout(saveTimer)
+    saveTimer = null
+  }
+
+  function clearStatusTimer() {
+    statusGeneration += 1
+    if (statusTimer === null) return
+    clearTimeout(statusTimer)
+    statusTimer = null
+  }
+
+  function beginTransition() {
+    const generation = transitionGeneration
+    transitionCount += 1
+    transitioning = true
+    return generation
+  }
+
+  function endTransition(generation) {
+    if (generation !== transitionGeneration) return
+    transitionCount = Math.max(0, transitionCount - 1)
+    transitioning = transitionCount > 0
+  }
+
+  function resetTransitionState() {
+    transitionGeneration += 1
+    transitionCount = 0
+    transitioning = false
+  }
+
+  function applyConfig(savedConfig) {
+    const previous = activeBase(config)
+    const current = activeBase(savedConfig)
+
+    if (previous?.name !== current?.name || previous?.path !== current?.path) {
+      resetEditorState()
     }
-  });
+
+    config = savedConfig
+    basePath = typeof current?.path === 'string' ? current.path : ''
+  }
+
+  function resetEditorState() {
+    noteRequestToken += 1
+    resetTransitionState()
+    clearSaveTimer()
+    clearStatusTimer()
+    activeNote = null
+    ignoreNextChange = true
+    markdownContent = ''
+    dirty = false
+    saveStatus = 'idle'
+    transitionError = ''
+  }
+
+  async function loadApplication() {
+    const token = ++loadToken
+    screen = 'loading'
+    loadError = ''
+
+    try {
+      const savedConfig = await getConfig()
+      if (!mounted || token !== loadToken) return
+
+      applyConfig(savedConfig)
+      resetEditorState()
+      screen = savedConfig?.setup_completed ? 'editor' : 'setup'
+    } catch (error) {
+      if (!mounted || token !== loadToken) return
+      loadError = errorMessage(error, 'Не удалось загрузить настройки')
+      screen = 'error'
+    }
+  }
+
+  function finishSetup(savedConfig) {
+    applyConfig(savedConfig)
+    resetEditorState()
+    screen = 'editor'
+  }
 
   async function loadNote(node) {
+    const token = ++noteRequestToken
+    const transition = beginTransition()
+    transitionError = ''
+
     try {
-      const res = await fetch(`/api/note?id=${encodeURIComponent(node.id)}`);
-      if (res.ok) {
-        const data = await res.json();
-        activeNote = node;
-        ignoreNextChange = true;
-        markdownContent = data.content;
-        saveStatus = 'idle';
+      try {
+        await flushWorkspace()
+      } catch (error) {
+        if (mounted && token === noteRequestToken && saveStatus !== 'error') {
+          showSaveError(error)
+        }
+        return
       }
-    } catch (err) {
-      console.error("Failed to load note:", err);
+
+      if (!mounted || token !== noteRequestToken) return
+      if (activeNote?.id === node.id) return
+
+      let note
+      try {
+        note = await getNote(node.id)
+      } catch (error) {
+        if (!mounted || token !== noteRequestToken) return
+        transitionError = errorMessage(error, 'Не удалось загрузить заметку')
+        return
+      }
+
+      if (!mounted || token !== noteRequestToken) return
+
+      try {
+        await flushEditorUploads()
+        await flushPendingSave()
+      } catch (error) {
+        if (mounted && token === noteRequestToken && saveStatus !== 'error') {
+          showSaveError(error)
+        }
+        return
+      }
+
+      if (!mounted || token !== noteRequestToken) return
+
+      clearSaveTimer()
+      clearStatusTimer()
+      activeNote = node
+      ignoreNextChange = true
+      markdownContent = typeof note?.content === 'string' ? note.content : ''
+      dirty = false
+      saveStatus = 'idle'
+      transitionError = ''
+    } finally {
+      endTransition(transition)
     }
   }
 
-  async function saveNote() {
-    if (!activeNote) return;
-    saveStatus = 'saving';
+  function showSaveError(error) {
+    if (!mounted) return
+    clearStatusTimer()
+    saveStatus = 'error'
+    transitionError = `Не удалось сохранить заметку: ${errorMessage(error, 'Неизвестная ошибка')}`
+  }
+
+  async function persistCurrentNote() {
+    if (!activeNote) return
+    if (savePromise) {
+      await savePromise
+      if (!mounted || !activeNote || !dirty) return
+      return persistCurrentNote()
+    }
+
+    const operationNoteId = activeNote.id
+    const operation = (async () => {
+      while (mounted && activeNote?.id === operationNoteId && dirty) {
+        const noteId = activeNote.id
+        const content = markdownContent
+        clearSaveTimer()
+        clearStatusTimer()
+        saveStatus = 'saving'
+        transitionError = ''
+
+        try {
+          await saveNote(noteId, content)
+        } catch (error) {
+          showSaveError(error)
+          throw error
+        }
+
+        if (!mounted || activeNote?.id !== noteId) return
+        if (markdownContent !== content) continue
+
+        dirty = false
+        saveStatus = 'saved'
+        const generation = statusGeneration
+        statusTimer = setTimeout(() => {
+          statusTimer = null
+          if (mounted && generation === statusGeneration && activeNote?.id === noteId) {
+            saveStatus = 'idle'
+          }
+        }, 3000)
+      }
+    })()
+
+    savePromise = operation
+
     try {
-      const res = await fetch('/api/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: activeNote.id, content: markdownContent })
-      });
-      if (!res.ok) throw new Error("Server returned error");
-      saveStatus = 'saved';
-      if (statusTimer) clearTimeout(statusTimer);
-      statusTimer = setTimeout(() => saveStatus = 'idle', 3000);
-    } catch (err) {
-      console.error("Failed to save note:", err);
-      saveStatus = 'error';
+      await operation
+    } finally {
+      if (savePromise === operation) savePromise = null
     }
   }
 
-  // Автосохранение (debounce 2 секунды)
+  async function flushPendingSave() {
+    clearSaveTimer()
+    if (savePromise) await savePromise
+    if (dirty) await persistCurrentNote()
+  }
+
+  async function flushEditorUploads() {
+    if (!mounted) return
+    const uploads = notesWorkspace?.flushPendingUploads?.()
+    if (uploads) await uploads
+  }
+
+  async function flushWorkspace() {
+    await flushEditorUploads()
+    await flushPendingSave()
+    await flushEditorUploads()
+    await flushPendingSave()
+  }
+
+  function affectsActiveNote(id) {
+    const activeId = activeNote?.id
+    return activeId === id || activeId?.startsWith(`${id}/`)
+  }
+
+  async function mutateNote(id, request) {
+    if (!affectsActiveNote(id)) return request()
+
+    const transition = beginTransition()
+    transitionError = ''
+
+    try {
+      try {
+        await flushWorkspace()
+      } catch (error) {
+        if (mounted && saveStatus !== 'error') showSaveError(error)
+        throw error
+      }
+
+      await request()
+      if (mounted) resetEditorState()
+    } finally {
+      endTransition(transition)
+    }
+  }
+
+  function renameNode(id, newName) {
+    return mutateNote(id, () => renameNote(id, newName))
+  }
+
+  function deleteNode(id) {
+    return mutateNote(id, () => deleteNote(id))
+  }
+
+  async function saveNow() {
+    if (!activeNote) return
+    dirty = true
+    transitionError = ''
+    try {
+      await flushPendingSave()
+    } catch (error) {
+      showSaveError(error)
+    }
+  }
+
+  async function openSettings() {
+    const transition = beginTransition()
+    try {
+      await openSettingsSafely({
+        flush: flushWorkspace,
+        open: () => {
+          if (mounted) screen = 'settings'
+        },
+      })
+    } catch (error) {
+      showSaveError(error)
+    } finally {
+      endTransition(transition)
+    }
+  }
+
+  async function openBase(name) {
+    await switchBaseSafely({
+      name,
+      flush: flushPendingSave,
+      switchRequest: switchBase,
+      commit: (savedConfig) => {
+        if (!mounted) return
+        applyConfig(savedConfig)
+        screen = 'editor'
+      },
+    })
+  }
+
   $effect(() => {
-    const currentContent = markdownContent; // trigger dependency
-    
+    const currentContent = markdownContent
+    const currentNote = activeNote
+
     if (ignoreNextChange) {
-       ignoreNextChange = false;
-       return;
+      ignoreNextChange = false
+      return
     }
-    
-    if (activeNote) {
-      if (saveTimer) clearTimeout(saveTimer);
+
+    if (currentNote) {
+      dirty = true
+      clearSaveTimer()
       saveTimer = setTimeout(() => {
-        saveNote();
-      }, 2000);
+        saveTimer = null
+        void persistCurrentNote().catch(showSaveError)
+      }, 2000)
     }
-  });
+  })
+
+  onMount(() => {
+    mounted = true
+    void loadApplication()
+
+    return () => {
+      mounted = false
+      loadToken += 1
+      noteRequestToken += 1
+      resetTransitionState()
+      clearSaveTimer()
+      clearStatusTimer()
+    }
+  })
 </script>
 
-<div class="flex flex-col h-screen w-full bg-white text-gray-800 font-sans overflow-hidden">
-  <div class="flex-1 flex overflow-hidden">
-    <Sidebar onSelect={loadNote} onDelete={(id) => { if (activeNote?.id === id) activeNote = null; }} />
-
-    <main class="flex-1 flex flex-col h-full overflow-hidden min-w-0">
-      <header class="bg-white border-b border-gray-200 px-4 py-2 flex items-center justify-between shrink-0 h-14">
-      <div class="font-semibold text-gray-800 truncate">
-        {activeNote ? activeNote.name : 'Выберите заметку'}
-      </div>
-      <div class="flex gap-3 items-center">
-        {#if saveStatus === 'saving'}
-          <span class="text-sm text-blue-500 font-medium flex items-center gap-1">
-             <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-             Сохранение...
-          </span>
-        {:else if saveStatus === 'saved'}
-          <span class="text-sm text-green-600 font-medium flex items-center gap-1">
-            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-            Сохранено
-          </span>
-        {:else if saveStatus === 'error'}
-          <span class="text-sm text-red-500 font-medium">Ошибка сохранения</span>
-        {/if}
-        
-        <button 
-          onclick={saveNote}
-          disabled={!activeNote || saveStatus === 'saving'}
-          class="px-4 py-1.5 bg-blue-600 text-white font-medium text-sm rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors shadow-sm cursor-pointer">
-          Сохранить
-        </button>
-      </div>
-    </header>
-
-    <div class="flex-1 overflow-hidden">
-      {#if activeNote}
-        <Editor noteId={activeNote.id} bind:content={markdownContent} />
-      {:else}
-        <div class="h-full flex items-center justify-center text-gray-400 bg-gray-50">
-          Выберите файл в меню слева
-        </div>
-      {/if}
-    </div>
+<div class="min-h-screen w-full">
+  {#if screen === 'loading'}
+    <main role="status" class="flex min-h-screen flex-col items-center justify-center gap-4 bg-slate-100 text-slate-700">
+      <svg class="h-8 w-8 animate-spin text-blue-600" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.37 0 0 5.37 0 12h4z"></path>
+      </svg>
+      <h1 class="text-lg font-semibold">Загрузка настроек...</h1>
     </main>
-  </div>
-
-  <!-- Status Line -->
-  <footer class="bg-gray-100 border-t border-gray-200 px-3 py-1 flex items-center shrink-0 h-6">
-    <span class="text-[11px] text-gray-500 font-mono truncate" title="Текущая база заметок">
-      {basePath ? `📂 ${basePath}` : 'Загрузка информации о базе...'}
-    </span>
-  </footer>
+  {:else if screen === 'error'}
+    <main class="flex min-h-screen flex-col items-center justify-center gap-5 bg-slate-100 px-6 text-center">
+      <p role="alert" class="max-w-xl rounded-lg border border-red-200 bg-red-50 px-5 py-4 text-red-700">
+        {loadError}
+      </p>
+      <button
+        type="button"
+        onclick={loadApplication}
+        class="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+      >
+        Повторить
+      </button>
+    </main>
+  {:else if screen === 'setup'}
+    <SetupWizard {config} onComplete={finishSetup} />
+  {:else if screen === 'editor'}
+    <NotesWorkspace
+      bind:this={notesWorkspace}
+      {activeNote}
+      bind:content={markdownContent}
+      {saveStatus}
+      {basePath}
+      {transitioning}
+      error={transitionError}
+      onSelectNote={loadNote}
+      onRenameNote={renameNode}
+      onDeleteNote={deleteNode}
+      onSave={saveNow}
+      onOpenSettings={openSettings}
+    />
+  {:else if screen === 'settings'}
+    <SettingsWorkspace
+      {config}
+      onConfigChange={applyConfig}
+      onSwitch={openBase}
+      onBack={() => screen = 'editor'}
+    />
+  {/if}
 </div>

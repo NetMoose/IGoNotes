@@ -31,6 +31,12 @@ func ResolveStartupBase(configService *ConfigService, requestedBase, dataDir str
 		}
 	}
 
+	structurallyEmpty := config.BaseDir == "" && len(config.Bases) == 0 && config.CurrentBase == ""
+	setupIncomplete := config.SetupCompleted == nil || !*config.SetupCompleted
+	if structurallyEmpty && setupIncomplete && requestedBase == "" {
+		return "", nil
+	}
+
 	return selectConfiguredBase(config, requestedBase)
 }
 
@@ -44,14 +50,16 @@ func initializeDefaultConfig(configService *ConfigService, dataDir string) (*mod
 		return nil, fmt.Errorf("не удалось создать базу по умолчанию %q: %w", basePath, err)
 	}
 
+	setupCompleted := false
 	config := &model.Config{
-		BaseDir: baseRoot,
+		BaseDir: filepath.Clean(baseRoot),
 		Bases: []model.Base{{
 			Name:     defaultBaseName,
-			Path:     basePath,
+			Path:     filepath.Clean(basePath),
 			AutoSync: false,
 		}},
-		CurrentBase: defaultBaseName,
+		CurrentBase:    defaultBaseName,
+		SetupCompleted: &setupCompleted,
 	}
 	if err := configService.Save(config); err != nil {
 		return nil, fmt.Errorf("не удалось сохранить первоначальную конфигурацию: %w", err)

@@ -3,7 +3,9 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"os"
 
 	"IGoNotes/internal/model"
 	"IGoNotes/internal/service"
@@ -12,6 +14,9 @@ import (
 type NoteHandler struct {
 	NoteService *service.NoteService
 }
+
+// maxAssetRequestSize caps the full multipart HTTP body, including framing.
+const maxAssetRequestSize int64 = 10 << 20
 
 func NewNoteHandler(noteService *service.NoteService) *NoteHandler {
 	return &NoteHandler{NoteService: noteService}
@@ -30,7 +35,7 @@ func (h *NoteHandler) GetInfo(w http.ResponseWriter, r *http.Request) {
 func (h *NoteHandler) GetNotes(w http.ResponseWriter, r *http.Request) {
 	nodes, err := h.NoteService.GetTree()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
@@ -45,12 +50,13 @@ func (h *NoteHandler) GetNotes(w http.ResponseWriter, r *http.Request) {
 // SyncNotes обрабатывает POST /api/sync
 func (h *NoteHandler) SyncNotes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
 
 	if err := h.NoteService.SyncFS(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
@@ -62,13 +68,21 @@ func (h *NoteHandler) SyncNotes(w http.ResponseWriter, r *http.Request) {
 func (h *NoteHandler) GetNote(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		http.Error(w, "missing id parameter", http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "id")
 		return
 	}
 
 	content, err := h.NoteService.GetNoteContent(id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, os.ErrNotExist) {
+			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidNotePath) {
+			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
+			return
+		}
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
@@ -84,40 +98,58 @@ func (h *NoteHandler) GetNote(w http.ResponseWriter, r *http.Request) {
 func (h *NoteHandler) GetRawFile(w http.ResponseWriter, r *http.Request) {
 	filePath := r.URL.Query().Get("path")
 	if filePath == "" {
-		http.Error(w, "missing path", http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "path")
 		return
 	}
 
-	fullPath, err := h.NoteService.GetAbsoluteFilePath(filePath)
+	file, info, err := h.NoteService.OpenRawFile(filePath)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		if errors.Is(err, service.ErrInvalidNotePath) {
+			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "path")
+			return
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			WriteAPIError(w, http.StatusNotFound, "file_not_found", "File not found", "path")
+			return
+		}
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
+	defer file.Close()
 
-	http.ServeFile(w, r, fullPath)
+	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 }
 
 // SaveNote обрабатывает POST /api/save
 func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
 
 	var req model.SaveNoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "bad_json", "Invalid JSON", "")
 		return
 	}
 	defer r.Body.Close()
 
 	if req.ID == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "id")
 		return
 	}
 
 	if err := h.NoteService.SaveNoteContent(req.ID, req.Content); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, os.ErrNotExist) {
+			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidNotePath) {
+			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
+			return
+		}
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
@@ -128,32 +160,46 @@ func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 // CreateNote обрабатывает POST /api/notes
 func (h *NoteHandler) CreateNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
 
 	var req model.CreateNoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "bad_json", "Invalid JSON", "")
 		return
 	}
 	defer r.Body.Close()
 
-	if req.Name == "" || (req.Type != "file" && req.Type != "dir") {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+	if req.Name == "" {
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "name")
+		return
+	}
+	if req.Type == "" {
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "type")
+		return
+	}
+	if req.Type != "file" && req.Type != "dir" {
+		WriteAPIError(w, http.StatusBadRequest, "invalid_request", "Invalid request", "type")
 		return
 	}
 
 	node, err := h.NoteService.CreateNode(req.ParentID, req.Name, req.Type)
 	if err != nil {
 		if errors.Is(err, service.ErrAlreadyExists) {
-			// Если объект уже существует, возвращаем 409 Conflict и данные объекта
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(node)
+			WriteAPIError(w, http.StatusConflict, "note_conflict", "Note already exists", "name")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, os.ErrNotExist) {
+			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "parent_id")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidNotePath) {
+			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "parent_id")
+			return
+		}
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
@@ -164,18 +210,27 @@ func (h *NoteHandler) CreateNote(w http.ResponseWriter, r *http.Request) {
 // DeleteNote обрабатывает DELETE /api/note?id=...
 func (h *NoteHandler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodDelete)
+		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
 
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "id")
 		return
 	}
 
 	if err := h.NoteService.DeleteNode(id); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, os.ErrNotExist) {
+			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidNotePath) {
+			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
+			return
+		}
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
@@ -185,24 +240,41 @@ func (h *NoteHandler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 // RenameNote обрабатывает PUT /api/rename
 func (h *NoteHandler) RenameNote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPut)
+		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
 
 	var req model.RenameRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "bad_json", "Invalid JSON", "")
 		return
 	}
 	defer r.Body.Close()
 
-	if req.ID == "" || req.NewName == "" {
-		http.Error(w, "missing id or new_name", http.StatusBadRequest)
+	if req.ID == "" {
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "id")
+		return
+	}
+	if req.NewName == "" {
+		WriteAPIError(w, http.StatusBadRequest, "missing_field", "Missing required field", "new_name")
 		return
 	}
 
 	if err := h.NoteService.RenameNode(req.ID, req.NewName); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, service.ErrAlreadyExists) {
+			WriteAPIError(w, http.StatusConflict, "note_conflict", "Note already exists", "new_name")
+			return
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidNotePath) {
+			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
+			return
+		}
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
@@ -213,26 +285,38 @@ func (h *NoteHandler) RenameNote(w http.ResponseWriter, r *http.Request) {
 // UploadAsset обрабатывает POST /api/assets
 func (h *NoteHandler) UploadAsset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
 
-	// Ограничиваем размер загружаемого файла (например, 10 MB)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		http.Error(w, "File too large", http.StatusBadRequest)
+	r.Body = http.MaxBytesReader(w, r.Body, maxAssetRequestSize)
+	defer r.Body.Close()
+	if err := r.ParseMultipartForm(maxAssetRequestSize); err != nil {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+		WriteAPIError(w, http.StatusBadRequest, "file_too_large", "File too large", "file")
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		WriteAPIError(w, http.StatusBadRequest, "file_too_large", "File too large", "file")
 		return
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "No file provided", http.StatusBadRequest)
+		WriteAPIError(w, http.StatusBadRequest, "missing_file", "No file provided", "file")
 		return
 	}
 	defer file.Close()
 
 	relPath, err := h.NoteService.SaveAsset(file, header.Filename)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
 
