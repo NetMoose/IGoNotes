@@ -45,7 +45,7 @@
     {#if !current}
       <button
         type="button"
-        onclick={() => onOpen(base)}
+        onclick={() => onOpen(base.name)}
         disabled={busy}
         class="rounded-lg bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
       >

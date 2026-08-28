@@ -57,6 +57,22 @@ function baseArticle(name) {
 }
 
 describe('BaseCard', () => {
+  it('passes only the exact base name to onOpen', async () => {
+    const user = userEvent.setup()
+    const onOpen = vi.fn()
+    render(BaseCard, {
+      base: config.bases[1],
+      onOpen,
+      onEdit: vi.fn(),
+      onForget: vi.fn(),
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Открыть' }))
+
+    expect(onOpen).toHaveBeenCalledOnce()
+    expect(onOpen).toHaveBeenCalledWith('work')
+  })
+
   it('passes the base and exact Forget trigger to onForget', async () => {
     const user = userEvent.setup()
     const onForget = vi.fn()
@@ -90,8 +106,14 @@ describe('SettingsWorkspace', () => {
     expect(screen.getByText('/notes/personal')).toBeVisible()
     expect(screen.getByText('/srv/work')).toBeVisible()
     expect(within(baseArticle('personal')).getByText('Текущая')).toBeVisible()
-    expect(screen.getByRole('tab', { name: 'Базы' })).toHaveAttribute('aria-current', 'page')
-    const gitTab = screen.getByRole('tab', { name: 'Git' })
+    const basesTab = screen.getByRole('tab', { name: 'Базы заметок' })
+    const gitTab = screen.getByRole('tab', { name: 'Git, скоро' })
+    const panel = screen.getByRole('tabpanel')
+    expect(basesTab).toHaveAttribute('aria-current', 'page')
+    expect(basesTab.id).not.toBe('')
+    expect(panel.id).not.toBe('')
+    expect(basesTab).toHaveAttribute('aria-controls', panel.id)
+    expect(panel).toHaveAttribute('aria-labelledby', basesTab.id)
     expect(gitTab).toHaveAttribute('aria-disabled', 'true')
     expect(gitTab).toHaveAttribute('tabindex', '-1')
     expect(screen.getAllByRole('button', { name: 'Забыть' })).toHaveLength(1)
@@ -106,6 +128,28 @@ describe('SettingsWorkspace', () => {
     expect(within(card).queryByRole('button', { name: 'Открыть' })).not.toBeInTheDocument()
     expect(within(card).queryByRole('button', { name: 'Забыть' })).not.toBeInTheDocument()
     expect(within(card).getByRole('button', { name: 'Изменить' })).toBeEnabled()
+  })
+
+  it('focuses Add and Edit panel headings and returns focus to the list on Cancel', async () => {
+    const user = userEvent.setup()
+    renderWorkspace()
+
+    await user.click(screen.getByRole('button', { name: 'Добавить базу' }))
+    const addHeading = screen.getByRole('heading', { name: 'Добавить базу' })
+    expect(addHeading).toHaveAttribute('tabindex', '-1')
+    await waitFor(() => expect(addHeading).toHaveFocus())
+
+    await user.click(screen.getByRole('button', { name: 'Отмена' }))
+    const listHeading = screen.getByRole('heading', { name: 'Базы заметок' })
+    await waitFor(() => expect(listHeading).toHaveFocus())
+
+    await user.click(within(baseArticle('personal')).getByRole('button', { name: 'Изменить' }))
+    const editHeading = screen.getByRole('heading', { name: 'Изменить базу' })
+    expect(editHeading).toHaveAttribute('tabindex', '-1')
+    await waitFor(() => expect(editHeading).toHaveFocus())
+
+    await user.click(screen.getByRole('button', { name: 'Отмена' }))
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Базы заметок' })).toHaveFocus())
   })
 
   it('adds a base and returns to the list with the saved config', async () => {
@@ -161,27 +205,109 @@ describe('SettingsWorkspace', () => {
     expect(screen.getByRole('button', { name: 'Назад к заметкам' })).toBeVisible()
   })
 
-  it('cancels Forget back to its trigger, then forgets and focuses the list heading', async () => {
+  it('applies forgotten config before closing and then focuses the list heading', async () => {
     const user = userEvent.setup()
     const savedConfig = oneBaseConfig
     vi.mocked(forgetBase).mockResolvedValue(savedConfig)
-    const { props } = renderWorkspace()
+    let result
+    const onConfigChange = vi.fn(async (nextConfig) => {
+      expect(screen.getByRole('heading', { name: 'Базы заметок' })).not.toHaveFocus()
+      expect(screen.getByRole('dialog')).toBeInTheDocument()
+      await result.rerender({ ...result.props, config: nextConfig })
+    })
+    result = renderWorkspace({ onConfigChange })
     const trigger = within(baseArticle('work')).getByRole('button', { name: 'Забыть' })
 
     await user.click(trigger)
-    expect(screen.getByRole('dialog')).toHaveTextContent('Каталог и файлы останутся на диске')
+    expect(screen.getByRole('dialog', { name: /work/ })).toHaveTextContent(
+      'Каталог и файлы останутся на диске',
+    )
     await user.click(screen.getByRole('button', { name: 'Отмена' }))
     await waitFor(() => expect(trigger).toHaveFocus())
 
     await user.click(trigger)
+    expect(screen.getByRole('dialog')).toHaveTextContent('Каталог и файлы останутся на диске')
     await user.click(screen.getByRole('button', { name: 'Забыть базу' }))
 
     expect(forgetBase).toHaveBeenCalledOnce()
     expect(forgetBase).toHaveBeenCalledWith('work')
-    await waitFor(() => expect(props.onConfigChange).toHaveBeenCalledWith(savedConfig))
+    await waitFor(() => expect(onConfigChange).toHaveBeenCalledWith(savedConfig))
+    expect(screen.queryByRole('article', { name: 'База work' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     const heading = screen.getByRole('heading', { name: 'Базы заметок' })
     await waitFor(() => expect(heading).toHaveFocus())
     expect(heading).toHaveAttribute('tabindex', '-1')
+  })
+
+  it('closes to a workspace alert when an add config callback rejects', async () => {
+    const user = userEvent.setup()
+    const savedConfig = config
+    const onConfigChange = vi.fn().mockRejectedValue(new Error('Родитель отклонил конфигурацию'))
+    const unhandled = vi.fn((event) => event.preventDefault())
+    vi.mocked(createBase).mockResolvedValue(savedConfig)
+    window.addEventListener('unhandledrejection', unhandled)
+
+    try {
+      renderWorkspace({ config: oneBaseConfig, onConfigChange })
+      await user.click(screen.getByRole('button', { name: 'Добавить базу' }))
+      await user.type(screen.getByLabelText('Имя базы'), 'work')
+      await user.type(screen.getByLabelText('Родительский каталог'), '/notes')
+      await user.click(screen.getByRole('button', { name: 'Добавить' }))
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('Родитель отклонил конфигурацию')
+      expect(screen.queryByLabelText('Имя базы')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Добавить базу' })).toBeEnabled()
+      expect(createBase).toHaveBeenCalledOnce()
+      expect(onConfigChange).toHaveBeenCalledOnce()
+      await Promise.resolve()
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('unhandledrejection', unhandled)
+    }
+  })
+
+  it('closes and focuses the list with an alert when a forget config callback throws', async () => {
+    const user = userEvent.setup()
+    const onConfigChange = vi.fn(() => {
+      throw new Error('Не удалось применить конфигурацию')
+    })
+    const unhandled = vi.fn((event) => event.preventDefault())
+    vi.mocked(forgetBase).mockResolvedValue(oneBaseConfig)
+    window.addEventListener('unhandledrejection', unhandled)
+
+    try {
+      renderWorkspace({ onConfigChange })
+      await user.click(within(baseArticle('work')).getByRole('button', { name: 'Забыть' }))
+      await user.click(screen.getByRole('button', { name: 'Забыть базу' }))
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось применить конфигурацию')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      await waitFor(() => expect(
+        screen.getByRole('heading', { name: 'Базы заметок' }),
+      ).toHaveFocus())
+      expect(screen.getByRole('button', { name: 'Добавить базу' })).toBeEnabled()
+      expect(forgetBase).toHaveBeenCalledOnce()
+      expect(onConfigChange).toHaveBeenCalledOnce()
+      await Promise.resolve()
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('unhandledrejection', unhandled)
+    }
+  })
+
+  it('invalidates Forget against changed config without calling the API', async () => {
+    const user = userEvent.setup()
+    const result = renderWorkspace()
+    await user.click(within(baseArticle('work')).getByRole('button', { name: 'Забыть' }))
+
+    await result.rerender({ ...result.props, config: oneBaseConfig })
+    await user.click(screen.getByRole('button', { name: 'Забыть базу' }))
+
+    expect(forgetBase).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(
+      screen.getByRole('heading', { name: 'Базы заметок' }),
+    ).toHaveFocus())
   })
 
   it('puts a failed Forget error on its card and restores the trigger focus', async () => {
