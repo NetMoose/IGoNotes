@@ -117,6 +117,33 @@ describe('DirectoryField', () => {
     expect(screen.getByLabelText('Каталог')).toHaveValue('/home/user/selected')
   })
 
+  it('discards a pending selection after the field context changes', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    const onPickerNotice = vi.fn()
+    vi.mocked(selectDirectory).mockReturnValue(request.promise)
+    const { rerender } = render(DirectoryField, {
+      id: 'path',
+      value: '/draft-a',
+      onPickerNotice,
+    })
+    const button = screen.getByRole('button', { name: 'Обзор' })
+
+    await user.click(button)
+    expect(screen.getByRole('status')).toHaveTextContent('Выбор каталога...')
+
+    await rerender({ id: 'path', value: '/draft-b', onPickerNotice })
+    expect(screen.getByLabelText('Каталог')).toHaveValue('/draft-b')
+
+    request.resolve('/picked-for-a')
+
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    expect(button).toBeEnabled()
+    expect(screen.getByLabelText('Каталог')).toHaveValue('/draft-b')
+    expect(onPickerNotice).toHaveBeenCalledOnce()
+    expect(onPickerNotice).toHaveBeenCalledWith('')
+  })
+
   it.each(['resolve', 'reject'])(
     'ignores a stale picker %s after unmount',
     async (settlement) => {

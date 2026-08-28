@@ -15,6 +15,34 @@
 
   let picking = $state(false)
   let requestToken = 0
+  let contextInitialized = false
+  let contextId
+  let contextLabel
+  let contextValue
+
+  $effect(() => {
+    const nextId = id
+    const nextLabel = label
+    const nextValue = value
+    if (!contextInitialized) {
+      contextInitialized = true
+      contextId = nextId
+      contextLabel = nextLabel
+      contextValue = nextValue
+      return
+    }
+    if (
+      nextId !== contextId
+      || nextLabel !== contextLabel
+      || nextValue !== contextValue
+    ) {
+      contextId = nextId
+      contextLabel = nextLabel
+      contextValue = nextValue
+      requestToken += 1
+      picking = false
+    }
+  })
 
   onDestroy(() => {
     requestToken += 1
