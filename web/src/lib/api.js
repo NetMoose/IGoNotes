@@ -91,6 +91,7 @@ async function mutateConfig(path, options) {
     || payload.config === null
     || typeof payload.config !== 'object'
     || Array.isArray(payload.config)
+    || typeof payload.base_path !== 'string'
   ) {
     throw new ApiError({
       status,

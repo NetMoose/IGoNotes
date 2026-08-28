@@ -238,6 +238,9 @@ describe('frontend API client', () => {
     ['a null config', { config: null, base_path: '/notes/work' }],
     ['an array config', { config: [], base_path: '/notes/work' }],
     ['a primitive config', { config: 'invalid', base_path: '/notes/work' }],
+    ['a missing base_path', { config: configFixture() }],
+    ['a null base_path', { config: configFixture(), base_path: null }],
+    ['a non-string base_path', { config: configFixture(), base_path: 42 }],
   ])('rejects a successful settings mutation response with %s', async (_case, payload) => {
     fetchMock.mockResolvedValue(jsonResponse(payload))
 
