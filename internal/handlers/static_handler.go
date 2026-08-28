@@ -35,6 +35,9 @@ func (h *SPAHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f, err := h.staticFS.Open(p)
 	if err == nil {
 		f.Close()
+		if p == "manifest.webmanifest" {
+			w.Header().Set("Content-Type", "application/manifest+json")
+		}
 		// Файл существует, отдаем его
 		http.FileServer(http.FS(h.staticFS)).ServeHTTP(w, r)
 		return
