@@ -14,8 +14,9 @@ var (
 )
 
 type CommandResult struct {
-	Output   []byte
-	ExitCode int
+	Output     []byte
+	Diagnostic []byte
+	ExitCode   int
 }
 
 type CommandRunner interface {
@@ -25,7 +26,7 @@ type CommandRunner interface {
 type ExecCommandRunner struct{}
 
 func (ExecCommandRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
-	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	output, err := exec.CommandContext(ctx, name, args...).Output()
 	result := CommandResult{Output: output, ExitCode: -1}
 	if err == nil {
 		result.ExitCode = 0
@@ -34,6 +35,7 @@ func (ExecCommandRunner) Run(ctx context.Context, name string, args ...string) (
 
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
+		result.Diagnostic = exitErr.Stderr
 		result.ExitCode = exitErr.ExitCode()
 	}
 	return result, err
@@ -55,9 +57,9 @@ const windowsPickerScript = `$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    [Console]::Out.Write($dialog.SelectedPath)
+    [Console]::Out.WriteLine($dialog.SelectedPath)
 } else {
-    [Console]::Out.Write('` + directoryPickerCancelMarker + `')
+    [Console]::Out.WriteLine('` + directoryPickerCancelMarker + `')
 }`
 
 const macOSPickerScript = `try
@@ -85,6 +87,7 @@ func (p *DirectoryPicker) SelectDirectory(ctx context.Context) (string, error) {
 			ctx,
 			"run Windows directory picker",
 			"powershell.exe",
+			"\r\n",
 			"-NoProfile",
 			"-NonInteractive",
 			"-STA",
@@ -97,6 +100,7 @@ func (p *DirectoryPicker) SelectDirectory(ctx context.Context) (string, error) {
 			ctx,
 			"run macOS directory picker",
 			"osascript",
+			"\n",
 			"-e",
 			macOSPickerScript,
 		)
@@ -111,19 +115,20 @@ func (p *DirectoryPicker) selectLinuxDirectory(ctx context.Context) (string, err
 		ctx,
 		"run zenity directory picker",
 		"zenity",
+		"\n",
 		"--file-selection",
 		"--directory",
 	)
 	if err == nil {
 		return path, nil
 	}
-	if ctx.Err() != nil {
+	if isContextError(err) {
 		return "", err
 	}
-	if result.ExitCode == 1 {
+	if result.ExitCode == 1 && commandDiagnostic(result) == "" {
 		return "", ErrDirectorySelectionCanceled
 	}
-	if !errors.Is(err, ErrDirectoryPickerUnavailable) && !errors.Is(err, exec.ErrNotFound) {
+	if !errors.Is(err, exec.ErrNotFound) {
 		return "", err
 	}
 
@@ -131,9 +136,13 @@ func (p *DirectoryPicker) selectLinuxDirectory(ctx context.Context) (string, err
 		ctx,
 		"run kdialog directory picker",
 		"kdialog",
+		"\n",
 		"--getexistingdirectory",
 	)
-	if err != nil && result.ExitCode == 1 {
+	if isContextError(err) {
+		return "", err
+	}
+	if err != nil && result.ExitCode == 1 && commandDiagnostic(result) == "" {
 		return "", ErrDirectorySelectionCanceled
 	}
 	return path, err
@@ -143,6 +152,7 @@ func (p *DirectoryPicker) runFixedCommand(
 	ctx context.Context,
 	operation string,
 	name string,
+	protocolTerminator string,
 	args ...string,
 ) (string, CommandResult, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -162,7 +172,7 @@ func (p *DirectoryPicker) runFixedCommand(
 			return "", result, fmt.Errorf("%s: %w: %w", operation, ErrDirectoryPickerUnavailable, err)
 		}
 
-		diagnostic := strings.TrimRight(string(result.Output), "\r\n")
+		diagnostic := commandDiagnostic(result)
 		if result.ExitCode >= 0 {
 			operation = fmt.Sprintf("%s (exit code %d)", operation, result.ExitCode)
 		}
@@ -172,7 +182,7 @@ func (p *DirectoryPicker) runFixedCommand(
 		return "", result, fmt.Errorf("%s: %w", operation, err)
 	}
 
-	path := strings.TrimRight(string(result.Output), "\r\n")
+	path := strings.TrimSuffix(string(result.Output), protocolTerminator)
 	if path == directoryPickerCancelMarker {
 		return "", result, ErrDirectorySelectionCanceled
 	}
@@ -180,4 +190,12 @@ func (p *DirectoryPicker) runFixedCommand(
 		return "", result, fmt.Errorf("%s returned an empty path", operation)
 	}
 	return path, result, nil
+}
+
+func commandDiagnostic(result CommandResult) string {
+	return strings.TrimRight(string(result.Diagnostic), "\r\n")
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
