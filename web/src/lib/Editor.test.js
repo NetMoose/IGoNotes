@@ -107,4 +107,33 @@ describe('Editor image uploads', () => {
       window.removeEventListener('unhandledrejection', unhandled)
     }
   })
+
+  it('flushes the final uploaded image before a note transition changes content', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    vi.mocked(uploadAsset).mockReturnValue(request.promise)
+    const { container } = await renderEditor()
+    const output = screen.getByLabelText('Markdown content')
+    const flushed = screen.getByLabelText('Flushed markdown')
+    const transitionStatus = screen.getByLabelText('Transition status')
+
+    try {
+      await user.upload(container.querySelector('input[type="file"]'), imageFile('pending.png'))
+      expect(output).toHaveTextContent('Загрузка...')
+
+      await user.click(screen.getByRole('button', { name: 'Transition note' }))
+
+      expect(transitionStatus).toHaveTextContent('note.md')
+      expect(flushed.textContent).toBe('')
+
+      request.resolve({ path: 'assets/images/pending.png' })
+
+      await waitFor(() => expect(transitionStatus).toHaveTextContent('next.md'))
+      expect(flushed).toHaveTextContent('![[assets/images/pending.png]]')
+      expect(flushed).not.toHaveTextContent('Загрузка...')
+      expect(flushed).not.toHaveTextContent('igonotes-upload')
+    } finally {
+      request.resolve({ path: 'assets/images/pending.png' })
+    }
+  })
 })

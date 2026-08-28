@@ -28,6 +28,7 @@ import {
   syncNotes,
 } from './api.js'
 import NotesWorkspace from './NotesWorkspace.svelte'
+import { setEditorFlush } from '../test/EditorStub.svelte'
 import NotesWorkspaceHost from '../test/NotesWorkspaceHost.svelte'
 
 function deferred() {
@@ -73,6 +74,7 @@ async function renderWorkspace(overrides = {}) {
 
 describe('NotesWorkspace', () => {
   beforeEach(() => {
+    setEditorFlush()
     vi.mocked(getNotes).mockReset().mockResolvedValue([])
     vi.mocked(syncNotes).mockReset().mockResolvedValue(null)
     vi.mocked(createNote).mockReset()
@@ -112,6 +114,62 @@ describe('NotesWorkspace', () => {
 
     expect(props.onSelectNote).toHaveBeenCalledOnce()
     expect(props.onSelectNote).toHaveBeenCalledWith(note)
+  })
+
+  it('waits for editor uploads before forwarding a selected file', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    const flush = vi.fn(() => request.promise)
+    const note = fileNode('next.md')
+    setEditorFlush(flush)
+    vi.mocked(getNotes).mockResolvedValue([note])
+    const { props } = await renderWorkspace({
+      activeNote: fileNode('current.md'),
+      content: '# Current',
+    })
+
+    await user.click(screen.getByRole('button', { name: 'next.md' }))
+
+    expect(flush).toHaveBeenCalledOnce()
+    expect(props.onSelectNote).not.toHaveBeenCalled()
+
+    request.resolve()
+
+    await waitFor(() => expect(props.onSelectNote).toHaveBeenCalledOnce())
+    expect(props.onSelectNote).toHaveBeenCalledWith(note)
+  })
+
+  it('waits for editor uploads before opening settings', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    const flush = vi.fn(() => request.promise)
+    setEditorFlush(flush)
+    const { props } = await renderWorkspace({
+      activeNote: fileNode('current.md'),
+      content: '# Current',
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+
+    expect(flush).toHaveBeenCalledOnce()
+    expect(props.onOpenSettings).not.toHaveBeenCalled()
+
+    request.resolve()
+
+    await waitFor(() => expect(props.onOpenSettings).toHaveBeenCalledOnce())
+  })
+
+  it('keeps settings and save synchronous without pending uploads', async () => {
+    const { props } = await renderWorkspace({
+      activeNote: fileNode('current.md'),
+      content: '# Current',
+    })
+
+    screen.getByRole('button', { name: 'Открыть настройки' }).click()
+    screen.getByRole('button', { name: 'Сохранить' }).click()
+
+    expect(props.onOpenSettings).toHaveBeenCalledOnce()
+    expect(props.onSave).toHaveBeenCalledOnce()
   })
 
   it('forwards a deleted file id from the real sidebar and modal', async () => {

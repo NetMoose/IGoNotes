@@ -13,11 +13,19 @@
     onSave,
     onOpenSettings,
   } = $props();
+
+  let editor = $state();
+
+  function runAfterUploads(callback, ...args) {
+    const uploads = editor?.flushPendingUploads?.();
+    if (!uploads) return callback(...args);
+    return Promise.resolve(uploads).then(() => callback(...args));
+  }
 </script>
 
 <div class="flex flex-col h-screen w-full bg-white text-gray-800 font-sans overflow-hidden">
   <div class="flex-1 flex overflow-hidden">
-    <Sidebar onSelect={onSelectNote} onDelete={onDeleteNote} />
+    <Sidebar onSelect={(...args) => runAfterUploads(onSelectNote, ...args)} onDelete={onDeleteNote} />
 
     <main class="flex-1 flex flex-col h-full overflow-hidden min-w-0">
       <header class="bg-white border-b border-gray-200 px-4 py-2 flex items-center justify-between shrink-0 h-14">
@@ -46,7 +54,7 @@
 
           <button
             type="button"
-            onclick={onOpenSettings}
+            onclick={(...args) => runAfterUploads(onOpenSettings, ...args)}
             disabled={saveStatus === 'saving'}
             aria-label="Открыть настройки"
             title="Настройки"
@@ -57,7 +65,7 @@
 
           <button
             type="button"
-            onclick={onSave}
+            onclick={(...args) => runAfterUploads(onSave, ...args)}
             disabled={!activeNote || saveStatus === 'saving'}
             class="px-4 py-1.5 bg-blue-600 text-white font-medium text-sm rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors shadow-sm cursor-pointer"
           >
@@ -68,7 +76,7 @@
 
       <div class="flex-1 overflow-hidden">
         {#if activeNote}
-          <Editor noteId={activeNote.id} bind:content />
+          <Editor bind:this={editor} noteId={activeNote.id} bind:content />
         {:else}
           <div class="h-full flex items-center justify-center text-gray-400 bg-gray-50">
             Выберите файл в меню слева

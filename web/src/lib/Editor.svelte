@@ -25,6 +25,7 @@
   let editorContainer;
   let editorView;
   let uploadId = 0;
+  const pendingUploads = new Set();
   let mode = $state('edit');
   let fileInput = $state();
   let showHeadingMenu = $state(false);
@@ -168,7 +169,17 @@
     };
   }
 
-  async function uploadImage(file, pos) {
+  export function flushPendingUploads() {
+    if (pendingUploads.size === 0) return;
+
+    return (async () => {
+      while (pendingUploads.size > 0) {
+        await Promise.allSettled([...pendingUploads]);
+      }
+    })();
+  }
+
+  function uploadImage(file, pos) {
     if (!file.type.startsWith('image/') || !editorView) return;
     
     const placeholder = `![[Загрузка...]]<!-- igonotes-upload-${++uploadId} -->`;
@@ -177,44 +188,50 @@
       selection: { anchor: pos + placeholder.length }
     });
 
-    try {
-      const data = await uploadAsset(file);
-      if (
-        !data
-        || typeof data !== 'object'
-        || typeof data.path !== 'string'
-        || !data.path.trim()
-      ) {
-        throw new Error('Invalid upload response');
-      }
-      if (!editorView) return;
+    const operation = (async () => {
+      try {
+        const data = await uploadAsset(file);
+        if (
+          !data
+          || typeof data !== 'object'
+          || typeof data.path !== 'string'
+          || !data.path.trim()
+        ) {
+          throw new Error('Invalid upload response');
+        }
+        if (!editorView) return;
 
-      const docStr = editorView.state.doc.toString();
-      const searchIndex = docStr.indexOf(placeholder);
-      if (searchIndex !== -1) {
-        editorView.dispatch({
-          changes: {
-            from: searchIndex,
-            to: searchIndex + placeholder.length,
-            insert: `![[${data.path}]]`
-          }
-        });
+        const docStr = editorView.state.doc.toString();
+        const searchIndex = docStr.indexOf(placeholder);
+        if (searchIndex !== -1) {
+          editorView.dispatch({
+            changes: {
+              from: searchIndex,
+              to: searchIndex + placeholder.length,
+              insert: `![[${data.path}]]`
+            }
+          });
+        }
+      } catch (err) {
+        if (!editorView) return;
+        console.error(err);
+        const docStr = editorView.state.doc.toString();
+        const searchIndex = docStr.indexOf(placeholder);
+        if (searchIndex !== -1) {
+          editorView.dispatch({
+            changes: {
+              from: searchIndex,
+              to: searchIndex + placeholder.length,
+              insert: `![[Ошибка загрузки]]`
+            }
+          });
+        }
       }
-    } catch (err) {
-      if (!editorView) return;
-      console.error(err);
-      const docStr = editorView.state.doc.toString();
-      const searchIndex = docStr.indexOf(placeholder);
-      if (searchIndex !== -1) {
-        editorView.dispatch({
-          changes: {
-            from: searchIndex,
-            to: searchIndex + placeholder.length,
-            insert: `![[Ошибка загрузки]]`
-          }
-        });
-      }
-    }
+    })();
+
+    pendingUploads.add(operation);
+    void operation.finally(() => pendingUploads.delete(operation)).catch(() => {});
+    return operation;
   }
 
   function applyFormat(prefix, suffix = '') {
