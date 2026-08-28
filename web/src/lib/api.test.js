@@ -97,16 +97,16 @@ describe('frontend API client', () => {
   it('preserves a structured 409 API error', async () => {
     fetchMock.mockResolvedValue(jsonResponse({
       code: 'base_name_conflict',
-      message: 'База уже существует',
+      message: 'base name already exists',
       field: 'name',
     }, 409))
 
-    await expect(createBase({ mode: 'create', name: 'work', path: '/notes/work' })).rejects.toMatchObject({
+    await expect(createBase({ mode: 'create', name: 'work', path: '/notes' })).rejects.toMatchObject({
       name: 'ApiError',
       status: 409,
       code: 'base_name_conflict',
       field: 'name',
-      message: 'База уже существует',
+      message: 'base name already exists',
     })
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
