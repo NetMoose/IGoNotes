@@ -9,7 +9,12 @@ import {
 
 describe('base draft helpers', () => {
   it('trims surrounding whitespace without changing case', () => {
-    expect(normalizeBaseDraft({ mode: 'create', name: ' Work ', path: ' /notes ' })).toEqual({
+    expect(normalizeBaseDraft({
+      mode: 'create',
+      name: ' Work ',
+      path: ' /notes ',
+      expanded: true,
+    })).toEqual({
       mode: 'create',
       name: 'Work',
       path: '/notes',
@@ -28,20 +33,19 @@ describe('base draft helpers', () => {
   )
 
   it('rejects an exact duplicate name case-sensitively', () => {
-    const bases = [{ name: 'Work' }]
+    const options = { existingNames: ['Work'] }
 
-    expect(validateBaseDraft({ mode: 'connect', name: 'Work', path: '/notes' }, bases)).toEqual({
+    expect(validateBaseDraft({ mode: 'connect', name: 'Work', path: '/notes' }, options)).toEqual({
       name: 'База с таким именем уже добавлена',
     })
-    expect(validateBaseDraft({ mode: 'connect', name: 'work', path: '/notes' }, bases)).toEqual({})
+    expect(validateBaseDraft({ mode: 'connect', name: 'work', path: '/notes' }, options)).toEqual({})
   })
 
   it('allows the unchanged original name while editing', () => {
     expect(
       validateBaseDraft(
         { mode: 'connect', name: 'Work', path: '/notes' },
-        [{ name: 'Work' }],
-        'Work',
+        { existingNames: ['Work'], originalName: 'Work' },
       ),
     ).toEqual({})
   })
@@ -56,6 +60,7 @@ describe('base draft helpers', () => {
     [{ mode: 'create', name: 'work', path: '/notes/' }, '/notes/work'],
     [{ mode: 'create', name: 'work', path: 'C:\\Notes\\' }, 'C:\\Notes\\work'],
     [{ mode: 'connect', name: 'work', path: '/notes/work/' }, '/notes/work/'],
+    [{ mode: 'edit', name: 'renamed', path: ' /notes/work/ ' }, '/notes/work/'],
   ])('resolves a base path for %o', (draft, expected) => {
     expect(resolveBasePath(draft)).toBe(expected)
   })

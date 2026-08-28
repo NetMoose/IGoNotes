@@ -1,12 +1,12 @@
 export function normalizeBaseDraft(draft) {
   return {
-    ...draft,
+    mode: typeof draft?.mode === 'string' ? draft.mode : '',
     name: typeof draft?.name === 'string' ? draft.name.trim() : '',
     path: typeof draft?.path === 'string' ? draft.path.trim() : '',
   }
 }
 
-export function validateBaseDraft(draft, bases = [], originalName = '') {
+export function validateBaseDraft(draft, { existingNames = [], originalName = '' } = {}) {
   const normalized = normalizeBaseDraft(draft)
   const errors = {}
 
@@ -19,8 +19,8 @@ export function validateBaseDraft(draft, bases = [], originalName = '') {
     errors.name = 'Имя новой базы не может быть точкой и содержать / или \\'
   } else if (
     normalized.name !== originalName
-    && Array.isArray(bases)
-    && bases.some((base) => base?.name === normalized.name)
+    && Array.isArray(existingNames)
+    && existingNames.includes(normalized.name)
   ) {
     errors.name = 'База с таким именем уже добавлена'
   }
@@ -34,7 +34,7 @@ export function validateBaseDraft(draft, bases = [], originalName = '') {
 
 export function resolveBasePath(draft) {
   const normalized = normalizeBaseDraft(draft)
-  if (normalized.mode === 'connect') {
+  if (normalized.mode !== 'create') {
     return normalized.path
   }
 

@@ -10,6 +10,16 @@ vi.mock('../api.js', async (importOriginal) => {
 import { ApiError, selectDirectory } from '../api.js'
 import DirectoryField from './DirectoryField.svelte'
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 describe('DirectoryField', () => {
   beforeEach(() => {
     vi.mocked(selectDirectory).mockReset()
@@ -65,13 +75,84 @@ describe('DirectoryField', () => {
   })
 
   it('connects a visible path error to the input accessibility state', () => {
-    render(DirectoryField, { id: 'path', error: 'Каталог не найден' })
+    render(DirectoryField, {
+      id: 'path',
+      hint: 'Выберите существующий каталог',
+      error: 'Каталог не найден',
+    })
 
     const input = screen.getByLabelText('Каталог')
     expect(input).toHaveAttribute('aria-invalid', 'true')
-    expect(input).toHaveAttribute('aria-describedby', 'path-error')
+    expect(input).toHaveAttribute('aria-describedby', 'path-hint path-error')
+    expect(screen.getByText('Выберите существующий каталог')).toHaveAttribute('id', 'path-hint')
     expect(screen.getByText('Каталог не найден')).toHaveAttribute('id', 'path-error')
   })
+
+  it('connects a visible hint to the input without marking it invalid', () => {
+    render(DirectoryField, { id: 'path', hint: 'Можно ввести путь вручную' })
+
+    const input = screen.getByLabelText('Каталог')
+    expect(input).not.toHaveAttribute('aria-invalid')
+    expect(input).toHaveAttribute('aria-describedby', 'path-hint')
+    expect(screen.getByText('Можно ввести путь вручную')).toHaveAttribute('id', 'path-hint')
+  })
+
+  it('shows pending picker state and restores controls after selection', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    vi.mocked(selectDirectory).mockReturnValue(request.promise)
+    render(DirectoryField, { id: 'path', value: '' })
+    const button = screen.getByRole('button', { name: 'Обзор' })
+
+    await user.click(button)
+
+    expect(screen.getByRole('status')).toHaveTextContent('Выбор каталога...')
+    expect(button).toBeDisabled()
+    expect(screen.getByLabelText('Каталог')).toBeEnabled()
+
+    request.resolve('/home/user/selected')
+
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    expect(button).toBeEnabled()
+    expect(screen.getByLabelText('Каталог')).toHaveValue('/home/user/selected')
+  })
+
+  it.each(['resolve', 'reject'])(
+    'ignores a stale picker %s after unmount',
+    async (settlement) => {
+      const user = userEvent.setup()
+      const request = deferred()
+      const onPickerNotice = vi.fn()
+      const setValue = vi.fn()
+      let value = '/manual/path'
+      vi.mocked(selectDirectory).mockReturnValue(request.promise)
+      const { unmount } = render(DirectoryField, {
+        id: 'path',
+        get value() { return value },
+        set value(nextValue) {
+          setValue(nextValue)
+          value = nextValue
+        },
+        onPickerNotice,
+      })
+
+      await user.click(screen.getByRole('button', { name: 'Обзор' }))
+      expect(onPickerNotice).toHaveBeenCalledOnce()
+      expect(onPickerNotice).toHaveBeenCalledWith('')
+
+      unmount()
+      if (settlement === 'resolve') {
+        request.resolve('/late/path')
+      } else {
+        request.reject(new Error('late picker failure'))
+      }
+      await request.promise.catch(() => {})
+      await Promise.resolve()
+
+      expect(onPickerNotice).toHaveBeenCalledOnce()
+      expect(setValue).not.toHaveBeenCalled()
+    },
+  )
 
   it('forwards operational picker errors and re-enables the browse button', async () => {
     const user = userEvent.setup()
