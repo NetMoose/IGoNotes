@@ -108,22 +108,36 @@
 
     if (!mounted || token !== noteRequestToken) return
 
+    let note
     try {
-      const note = await getNote(node.id)
-      if (!mounted || token !== noteRequestToken) return
-
-      clearSaveTimer()
-      clearStatusTimer()
-      activeNote = node
-      ignoreNextChange = true
-      markdownContent = typeof note?.content === 'string' ? note.content : ''
-      dirty = false
-      saveStatus = 'idle'
-      transitionError = ''
+      note = await getNote(node.id)
     } catch (error) {
       if (!mounted || token !== noteRequestToken) return
       transitionError = errorMessage(error, 'Не удалось загрузить заметку')
+      return
     }
+
+    if (!mounted || token !== noteRequestToken) return
+
+    try {
+      await flushPendingSave()
+    } catch (error) {
+      if (mounted && token === noteRequestToken && saveStatus !== 'error') {
+        showSaveError(error)
+      }
+      return
+    }
+
+    if (!mounted || token !== noteRequestToken) return
+
+    clearSaveTimer()
+    clearStatusTimer()
+    activeNote = node
+    ignoreNextChange = true
+    markdownContent = typeof note?.content === 'string' ? note.content : ''
+    dirty = false
+    saveStatus = 'idle'
+    transitionError = ''
   }
 
   function showSaveError(error) {

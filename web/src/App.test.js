@@ -573,6 +573,100 @@ describe('App setup gate', () => {
     }
   })
 
+  it('saves edits made while the next note is loading before applying its response', async () => {
+    const initialUser = userEvent.setup()
+    const noteA = fileNode('a.md')
+    const noteB = fileNode('b.md')
+    const loadB = deferred()
+    const saveA = deferred()
+    vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
+    vi.mocked(getNote).mockImplementation((id) => (
+      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+    ))
+    vi.mocked(saveNote).mockReturnValue(saveA.promise)
+
+    render(App)
+    await initialUser.click(await screen.findByRole('button', { name: 'a.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+
+    vi.useFakeTimers()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    try {
+      await user.click(screen.getByRole('button', { name: 'b.md' }))
+      expect(getNote).toHaveBeenCalledWith(noteB.id)
+      await user.clear(textarea)
+      await user.type(textarea, '# A latest')
+      expect(saveNote).not.toHaveBeenCalled()
+
+      loadB.resolve({ content: '# B' })
+      await loadB.promise
+      await vi.advanceTimersByTimeAsync(0)
+      await tick()
+
+      expect(saveNote).toHaveBeenCalledOnce()
+      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A latest')
+      expect(screen.getByLabelText('Markdown')).toHaveValue('# A latest')
+
+      saveA.resolve(null)
+      await saveA.promise
+      await vi.advanceTimersByTimeAsync(0)
+      await tick()
+
+      expect(screen.getByLabelText('Markdown')).toHaveValue('# B')
+      expect(saveNote).toHaveBeenCalledOnce()
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps late edits when their post-load save fails', async () => {
+    const initialUser = userEvent.setup()
+    const noteA = fileNode('a.md')
+    const noteB = fileNode('b.md')
+    const loadB = deferred()
+    const saveA = deferred()
+    vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
+    vi.mocked(getNote).mockImplementation((id) => (
+      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+    ))
+    vi.mocked(saveNote).mockReturnValue(saveA.promise)
+
+    render(App)
+    await initialUser.click(await screen.findByRole('button', { name: 'a.md' }))
+    const textarea = await screen.findByLabelText('Markdown')
+
+    vi.useFakeTimers()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    try {
+      await user.click(screen.getByRole('button', { name: 'b.md' }))
+      await user.clear(textarea)
+      await user.type(textarea, '# A latest')
+      loadB.resolve({ content: '# B' })
+      await loadB.promise
+      await vi.advanceTimersByTimeAsync(0)
+      await tick()
+
+      expect(getNote).toHaveBeenCalledWith(noteB.id)
+      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A latest')
+      expect(screen.getByLabelText('Markdown')).toHaveValue('# A latest')
+
+      saveA.reject(new Error('Диск недоступен'))
+      await saveA.promise.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      await tick()
+
+      expect(within(screen.getByRole('main')).getByText('a.md')).toBeVisible()
+      expect(screen.getByLabelText('Markdown')).toHaveValue('# A latest')
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        /^Не удалось сохранить заметку: Диск недоступен$/,
+      )
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
   it('manually saves unchanged content and catches save errors in the UI', async () => {
     const user = userEvent.setup()
     const note = fileNode('draft.md')
