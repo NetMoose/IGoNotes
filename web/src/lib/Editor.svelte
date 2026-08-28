@@ -24,6 +24,7 @@
   
   let editorContainer;
   let editorView;
+  let uploadId = 0;
   let mode = $state('edit');
   let fileInput = $state();
   let showHeadingMenu = $state(false);
@@ -168,16 +169,26 @@
   }
 
   async function uploadImage(file, pos) {
-    if (!file.type.startsWith('image/')) return;
+    if (!file.type.startsWith('image/') || !editorView) return;
     
-    const placeholder = `![[Загрузка...]]`;
+    const placeholder = `![[Загрузка...]]<!-- igonotes-upload-${++uploadId} -->`;
     editorView.dispatch({
-      changes: { from: pos, insert: placeholder }
+      changes: { from: pos, insert: placeholder },
+      selection: { anchor: pos + placeholder.length }
     });
 
     try {
       const data = await uploadAsset(file);
-      
+      if (
+        !data
+        || typeof data !== 'object'
+        || typeof data.path !== 'string'
+        || !data.path.trim()
+      ) {
+        throw new Error('Invalid upload response');
+      }
+      if (!editorView) return;
+
       const docStr = editorView.state.doc.toString();
       const searchIndex = docStr.indexOf(placeholder);
       if (searchIndex !== -1) {
@@ -190,6 +201,7 @@
         });
       }
     } catch (err) {
+      if (!editorView) return;
       console.error(err);
       const docStr = editorView.state.doc.toString();
       const searchIndex = docStr.indexOf(placeholder);
@@ -307,7 +319,10 @@
   });
 
   onDestroy(() => {
-    if (editorView) editorView.destroy();
+    if (editorView) {
+      editorView.destroy();
+      editorView = null;
+    }
   });
 
   function renderMarkdown(md) {
