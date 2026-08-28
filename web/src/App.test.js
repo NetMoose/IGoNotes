@@ -50,9 +50,13 @@ import {
 } from './lib/api.js'
 
 const firstRunConfig = {
-  base_dir: '',
-  bases: [],
-  current_base: '',
+  base_dir: '/home/user/.igonotes/bases',
+  bases: [{
+    name: 'default',
+    path: '/home/user/.igonotes/bases/default',
+    auto_sync: false,
+  }],
+  current_base: 'default',
   setup_completed: false,
 }
 

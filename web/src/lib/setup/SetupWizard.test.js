@@ -11,9 +11,13 @@ import { ApiError, completeSetup } from '../api.js'
 import SetupWizard from './SetupWizard.svelte'
 
 const firstRunConfig = {
-  base_dir: '',
-  bases: [],
-  current_base: '',
+  base_dir: '/home/user/.igonotes/bases',
+  bases: [{
+    name: 'default',
+    path: '/home/user/.igonotes/bases/default',
+    auto_sync: false,
+  }],
+  current_base: 'default',
   setup_completed: false,
 }
 
@@ -124,6 +128,21 @@ describe('SetupWizard', () => {
     })
 
     expect(screen.getByText('/home/user/notes/work')).toBeVisible()
+  })
+
+  it('allows the initial setup to replace the default placeholder', async () => {
+    const user = userEvent.setup()
+    renderWizard()
+    await openDetails(user, 'Создать новую')
+
+    await enterDetails(user, {
+      name: 'default',
+      path: '/home/user/notes',
+      pathLabel: 'Родительский каталог',
+    })
+
+    expect(screen.getByRole('heading', { name: 'Проверьте настройки' })).toBeVisible()
+    expect(screen.getByText('/home/user/notes/default')).toBeVisible()
   })
 
   it('reviews a connect draft with the exact existing path', async () => {

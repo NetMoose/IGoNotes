@@ -5,7 +5,7 @@
   import { normalizeBaseDraft, resolveBasePath } from '../base-draft.js'
   import BaseForm from './BaseForm.svelte'
 
-  let { config, onComplete } = $props()
+  let { onComplete } = $props()
 
   let step = $state(1)
   let draft = $state({ mode: '', name: '', path: '' })
@@ -17,11 +17,6 @@
   let headingElement = $state()
   let detailsElement = $state()
   let generalErrorElement = $state()
-  let existingNames = $derived(
-    Array.isArray(config?.bases)
-      ? config.bases.map((base) => base?.name).filter((name) => typeof name === 'string')
-      : [],
-  )
 
   const stepLabels = ['Выбор базы', 'Параметры', 'Проверка']
 
@@ -210,7 +205,6 @@
             mode={draft.mode}
             initialName={draft.name}
             initialPath={draft.path}
-            {existingNames}
             submitLabel="Продолжить"
             {busy}
             {apiError}
