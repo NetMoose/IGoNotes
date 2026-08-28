@@ -16,7 +16,7 @@ function networkError(error) {
   })
 }
 
-async function request(path, options = {}) {
+async function requestWithStatus(path, options = {}) {
   const headers = new Headers(options.headers)
   const body = options.body
   const isFormData = typeof FormData !== 'undefined' && body instanceof FormData
@@ -33,7 +33,7 @@ async function request(path, options = {}) {
   }
 
   if (response.status === 204) {
-    return null
+    return { status: response.status, payload: null }
   }
 
   let text
@@ -70,7 +70,12 @@ async function request(path, options = {}) {
     })
   }
 
-  return payload
+  return { status: response.status, payload }
+}
+
+async function request(path, options = {}) {
+  const result = await requestWithStatus(path, options)
+  return result.payload
 }
 
 function jsonBody(value) {
@@ -128,23 +133,24 @@ export function switchBase(name) {
 }
 
 export async function selectDirectory() {
-  const result = await request('/api/system/select-directory', { method: 'POST' })
-  if (result === null) {
+  const { status, payload } = await requestWithStatus('/api/system/select-directory', { method: 'POST' })
+  if (status === 204) {
     return null
   }
   if (
-    typeof result !== 'object'
-    || Array.isArray(result)
-    || typeof result.path !== 'string'
-    || result.path.length === 0
+    payload === null
+    || typeof payload !== 'object'
+    || Array.isArray(payload)
+    || typeof payload.path !== 'string'
+    || payload.path.length === 0
   ) {
     throw new ApiError({
-      status: 200,
+      status,
       code: 'invalid_response',
       message: 'Приложение вернуло некорректный JSON',
     })
   }
-  return result.path
+  return payload.path
 }
 
 export function getInfo() {

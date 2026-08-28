@@ -123,6 +123,20 @@ describe('frontend API client', () => {
     })
   })
 
+  it.each([
+    ['an empty body', ''],
+    ['JSON null', 'null'],
+  ])('rejects a successful directory picker response with %s', async (_case, body) => {
+    fetchMock.mockResolvedValue(response(body, 200))
+
+    await expect(selectDirectory()).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 200,
+      code: 'invalid_response',
+      message: 'Приложение вернуло некорректный JSON',
+    })
+  })
+
   it('rejects a successful directory picker response without a non-empty path', async () => {
     fetchMock.mockResolvedValue(jsonResponse({ path: '' }))
 
@@ -133,6 +147,12 @@ describe('frontend API client', () => {
       code: 'invalid_response',
       message: 'Приложение вернуло некорректный JSON',
     })
+  })
+
+  it('returns the selected directory path from a successful response', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ path: '/notes/team' }))
+
+    await expect(selectDirectory()).resolves.toBe('/notes/team')
   })
 
   it('keeps a directory picker 501 response as a typed error', async () => {
@@ -231,7 +251,7 @@ describe('frontend API client', () => {
   })
 
   it('creates, completes setup, and forgets bases before refreshing config', async () => {
-    const draft = { mode: 'create', name: 'team', path: '/notes/team' }
+    const draft = { mode: 'create', name: 'team', path: '/notes' }
     const created = configFixture('team', '/notes/team')
     const completed = configFixture('team', '/notes/team')
     const forgotten = configFixture('personal', '/notes/personal')
