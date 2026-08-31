@@ -1,58 +1,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"IGoNotes/internal/handlers"
 	"IGoNotes/internal/repository"
 	"IGoNotes/internal/service"
 	"IGoNotes/web"
 )
-
-func localServerEndpoint(port string) (string, string) {
-	address := net.JoinHostPort("127.0.0.1", port)
-	return address, "http://" + address
-}
-
-func serveLocal(
-	address string,
-	handler http.Handler,
-	ready func(),
-	serve func(net.Listener, http.Handler) error,
-) error {
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-
-	ready()
-	return serve(listener, handler)
-}
-
-func openBrowser(url string) error {
-	var cmd string
-	var args []string
-
-	switch runtime.GOOS {
-	case "windows":
-		cmd = "cmd"
-		args = []string{"/c", "start"}
-	case "darwin":
-		cmd = "open"
-	default: // "linux", "freebsd", "openbsd", "netbsd"
-		cmd = "xdg-open"
-	}
-	args = append(args, url)
-	return exec.Command(cmd, args...).Start()
-}
 
 func main() {
 	// Определение CLI-флагов
@@ -128,7 +89,7 @@ func main() {
 	registerSystemRoutes(router, systemHandler)
 
 	address, url := localServerEndpoint(*port)
-	if err := serveLocal(address, router, func() {
+	if err := serveLocal(context.Background(), address, newHTTPServer(router), func() {
 		log.Printf("Сервер запущен на %s", url)
 
 		if !*noBrowser {
@@ -137,7 +98,7 @@ func main() {
 				log.Printf("Не удалось открыть браузер автоматически: %v", err)
 			}
 		}
-	}, http.Serve); err != nil {
+	}, 10*time.Second); err != nil {
 		log.Fatal(err)
 	}
 }
