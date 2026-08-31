@@ -179,6 +179,52 @@ func TestSystemdUserManagerUninstallRemovalFailureSkipsReload(t *testing.T) {
 	)
 }
 
+func TestSystemdUserManagerUninstallDurabilityFailureStillReloads(t *testing.T) {
+	tests := []struct {
+		name      string
+		reloadErr error
+	}{
+		{name: "sync failure"},
+		{name: "sync and reload failure", reloadErr: errors.New("reload failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			unitPath, _ := writeOwnedSystemdTestUnit(t, root)
+			systemctlPath := filepath.Join(root, "systemctl")
+			syncErr := errors.New("directory sync failed")
+			runner := &recordingSystemdRunner{responses: map[string]systemdRunnerResponse{}}
+			if tt.reloadErr != nil {
+				runner.responses["--user\x00daemon-reload"] = systemdRunnerResponse{
+					result: CommandResult{Diagnostic: []byte("reload diagnostic\n"), ExitCode: 1},
+					err:    tt.reloadErr,
+				}
+			}
+			manager := newSystemdUninstallTestManager(root, systemctlPath, runner)
+			manager.syncDirectory = func(path string) error {
+				if path != filepath.Dir(unitPath) {
+					t.Errorf("sync directory = %q, want %q", path, filepath.Dir(unitPath))
+				}
+				return syncErr
+			}
+
+			err := manager.Uninstall(context.Background())
+			if !errors.Is(err, syncErr) {
+				t.Fatalf("Uninstall() error = %v, want wrapped %v", err, syncErr)
+			}
+			if tt.reloadErr != nil && !errors.Is(err, tt.reloadErr) {
+				t.Errorf("Uninstall() error = %v, want wrapped %v", err, tt.reloadErr)
+			}
+			assertPathDoesNotExist(t, unitPath)
+			assertSystemdCalls(t, runner.calls, systemctlPath,
+				[]string{"--user", "show-environment"},
+				[]string{"--user", "disable", "--now", SystemdUserUnitName},
+				[]string{"--user", "daemon-reload"},
+			)
+		})
+	}
+}
+
 func TestSystemdUserManagerUninstallReloadFailureReturnsAfterRemoval(t *testing.T) {
 	root := t.TempDir()
 	unitPath, _ := writeOwnedSystemdTestUnit(t, root)
@@ -309,14 +355,66 @@ func TestSystemdUserManagerUninstallSystemctlPreflightFailureLeavesUnit(t *testi
 	}
 }
 
+func TestSystemdUserManagerRunSystemctlPreservesContextError(t *testing.T) {
+	tests := []struct {
+		name    string
+		context func(*testing.T) context.Context
+		wantErr error
+	}{
+		{
+			name: "canceled",
+			context: func(_ *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "deadline exceeded",
+			context: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+				t.Cleanup(cancel)
+				return ctx
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runnerErr := errors.New("runner stopped")
+			runner := &recordingSystemdRunner{responses: map[string]systemdRunnerResponse{
+				"--user\x00show-environment": {
+					result: CommandResult{Diagnostic: []byte("context diagnostic\n"), ExitCode: 1},
+					err:    runnerErr,
+				},
+			}}
+			manager := newSystemdUninstallTestManager(t.TempDir(), "/systemctl", runner)
+
+			_, err := manager.runSystemctl(tt.context(t), "/systemctl", "probe user manager", "--user", "show-environment")
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("runSystemctl() error = %v, want wrapped %v", err, tt.wantErr)
+			}
+			if !errors.Is(err, runnerErr) {
+				t.Errorf("runSystemctl() error = %v, want wrapped runner error %v", err, runnerErr)
+			}
+			if !strings.Contains(err.Error(), "probe user manager") || !strings.Contains(err.Error(), "context diagnostic") {
+				t.Errorf("runSystemctl() error = %q, want operation and diagnostic", err)
+			}
+		})
+	}
+}
+
 type systemdInstallUninstallKey struct{}
 
 type serialSystemdRunner struct {
-	installReload  chan struct{}
-	releaseInstall chan struct{}
-	reloadOnce     sync.Once
-	mu             sync.Mutex
-	calls          []string
+	blockActor string
+	blockArgs  []string
+	blocked    chan struct{}
+	release    chan struct{}
+	blockOnce  sync.Once
+	mu         sync.Mutex
+	calls      []string
 }
 
 func (r *serialSystemdRunner) Run(ctx context.Context, _ string, args ...string) (CommandResult, error) {
@@ -326,9 +424,9 @@ func (r *serialSystemdRunner) Run(ctx context.Context, _ string, args ...string)
 	r.calls = append(r.calls, command)
 	r.mu.Unlock()
 
-	if actor == "install" && reflect.DeepEqual(args, []string{"--user", "daemon-reload"}) {
-		r.reloadOnce.Do(func() { close(r.installReload) })
-		<-r.releaseInstall
+	if actor == r.blockActor && reflect.DeepEqual(args, r.blockArgs) {
+		r.blockOnce.Do(func() { close(r.blocked) })
+		<-r.release
 	}
 	return CommandResult{}, nil
 }
@@ -338,10 +436,14 @@ func TestSystemdUserManagerUninstallSerializesWithInstallActivation(t *testing.T
 	executablePath := makeSystemdTestExecutable(t, root)
 	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
 	runner := &serialSystemdRunner{
-		installReload:  make(chan struct{}),
-		releaseInstall: make(chan struct{}),
+		blockActor: "install",
+		blockArgs:  []string{"--user", "daemon-reload"},
+		blocked:    make(chan struct{}),
+		release:    make(chan struct{}),
 	}
 	manager := newSystemdTestManager(root, executablePath, filepath.Join(root, "systemctl"), runner)
+	onLockContention, uninstallWaiting := newSystemdLockContentionBarrier()
+	manager.onLockContention = onLockContention
 	installDone := make(chan error, 1)
 	go func() {
 		_, err := manager.Install(
@@ -350,20 +452,20 @@ func TestSystemdUserManagerUninstallSerializesWithInstallActivation(t *testing.T
 		)
 		installDone <- err
 	}()
-	<-runner.installReload
+	<-runner.blocked
 
 	uninstallDone := make(chan error, 1)
 	go func() {
 		uninstallDone <- manager.Uninstall(context.WithValue(context.Background(), systemdInstallUninstallKey{}, "uninstall"))
 	}()
 
-	timer := time.NewTimer(50 * time.Millisecond)
+	<-uninstallWaiting
 	select {
 	case err := <-uninstallDone:
 		t.Fatalf("Uninstall() completed while Install() activation held lock: %v", err)
-	case <-timer.C:
+	default:
 	}
-	close(runner.releaseInstall)
+	close(runner.release)
 	if err := <-installDone; err != nil {
 		t.Fatalf("Install() error = %v, want nil", err)
 	}
@@ -389,6 +491,132 @@ func TestSystemdUserManagerUninstallSerializesWithInstallActivation(t *testing.T
 	assertPathDoesNotExist(t, unitPath)
 }
 
+func TestSystemdUserManagerInstallWaitsForUninstallAndInstallsAbsentTarget(t *testing.T) {
+	root := t.TempDir()
+	unitPath, _ := writeOwnedSystemdTestUnit(t, root)
+	executablePath := makeSystemdTestExecutable(t, root)
+	systemctlPath := filepath.Join(root, "systemctl")
+	runner := &serialSystemdRunner{
+		blockActor: "uninstall",
+		blockArgs:  []string{"--user", "disable", "--now", SystemdUserUnitName},
+		blocked:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	uninstallManager := newSystemdUninstallTestManager(root, systemctlPath, runner)
+	installManager := newSystemdTestManager(root, executablePath, systemctlPath, runner)
+	onLockContention, installWaiting := newSystemdLockContentionBarrier()
+	installManager.onLockContention = onLockContention
+
+	uninstallDone := make(chan error, 1)
+	go func() {
+		uninstallDone <- uninstallManager.Uninstall(context.WithValue(context.Background(), systemdInstallUninstallKey{}, "uninstall"))
+	}()
+	<-runner.blocked
+
+	type installOutcome struct {
+		result SystemdInstallResult
+		err    error
+	}
+	installDone := make(chan installOutcome, 1)
+	go func() {
+		result, err := installManager.Install(
+			context.WithValue(context.Background(), systemdInstallUninstallKey{}, "install"),
+			SystemdInstallOptions{Port: "8401"},
+		)
+		installDone <- installOutcome{result: result, err: err}
+	}()
+	<-installWaiting
+	select {
+	case outcome := <-installDone:
+		t.Fatalf("Install() completed while Uninstall() held lock: result=%+v error=%v", outcome.result, outcome.err)
+	default:
+	}
+	close(runner.release)
+
+	if err := <-uninstallDone; err != nil {
+		t.Fatalf("Uninstall() error = %v, want nil", err)
+	}
+	outcome := <-installDone
+	if outcome.err != nil {
+		t.Fatalf("Install() error = %v, want nil", outcome.err)
+	}
+	if outcome.result.UnitPath != unitPath {
+		t.Errorf("Install() UnitPath = %q, want %q", outcome.result.UnitPath, unitPath)
+	}
+
+	runner.mu.Lock()
+	calls := append([]string(nil), runner.calls...)
+	runner.mu.Unlock()
+	want := []string{
+		"uninstall: --user show-environment",
+		"uninstall: --user disable --now " + SystemdUserUnitName,
+		"install: --user show-environment",
+		"uninstall: --user daemon-reload",
+		"install: --user daemon-reload",
+		"install: --user enable " + SystemdUserUnitName,
+		"install: --user restart " + SystemdUserUnitName,
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("systemctl sequence = %#v, want %#v", calls, want)
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("ReadFile(): %v", err)
+	}
+	if !strings.Contains(string(content), `"--port" "8401"`) {
+		t.Errorf("final unit = %q, want installed port", content)
+	}
+}
+
+func TestSystemdUserManagerUninstallPreservesForeignUnitReplacedDuringDisable(t *testing.T) {
+	root := t.TempDir()
+	unitPath, _ := writeOwnedSystemdTestUnit(t, root)
+	systemctlPath := filepath.Join(root, "systemctl")
+	foreign := []byte("# Foreign replacement\n[Unit]\nDescription=Foreign\n")
+	runner := &serialSystemdRunner{
+		blockActor: "uninstall",
+		blockArgs:  []string{"--user", "disable", "--now", SystemdUserUnitName},
+		blocked:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	manager := newSystemdUninstallTestManager(root, systemctlPath, runner)
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Uninstall(context.WithValue(context.Background(), systemdInstallUninstallKey{}, "uninstall"))
+	}()
+	<-runner.blocked
+	temporaryPath := filepath.Join(filepath.Dir(unitPath), "foreign.service")
+	if err := os.WriteFile(temporaryPath, foreign, 0o644); err != nil {
+		t.Fatalf("WriteFile(): %v", err)
+	}
+	if err := os.Rename(temporaryPath, unitPath); err != nil {
+		t.Fatalf("Rename(): %v", err)
+	}
+	close(runner.release)
+
+	err := <-done
+	if err == nil || !strings.Contains(err.Error(), "not managed") {
+		t.Fatalf("Uninstall() error = %v, want ownership error", err)
+	}
+	content, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile(): %v", readErr)
+	}
+	if !reflect.DeepEqual(content, foreign) {
+		t.Errorf("unit changed to %q, want foreign replacement %q", content, foreign)
+	}
+	runner.mu.Lock()
+	calls := append([]string(nil), runner.calls...)
+	runner.mu.Unlock()
+	want := []string{
+		"uninstall: --user show-environment",
+		"uninstall: --user disable --now " + SystemdUserUnitName,
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("systemctl sequence = %#v, want %#v", calls, want)
+	}
+}
+
 func TestSystemdUserManagerUninstallCancelsWhileWaitingForUnitLock(t *testing.T) {
 	root := t.TempDir()
 	unitPath, original := writeOwnedSystemdTestUnit(t, root)
@@ -412,20 +640,16 @@ func TestSystemdUserManagerUninstallCancelsWhileWaitingForUnitLock(t *testing.T)
 		},
 		nil,
 	)
+	onLockContention, waiting := newSystemdLockContentionBarrier()
+	manager.onLockContention = onLockContention
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- manager.Uninstall(ctx) }()
 	<-configResolved
-	time.Sleep(2 * systemdUnitLockPollInterval)
+	<-waiting
 	cancel()
 
-	timer := time.NewTimer(250 * time.Millisecond)
-	var uninstallErr error
-	select {
-	case uninstallErr = <-done:
-	case <-timer.C:
-		t.Fatal("Uninstall() did not observe context cancellation while waiting for lock")
-	}
+	uninstallErr := <-done
 	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_UN); err != nil {
 		t.Fatalf("release systemd unit lock: %v", err)
 	}
@@ -473,10 +697,12 @@ func TestSystemdUserManagerUninstallUnitRemovedWhileWaitingForLock(t *testing.T)
 		},
 		nil,
 	)
+	onLockContention, waiting := newSystemdLockContentionBarrier()
+	manager.onLockContention = onLockContention
 	done := make(chan error, 1)
 	go func() { done <- manager.Uninstall(context.Background()) }()
 	<-configResolved
-	time.Sleep(2 * systemdUnitLockPollInterval)
+	<-waiting
 	if err := os.Remove(unitPath); err != nil {
 		t.Fatalf("Remove(): %v", err)
 	}
@@ -496,6 +722,14 @@ func TestSystemdUserManagerUninstallUnitRemovedWhileWaitingForLock(t *testing.T)
 	if len(runner.calls) != 0 {
 		t.Errorf("Run calls = %d, want 0", len(runner.calls))
 	}
+}
+
+func newSystemdLockContentionBarrier() (func(), <-chan struct{}) {
+	contended := make(chan struct{})
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(contended) })
+	}, contended
 }
 
 func writeOwnedSystemdTestUnit(t *testing.T, root string) (string, []byte) {

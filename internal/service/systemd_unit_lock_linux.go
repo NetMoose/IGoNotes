@@ -13,7 +13,7 @@ import (
 
 const systemdUnitLockPollInterval = 10 * time.Millisecond
 
-func acquireSystemdUnitLock(ctx context.Context, path string) (func() error, error) {
+func acquireSystemdUnitLock(ctx context.Context, path string, onContention func()) (func() error, error) {
 	lockFile, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -37,6 +37,9 @@ func acquireSystemdUnitLock(ctx context.Context, path string) (func() error, err
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
 			return closeWithError(err)
+		}
+		if onContention != nil {
+			onContention()
 		}
 		select {
 		case <-ctx.Done():

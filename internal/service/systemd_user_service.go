@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,12 +17,14 @@ type SystemdInstallResult struct {
 }
 
 type SystemdUserManager struct {
-	goos          string
-	runner        CommandRunner
-	lookPath      func(string) (string, error)
-	userConfigDir func() (string, error)
-	executable    func() (string, error)
-	remove        func(string) error
+	goos             string
+	runner           CommandRunner
+	lookPath         func(string) (string, error)
+	userConfigDir    func() (string, error)
+	executable       func() (string, error)
+	remove           func(string) error
+	syncDirectory    func(string) error
+	onLockContention func()
 }
 
 func NewSystemdUserManager(
@@ -38,6 +41,7 @@ func NewSystemdUserManager(
 		userConfigDir: userConfigDir,
 		executable:    executable,
 		remove:        os.Remove,
+		syncDirectory: syncSystemdUnitDirectory,
 	}
 }
 
@@ -94,7 +98,6 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 	}
 
 	existing, err := os.ReadFile(unitPath)
-	targetExisted := err == nil
 	if err == nil {
 		if !hasSystemdUnitMarker(existing) {
 			return SystemdInstallResult{}, fmt.Errorf("refuse to replace %q: existing unit is not managed by IGoNotes", unitPath)
@@ -142,7 +145,16 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 		{operation: "enable " + SystemdUserUnitName, args: []string{"--user", "enable", SystemdUserUnitName}},
 		{operation: "restart " + SystemdUserUnitName, args: []string{"--user", "restart", SystemdUserUnitName}},
 	}
-	err = withSystemdUnitLock(ctx, unitPath, func() error {
+	err = withSystemdUnitLock(ctx, unitPath, m.onLockContention, func() error {
+		existing, err := os.ReadFile(unitPath)
+		targetExisted := err == nil
+		if err == nil {
+			if !hasSystemdUnitMarker(existing) {
+				return fmt.Errorf("refuse to replace %q: existing unit is not managed by IGoNotes", unitPath)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("read existing systemd user unit %q under lock: %w", unitPath, err)
+		}
 		if err := installSystemdUnitAtomically(unitPath, unit, targetExisted); err != nil {
 			return err
 		}
@@ -196,7 +208,7 @@ func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
 		return fmt.Errorf("stat systemd user unit %q: %w", unitPath, err)
 	}
 
-	return withSystemdUnitLock(ctx, unitPath, func() error {
+	return withSystemdUnitLock(ctx, unitPath, m.onLockContention, func() error {
 		content, err := os.ReadFile(unitPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -225,26 +237,39 @@ func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
 		if _, err := m.runSystemctl(ctx, systemctlPath, "disable systemd user service", "--user", "disable", "--now", SystemdUserUnitName); err != nil {
 			return err
 		}
+		content, err = os.ReadFile(unitPath)
+		if err != nil {
+			return fmt.Errorf("revalidate systemd user unit %q before removal: %w", unitPath, err)
+		}
+		if !hasSystemdUnitMarker(content) {
+			return fmt.Errorf("refuse to remove %q: unit is not managed by IGoNotes after disable", unitPath)
+		}
 		if err := m.remove(unitPath); err != nil {
 			return fmt.Errorf("remove systemd user unit %q: %w", unitPath, err)
 		}
 
-		unitDirectory := filepath.Dir(unitPath)
-		parent, err := os.Open(unitDirectory)
-		if err != nil {
-			return fmt.Errorf("open systemd user unit directory %q after removal: %w", unitDirectory, err)
+		durabilityErr := m.syncDirectory(filepath.Dir(unitPath))
+		if durabilityErr != nil {
+			durabilityErr = fmt.Errorf("persist systemd user unit removal %q: %w", unitPath, durabilityErr)
 		}
-		if err := parent.Sync(); err != nil {
-			_ = parent.Close()
-			return fmt.Errorf("sync systemd user unit directory %q after removal: %w", unitDirectory, err)
-		}
-		if err := parent.Close(); err != nil {
-			return fmt.Errorf("close systemd user unit directory %q after removal: %w", unitDirectory, err)
-		}
-
-		_, err = m.runSystemctl(ctx, systemctlPath, "reload systemd user manager", "--user", "daemon-reload")
-		return err
+		_, reloadErr := m.runSystemctl(ctx, systemctlPath, "reload systemd user manager", "--user", "daemon-reload")
+		return errors.Join(durabilityErr, reloadErr)
 	})
+}
+
+func syncSystemdUnitDirectory(directory string) error {
+	parent, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("open systemd user unit directory %q after removal: %w", directory, err)
+	}
+	if err := parent.Sync(); err != nil {
+		_ = parent.Close()
+		return fmt.Errorf("sync systemd user unit directory %q after removal: %w", directory, err)
+	}
+	if err := parent.Close(); err != nil {
+		return fmt.Errorf("close systemd user unit directory %q after removal: %w", directory, err)
+	}
+	return nil
 }
 
 func isASCIIDecimal(value string) bool {
@@ -268,6 +293,9 @@ func (m *SystemdUserManager) runSystemctl(
 	result, err := m.runner.Run(ctx, systemctlPath, args...)
 	if err == nil {
 		return result, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = errors.Join(ctxErr, err)
 	}
 	diagnostic := commandDiagnostic(result)
 	if diagnostic != "" {

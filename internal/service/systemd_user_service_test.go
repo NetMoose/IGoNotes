@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -526,17 +525,15 @@ func TestSystemdUserManagerInstallSerializesUnitAndActivation(t *testing.T) {
 		releaseFirst: make(chan struct{}),
 	}
 	firstManager := newSystemdTestManager(root, executablePath, filepath.Join(root, "systemctl"), runner)
-	secondExecutableReady := make(chan struct{})
 	secondManager := NewSystemdUserManager(
 		"linux",
 		runner,
 		func(string) (string, error) { return filepath.Join(root, "systemctl"), nil },
 		func() (string, error) { return root, nil },
-		func() (string, error) {
-			close(secondExecutableReady)
-			return executablePath, nil
-		},
+		func() (string, error) { return executablePath, nil },
 	)
+	onLockContention, secondWaiting := newSystemdLockContentionBarrier()
+	secondManager.onLockContention = onLockContention
 
 	type installOutcome struct {
 		result SystemdInstallResult
@@ -574,22 +571,14 @@ func TestSystemdUserManagerInstallSerializesUnitAndActivation(t *testing.T) {
 		)
 		secondDone <- installOutcome{result: result, err: err}
 	}()
-	<-secondExecutableReady
-
-	contentionTimer := time.NewTimer(50 * time.Millisecond)
+	<-secondWaiting
 	var secondOutcome installOutcome
 	secondCompleted := false
 	select {
 	case secondOutcome = <-secondDone:
 		secondCompleted = true
 		t.Errorf("second Install() completed before first activation was released: result=%+v error=%v", secondOutcome.result, secondOutcome.err)
-	case <-contentionTimer.C:
-	}
-	if !contentionTimer.Stop() {
-		select {
-		case <-contentionTimer.C:
-		default:
-		}
+	default:
 	}
 	close(runner.releaseFirst)
 
@@ -653,50 +642,31 @@ func TestSystemdUserManagerInstallCancelsWhileWaitingForUnitLock(t *testing.T) {
 	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
 		t.Fatalf("hold systemd unit lock: %v", err)
 	}
-	executableReady := make(chan struct{})
 	runner := &recordingSystemdRunner{}
 	manager := NewSystemdUserManager(
 		"linux",
 		runner,
 		func(string) (string, error) { return filepath.Join(root, "systemctl"), nil },
 		func() (string, error) { return root, nil },
-		func() (string, error) {
-			close(executableReady)
-			return executablePath, nil
-		},
+		func() (string, error) { return executablePath, nil },
 	)
+	onLockContention, waiting := newSystemdLockContentionBarrier()
+	manager.onLockContention = onLockContention
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
 		_, err := manager.Install(ctx, SystemdInstallOptions{Port: "8201"})
 		done <- err
 	}()
-	<-executableReady
+	<-waiting
 	cancel()
 
-	cancelTimer := time.NewTimer(250 * time.Millisecond)
-	var installErr error
-	timedOut := false
-	select {
-	case installErr = <-done:
-	case <-cancelTimer.C:
-		timedOut = true
-		installErr = errors.New("Install did not observe context cancellation while waiting for lock")
-	}
-	if !cancelTimer.Stop() {
-		select {
-		case <-cancelTimer.C:
-		default:
-		}
-	}
+	installErr := <-done
 	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_UN); err != nil {
 		t.Fatalf("release systemd unit lock: %v", err)
 	}
 	if err := lockFile.Close(); err != nil {
 		t.Fatalf("close systemd unit lock: %v", err)
-	}
-	if timedOut {
-		<-done
 	}
 	if !errors.Is(installErr, context.Canceled) {
 		t.Fatalf("Install() error = %v, want context.Canceled", installErr)

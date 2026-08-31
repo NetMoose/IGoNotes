@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 )
 
-func withSystemdUnitLock(ctx context.Context, unitPath string, action func() error) error {
+func withSystemdUnitLock(ctx context.Context, unitPath string, onContention func(), action func() error) error {
 	lockPath := filepath.Join(filepath.Dir(unitPath), "."+filepath.Base(unitPath)+".lock")
-	release, err := acquireSystemdUnitLock(ctx, lockPath)
+	release, err := acquireSystemdUnitLock(ctx, lockPath, onContention)
 	if err != nil {
 		return fmt.Errorf("lock systemd user unit %q: %w", unitPath, err)
 	}
