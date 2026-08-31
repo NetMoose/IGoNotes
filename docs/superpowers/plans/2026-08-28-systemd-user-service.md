@@ -12,13 +12,15 @@
 
 **Systemd references:** `systemd.service(5)` for direct `ExecStart` execution and the `:` prefix that disables environment substitution; `systemd.syntax(7)` for quoting/C escapes and `%%`; `systemctl(1)` for `daemon-reload`, `enable`, `restart`, and `disable --now`.
 
+**Practical threat model:** The exact marker rejects pre-existing/static foreign units, initially absent creation uses no-replace, and a stable advisory lock serializes cooperating IGoNotes processes. Marker checks and best-effort revalidation are collision safeguards, not a security boundary. Concurrent replacement or editing by another same-user process, direct user action, or user-systemd operation is unsupported because such actors can ignore the advisory lock.
+
 ---
 
 ## File Structure
 
 - Create `internal/service/systemd_unit.go`: pure install options, constants, systemd argument quoting, and deterministic unit rendering.
 - Create `internal/service/systemd_unit_test.go`: byte-exact renderer and escaping tests.
-- Create `internal/service/systemd_user_service.go`: platform preflight, ownership checks, atomic unit writes, and ordered `systemctl --user` operations.
+- Create `internal/service/systemd_user_service.go`: platform preflight, marker collision checks, cooperative locking, atomic unit writes, and ordered `systemctl --user` operations.
 - Create `internal/service/systemd_user_service_test.go`: fake command runner plus install/uninstall filesystem and failure tests.
 - Create `cmd/api/service_command.go`: top-level command dispatch, service subcommand parsing, relative config normalization, and user output.
 - Create `cmd/api/service_command_test.go`: dispatch and parser/output contract tests.
@@ -398,7 +400,7 @@ func TestSystemdUserManagerInstallRejectsForeignUnit(t *testing.T) {
 
 	_, err := manager.Install(context.Background(), SystemdInstallOptions{Port: "8080"})
 	if err == nil || !strings.Contains(err.Error(), "not managed by IGoNotes") {
-		t.Fatalf("Install() error = %v, want ownership error", err)
+		t.Fatalf("Install() error = %v, want marker collision error", err)
 	}
 	got, readErr := os.ReadFile(unitPath)
 	if readErr != nil || string(got) != string(want) {
@@ -730,7 +732,7 @@ func (m *SystemdUserManager) runSystemctl(ctx context.Context, systemctl string,
 }
 ```
 
-During implementation, keep the executable validation after all non-mutating preflight checks and before `MkdirAll`. Do not move relative `--config` normalization here; that belongs to the CLI task because the manager receives final unit arguments.
+During implementation, keep the executable validation after all non-mutating preflight checks and before `MkdirAll`. Do not move relative `--config` normalization here; that belongs to the CLI task because the manager receives final unit arguments. Treat marker checks as safeguards against pre-existing/static collisions. Creation at an absent path must use no-replace, and install/update activation must remain inside the stable advisory lock shared by cooperating IGoNotes invocations; arbitrary concurrent same-user mutation remains unsupported.
 
 - [ ] **Step 4: Run focused install tests and the existing directory-picker runner tests**
 
@@ -750,13 +752,13 @@ git add internal/service/systemd_user_service.go internal/service/systemd_user_s
 git commit -m "feat: install systemd user service"
 ```
 
-### Task 3: Uninstall the Owned User Unit Safely
+### Task 3: Uninstall the Marker-Managed User Unit Cooperatively
 
 **Files:**
 - Modify: `internal/service/systemd_user_service.go`
 - Modify: `internal/service/systemd_user_service_test.go`
 
-- [ ] **Step 1: Write failing uninstall ownership and ordering tests**
+- [ ] **Step 1: Write failing uninstall marker and ordering tests**
 
 Append these tests to `internal/service/systemd_user_service_test.go`:
 
@@ -813,7 +815,7 @@ func TestSystemdUserManagerUninstallDoesNotTouchForeignUnit(t *testing.T) {
 
 	err := manager.Uninstall(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "not managed by IGoNotes") {
-		t.Fatalf("Uninstall() error = %v, want ownership error", err)
+		t.Fatalf("Uninstall() error = %v, want marker collision error", err)
 	}
 	got, readErr := os.ReadFile(unitPath)
 	if readErr != nil || string(got) != string(want) {
@@ -882,7 +884,7 @@ go test ./internal/service -run '^TestSystemdUserManagerUninstall' -count=1
 
 Expected: build failure because `Uninstall` does not exist.
 
-- [ ] **Step 3: Implement idempotent, ownership-protected uninstall**
+- [ ] **Step 3: Implement idempotent, marker-guarded uninstall**
 
 Add this method to `internal/service/systemd_user_service.go`:
 
@@ -920,7 +922,7 @@ func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
 }
 ```
 
-The missing-file branch must occur before `LookPath` or `systemctl`; this is what prevents an idempotent uninstall from disabling a vendor unit with the same name.
+The missing-file branch must occur before `LookPath` or `systemctl`; this prevents an idempotent uninstall from disabling a static vendor unit with the same name. For a present entry, hold the same stable advisory lock used by install through disable, removal, and reload, and perform best-effort marker revalidation before removal. This serializes cooperating IGoNotes processes only; it does not exclude a non-cooperating same-user writer and must not be described as an authorization or security guarantee.
 
 - [ ] **Step 4: Run all systemd manager tests**
 
@@ -933,7 +935,7 @@ go test ./internal/service -run '^(TestSystemdUserManager|TestRenderSystemdUserU
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit safe uninstallation**
+- [ ] **Step 5: Commit marker-guarded uninstallation**
 
 ```bash
 git add internal/service/systemd_user_service.go internal/service/systemd_user_service_test.go
