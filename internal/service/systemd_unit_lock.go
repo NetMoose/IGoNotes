@@ -1,14 +1,15 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
 )
 
-func withSystemdUnitLock(unitPath string, action func() error) error {
+func withSystemdUnitLock(ctx context.Context, unitPath string, action func() error) error {
 	lockPath := filepath.Join(filepath.Dir(unitPath), "."+filepath.Base(unitPath)+".lock")
-	release, err := acquireSystemdUnitLock(lockPath)
+	release, err := acquireSystemdUnitLock(ctx, lockPath)
 	if err != nil {
 		return fmt.Errorf("lock systemd user unit %q: %w", unitPath, err)
 	}

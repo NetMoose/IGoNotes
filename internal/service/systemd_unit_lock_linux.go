@@ -3,26 +3,46 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-func acquireSystemdUnitLock(path string) (func() error, error) {
+const systemdUnitLockPollInterval = 10 * time.Millisecond
+
+func acquireSystemdUnitLock(ctx context.Context, path string) (func() error, error) {
 	lockFile, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
+	closeWithError := func(err error) (func() error, error) {
+		return nil, errors.Join(err, lockFile.Close())
+	}
+	ticker := time.NewTicker(systemdUnitLockPollInterval)
+	defer ticker.Stop()
+
 	for {
-		err = unix.Flock(int(lockFile.Fd()), unix.LOCK_EX)
-		if err != unix.EINTR {
+		if err := ctx.Err(); err != nil {
+			return closeWithError(err)
+		}
+		err = unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
 			break
 		}
-	}
-	if err != nil {
-		_ = lockFile.Close()
-		return nil, err
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			return closeWithError(err)
+		}
+		select {
+		case <-ctx.Done():
+			return closeWithError(ctx.Err())
+		case <-ticker.C:
+		}
 	}
 
 	return func() error {

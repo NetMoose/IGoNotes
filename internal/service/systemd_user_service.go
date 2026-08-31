@@ -127,8 +127,9 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 	if err != nil {
 		return SystemdInstallResult{}, fmt.Errorf("render systemd user unit: %w", err)
 	}
-	if err := installSystemdUnitAtomically(unitPath, unit, targetExisted); err != nil {
-		return SystemdInstallResult{}, err
+	unitDirectory := filepath.Dir(unitPath)
+	if err := os.MkdirAll(unitDirectory, 0o755); err != nil {
+		return SystemdInstallResult{}, fmt.Errorf("create systemd user unit directory %q: %w", unitDirectory, err)
 	}
 
 	activationCommands := []struct {
@@ -139,11 +140,20 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 		{operation: "enable " + SystemdUserUnitName, args: []string{"--user", "enable", SystemdUserUnitName}},
 		{operation: "restart " + SystemdUserUnitName, args: []string{"--user", "restart", SystemdUserUnitName}},
 	}
-	for _, command := range activationCommands {
-		result, runErr := m.runner.Run(ctx, systemctlPath, command.args...)
-		if runErr != nil {
-			return SystemdInstallResult{}, systemdActivationError(command.operation, result, runErr)
+	err = withSystemdUnitLock(ctx, unitPath, func() error {
+		if err := installSystemdUnitAtomically(unitPath, unit, targetExisted); err != nil {
+			return err
 		}
+		for _, command := range activationCommands {
+			result, runErr := m.runner.Run(ctx, systemctlPath, command.args...)
+			if runErr != nil {
+				return systemdActivationError(command.operation, result, runErr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return SystemdInstallResult{}, err
 	}
 
 	return SystemdInstallResult{
@@ -188,10 +198,6 @@ func hasSystemdUnitMarker(content []byte) bool {
 
 func installSystemdUnitAtomically(unitPath string, content []byte, targetExisted bool) error {
 	directory := filepath.Dir(unitPath)
-	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return fmt.Errorf("create systemd user unit directory %q: %w", directory, err)
-	}
-
 	temporary, err := os.CreateTemp(directory, ".igonotes-service-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temporary systemd user unit in %q: %w", directory, err)
@@ -226,29 +232,27 @@ func installSystemdUnitAtomically(unitPath string, content []byte, targetExisted
 	}
 	defer parent.Close()
 
-	return withSystemdUnitLock(unitPath, func() error {
-		if targetExisted {
-			existing, err := os.ReadFile(unitPath)
-			if err != nil {
-				return fmt.Errorf("revalidate existing systemd user unit %q: %w", unitPath, err)
-			}
-			if !hasSystemdUnitMarker(existing) {
-				return fmt.Errorf("refuse to replace %q: existing unit is no longer managed by IGoNotes", unitPath)
-			}
-			if err := os.Rename(temporaryPath, unitPath); err != nil {
-				return fmt.Errorf("replace systemd user unit %q: %w", unitPath, err)
-			}
-		} else {
-			if err := renameNoReplace(parent, filepath.Base(temporaryPath), filepath.Base(unitPath)); err != nil {
-				return fmt.Errorf("replace initially absent systemd user unit %q without overwriting: %w", unitPath, err)
-			}
+	if targetExisted {
+		existing, err := os.ReadFile(unitPath)
+		if err != nil {
+			return fmt.Errorf("revalidate existing systemd user unit %q: %w", unitPath, err)
 		}
+		if !hasSystemdUnitMarker(existing) {
+			return fmt.Errorf("refuse to replace %q: existing unit is no longer managed by IGoNotes", unitPath)
+		}
+		if err := os.Rename(temporaryPath, unitPath); err != nil {
+			return fmt.Errorf("replace systemd user unit %q: %w", unitPath, err)
+		}
+	} else {
+		if err := renameNoReplace(parent, filepath.Base(temporaryPath), filepath.Base(unitPath)); err != nil {
+			return fmt.Errorf("replace initially absent systemd user unit %q without overwriting: %w", unitPath, err)
+		}
+	}
 
-		if err := parent.Sync(); err != nil {
-			return fmt.Errorf("sync systemd user unit directory %q: %w", directory, err)
-		}
-		return nil
-	})
+	if err := parent.Sync(); err != nil {
+		return fmt.Errorf("sync systemd user unit directory %q: %w", directory, err)
+	}
+	return nil
 }
 
 func systemdActivationError(operation string, result CommandResult, err error) error {

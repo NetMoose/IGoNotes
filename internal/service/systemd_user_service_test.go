@@ -9,7 +9,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type systemdRunnerCall struct {
@@ -450,6 +454,275 @@ func TestSystemdUserManagerInstallRevalidatesOwnedUnitBeforeReplacement(t *testi
 		[]string{"--user", "show-environment"},
 	)
 	assertNoSystemdTempFiles(t, filepath.Dir(unitPath))
+}
+
+type concurrentSystemdInstallKey struct{}
+
+type concurrentSystemdActivation struct {
+	installer string
+	command   string
+	unitPort  string
+}
+
+type concurrentSystemdRunner struct {
+	unitPath      string
+	firstReload   chan struct{}
+	releaseFirst  chan struct{}
+	firstOnce     sync.Once
+	mu            sync.Mutex
+	activations   []concurrentSystemdActivation
+	contentErrors []error
+}
+
+func (r *concurrentSystemdRunner) Run(ctx context.Context, _ string, args ...string) (CommandResult, error) {
+	if reflect.DeepEqual(args, []string{"--user", "show-environment"}) {
+		return CommandResult{}, nil
+	}
+
+	installer, _ := ctx.Value(concurrentSystemdInstallKey{}).(string)
+	content, err := os.ReadFile(r.unitPath)
+	port := ""
+	if err == nil {
+		for _, candidate := range []string{"8101", "8102"} {
+			if strings.Contains(string(content), `"--port" "`+candidate+`"`) {
+				port = candidate
+				break
+			}
+		}
+	}
+
+	r.mu.Lock()
+	r.activations = append(r.activations, concurrentSystemdActivation{
+		installer: installer,
+		command:   strings.Join(args, " "),
+		unitPort:  port,
+	})
+	if err != nil {
+		r.contentErrors = append(r.contentErrors, err)
+	}
+	r.mu.Unlock()
+
+	if installer == "first" && reflect.DeepEqual(args, []string{"--user", "daemon-reload"}) {
+		r.firstOnce.Do(func() { close(r.firstReload) })
+		<-r.releaseFirst
+	}
+	return CommandResult{}, nil
+}
+
+func TestSystemdUserManagerInstallSerializesUnitAndActivation(t *testing.T) {
+	root := t.TempDir()
+	executablePath := makeSystemdTestExecutable(t, root)
+	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(): %v", err)
+	}
+	if err := os.WriteFile(unitPath, []byte(systemdUnitMarker+"\nold managed unit\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(): %v", err)
+	}
+
+	runner := &concurrentSystemdRunner{
+		unitPath:     unitPath,
+		firstReload:  make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	firstManager := newSystemdTestManager(root, executablePath, filepath.Join(root, "systemctl"), runner)
+	secondExecutableReady := make(chan struct{})
+	secondManager := NewSystemdUserManager(
+		"linux",
+		runner,
+		func(string) (string, error) { return filepath.Join(root, "systemctl"), nil },
+		func() (string, error) { return root, nil },
+		func() (string, error) {
+			close(secondExecutableReady)
+			return executablePath, nil
+		},
+	)
+
+	type installOutcome struct {
+		result SystemdInstallResult
+		err    error
+	}
+	firstDone := make(chan installOutcome, 1)
+	go func() {
+		result, err := firstManager.Install(
+			context.WithValue(context.Background(), concurrentSystemdInstallKey{}, "first"),
+			SystemdInstallOptions{Port: "8101", Base: "first"},
+		)
+		firstDone <- installOutcome{result: result, err: err}
+	}()
+	<-runner.firstReload
+
+	lockFile := openSystemdTestLockFile(t, unitPath)
+	lockErr := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if lockErr == nil {
+		if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_UN); err != nil {
+			t.Errorf("unlock unexpected test lock: %v", err)
+		}
+		t.Error("systemd unit lock was not held during daemon-reload")
+	} else if !errors.Is(lockErr, unix.EWOULDBLOCK) && !errors.Is(lockErr, unix.EAGAIN) {
+		t.Fatalf("probe systemd unit lock: %v", lockErr)
+	}
+	if err := lockFile.Close(); err != nil {
+		t.Fatalf("close lock probe: %v", err)
+	}
+
+	secondDone := make(chan installOutcome, 1)
+	go func() {
+		result, err := secondManager.Install(
+			context.WithValue(context.Background(), concurrentSystemdInstallKey{}, "second"),
+			SystemdInstallOptions{Port: "8102", Base: "second"},
+		)
+		secondDone <- installOutcome{result: result, err: err}
+	}()
+	<-secondExecutableReady
+
+	contentionTimer := time.NewTimer(50 * time.Millisecond)
+	var secondOutcome installOutcome
+	secondCompleted := false
+	select {
+	case secondOutcome = <-secondDone:
+		secondCompleted = true
+		t.Errorf("second Install() completed before first activation was released: result=%+v error=%v", secondOutcome.result, secondOutcome.err)
+	case <-contentionTimer.C:
+	}
+	if !contentionTimer.Stop() {
+		select {
+		case <-contentionTimer.C:
+		default:
+		}
+	}
+	close(runner.releaseFirst)
+
+	firstOutcome := <-firstDone
+	if !secondCompleted {
+		secondOutcome = <-secondDone
+	}
+	if firstOutcome.err != nil {
+		t.Fatalf("first Install() error = %v, want nil", firstOutcome.err)
+	}
+	if secondOutcome.err != nil {
+		t.Fatalf("second Install() error = %v, want nil", secondOutcome.err)
+	}
+	if firstOutcome.result.URL != "http://127.0.0.1:8101" {
+		t.Errorf("first Install() URL = %q", firstOutcome.result.URL)
+	}
+	if secondOutcome.result.URL != "http://127.0.0.1:8102" {
+		t.Errorf("second Install() URL = %q", secondOutcome.result.URL)
+	}
+
+	runner.mu.Lock()
+	activations := append([]concurrentSystemdActivation(nil), runner.activations...)
+	contentErrors := append([]error(nil), runner.contentErrors...)
+	runner.mu.Unlock()
+	if len(contentErrors) != 0 {
+		t.Errorf("unit reads during activation failed: %v", contentErrors)
+	}
+	wantActivations := []concurrentSystemdActivation{
+		{installer: "first", command: "--user daemon-reload", unitPort: "8101"},
+		{installer: "first", command: "--user enable " + SystemdUserUnitName, unitPort: "8101"},
+		{installer: "first", command: "--user restart " + SystemdUserUnitName, unitPort: "8101"},
+		{installer: "second", command: "--user daemon-reload", unitPort: "8102"},
+		{installer: "second", command: "--user enable " + SystemdUserUnitName, unitPort: "8102"},
+		{installer: "second", command: "--user restart " + SystemdUserUnitName, unitPort: "8102"},
+	}
+	if !reflect.DeepEqual(activations, wantActivations) {
+		t.Errorf("activation sequence = %#v, want %#v", activations, wantActivations)
+	}
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("ReadFile(): %v", err)
+	}
+	if !strings.Contains(string(content), `"--port" "8102"`) {
+		t.Errorf("final unit = %q, want second install", content)
+	}
+}
+
+func TestSystemdUserManagerInstallCancelsWhileWaitingForUnitLock(t *testing.T) {
+	root := t.TempDir()
+	executablePath := makeSystemdTestExecutable(t, root)
+	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(): %v", err)
+	}
+	original := []byte(systemdUnitMarker + "\noriginal managed unit\n")
+	if err := os.WriteFile(unitPath, original, 0o644); err != nil {
+		t.Fatalf("WriteFile(): %v", err)
+	}
+
+	lockFile := openSystemdTestLockFile(t, unitPath)
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatalf("hold systemd unit lock: %v", err)
+	}
+	executableReady := make(chan struct{})
+	runner := &recordingSystemdRunner{}
+	manager := NewSystemdUserManager(
+		"linux",
+		runner,
+		func(string) (string, error) { return filepath.Join(root, "systemctl"), nil },
+		func() (string, error) { return root, nil },
+		func() (string, error) {
+			close(executableReady)
+			return executablePath, nil
+		},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.Install(ctx, SystemdInstallOptions{Port: "8201"})
+		done <- err
+	}()
+	<-executableReady
+	cancel()
+
+	cancelTimer := time.NewTimer(250 * time.Millisecond)
+	var installErr error
+	timedOut := false
+	select {
+	case installErr = <-done:
+	case <-cancelTimer.C:
+		timedOut = true
+		installErr = errors.New("Install did not observe context cancellation while waiting for lock")
+	}
+	if !cancelTimer.Stop() {
+		select {
+		case <-cancelTimer.C:
+		default:
+		}
+	}
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatalf("release systemd unit lock: %v", err)
+	}
+	if err := lockFile.Close(); err != nil {
+		t.Fatalf("close systemd unit lock: %v", err)
+	}
+	if timedOut {
+		<-done
+	}
+	if !errors.Is(installErr, context.Canceled) {
+		t.Fatalf("Install() error = %v, want context.Canceled", installErr)
+	}
+
+	content, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("ReadFile(): %v", err)
+	}
+	if !reflect.DeepEqual(content, original) {
+		t.Errorf("unit changed to %q, want %q", content, original)
+	}
+	assertSystemdCalls(t, runner.calls, filepath.Join(root, "systemctl"),
+		[]string{"--user", "show-environment"},
+	)
+	assertNoSystemdTempFiles(t, filepath.Dir(unitPath))
+}
+
+func openSystemdTestLockFile(t *testing.T, unitPath string) *os.File {
+	t.Helper()
+	lockPath := filepath.Join(filepath.Dir(unitPath), "."+filepath.Base(unitPath)+".lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("OpenFile(%q): %v", lockPath, err)
+	}
+	return lockFile
 }
 
 func TestSystemdUserManagerInstallActivationFailures(t *testing.T) {
