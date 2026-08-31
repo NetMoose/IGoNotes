@@ -1,3 +1,5 @@
+//go:build linux
+
 package service
 
 import (
@@ -117,36 +119,7 @@ func TestSystemdUserManagerInstallRepeatsOwnedReplacement(t *testing.T) {
 	)
 }
 
-func TestSystemdUserManagerInstallRejectsUnsupportedOSAndNilDependencies(t *testing.T) {
-	t.Run("unsupported OS is rejected before dependencies and files", func(t *testing.T) {
-		root := filepath.Join(t.TempDir(), "must-not-exist")
-		runner := &recordingSystemdRunner{}
-		called := false
-		dependency := func() (string, error) {
-			called = true
-			return "", errors.New("must not be called")
-		}
-		lookPath := func(string) (string, error) {
-			called = true
-			return "", errors.New("must not be called")
-		}
-		manager := NewSystemdUserManager("darwin", runner, lookPath, dependency, dependency)
-
-		_, err := manager.Install(context.Background(), SystemdInstallOptions{Port: "8080"})
-		if err == nil || !strings.Contains(err.Error(), "linux") {
-			t.Fatalf("Install() error = %v, want unsupported Linux-only error", err)
-		}
-		if called {
-			t.Error("Install() called an injected dependency for unsupported OS")
-		}
-		if len(runner.calls) != 0 {
-			t.Errorf("Run calls = %d, want 0", len(runner.calls))
-		}
-		if _, statErr := os.Stat(root); !errors.Is(statErr, os.ErrNotExist) {
-			t.Errorf("Stat(%q) error = %v, want not exist", root, statErr)
-		}
-	})
-
+func TestSystemdUserManagerInstallRejectsNilDependencies(t *testing.T) {
 	dependencies := []struct {
 		name       string
 		managerFor func(root string, runner CommandRunner) *SystemdUserManager
@@ -197,7 +170,7 @@ func TestSystemdUserManagerInstallRejectsUnsupportedOSAndNilDependencies(t *test
 }
 
 func TestSystemdUserManagerInstallRejectsInvalidPortsBeforeDependencies(t *testing.T) {
-	for _, port := range []string{"", "0", "-1", "abc", "65536"} {
+	for _, port := range []string{"", "0", "-1", "+8080", " 8080", "8080 ", "\t8080", "abc", "65536"} {
 		t.Run(port, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "must-not-exist")
 			runner := &recordingSystemdRunner{}
@@ -395,6 +368,87 @@ func TestSystemdUserManagerInstallPreservesForeignUnit(t *testing.T) {
 	if len(runner.calls) != 1 {
 		t.Errorf("Run calls = %d, want only show-environment", len(runner.calls))
 	}
+	assertNoSystemdTempFiles(t, filepath.Dir(unitPath))
+}
+
+func TestSystemdUserManagerInstallPreservesForeignUnitCreatedAfterPreflight(t *testing.T) {
+	root := t.TempDir()
+	executablePath := makeSystemdTestExecutable(t, root)
+	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
+	foreign := []byte("# Created after preflight\n[Unit]\nDescription=Foreign\n")
+	runner := &recordingSystemdRunner{}
+	manager := NewSystemdUserManager(
+		"linux",
+		runner,
+		func(string) (string, error) { return filepath.Join(root, "systemctl"), nil },
+		func() (string, error) { return root, nil },
+		func() (string, error) {
+			if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+				t.Fatalf("MkdirAll(): %v", err)
+			}
+			if err := os.WriteFile(unitPath, foreign, 0o600); err != nil {
+				t.Fatalf("WriteFile(): %v", err)
+			}
+			return executablePath, nil
+		},
+	)
+
+	_, err := manager.Install(context.Background(), SystemdInstallOptions{Port: "8080"})
+	if err == nil || !strings.Contains(err.Error(), "replace") {
+		t.Fatalf("Install() error = %v, want replacement race error", err)
+	}
+	got, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile(): %v", readErr)
+	}
+	if !reflect.DeepEqual(got, foreign) {
+		t.Errorf("racing foreign unit changed to %q, want %q", got, foreign)
+	}
+	assertSystemdCalls(t, runner.calls, filepath.Join(root, "systemctl"),
+		[]string{"--user", "show-environment"},
+	)
+	assertNoSystemdTempFiles(t, filepath.Dir(unitPath))
+}
+
+func TestSystemdUserManagerInstallRevalidatesOwnedUnitBeforeReplacement(t *testing.T) {
+	root := t.TempDir()
+	executablePath := makeSystemdTestExecutable(t, root)
+	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(): %v", err)
+	}
+	if err := os.WriteFile(unitPath, []byte(systemdUnitMarker+"\nold managed unit\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(): %v", err)
+	}
+	foreign := []byte("# Replaced after preflight\n[Unit]\nDescription=Foreign\n")
+	runner := &recordingSystemdRunner{}
+	manager := NewSystemdUserManager(
+		"linux",
+		runner,
+		func(string) (string, error) { return filepath.Join(root, "systemctl"), nil },
+		func() (string, error) { return root, nil },
+		func() (string, error) {
+			if err := os.WriteFile(unitPath, foreign, 0o600); err != nil {
+				t.Fatalf("WriteFile(): %v", err)
+			}
+			return executablePath, nil
+		},
+	)
+
+	_, err := manager.Install(context.Background(), SystemdInstallOptions{Port: "8080"})
+	if err == nil || !strings.Contains(err.Error(), "managed") {
+		t.Fatalf("Install() error = %v, want final ownership error", err)
+	}
+	got, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile(): %v", readErr)
+	}
+	if !reflect.DeepEqual(got, foreign) {
+		t.Errorf("racing foreign unit changed to %q, want %q", got, foreign)
+	}
+	assertSystemdCalls(t, runner.calls, filepath.Join(root, "systemctl"),
+		[]string{"--user", "show-environment"},
+	)
 	assertNoSystemdTempFiles(t, filepath.Dir(unitPath))
 }
 

@@ -59,6 +59,9 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 		return SystemdInstallResult{}, fmt.Errorf("install systemd user service: Executable dependency is nil")
 	}
 
+	if !isASCIIDecimal(options.Port) {
+		return SystemdInstallResult{}, fmt.Errorf("install systemd user service: invalid port %q: must be a decimal integer from 1 to 65535", options.Port)
+	}
 	port, err := strconv.Atoi(options.Port)
 	if err != nil || port < 1 || port > 65535 {
 		return SystemdInstallResult{}, fmt.Errorf("install systemd user service: invalid port %q: must be a decimal integer from 1 to 65535", options.Port)
@@ -89,6 +92,7 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 	}
 
 	existing, err := os.ReadFile(unitPath)
+	targetExisted := err == nil
 	if err == nil {
 		if !hasSystemdUnitMarker(existing) {
 			return SystemdInstallResult{}, fmt.Errorf("refuse to replace %q: existing unit is not managed by IGoNotes", unitPath)
@@ -123,7 +127,7 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 	if err != nil {
 		return SystemdInstallResult{}, fmt.Errorf("render systemd user unit: %w", err)
 	}
-	if err := installSystemdUnitAtomically(unitPath, unit); err != nil {
+	if err := installSystemdUnitAtomically(unitPath, unit, targetExisted); err != nil {
 		return SystemdInstallResult{}, err
 	}
 
@@ -148,6 +152,18 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 	}, nil
 }
 
+func isASCIIDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *SystemdUserManager) runSystemctl(
 	ctx context.Context,
 	systemctlPath string,
@@ -170,7 +186,7 @@ func hasSystemdUnitMarker(content []byte) bool {
 	return len(content) >= len(prefix) && string(content[:len(prefix)]) == prefix
 }
 
-func installSystemdUnitAtomically(unitPath string, content []byte) error {
+func installSystemdUnitAtomically(unitPath string, content []byte, targetExisted bool) error {
 	directory := filepath.Dir(unitPath)
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return fmt.Errorf("create systemd user unit directory %q: %w", directory, err)
@@ -203,10 +219,36 @@ func installSystemdUnitAtomically(unitPath string, content []byte) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close temporary systemd user unit %q: %w", temporaryPath, err)
 	}
-	if err := os.Rename(temporaryPath, unitPath); err != nil {
-		return fmt.Errorf("replace systemd user unit %q: %w", unitPath, err)
+
+	parent, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("open systemd user unit directory %q: %w", directory, err)
 	}
-	return nil
+	defer parent.Close()
+
+	return withSystemdUnitLock(unitPath, func() error {
+		if targetExisted {
+			existing, err := os.ReadFile(unitPath)
+			if err != nil {
+				return fmt.Errorf("revalidate existing systemd user unit %q: %w", unitPath, err)
+			}
+			if !hasSystemdUnitMarker(existing) {
+				return fmt.Errorf("refuse to replace %q: existing unit is no longer managed by IGoNotes", unitPath)
+			}
+			if err := os.Rename(temporaryPath, unitPath); err != nil {
+				return fmt.Errorf("replace systemd user unit %q: %w", unitPath, err)
+			}
+		} else {
+			if err := renameNoReplace(parent, filepath.Base(temporaryPath), filepath.Base(unitPath)); err != nil {
+				return fmt.Errorf("replace initially absent systemd user unit %q without overwriting: %w", unitPath, err)
+			}
+		}
+
+		if err := parent.Sync(); err != nil {
+			return fmt.Errorf("sync systemd user unit directory %q: %w", directory, err)
+		}
+		return nil
+	})
 }
 
 func systemdActivationError(operation string, result CommandResult, err error) error {
