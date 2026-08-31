@@ -162,6 +162,89 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 	}, nil
 }
 
+func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
+	if m == nil {
+		return fmt.Errorf("uninstall systemd user service: manager is nil")
+	}
+	if m.goos != "linux" {
+		return fmt.Errorf("uninstall systemd user service is supported only on linux, not %s", m.goos)
+	}
+	if m.runner == nil {
+		return fmt.Errorf("uninstall systemd user service: command runner is nil")
+	}
+	if m.lookPath == nil {
+		return fmt.Errorf("uninstall systemd user service: LookPath dependency is nil")
+	}
+	if m.userConfigDir == nil {
+		return fmt.Errorf("uninstall systemd user service: UserConfigDir dependency is nil")
+	}
+
+	configRoot, err := m.userConfigDir()
+	if err != nil {
+		return fmt.Errorf("resolve user config directory: %w", err)
+	}
+	if configRoot == "" {
+		return fmt.Errorf("resolve user config directory: config root is empty")
+	}
+	unitPath := filepath.Join(configRoot, "systemd", "user", SystemdUserUnitName)
+	if _, err := os.Stat(unitPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat systemd user unit %q: %w", unitPath, err)
+	}
+
+	return withSystemdUnitLock(ctx, unitPath, func() error {
+		content, err := os.ReadFile(unitPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("read systemd user unit %q: %w", unitPath, err)
+		}
+		if !hasSystemdUnitMarker(content) {
+			return fmt.Errorf("refuse to uninstall %q: unit is not managed by IGoNotes", unitPath)
+		}
+
+		systemctlPath, err := m.lookPath("systemctl")
+		if err != nil {
+			return fmt.Errorf("resolve systemctl: %w", err)
+		}
+		if systemctlPath == "" {
+			return fmt.Errorf("resolve systemctl: LookPath returned an empty path")
+		}
+		systemctlPath, err = filepath.Abs(systemctlPath)
+		if err != nil {
+			return fmt.Errorf("make systemctl path absolute: %w", err)
+		}
+		if _, err := m.runSystemctl(ctx, systemctlPath, "probe systemctl --user show-environment", "--user", "show-environment"); err != nil {
+			return err
+		}
+		if _, err := m.runSystemctl(ctx, systemctlPath, "disable systemd user service", "--user", "disable", "--now", SystemdUserUnitName); err != nil {
+			return err
+		}
+		if err := os.Remove(unitPath); err != nil {
+			return fmt.Errorf("remove systemd user unit %q: %w", unitPath, err)
+		}
+
+		unitDirectory := filepath.Dir(unitPath)
+		parent, err := os.Open(unitDirectory)
+		if err != nil {
+			return fmt.Errorf("open systemd user unit directory %q after removal: %w", unitDirectory, err)
+		}
+		if err := parent.Sync(); err != nil {
+			_ = parent.Close()
+			return fmt.Errorf("sync systemd user unit directory %q after removal: %w", unitDirectory, err)
+		}
+		if err := parent.Close(); err != nil {
+			return fmt.Errorf("close systemd user unit directory %q after removal: %w", unitDirectory, err)
+		}
+
+		_, err = m.runSystemctl(ctx, systemctlPath, "reload systemd user manager", "--user", "daemon-reload")
+		return err
+	})
+}
+
 func isASCIIDecimal(value string) bool {
 	if value == "" {
 		return false
