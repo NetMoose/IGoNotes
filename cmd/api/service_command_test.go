@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"reflect"
 	"strings"
 	"testing"
@@ -180,11 +181,15 @@ func TestRunServiceCommandRejectsInvalidSyntaxWithoutManagerCall(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			manager := &fakeUserServiceManager{}
-			err := runServiceCommand(context.Background(), test.args, &bytes.Buffer{}, manager, func(path string) (string, error) {
+			var output bytes.Buffer
+			err := runServiceCommand(context.Background(), test.args, &output, manager, func(path string) (string, error) {
 				return path, nil
 			})
 			if err == nil || !strings.Contains(err.Error(), test.wantMessage) {
 				t.Fatalf("error = %v, want message containing %q", err, test.wantMessage)
+			}
+			if got := commandExitCode(err); got != 2 {
+				t.Fatalf("commandExitCode() = %d, want 2", got)
 			}
 			if manager.installCalls != 0 || manager.uninstallCalls != 0 {
 				t.Fatalf("manager calls = install %d, uninstall %d; want none", manager.installCalls, manager.uninstallCalls)
@@ -229,7 +234,56 @@ func TestRunServiceCommandPreservesManagerErrors(t *testing.T) {
 			if !errors.Is(err, managerErr) {
 				t.Fatalf("error = %v, want errors.Is(managerErr)", err)
 			}
+			if got := commandExitCode(err); got != 1 {
+				t.Fatalf("commandExitCode() = %d, want 1", got)
+			}
 		})
+	}
+}
+
+func TestRunServiceCommandInstallHelpPrintsUsageWithoutManagerCall(t *testing.T) {
+	for _, helpFlag := range []string{"-h", "--help"} {
+		t.Run(helpFlag, func(t *testing.T) {
+			manager := &fakeUserServiceManager{}
+			var output bytes.Buffer
+			err := runServiceCommand(context.Background(), []string{"install", helpFlag}, &output, manager, func(path string) (string, error) {
+				return path, nil
+			})
+			if !errors.Is(err, flag.ErrHelp) {
+				t.Fatalf("runServiceCommand() error = %v, want errors.Is(flag.ErrHelp)", err)
+			}
+			if got := commandExitCode(err); got != 0 {
+				t.Fatalf("commandExitCode() = %d, want 0", got)
+			}
+			if manager.installCalls != 0 || manager.uninstallCalls != 0 {
+				t.Fatalf("manager calls = install %d, uninstall %d; want none", manager.installCalls, manager.uninstallCalls)
+			}
+			for _, want := range []string{"Usage of service install", "-config", "-port", "-base"} {
+				if !strings.Contains(output.String(), want) {
+					t.Errorf("help output %q does not contain %q", output.String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestRunServiceCommandInstallUnknownFlagIsReportedUsageError(t *testing.T) {
+	manager := &fakeUserServiceManager{}
+	var output bytes.Buffer
+	err := runServiceCommand(context.Background(), []string{"install", "--unknown"}, &output, manager, func(path string) (string, error) {
+		return path, nil
+	})
+	if got := commandExitCode(err); got != 2 {
+		t.Fatalf("commandExitCode() = %d, want 2; error = %v", got, err)
+	}
+	if shouldLogCommandError(err) {
+		t.Fatal("shouldLogCommandError() = true for an error already reported by FlagSet")
+	}
+	if !strings.Contains(output.String(), "flag provided but not defined") {
+		t.Fatalf("parser output = %q, want unknown flag diagnostic", output.String())
+	}
+	if manager.installCalls != 0 || manager.uninstallCalls != 0 {
+		t.Fatalf("manager calls = install %d, uninstall %d; want none", manager.installCalls, manager.uninstallCalls)
 	}
 }
 

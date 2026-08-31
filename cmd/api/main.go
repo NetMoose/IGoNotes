@@ -29,9 +29,9 @@ type serverOptions struct {
 	noBrowser  bool
 }
 
-func parseServerOptions(args []string) (serverOptions, error) {
+func parseServerOptions(args []string, output io.Writer) (serverOptions, error) {
 	flags := flag.NewFlagSet("igonotes", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
+	flags.SetOutput(output)
 
 	var options serverOptions
 	flags.StringVar(&options.configPath, "config", "", "Каталог конфигурации (по умолчанию системный каталог пользователя)")
@@ -39,13 +39,17 @@ func parseServerOptions(args []string) (serverOptions, error) {
 	flags.StringVar(&options.base, "base", "", "Имя базы для открытия")
 	flags.BoolVar(&options.noBrowser, "no-browser", false, "Не открывать браузер автоматически")
 	if err := flags.Parse(args); err != nil {
-		return serverOptions{}, fmt.Errorf("parse server options: %w", err)
+		err = fmt.Errorf("parse server options: %w", err)
+		if errors.Is(err, flag.ErrHelp) {
+			return serverOptions{}, err
+		}
+		return serverOptions{}, &commandLineError{err: err, reported: true}
 	}
 	return options, nil
 }
 
 func runServer(ctx context.Context, args []string) (returnErr error) {
-	options, err := parseServerOptions(args)
+	options, err := parseServerOptions(args, os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -141,8 +145,13 @@ func runMain() error {
 }
 
 func main() {
-	if err := runMain(); err != nil {
-		log.Print(err)
-		os.Exit(1)
+	err := runMain()
+	exitCode := commandExitCode(err)
+	if exitCode == 0 {
+		return
 	}
+	if shouldLogCommandError(err) {
+		log.Print(err)
+	}
+	os.Exit(exitCode)
 }

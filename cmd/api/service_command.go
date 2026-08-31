@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,21 +34,25 @@ func runServiceCommand(
 	absolutePath func(string) (string, error),
 ) error {
 	if len(args) == 0 {
-		return fmt.Errorf("service command requires a subcommand: expected install or uninstall")
+		return &commandLineError{err: fmt.Errorf("service command requires a subcommand: expected install or uninstall")}
 	}
 
 	switch args[0] {
 	case "install":
 		flags := flag.NewFlagSet("service install", flag.ContinueOnError)
-		flags.SetOutput(io.Discard)
+		flags.SetOutput(output)
 		port := flags.String("port", "8080", "port for the local server")
 		configDir := flags.String("config", "", "configuration directory")
 		base := flags.String("base", "", "base to open")
 		if err := flags.Parse(args[1:]); err != nil {
-			return fmt.Errorf("parse service install options: %w", err)
+			err = fmt.Errorf("parse service install options: %w", err)
+			if errors.Is(err, flag.ErrHelp) {
+				return err
+			}
+			return &commandLineError{err: err, reported: true}
 		}
 		if flags.NArg() != 0 {
-			return fmt.Errorf("service install does not accept operands: %q", flags.Args())
+			return &commandLineError{err: fmt.Errorf("service install does not accept operands: %q", flags.Args())}
 		}
 
 		if *configDir != "" {
@@ -74,7 +79,7 @@ func runServiceCommand(
 
 	case "uninstall":
 		if len(args) != 1 {
-			return fmt.Errorf("service uninstall does not accept options or operands")
+			return &commandLineError{err: fmt.Errorf("service uninstall does not accept options or operands")}
 		}
 		if err := manager.Uninstall(ctx); err != nil {
 			return fmt.Errorf("uninstall service: %w", err)
@@ -85,6 +90,6 @@ func runServiceCommand(
 		return nil
 
 	default:
-		return fmt.Errorf("unknown service subcommand %q: expected install or uninstall", args[0])
+		return &commandLineError{err: fmt.Errorf("unknown service subcommand %q: expected install or uninstall", args[0])}
 	}
 }
