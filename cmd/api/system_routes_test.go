@@ -200,7 +200,7 @@ func TestMainWiresDirectoryPickerRouteBeforeServing(t *testing.T) {
 		"systemHandler := handlers.NewSystemHandler(directoryPicker)",
 		"router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)",
 		"registerSystemRoutes(router, systemHandler)",
-		"if err := serveLocal(context.Background(), address, newHTTPServer(router)",
+		"return serveLocal(ctx, address, newHTTPServer(router)",
 	}
 	remaining := string(source)
 	for _, snippet := range orderedSnippets {
