@@ -8,6 +8,7 @@ import (
 )
 
 func withSystemdUnitLock(ctx context.Context, unitPath string, onContention func(), action func() error) error {
+	// This advisory lock serializes IGoNotes processes; other same-user writers can ignore it.
 	lockPath := filepath.Join(filepath.Dir(unitPath), "."+filepath.Base(unitPath)+".lock")
 	release, err := acquireSystemdUnitLock(ctx, lockPath, onContention)
 	if err != nil {

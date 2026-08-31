@@ -68,6 +68,47 @@ func TestSystemdUserManagerUninstallAbsentUnitSkipsSystemctl(t *testing.T) {
 	assertPathDoesNotExist(t, filepath.Join(root, "systemd"))
 }
 
+func TestSystemdUserManagerUninstallRejectsDanglingSymlink(t *testing.T) {
+	root := t.TempDir()
+	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(): %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "missing-unit"), unitPath); err != nil {
+		t.Fatalf("Symlink(): %v", err)
+	}
+	lookPathCalls := 0
+	runner := &recordingSystemdRunner{}
+	manager := NewSystemdUserManager(
+		"linux",
+		runner,
+		func(string) (string, error) {
+			lookPathCalls++
+			return filepath.Join(root, "systemctl"), nil
+		},
+		func() (string, error) { return root, nil },
+		nil,
+	)
+
+	err := manager.Uninstall(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "read") {
+		t.Fatalf("Uninstall() error = %v, want existing-entry read error", err)
+	}
+	info, lstatErr := os.Lstat(unitPath)
+	if lstatErr != nil {
+		t.Fatalf("Lstat(): %v", lstatErr)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("unit mode = %v, want symlink", info.Mode())
+	}
+	if lookPathCalls != 0 {
+		t.Errorf("LookPath calls = %d, want 0", lookPathCalls)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("Run calls = %d, want 0", len(runner.calls))
+	}
+}
+
 func TestSystemdUserManagerUninstallPreservesForeignUnit(t *testing.T) {
 	root := t.TempDir()
 	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)

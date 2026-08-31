@@ -28,11 +28,46 @@ type systemdRunnerResponse struct {
 type recordingSystemdRunner struct {
 	calls     []systemdRunnerCall
 	responses map[string]systemdRunnerResponse
+	beforeRun func([]string)
+}
+
+type triggeredSystemdContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+	mu   sync.RWMutex
+	err  error
+}
+
+func newTriggeredSystemdContext() *triggeredSystemdContext {
+	return &triggeredSystemdContext{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *triggeredSystemdContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *triggeredSystemdContext) Err() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.err
+}
+
+func (c *triggeredSystemdContext) trigger(err error) {
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.err = err
+		c.mu.Unlock()
+		close(c.done)
+	})
 }
 
 func (r *recordingSystemdRunner) Run(_ context.Context, name string, args ...string) (CommandResult, error) {
 	call := systemdRunnerCall{name: name, args: append([]string(nil), args...)}
 	r.calls = append(r.calls, call)
+	if r.beforeRun != nil {
+		r.beforeRun(args)
+	}
 	response := r.responses[strings.Join(args, "\x00")]
 	return response.result, response.err
 }
@@ -372,6 +407,36 @@ func TestSystemdUserManagerInstallPreservesForeignUnit(t *testing.T) {
 		t.Errorf("Run calls = %d, want only show-environment", len(runner.calls))
 	}
 	assertNoSystemdTempFiles(t, filepath.Dir(unitPath))
+}
+
+func TestSystemdUserManagerInstallRejectsDanglingSymlink(t *testing.T) {
+	root := t.TempDir()
+	executablePath := makeSystemdTestExecutable(t, root)
+	unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(): %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "missing-unit"), unitPath); err != nil {
+		t.Fatalf("Symlink(): %v", err)
+	}
+	systemctlPath := filepath.Join(root, "systemctl")
+	runner := &recordingSystemdRunner{}
+	manager := newSystemdTestManager(root, executablePath, systemctlPath, runner)
+
+	_, err := manager.Install(context.Background(), SystemdInstallOptions{Port: "8080"})
+	if err == nil || !strings.Contains(err.Error(), "read existing") {
+		t.Fatalf("Install() error = %v, want existing-entry read error", err)
+	}
+	info, lstatErr := os.Lstat(unitPath)
+	if lstatErr != nil {
+		t.Fatalf("Lstat(): %v", lstatErr)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("unit mode = %v, want symlink", info.Mode())
+	}
+	assertSystemdCalls(t, runner.calls, systemctlPath,
+		[]string{"--user", "show-environment"},
+	)
 }
 
 func TestSystemdUserManagerInstallPreservesForeignUnitCreatedAfterPreflight(t *testing.T) {
@@ -768,6 +833,91 @@ func TestSystemdUserManagerInstallActivationFailures(t *testing.T) {
 			assertSystemdCalls(t, runner.calls, systemctlPath, tt.wantCalls...)
 			assertNoSystemdTempFiles(t, filepath.Dir(unitPath))
 		})
+	}
+}
+
+func TestSystemdUserManagerInstallActivationFailuresPreserveContext(t *testing.T) {
+	contextTests := []struct {
+		name    string
+		setup   func(*testing.T) (context.Context, func())
+		wantErr error
+	}{
+		{
+			name: "canceled",
+			setup: func(_ *testing.T) (context.Context, func()) {
+				ctx := newTriggeredSystemdContext()
+				return ctx, func() { ctx.trigger(context.Canceled) }
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "deadline exceeded",
+			setup: func(_ *testing.T) (context.Context, func()) {
+				ctx := newTriggeredSystemdContext()
+				return ctx, func() { ctx.trigger(context.DeadlineExceeded) }
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+	activationTests := []struct {
+		name       string
+		failedArgs []string
+	}{
+		{name: "reload", failedArgs: []string{"--user", "daemon-reload"}},
+		{name: "enable", failedArgs: []string{"--user", "enable", SystemdUserUnitName}},
+		{name: "restart", failedArgs: []string{"--user", "restart", SystemdUserUnitName}},
+	}
+	for _, contextTest := range contextTests {
+		for _, activationTest := range activationTests {
+			t.Run(contextTest.name+"/"+activationTest.name, func(t *testing.T) {
+				root := t.TempDir()
+				executablePath := makeSystemdTestExecutable(t, root)
+				systemctlPath := filepath.Join(root, "systemctl")
+				ctx, failContext := contextTest.setup(t)
+				commandErr := errors.New("activation execution failed")
+				failureKey := strings.Join(activationTest.failedArgs, "\x00")
+				runner := &recordingSystemdRunner{
+					responses: map[string]systemdRunnerResponse{
+						failureKey: {
+							result: CommandResult{Diagnostic: []byte("activation diagnostic\n"), ExitCode: 1},
+							err:    commandErr,
+						},
+					},
+					beforeRun: func(args []string) {
+						if strings.Join(args, "\x00") == failureKey {
+							failContext()
+						}
+					},
+				}
+				manager := newSystemdTestManager(root, executablePath, systemctlPath, runner)
+
+				_, err := manager.Install(ctx, SystemdInstallOptions{Port: "8765"})
+				if !errors.Is(err, contextTest.wantErr) {
+					t.Fatalf("Install() error = %v, want wrapped %v", err, contextTest.wantErr)
+				}
+				if !errors.Is(err, commandErr) {
+					t.Errorf("Install() error = %v, want wrapped runner cause %v", err, commandErr)
+				}
+				for _, fragment := range []string{
+					activationTest.name,
+					"activation diagnostic",
+					"systemctl --user status " + SystemdUserUnitName,
+					"journalctl --user-unit " + SystemdUserUnitName,
+				} {
+					if !strings.Contains(err.Error(), fragment) {
+						t.Errorf("Install() error = %q, want %q", err, fragment)
+					}
+				}
+				unitPath := filepath.Join(root, "systemd", "user", SystemdUserUnitName)
+				content, readErr := os.ReadFile(unitPath)
+				if readErr != nil {
+					t.Fatalf("ReadFile(%q): %v", unitPath, readErr)
+				}
+				if !hasSystemdUnitMarker(content) {
+					t.Errorf("retained unit = %q, want managed unit", content)
+				}
+			})
+		}
 	}
 }
 

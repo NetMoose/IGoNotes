@@ -97,13 +97,14 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 		return SystemdInstallResult{}, err
 	}
 
-	existing, err := os.ReadFile(unitPath)
-	if err == nil {
+	existing, targetExists, err := readSystemdUnitEntry(unitPath)
+	if err != nil {
+		return SystemdInstallResult{}, fmt.Errorf("read existing systemd user unit %q: %w", unitPath, err)
+	}
+	if targetExists {
 		if !hasSystemdUnitMarker(existing) {
 			return SystemdInstallResult{}, fmt.Errorf("refuse to replace %q: existing unit is not managed by IGoNotes", unitPath)
 		}
-	} else if !os.IsNotExist(err) {
-		return SystemdInstallResult{}, fmt.Errorf("read existing systemd user unit %q: %w", unitPath, err)
 	}
 
 	executablePath, err := m.executable()
@@ -146,21 +147,24 @@ func (m *SystemdUserManager) Install(ctx context.Context, options SystemdInstall
 		{operation: "restart " + SystemdUserUnitName, args: []string{"--user", "restart", SystemdUserUnitName}},
 	}
 	err = withSystemdUnitLock(ctx, unitPath, m.onLockContention, func() error {
-		existing, err := os.ReadFile(unitPath)
-		targetExisted := err == nil
-		if err == nil {
+		existing, targetExists, err := readSystemdUnitEntry(unitPath)
+		if err != nil {
+			return fmt.Errorf("read existing systemd user unit %q under lock: %w", unitPath, err)
+		}
+		if targetExists {
 			if !hasSystemdUnitMarker(existing) {
 				return fmt.Errorf("refuse to replace %q: existing unit is not managed by IGoNotes", unitPath)
 			}
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("read existing systemd user unit %q under lock: %w", unitPath, err)
 		}
-		if err := installSystemdUnitAtomically(unitPath, unit, targetExisted); err != nil {
+		if err := installSystemdUnitAtomically(unitPath, unit, targetExists); err != nil {
 			return err
 		}
 		for _, command := range activationCommands {
 			result, runErr := m.runner.Run(ctx, systemctlPath, command.args...)
 			if runErr != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					runErr = errors.Join(ctxErr, runErr)
+				}
 				return systemdActivationError(command.operation, result, runErr)
 			}
 		}
@@ -201,7 +205,7 @@ func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
 		return fmt.Errorf("resolve user config directory: config root is empty")
 	}
 	unitPath := filepath.Join(configRoot, "systemd", "user", SystemdUserUnitName)
-	if _, err := os.Stat(unitPath); err != nil {
+	if _, err := os.Lstat(unitPath); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
@@ -209,12 +213,12 @@ func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
 	}
 
 	return withSystemdUnitLock(ctx, unitPath, m.onLockContention, func() error {
-		content, err := os.ReadFile(unitPath)
+		content, targetExists, err := readSystemdUnitEntry(unitPath)
 		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
 			return fmt.Errorf("read systemd user unit %q: %w", unitPath, err)
+		}
+		if !targetExists {
+			return nil
 		}
 		if !hasSystemdUnitMarker(content) {
 			return fmt.Errorf("refuse to uninstall %q: unit is not managed by IGoNotes", unitPath)
@@ -237,6 +241,7 @@ func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
 		if _, err := m.runSystemctl(ctx, systemctlPath, "disable systemd user service", "--user", "disable", "--now", SystemdUserUnitName); err != nil {
 			return err
 		}
+		// This is a collision safeguard, not atomic exclusion from non-cooperating same-user writers.
 		content, err = os.ReadFile(unitPath)
 		if err != nil {
 			return fmt.Errorf("revalidate systemd user unit %q before removal: %w", unitPath, err)
@@ -307,6 +312,20 @@ func (m *SystemdUserManager) runSystemctl(
 func hasSystemdUnitMarker(content []byte) bool {
 	prefix := systemdUnitMarker + "\n"
 	return len(content) >= len(prefix) && string(content[:len(prefix)]) == prefix
+}
+
+func readSystemdUnitEntry(path string) ([]byte, bool, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, true, err
+	}
+	return content, true, nil
 }
 
 func installSystemdUnitAtomically(unitPath string, content []byte, targetExisted bool) error {
