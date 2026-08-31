@@ -23,7 +23,7 @@ Description=IGoNotes local note server
 
 [Service]
 Type=simple
-ExecStart=: "/opt/IGo Notes/igo%%notes" "--port" "8080" "--config" "/home/user/My Config/$current" "--base" "Base \"quoted\"\\path" "--no-browser"
+ExecStart=:"/opt/IGo Notes/igo%%notes" "--port" "8080" "--config" "/home/user/My Config/$current" "--base" "Base \"quoted\"\\path" "--no-browser"
 Restart=on-failure
 RestartSec=3
 
@@ -47,7 +47,7 @@ Description=IGoNotes local note server
 
 [Service]
 Type=simple
-ExecStart=: "/usr/bin/igonotes" "--port" "9000" "--no-browser"
+ExecStart=:"/usr/bin/igonotes" "--port" "9000" "--no-browser"
 Restart=on-failure
 RestartSec=3
 

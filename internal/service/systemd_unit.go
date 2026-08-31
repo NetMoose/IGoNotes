@@ -41,7 +41,7 @@ Description=IGoNotes local note server
 
 [Service]
 Type=simple
-ExecStart=: ` + strings.Join(quoted, " ") + `
+ExecStart=:` + strings.Join(quoted, " ") + `
 Restart=on-failure
 RestartSec=3
 
