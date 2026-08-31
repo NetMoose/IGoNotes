@@ -145,6 +145,40 @@ func TestSystemdUserManagerUninstallDisableFailureLeavesUnit(t *testing.T) {
 	)
 }
 
+func TestSystemdUserManagerUninstallRemovalFailureSkipsReload(t *testing.T) {
+	root := t.TempDir()
+	unitPath, original := writeOwnedSystemdTestUnit(t, root)
+	systemctlPath := filepath.Join(root, "systemctl")
+	removeErr := errors.New("remove failed")
+	runner := &recordingSystemdRunner{}
+	manager := newSystemdUninstallTestManager(root, systemctlPath, runner)
+	manager.remove = func(path string) error {
+		if path != unitPath {
+			t.Errorf("remove path = %q, want %q", path, unitPath)
+		}
+		return removeErr
+	}
+
+	err := manager.Uninstall(context.Background())
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("Uninstall() error = %v, want wrapped %v", err, removeErr)
+	}
+	if !strings.Contains(err.Error(), "remove") {
+		t.Errorf("Uninstall() error = %q, want removal stage", err)
+	}
+	got, readErr := os.ReadFile(unitPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile(): %v", readErr)
+	}
+	if !reflect.DeepEqual(got, original) {
+		t.Errorf("unit changed to %q, want %q", got, original)
+	}
+	assertSystemdCalls(t, runner.calls, systemctlPath,
+		[]string{"--user", "show-environment"},
+		[]string{"--user", "disable", "--now", SystemdUserUnitName},
+	)
+}
+
 func TestSystemdUserManagerUninstallReloadFailureReturnsAfterRemoval(t *testing.T) {
 	root := t.TempDir()
 	unitPath, _ := writeOwnedSystemdTestUnit(t, root)

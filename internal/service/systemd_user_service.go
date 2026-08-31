@@ -21,6 +21,7 @@ type SystemdUserManager struct {
 	lookPath      func(string) (string, error)
 	userConfigDir func() (string, error)
 	executable    func() (string, error)
+	remove        func(string) error
 }
 
 func NewSystemdUserManager(
@@ -36,6 +37,7 @@ func NewSystemdUserManager(
 		lookPath:      lookPath,
 		userConfigDir: userConfigDir,
 		executable:    executable,
+		remove:        os.Remove,
 	}
 }
 
@@ -223,7 +225,7 @@ func (m *SystemdUserManager) Uninstall(ctx context.Context) error {
 		if _, err := m.runSystemctl(ctx, systemctlPath, "disable systemd user service", "--user", "disable", "--now", SystemdUserUnitName); err != nil {
 			return err
 		}
-		if err := os.Remove(unitPath); err != nil {
+		if err := m.remove(unitPath); err != nil {
 			return fmt.Errorf("remove systemd user unit %q: %w", unitPath, err)
 		}
 
