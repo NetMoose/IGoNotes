@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"IGoNotes/internal/handlers"
 	"IGoNotes/internal/repository"
@@ -16,91 +20,80 @@ import (
 	"IGoNotes/web"
 )
 
-func localServerEndpoint(port string) (string, string) {
-	address := net.JoinHostPort("127.0.0.1", port)
-	return address, "http://" + address
+const gracefulShutdownTimeout = 10 * time.Second
+
+type serverOptions struct {
+	configPath string
+	port       string
+	base       string
+	noBrowser  bool
 }
 
-func serveLocal(
-	address string,
-	handler http.Handler,
-	ready func(),
-	serve func(net.Listener, http.Handler) error,
-) error {
-	listener, err := net.Listen("tcp", address)
+func parseServerOptions(args []string, output io.Writer) (serverOptions, error) {
+	flags := flag.NewFlagSet("igonotes", flag.ContinueOnError)
+	flags.SetOutput(output)
+
+	var options serverOptions
+	flags.StringVar(&options.configPath, "config", "", "Каталог конфигурации (по умолчанию системный каталог пользователя)")
+	flags.StringVar(&options.port, "port", "8080", "Порт сервера")
+	flags.StringVar(&options.base, "base", "", "Имя базы для открытия")
+	flags.BoolVar(&options.noBrowser, "no-browser", false, "Не открывать браузер автоматически")
+	if err := flags.Parse(args); err != nil {
+		err = fmt.Errorf("parse server options: %w", err)
+		if errors.Is(err, flag.ErrHelp) {
+			return serverOptions{}, err
+		}
+		return serverOptions{}, &commandLineError{err: err, reported: true}
+	}
+	return options, nil
+}
+
+func runServer(ctx context.Context, args []string) (returnErr error) {
+	options, err := parseServerOptions(args, os.Stderr)
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
 
-	ready()
-	return serve(listener, handler)
-}
-
-func openBrowser(url string) error {
-	var cmd string
-	var args []string
-
-	switch runtime.GOOS {
-	case "windows":
-		cmd = "cmd"
-		args = []string{"/c", "start"}
-	case "darwin":
-		cmd = "open"
-	default: // "linux", "freebsd", "openbsd", "netbsd"
-		cmd = "xdg-open"
-	}
-	args = append(args, url)
-	return exec.Command(cmd, args...).Start()
-}
-
-func main() {
-	// Определение CLI-флагов
-	configPath := flag.String("config", "", "Каталог конфигурации (по умолчанию системный каталог пользователя)")
-	port := flag.String("port", "8080", "Порт сервера")
-	base := flag.String("base", "", "Имя базы для открытия")
-	noBrowser := flag.Bool("no-browser", false, "Не открывать браузер автоматически")
-	flag.Parse()
-
-	resolvedConfigDir, err := resolveConfigDir(*configPath, os.UserConfigDir)
+	resolvedConfigDir, err := resolveConfigDir(options.configPath, os.UserConfigDir)
 	if err != nil {
-		log.Fatal("Ошибка определения каталога конфигурации: ", err)
+		return fmt.Errorf("определить каталог конфигурации: %w", err)
 	}
 	configFile := filepath.Join(resolvedConfigDir, "config.json")
 	configService := service.NewConfigService(configFile)
 
 	appDataDir, err := resolveDataDir(os.UserHomeDir)
 	if err != nil {
-		log.Fatal("Ошибка определения каталога данных: ", err)
+		return fmt.Errorf("определить каталог данных: %w", err)
 	}
-	basePath, err := service.ResolveStartupBase(configService, *base, appDataDir)
+	basePath, err := service.ResolveStartupBase(configService, options.base, appDataDir)
 	if err != nil {
-		log.Fatal("Ошибка выбора базы заметок: ", err)
+		return fmt.Errorf("выбрать базу заметок: %w", err)
 	}
 
-	// Инициализация базы данных
 	dbPath := filepath.Join(appDataDir, "metadata.db")
 	db, err := repository.InitDB(dbPath)
 	if err != nil {
-		log.Fatal("Ошибка инициализации БД:", err)
+		return fmt.Errorf("инициализировать БД: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("закрыть БД метаданных: %w", err))
+		}
+	}()
 
 	noteRepo := repository.NewNoteRepository(db)
-
-	// Инициализация сервисов
 	noteService := service.NewNoteService(noteRepo, basePath)
 	defer func() {
 		if err := noteService.Close(); err != nil {
-			log.Printf("Ошибка закрытия базы заметок: %v", err)
+			returnErr = errors.Join(returnErr, fmt.Errorf("закрыть базу заметок: %w", err))
 		}
 	}()
-	settingsService, err := service.NewSettingsService(configService, noteService, *base, log.Default())
+
+	settingsService, err := service.NewSettingsService(configService, noteService, options.base, log.Default())
 	if err != nil {
-		log.Fatal("Ошибка инициализации сервиса настроек: ", err)
+		return fmt.Errorf("инициализировать сервис настроек: %w", err)
 	}
 
-	// Запускаем первичную синхронизацию базы с диском при старте программы
 	go func() {
 		log.Println("Запуск первичной синхронизации файловой системы...")
 		if err := noteService.SyncFS(); err != nil {
@@ -110,34 +103,55 @@ func main() {
 		}
 	}()
 
-	// Создаем обработчики
 	noteHandler := handlers.NewNoteHandler(noteService)
 	settingsHandler := handlers.NewSettingsHandler(settingsService)
 	directoryPicker := service.NewDirectoryPicker(service.ExecCommandRunner{}, runtime.GOOS)
 	systemHandler := handlers.NewSystemHandler(directoryPicker)
 
-	// Инициализация статики (фронтенд)
 	distFS, err := web.GetDistFS()
 	if err != nil {
-		log.Fatal("Ошибка инициализации статических файлов фронтенда:", err)
+		return fmt.Errorf("инициализировать статические файлы фронтенда: %w", err)
 	}
 	spaHandler := handlers.NewSPAHandler(distFS)
 
-	// Маршрутизация
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
 	registerSystemRoutes(router, systemHandler)
 
-	address, url := localServerEndpoint(*port)
-	if err := serveLocal(address, router, func() {
+	address, url := localServerEndpoint(options.port)
+	return serveLocal(ctx, address, newHTTPServer(router), func() {
 		log.Printf("Сервер запущен на %s", url)
 
-		if !*noBrowser {
+		if !options.noBrowser {
 			log.Printf("Открываем браузер: %s", url)
 			if err := openBrowser(url); err != nil {
 				log.Printf("Не удалось открыть браузер автоматически: %v", err)
 			}
 		}
-	}, http.Serve); err != nil {
-		log.Fatal(err)
+	}, gracefulShutdownTimeout)
+}
+
+func runMain() error {
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
+	defer stop()
+
+	manager := service.NewSystemdUserManager(
+		runtime.GOOS,
+		service.ExecCommandRunner{},
+		exec.LookPath,
+		os.UserConfigDir,
+		os.Executable,
+	)
+	return dispatchCommand(ctx, os.Args[1:], os.Stdout, manager, runServer)
+}
+
+func main() {
+	err := runMain()
+	exitCode := commandExitCode(err)
+	if exitCode == 0 {
+		return
 	}
+	if shouldLogCommandError(err) {
+		log.Print(err)
+	}
+	os.Exit(exitCode)
 }
