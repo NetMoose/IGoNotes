@@ -247,6 +247,32 @@ func TestClientInspectLocalHandlesExpectedAbsence(t *testing.T) {
 	runner.assertDone()
 }
 
+func TestClientInspectLocalPreservesLiteralBranchOutput(t *testing.T) {
+	root := t.TempDir()
+	gitDir := filepath.Join(root, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+		{want: readCommand(root, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
+		{want: readCommand(root, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: gitDir + "\n"}},
+		{want: readCommand(root, "symbolic-ref", "--quiet", "HEAD"), result: Result{Stdout: "refs/heads/topic\u00a0\n"}},
+		{want: readCommand(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")},
+		{want: readCommand(root, "remote", "get-url", "origin"), err: exitError(2)},
+		{want: readCommand(root, "config", "--get", "user.name"), err: exitError(1)},
+		{want: readCommand(root, "config", "--get", "user.email"), err: exitError(1)},
+		{want: readCommand(root, "rev-parse", "--verify", "HEAD"), err: exitError(128)},
+	}}
+	got, err := NewClient(runner).InspectLocal(context.Background(), root)
+	if err != nil {
+		t.Fatalf("InspectLocal() error = %v", err)
+	}
+	if got.CurrentBranch != "topic\u00a0" {
+		t.Fatalf("InspectLocal().CurrentBranch = %q, want literal non-breaking space", got.CurrentBranch)
+	}
+	runner.assertDone()
+}
+
 func TestClientInspectLocalRejectsMalformedSymbolicRef(t *testing.T) {
 	outputs := []string{
 		"",
@@ -256,6 +282,7 @@ func TestClientInspectLocalRejectsMalformedSymbolicRef(t *testing.T) {
 		"refs/heads/\n",
 		"refs/heads/main other\n",
 		"refs/heads/main\x00\n",
+		"refs/heads/main\n\n",
 		"refs/heads/main\nrefs/heads/other\n",
 	}
 	for _, output := range outputs {

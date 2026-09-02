@@ -179,7 +179,7 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 		}
 		detached = true
 	} else {
-		fullRef := strings.TrimSpace(branchResult.Stdout)
+		fullRef := singleLine(branchResult.Stdout)
 		var found bool
 		branch, found = strings.CutPrefix(fullRef, "refs/heads/")
 		if !found || branch == "" || containsInvalidRefOutputByte(branch) {
