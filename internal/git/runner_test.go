@@ -126,7 +126,9 @@ func TestCommandRunnerReplacesEnvironment(t *testing.T) {
 			factory := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 				cmd := helperCommand(ctx, "inspect")
 				cmd.Env = []string{
-					"KEEP=value",
+					"KEEP=value", "SSH_AUTH_SOCK=/safe/agent.sock",
+					"HTTP_PROXY=http://proxy.invalid", "HTTPS_PROXY=https://proxy.invalid",
+					"NO_PROXY=localhost", "SSL_CERT_FILE=/safe/ca.pem", "SSL_CERT_DIR=/safe/certs",
 					"GIT_TERMINAL_PROMPT=1", "GIT_TERMINAL_PROMPT=hostile",
 					"Git_Terminal_Prompt=mixed-hostile",
 					"LC_ALL=hostile", "LC_ALL=also-hostile",
@@ -137,6 +139,16 @@ func TestCommandRunnerReplacesEnvironment(t *testing.T) {
 					"git_optional_locks=mixed-hostile",
 					"GIT_NO_LAZY_FETCH=0", "GIT_NO_LAZY_FETCH=hostile",
 					"Git_No_Lazy_Fetch=mixed-hostile",
+					"GIT_DIR=/hostile/repository", "git_work_tree=/hostile/worktree",
+					"Git_Common_Dir=/hostile/common", "GIT_INDEX_FILE=/hostile/index",
+					"git_object_directory=/hostile/objects",
+					"GIT_ALTERNATE_OBJECT_DIRECTORIES=/hostile/alternates",
+					"Git_Config_Count=1", "GIT_CONFIG_KEY_0=core.pager",
+					"git_config_value_0=hostile", "GIT_CONFIG_GLOBAL=/hostile/config",
+					"Git_Ssh=/hostile/ssh", "GIT_SSH_COMMAND=/hostile/ssh-command",
+					"git_askpass=/hostile/git-askpass", "GIT_PROXY_COMMAND=/hostile/proxy",
+					"Git_External_Diff=/hostile/diff", "GIT_PAGER=/hostile/pager",
+					"Ssh_Askpass=/hostile/ssh-askpass", "SSH_ASKPASS_REQUIRE=force",
 				}
 				return cmd
 			}
@@ -157,7 +169,50 @@ func TestCommandRunnerReplacesEnvironment(t *testing.T) {
 			assertEnvValues(t, observation.Env, "GIT_ALLOW_PROTOCOL", []string{AllowedGitProtocols})
 			assertEnvValues(t, observation.Env, "GIT_OPTIONAL_LOCKS", test.wantOptionalLocks)
 			assertEnvValues(t, observation.Env, "GIT_NO_LAZY_FETCH", []string{"1"})
+			assertEnvValues(t, observation.Env, "SSH_ASKPASS", nil)
+			assertEnvValues(t, observation.Env, "SSH_ASKPASS_REQUIRE", []string{"never"})
+			assertEnvValues(t, observation.Env, "SSH_AUTH_SOCK", []string{"/safe/agent.sock"})
+			assertEnvValues(t, observation.Env, "HTTP_PROXY", []string{"http://proxy.invalid"})
+			assertEnvValues(t, observation.Env, "HTTPS_PROXY", []string{"https://proxy.invalid"})
+			assertEnvValues(t, observation.Env, "NO_PROXY", []string{"localhost"})
+			assertEnvValues(t, observation.Env, "SSL_CERT_FILE", []string{"/safe/ca.pem"})
+			assertEnvValues(t, observation.Env, "SSL_CERT_DIR", []string{"/safe/certs"})
+			assertOnlyCanonicalGitEnvironment(t, observation.Env, test.readOnly)
 		})
+	}
+}
+
+func assertOnlyCanonicalGitEnvironment(t *testing.T, env []string, readOnly bool) {
+	t.Helper()
+	want := map[string]string{
+		"git_terminal_prompt": "0",
+		"git_allow_protocol":  AllowedGitProtocols,
+		"git_no_lazy_fetch":   "1",
+	}
+	if readOnly {
+		want["git_optional_locks"] = "0"
+	}
+	seen := make(map[string]int, len(want))
+	for _, entry := range env {
+		key, value, found := strings.Cut(entry, "=")
+		key = strings.ToLower(key)
+		if !found || !strings.HasPrefix(key, "git_") {
+			continue
+		}
+		wantValue, allowed := want[key]
+		if !allowed {
+			t.Errorf("unexpected Git environment key %q", key)
+			continue
+		}
+		seen[key]++
+		if value != wantValue {
+			t.Errorf("environment %s = %q, want %q", key, value, wantValue)
+		}
+	}
+	for key := range want {
+		if seen[key] != 1 {
+			t.Errorf("environment %s count = %d, want 1", key, seen[key])
+		}
 	}
 }
 
@@ -489,6 +544,77 @@ func TestCommandRunnerDefaults(t *testing.T) {
 	if AllowedGitProtocols != "file:http:https:ssh:git" {
 		t.Fatalf("AllowedGitProtocols = %q", AllowedGitProtocols)
 	}
+}
+
+func TestCommandRunnerProductionEnvironmentIsolatesRepository(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("Git unavailable: %v", err)
+	}
+	selected := t.TempDir()
+	poisoned := t.TempDir()
+	runGitSetup(t, gitPath, selected, "init", "--quiet")
+	runGitSetup(t, gitPath, poisoned, "init", "--quiet")
+
+	hostileCommand := filepath.Join(t.TempDir(), "must-not-run")
+	t.Setenv("GIT_DIR", filepath.Join(poisoned, ".git"))
+	t.Setenv("GIT_WORK_TREE", poisoned)
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "igonotes.injected")
+	t.Setenv("GIT_CONFIG_VALUE_0", "true")
+	t.Setenv("GIT_SSH_COMMAND", hostileCommand)
+
+	runner := NewCommandRunner()
+	result, err := runner.Run(context.Background(), Command{
+		Dir: selected, Args: []string{"rev-parse", "--show-toplevel"}, ReadOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("rev-parse through production runner: %v", err)
+	}
+	canonicalSelected, err := filepath.EvalSymlinks(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := filepath.Clean(strings.TrimSpace(result.Stdout)); got != canonicalSelected {
+		t.Fatalf("rev-parse root = %q, want selected base %q", got, canonicalSelected)
+	}
+
+	result, err = runner.Run(context.Background(), Command{
+		Dir: selected, Args: []string{"config", "--get", "igonotes.injected"}, ReadOnly: true,
+	})
+	if err == nil {
+		t.Fatalf("injected Git config applied with output %q", result.Stdout)
+	}
+	var safeErr *SafeError
+	if !errors.As(err, &safeErr) || safeErr.ExitCode != 1 {
+		t.Fatalf("config lookup error = %#v, want Git exit code 1 for missing key", err)
+	}
+	if _, statErr := os.Stat(hostileCommand); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("hostile command path status = %v, want not created", statErr)
+	}
+}
+
+func runGitSetup(t *testing.T, gitPath, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(gitPath, args...)
+	cmd.Dir = dir
+	cmd.Env = cleanGitSetupEnvironment(os.Environ())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Git setup %q failed: %v: %s", args, err, output)
+	}
+}
+
+func cleanGitSetupEnvironment(env []string) []string {
+	clean := make([]string, 0, len(env)+2)
+	for _, entry := range env {
+		key, _, found := strings.Cut(entry, "=")
+		if found && (strings.HasPrefix(strings.ToUpper(key), "GIT_") ||
+			strings.EqualFold(key, "SSH_ASKPASS") || strings.EqualFold(key, "SSH_ASKPASS_REQUIRE")) {
+			continue
+		}
+		clean = append(clean, entry)
+	}
+	return append(clean, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
 }
 
 func TestSafeErrorClassification(t *testing.T) {

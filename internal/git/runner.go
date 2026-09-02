@@ -161,11 +161,13 @@ func gitEnvironment(environment []string, readOnly bool) []string {
 	if environment == nil {
 		environment = os.Environ()
 	}
-	keys := []string{"GIT_TERMINAL_PROMPT", "LC_ALL", "GIT_ALLOW_PROTOCOL", "GIT_OPTIONAL_LOCKS", "GIT_NO_LAZY_FETCH"}
-	filtered := make([]string, 0, len(environment)+5)
+	filtered := make([]string, 0, len(environment)+6)
 	for _, entry := range environment {
 		key, _, found := strings.Cut(entry, "=")
-		if found && containsFold(keys, key) {
+		if found && (isGitEnvironmentKey(key) ||
+			strings.EqualFold(key, "LC_ALL") ||
+			strings.EqualFold(key, "SSH_ASKPASS") ||
+			strings.EqualFold(key, "SSH_ASKPASS_REQUIRE")) {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -175,6 +177,7 @@ func gitEnvironment(environment []string, readOnly bool) []string {
 		"LC_ALL=C",
 		"GIT_ALLOW_PROTOCOL="+AllowedGitProtocols,
 		"GIT_NO_LAZY_FETCH=1",
+		"SSH_ASKPASS_REQUIRE=never",
 	)
 	if readOnly {
 		filtered = append(filtered, "GIT_OPTIONAL_LOCKS=0")
@@ -182,13 +185,8 @@ func gitEnvironment(environment []string, readOnly bool) []string {
 	return filtered
 }
 
-func containsFold(values []string, candidate string) bool {
-	for _, value := range values {
-		if strings.EqualFold(value, candidate) {
-			return true
-		}
-	}
-	return false
+func isGitEnvironmentKey(key string) bool {
+	return len(key) >= len("GIT_") && strings.EqualFold(key[:len("GIT_")], "GIT_")
 }
 
 func longestString(values []string) int {

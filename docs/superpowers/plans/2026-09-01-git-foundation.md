@@ -16,7 +16,7 @@ This plan implements Plan 1 of `docs/superpowers/specs/2026-09-01-git-synchroniz
 
 - Backward-compatible `model.Base` fields and probe/config/status DTOs.
 - A dedicated shell-free runner under `internal/git`.
-- Non-interactive execution, local/network timeouts, bounded output, redaction, and safe structured errors.
+- Non-interactive execution with an isolated Git environment, local/network timeouts, bounded output, redaction, and safe structured errors.
 - Git version, URL, branch, autosync interval, and commit-template validation.
 - Read-only local/remote probe.
 - Ordered SQLite migrations and persisted Git status.
@@ -42,7 +42,7 @@ Dependencies and staged behavior:
 - `GitConfirmations` is accepted in the DTO for forward compatibility but is neither persisted nor acted upon in this plan. Connect must re-probe and re-check confirmations against current state.
 - A read-only probe cannot discover an unseen remote commit graph without fetching objects. It reports `history_relation: "unknown"` and conservatively sets `merge_histories: true` when both local and selected remote histories exist but the remote tip is unavailable locally. Connect must determine the exact relationship after fetch.
 - `POST /api/git/probe` accepts an empty `git_branch` for the wizard's URL/authentication and remote-branch discovery pass. After the user selects or enters a branch, the wizard must probe again with that branch before review; `PUT /api/git/config` still requires and validates a nonempty branch. Frontend implementation remains excluded from this plan, but the backend contract and tests must support this two-pass flow.
-- Remote inputs are limited to explicit `https://`, `http://`, `ssh://`, `git://`, `file://`, scp-like, and local-path forms. Git remote-helper syntax such as `ext::<address>` or any arbitrary `<helper>::<address>` is never accepted, and every runner invocation overrides `GIT_ALLOW_PROTOCOL` with the matching fixed protocol allowlist.
+- Remote inputs are limited to explicit `https://`, `http://`, `ssh://`, `git://`, `file://`, scp-like, and local-path forms. Git remote-helper syntax such as `ext::<address>` or any arbitrary `<helper>::<address>` is never accepted. Every runner invocation case-insensitively removes inherited `GIT_*`, `SSH_ASKPASS`, and `SSH_ASKPASS_REQUIRE`, then sets exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, `GIT_ALLOW_PROTOCOL=file:http:https:ssh:git`, `GIT_NO_LAZY_FETCH=1`, and `SSH_ASKPASS_REQUIRE=never`; read-only commands alone also receive `GIT_OPTIONAL_LOCKS=0`. Ordinary authentication and transport infrastructure such as `SSH_AUTH_SOCK`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and standard TLS environment remains available.
 
 ## Final Public Contracts
 
@@ -110,7 +110,7 @@ func (s *GitStatusService) Status(context.Context, string) (model.GitStatusRespo
 - Create `internal/model/git_test.go`: JSON compatibility and state contract tests.
 - Create `internal/git/errors.go`: safe errors, classification, and redaction.
 - Create `internal/git/runner.go`: shell-free process runner.
-- Create `internal/git/runner_test.go`: argv, protocol/environment, timeout, limits, and redaction tests.
+- Create `internal/git/runner_test.go`: argv; case-insensitive removal of inherited `GIT_*`, `SSH_ASKPASS`, and `SSH_ASKPASS_REQUIRE`; exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, fixed `GIT_ALLOW_PROTOCOL`, `GIT_NO_LAZY_FETCH=1`, and `SSH_ASKPASS_REQUIRE=never`; `GIT_OPTIONAL_LOCKS=0` only for read-only commands; preserved agent/proxy/TLS infrastructure; timeout, limits, and redaction tests.
 - Create `internal/git/porcelain.go`: Git 2.28+ read-only command facade and parsers.
 - Create `internal/git/porcelain_test.go`: command and parser tests.
 - Create `internal/service/git_config.go`: strict remote URL/interval/template validation and rendering.
@@ -420,7 +420,7 @@ git commit -m "feat: define git synchronization contracts"
 
 - [ ] **Step 1: Write RED runner tests**
 
-Create an injected `commandFactory` and cover exact argv, environment replacement, local/network timeout selection, context cancellation, bounded stdout/stderr, executable-not-found, classification, and redaction. Assert every command, read-only or mutating, receives exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, and `GIT_ALLOW_PROTOCOL=file:http:https:ssh:git`, replacing hostile inherited values; assert only read-only commands receive `GIT_OPTIONAL_LOCKS=0`. The shell-safety test must include:
+Create an injected `commandFactory` and cover exact argv, environment isolation, local/network timeout selection, context cancellation, bounded stdout/stderr, executable-not-found, classification, and redaction. Assert every command case-insensitively removes all inherited `GIT_*`, `SSH_ASKPASS`, and `SSH_ASKPASS_REQUIRE` entries before receiving exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, `GIT_ALLOW_PROTOCOL=file:http:https:ssh:git`, `GIT_NO_LAZY_FETCH=1`, and `SSH_ASKPASS_REQUIRE=never`; assert only read-only commands receive `GIT_OPTIONAL_LOCKS=0`. Preserve ordinary non-Git infrastructure including `SSH_AUTH_SOCK`, HTTP(S) proxy/`NO_PROXY`, and standard TLS variables. The shell-safety test must include:
 
 ```go
 func TestCommandRunnerPassesArgumentsWithoutShell(t *testing.T) {
@@ -452,7 +452,7 @@ func TestCommandRunnerPassesArgumentsWithoutShell(t *testing.T) {
 
 Add `TestCommandRunnerRedactsBeforeDiagnosticTruncation` with a secret beginning just before the final diagnostic limit; the complete secret must not appear and no secret prefix may remain at the end.
 
-Add `TestCommandRunnerOverridesProtocolEnvironmentForEveryCommand` with table cases for `ReadOnly:true` and `ReadOnly:false`. Seed `cmd.Env` through the factory with duplicate `GIT_ALLOW_PROTOCOL=ext:file` and `GIT_TERMINAL_PROMPT=1` entries, run the command, and assert the child environment contains one fixed allowlist and one disabled-prompt value in both cases.
+Add `TestCommandRunnerReplacesEnvironment` with table cases for `ReadOnly:true` and `ReadOnly:false`. Seed `cmd.Env` through the factory with mixed-case repository-routing, object/index-routing, config-injection, executable-routing, pager/diff/proxy, `GIT_ASKPASS`, `SSH_ASKPASS`, and duplicate canonical `GIT_*` entries. Assert every inherited `GIT_*` and askpass route is absent, while the child contains exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, fixed `GIT_ALLOW_PROTOCOL`, `GIT_NO_LAZY_FETCH=1`, and `SSH_ASKPASS_REQUIRE=never`; only the read-only case contains `GIT_OPTIONAL_LOCKS=0`. Also assert `SSH_AUTH_SOCK`, HTTP(S) proxy/`NO_PROXY`, and standard TLS variables survive unchanged. Add a real `NewCommandRunner` regression that poisons ambient repository/config/executable routing, invokes read-only `rev-parse` in an independent selected repository, and proves the canonical selected base wins and injected config/commands do not apply; the test restores its environment and cannot execute the hostile command.
 
 - [ ] **Step 2: Run RED runner tests**
 
@@ -603,7 +603,7 @@ func NewCommandRunner() *CommandRunner {
 1. Canonicalize `Command.Dir` with `filepath.Abs`, `filepath.EvalSymlinks`, and `os.Stat`; require an existing directory.
 2. Select local or network timeout and derive a child context.
 3. Call `exec.CommandContext` directly with cloned `Args`; never invoke `sh`, `bash`, `cmd /c`, or construct a command string.
-4. Replace duplicate environment entries and always set `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, and `GIT_ALLOW_PROTOCOL=AllowedGitProtocols`; set `GIT_OPTIONAL_LOCKS=0` only for read-only commands. Never append without removing inherited copies, because a caller-controlled duplicate must not change which value Git observes.
+4. Build the child environment by case-insensitively removing every inherited key beginning `GIT_`, plus `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE`, before appending exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, `GIT_ALLOW_PROTOCOL=AllowedGitProtocols`, `GIT_NO_LAZY_FETCH=1`, and `SSH_ASKPASS_REQUIRE=never`; append exactly one `GIT_OPTIONAL_LOCKS=0` only for read-only commands. Preserve ordinary non-Git infrastructure including `SSH_AUTH_SOCK`, HTTP(S) proxy/`NO_PROXY`, and standard TLS variables. This blocks repository/object/index routing, config injection, executable/helper/pager/diff/proxy routing, askpass execution, and hostile duplicates without disabling the user's existing agent, proxy, or trust store.
 5. Bound stdout to `outputLimit` while continuing to consume writes and set `StdoutTruncated` when bytes were discarded.
 6. Capture stderr to `outputLimit + longestSecretLength`, redact exact `Secrets` and HTTP userinfo, then truncate the redacted diagnostic to `outputLimit`. This ordering prevents a secret crossing the truncation boundary from leaking partially.
 7. Return redacted stderr on success, set `StderrTruncated` when either capture or final truncation discarded bytes, and return no raw process output on failure.
@@ -644,7 +644,7 @@ gofmt -w internal/git/errors.go internal/git/runner.go internal/git/runner_test.
 go test ./internal/git -run 'Test(CommandRunner|SafeError)' -v
 ```
 
-Expected: PASS; exact argv is preserved, every command has the fixed protocol allowlist and disabled prompts, timeout errors unwrap correctly, and secrets are absent after redaction/truncation.
+Expected: PASS; exact argv is preserved; every child has all inherited `GIT_*`, `SSH_ASKPASS`, and `SSH_ASKPASS_REQUIRE` removed case-insensitively before receiving exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, fixed `GIT_ALLOW_PROTOCOL`, `GIT_NO_LAZY_FETCH=1`, and `SSH_ASKPASS_REQUIRE=never`; only read-only children receive `GIT_OPTIONAL_LOCKS=0`; ordinary agent/proxy/TLS infrastructure survives; timeout errors unwrap correctly; and secrets are absent after redaction/truncation.
 
 - [ ] **Step 6: Commit the runner**
 
@@ -766,15 +766,18 @@ git --version
 git check-ref-format refs/heads/<branch>
 git rev-parse --show-toplevel
 git rev-parse --absolute-git-dir
-git symbolic-ref --quiet --short HEAD
+git symbolic-ref --quiet HEAD
 git status --porcelain=v1 -z --untracked-files=all
 git remote get-url origin
 git config --get user.name
 git config --get user.email
 git rev-parse --verify HEAD
+git config --get extensions.partialClone
+git config --get-regexp ^remote\..*\.(promisor|partialclonefilter)$
 git cat-file -e <remote-oid>^{commit}
 git merge-base --is-ancestor <remote-oid> HEAD
 git merge-base HEAD <remote-oid>
+git rev-parse --is-shallow-repository
 git ls-remote --symref <remote>
 ```
 
@@ -833,14 +836,14 @@ Rules:
 - `ValidateBranch` accepts only a nonempty short branch name already stripped of surrounding whitespace; callers trim before validation, and the porcelain rejects rather than silently normalizes a value that still has surrounding whitespace. Before Git execution, reject leading `-`, fully qualified `refs/...` input, exact revision shorthands/pseudorefs `@`, `HEAD`, `FETCH_HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, `AUTO_MERGE`, and `BISECT_HEAD`; matching is exact and case-sensitive because lowercase names are ordinary refs.
 - Validate the literal full ref by invoking `git check-ref-format refs/heads/<branch>`, without `--branch` or `--normalize`. This prevents Git from expanding `@{-n}` and lets full-ref rules reject revision syntax including `@{`, `..`, `~`, `^`, `:`, `?`, `*`, `[`, backslash, controls, spaces, and malformed slash components.
 - Convert every static or `check-ref-format` rejection to `invalid_branch`, field `git_branch`, without returning Git diagnostics.
-- Treat `not_a_git_repository` from `--show-toplevel` as successful no-repository inspection.
+- Treat `not_a_git_repository` from `--show-toplevel` as successful no-repository inspection. `InspectLocal` still reads `user.name` and `user.email` in this case so global identity can be reported, but it runs no repository-only command such as absolute Git-dir, symbolic-ref, status, origin, HEAD, or operation-marker inspection.
 - Canonicalize the returned repository root.
-- Detect detached HEAD from `symbolic-ref` exit status.
+- Detect detached HEAD from `symbolic-ref` exit status. On success, require stdout to be exactly one `refs/heads/` line with no additional or empty lines, then strip that exact prefix to obtain the short branch; never ask Git to shorten or ambiguously render the ref.
 - Treat any NUL-delimited status record as dirty.
 - Resolve operation markers relative to `--absolute-git-dir`: `MERGE_HEAD`, `rebase-merge`, `rebase-apply`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`.
 - Identity is configured only when both name and email are nonempty.
 - Parse all `ls-remote --symref` records. `Empty` is true only when no refs are returned; tags without branches therefore make the remote nonempty. Store `refs/heads/<name>` as branch-to-OID entries and return deterministic sorted names at the service boundary.
-- `HistoryRelation` returns `none`, `shared`, `unrelated`, or `unknown`. It may use `cat-file` and `merge-base` only when the remote OID already exists locally; a missing object returns `unknown`, never fetches.
+- `HistoryRelation` returns `none`, `shared`, `unrelated`, or `unknown`. Before `cat-file`, query both `extensions.partialClone` and all `remote.*.(promisor|partialclonefilter)` entries with the exact read-only config commands above; any presence, regardless of value, returns `unknown` on the Git 2.28 baseline rather than risking lazy object access. `GIT_NO_LAZY_FETCH=1` is defense-in-depth on newer Git, not the baseline guarantee. Only after both checks report absence may `cat-file` and `merge-base` run when the remote OID already exists locally; a missing object returns `unknown`, never fetches. If no merge base exists, run `rev-parse --is-shallow-repository`: exact `true` returns `unknown`, exact `false` returns `unrelated`, and malformed/truncated output is an error, so shallow history is never misclassified as unrelated.
 - Reject any truncated `Result` before parsing version, refs, status, config, OIDs, or branch output; return a safe `git_command_failed` error with message `Git output exceeded the configured limit` rather than accepting partial machine data.
 
 - [ ] **Step 6: Run GREEN validation and porcelain tests**
@@ -1209,7 +1212,7 @@ Rules:
 
 - [ ] **Step 5: Add a real-Git read-only integration test**
 
-`TestGitProbeServiceIntegrationIsReadOnly` must skip when Git is unavailable or below 2.28, create temporary bare/working repos, configure local test identity, first probe with an empty branch to discover refs, then re-probe with the selected literal branch. Compare before/after bytes for `.git/config`, `git show-ref`, and `git status --porcelain=v1 -z`; assert the bare remote receives no new refs. The test environment must retain the runner's fixed `GIT_ALLOW_PROTOCOL=file:http:https:ssh:git` so the local bare remote works through the allowed `file` protocol.
+`TestGitProbeServiceIntegrationIsReadOnly` must skip when Git is unavailable or below 2.28, create temporary bare/working repos, configure local test identity, first probe with an empty branch to discover refs, then re-probe with the selected literal branch. Compare before/after bytes for `.git/config`, `git show-ref`, and `git status --porcelain=v1 -z`; assert the bare remote receives no new refs. The runner must case-insensitively remove inherited `GIT_*`, `SSH_ASKPASS`, and `SSH_ASKPASS_REQUIRE`, set exactly one `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, `GIT_ALLOW_PROTOCOL=file:http:https:ssh:git`, `GIT_NO_LAZY_FETCH=1`, and `SSH_ASKPASS_REQUIRE=never`, add `GIT_OPTIONAL_LOCKS=0` for these read-only calls, and preserve ordinary `SSH_AUTH_SOCK`, proxy/`NO_PROXY`, and TLS environment so the local bare remote remains available through the allowed `file` protocol without disabling normal transport infrastructure.
 
 - [ ] **Step 6: Run GREEN probe tests**
 
