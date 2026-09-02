@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -591,6 +592,54 @@ func TestCommandRunnerProductionEnvironmentIsolatesRepository(t *testing.T) {
 	}
 	if _, statErr := os.Stat(hostileCommand); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("hostile command path status = %v, want not created", statErr)
+	}
+}
+
+func TestCommandRunnerProductionEnvironmentBlocksGitSSHCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("executable marker script is Unix-only")
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("Git unavailable: %v", err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "git-ssh-command-ran")
+	script := filepath.Join(t.TempDir(), "git-ssh-command")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n: > \"$IGONOTES_GIT_SSH_MARKER\"\nexit 97\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(marker) })
+	t.Setenv("PATH", filepath.Dir(script)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GIT_SSH_COMMAND", filepath.Base(script))
+	t.Setenv("IGONOTES_GIT_SSH_MARKER", marker)
+
+	remote := "ssh://127.0.0.1:1/repo"
+	baselineCtx, cancelBaseline := context.WithTimeout(context.Background(), 5*time.Second)
+	baseline := exec.CommandContext(baselineCtx, gitPath, "ls-remote", remote)
+	baseline.Dir = t.TempDir()
+	baseline.Env = append(cleanGitSetupEnvironment(os.Environ()),
+		"GIT_SSH_COMMAND="+filepath.Base(script),
+	)
+	_ = baseline.Run()
+	cancelBaseline()
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("unfiltered Git did not execute marker command: %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelRun()
+	_, err = NewCommandRunner().Run(runCtx, Command{
+		Dir: t.TempDir(), Args: []string{"ls-remote", remote}, Scope: NetworkOperation, ReadOnly: true,
+	})
+	if err == nil {
+		t.Fatal("ls-remote to closed loopback port unexpectedly succeeded")
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("production runner executed ambient GIT_SSH_COMMAND: marker status = %v", statErr)
 	}
 }
 

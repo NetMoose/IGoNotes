@@ -773,7 +773,7 @@ git config --get user.name
 git config --get user.email
 git rev-parse --verify HEAD
 git config --get extensions.partialClone
-git config --get-regexp ^remote\..*\.(promisor|partialclonefilter)$
+git config --name-only --get-regexp '^remote\..*\.(promisor|partialclonefilter)$'
 git cat-file -e <remote-oid>^{commit}
 git merge-base --is-ancestor <remote-oid> HEAD
 git merge-base HEAD <remote-oid>
@@ -843,7 +843,7 @@ Rules:
 - Resolve operation markers relative to `--absolute-git-dir`: `MERGE_HEAD`, `rebase-merge`, `rebase-apply`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`.
 - Identity is configured only when both name and email are nonempty.
 - Parse all `ls-remote --symref` records. `Empty` is true only when no refs are returned; tags without branches therefore make the remote nonempty. Store `refs/heads/<name>` as branch-to-OID entries and return deterministic sorted names at the service boundary.
-- `HistoryRelation` returns `none`, `shared`, `unrelated`, or `unknown`. Before `cat-file`, query both `extensions.partialClone` and all `remote.*.(promisor|partialclonefilter)` entries with the exact read-only config commands above; any presence, regardless of value, returns `unknown` on the Git 2.28 baseline rather than risking lazy object access. `GIT_NO_LAZY_FETCH=1` is defense-in-depth on newer Git, not the baseline guarantee. Only after both checks report absence may `cat-file` and `merge-base` run when the remote OID already exists locally; a missing object returns `unknown`, never fetches. If no merge base exists, run `rev-parse --is-shallow-repository`: exact `true` returns `unknown`, exact `false` returns `unrelated`, and malformed/truncated output is an error, so shallow history is never misclassified as unrelated.
+- `HistoryRelation` returns `none`, `shared`, `unrelated`, or `unknown`. Before `cat-file`, query `extensions.partialClone` and then run the exact name-only command `git config --name-only --get-regexp '^remote\..*\.(promisor|partialclonefilter)$'`; any matching key presence, regardless of value, returns `unknown` on the Git 2.28 baseline rather than risking lazy object access. `GIT_NO_LAZY_FETCH=1` is defense-in-depth on newer Git, not the baseline guarantee. Only after both checks report absence may `cat-file` and `merge-base` run when the remote OID already exists locally; a missing object returns `unknown`, never fetches. If no merge base exists, run `rev-parse --is-shallow-repository`: exact `true` returns `unknown`, exact `false` returns `unrelated`, and malformed/truncated output is an error, so shallow history is never misclassified as unrelated.
 - Reject any truncated `Result` before parsing version, refs, status, config, OIDs, or branch output; return a safe `git_command_failed` error with message `Git output exceeded the configured limit` rather than accepting partial machine data.
 
 - [ ] **Step 6: Run GREEN validation and porcelain tests**
