@@ -203,6 +203,39 @@ func TestGitProbeServiceContractAndInputValidation(t *testing.T) {
 	})
 }
 
+func TestGitProbeServiceRejectsNilDependencies(t *testing.T) {
+	tests := []struct {
+		name    string
+		service func(*probePorcelainStub) *GitProbeService
+	}{
+		{name: "nil receiver", service: func(*probePorcelainStub) *GitProbeService { return nil }},
+		{name: "nil settings", service: func(p *probePorcelainStub) *GitProbeService { return NewGitProbeService(nil, p) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			porcelain := &probePorcelainStub{}
+			service := test.service(porcelain)
+			response, err := service.Probe(context.Background(), model.GitProbeRequest{Base: "work", GitURL: probeRemote})
+			if err != errGitProbeNotInitialized || err.Error() != "git probe service is not initialized" {
+				t.Fatalf("Probe() error = %v, want fixed internal initialization error", err)
+			}
+			if errors.Is(err, ErrBaseNotFound) {
+				t.Fatalf("Probe() error = %v, must not be classified as base not found", err)
+			}
+			var fieldErr *FieldError
+			if errors.As(err, &fieldErr) {
+				t.Fatalf("Probe() error = %#v, must not expose a field error", err)
+			}
+			if !reflect.DeepEqual(response, model.GitProbeResponse{}) {
+				t.Fatalf("Probe() response = %#v, want zero response", response)
+			}
+			if len(porcelain.calls) != 0 {
+				t.Fatalf("porcelain calls = %v, want none", porcelain.calls)
+			}
+		})
+	}
+}
+
 func TestGitProbeServiceDiscoversRemoteWithEmptyBranch(t *testing.T) {
 	dir, settings, porcelain := newProbeFixture(t)
 	porcelain.remote.Branches = map[string]string{"zeta": devOID, "main": mainOID, "alpha": devOID}
@@ -346,7 +379,7 @@ func TestGitProbeServiceVersionAndPorcelainErrorsAreSafe(t *testing.T) {
 func TestGitProbeServiceDerivesLocalStateAndOriginMutations(t *testing.T) {
 	t.Run("no repository is a matching creatable root", func(t *testing.T) {
 		_, settings, porcelain := newProbeFixture(t)
-		porcelain.local = gitcmd.LocalInspection{}
+		porcelain.local = gitcmd.LocalInspection{IdentityConfigured: true}
 		porcelain.remote = gitcmd.RemoteInspection{Empty: true, Branches: map[string]string{}}
 		response, err := runProbe(t, settings, porcelain, model.GitProbeRequest{Base: "work", GitURL: probeRemote, GitBranch: "main"})
 		if err != nil {
@@ -361,6 +394,21 @@ func TestGitProbeServiceDerivesLocalStateAndOriginMutations(t *testing.T) {
 		}
 		if !response.CanConfigure || response.HistoryRelation != "none" {
 			t.Errorf("CanConfigure/HistoryRelation = %v/%q, want true/none", response.CanConfigure, response.HistoryRelation)
+		}
+	})
+
+	t.Run("no repository without identity is blocked", func(t *testing.T) {
+		_, settings, porcelain := newProbeFixture(t)
+		porcelain.local = gitcmd.LocalInspection{}
+		porcelain.remote = gitcmd.RemoteInspection{Empty: true, Branches: map[string]string{}}
+		response, err := runProbe(t, settings, porcelain, model.GitProbeRequest{Base: "work", GitURL: probeRemote, GitBranch: "main"})
+		if err != nil {
+			t.Fatalf("Probe() error = %v", err)
+		}
+		requireBlocker(t, response, "identity_missing", "Git identity is not configured", "")
+		want := model.GitRequiredMutations{CreateRepository: true, AddOrigin: true, CreateBranch: true}
+		if response.RequiredMutations != want {
+			t.Errorf("RequiredMutations = %#v, want %#v", response.RequiredMutations, want)
 		}
 	})
 

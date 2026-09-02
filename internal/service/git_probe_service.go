@@ -15,6 +15,8 @@ const (
 	gitMergeRiskWarning   = "Connecting may merge existing local and remote histories."
 )
 
+var errGitProbeNotInitialized = errors.New("git probe service is not initialized")
+
 type GitPorcelain interface {
 	Version(context.Context, string) (gitcmd.Version, error)
 	ValidateBranch(context.Context, string, string) error
@@ -33,6 +35,10 @@ func NewGitProbeService(settings SettingsSnapshot, porcelain GitPorcelain) *GitP
 }
 
 func (s *GitProbeService) Probe(ctx context.Context, request model.GitProbeRequest) (model.GitProbeResponse, error) {
+	if s == nil || s.settings == nil {
+		return model.GitProbeResponse{}, errGitProbeNotInitialized
+	}
+
 	request.Base = strings.TrimSpace(request.Base)
 	if request.Base == "" {
 		return model.GitProbeResponse{}, fieldError(ErrBaseNotFound, "base", "base is required")
@@ -169,7 +175,7 @@ func gitProbeBlocker(local gitcmd.LocalInspection, rootMatches, existingOriginUn
 		return &model.APIError{Code: string(gitcmd.CodeRepositoryRoot), Message: "Git repository root does not match the base directory"}
 	case local.PendingOperation != "":
 		return &model.APIError{Code: string(gitcmd.CodeRepositoryLocked), Message: "Git repository has a pending operation"}
-	case local.HasRepository && !local.IdentityConfigured:
+	case !local.IdentityConfigured:
 		return &model.APIError{Code: string(gitcmd.CodeIdentityMissing), Message: "Git identity is not configured"}
 	case selectedBranchMissing:
 		return &model.APIError{Code: string(gitcmd.CodeInvalidBranch), Message: "Selected Git branch does not exist on the remote", Field: "git_branch"}

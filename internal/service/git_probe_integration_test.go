@@ -18,15 +18,49 @@ import (
 	"IGoNotes/internal/model"
 )
 
+func TestGitProbeTestEnvironmentFiltersInheritedGitVariables(t *testing.T) {
+	poisoned := map[string]string{
+		"GIT_DIR":                          "poison-dir",
+		"Git_Work_Tree":                    "poison-tree",
+		"GIT_OBJECT_DIRECTORY":             "poison-objects",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": "poison-alternates",
+		"GIT_ALLOW_PROTOCOL":               "ext",
+		"GIT_TEMPLATE_DIR":                 "poison-template",
+		"GIT_CONFIG_PARAMETERS":            "'alias.status=!false'",
+	}
+	for key, value := range poisoned {
+		t.Setenv(key, value)
+	}
+
+	environment := gitProbeTestEnvironment(t)
+	want := map[string]string{
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_CONFIG_GLOBAL":   os.DevNull,
+		"GIT_CONFIG_SYSTEM":   os.DevNull,
+		"GIT_TERMINAL_PROMPT": "0",
+		"GIT_ALLOW_PROTOCOL":  gitcmd.AllowedGitProtocols,
+		"GIT_NO_LAZY_FETCH":   "1",
+	}
+	got := gitProbeEnvironmentValues(environment)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("controlled Git environment = %#v, want %#v", got, want)
+	}
+	if ambient := gitProbeEnvironmentValues(os.Environ()); !reflect.DeepEqual(ambient, want) {
+		t.Fatalf("ambient Git environment = %#v, want %#v", ambient, want)
+	}
+	if !environmentContainsKey(environment, "PATH") {
+		t.Fatal("controlled environment removed PATH")
+	}
+}
+
 func TestGitProbeServiceIntegrationIsReadOnly(t *testing.T) {
+	gitEnvironment := gitProbeTestEnvironment(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
 			t.Skip("Git is unavailable")
 		}
 		t.Fatalf("locate Git: %v", err)
 	}
-	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
-	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
 
 	ctx := context.Background()
 	client := gitcmd.NewClient(gitcmd.NewCommandRunner())
@@ -44,29 +78,29 @@ func TestGitProbeServiceIntegrationIsReadOnly(t *testing.T) {
 	if err := os.Mkdir(working, 0o755); err != nil {
 		t.Fatalf("create working directory: %v", err)
 	}
-	runGitSetup(t, root, "init", "--bare", remote)
-	runGitSetup(t, working, "init", "--initial-branch=main")
-	runGitSetup(t, working, "config", "user.name", "IGoNotes Probe Test")
-	runGitSetup(t, working, "config", "user.email", "probe@example.invalid")
+	runGitSetup(t, gitEnvironment, root, "init", "--bare", remote)
+	runGitSetup(t, gitEnvironment, working, "init", "--initial-branch=main")
+	runGitSetup(t, gitEnvironment, working, "config", "user.name", "IGoNotes Probe Test")
+	runGitSetup(t, gitEnvironment, working, "config", "user.email", "probe@example.invalid")
 	if err := os.WriteFile(filepath.Join(working, "note.md"), []byte("# Read only\n"), 0o644); err != nil {
 		t.Fatalf("write fixture note: %v", err)
 	}
-	runGitSetup(t, working, "add", "note.md")
-	runGitSetup(t, working, "commit", "-m", "initial fixture")
-	remoteURL := "file://" + filepath.ToSlash(remote)
-	runGitSetup(t, working, "remote", "add", "origin", remoteURL)
-	runGitSetup(t, working, "push", "-u", "origin", "main")
+	runGitSetup(t, gitEnvironment, working, "add", "note.md")
+	runGitSetup(t, gitEnvironment, working, "commit", "-m", "initial fixture")
+	remoteURL := remote
+	runGitSetup(t, gitEnvironment, working, "remote", "add", "origin", remoteURL)
+	runGitSetup(t, gitEnvironment, working, "push", "-u", "origin", "main")
 
-	gitDir := strings.TrimSpace(string(runGitFixture(t, working, "rev-parse", "--absolute-git-dir")))
+	gitDir := strings.TrimSpace(string(runGitFixture(t, gitEnvironment, working, "rev-parse", "--absolute-git-dir")))
 	gitDir, err = filepath.EvalSymlinks(gitDir)
 	if err != nil {
 		t.Fatalf("canonicalize Git directory: %v", err)
 	}
-	remoteOID := strings.TrimSpace(string(runGitFixture(t, working, "rev-parse", "main")))
+	remoteOID := strings.TrimSpace(string(runGitFixture(t, gitEnvironment, working, "rev-parse", "main")))
 	beforeConfig := readProbeFixture(t, filepath.Join(gitDir, "config"))
-	beforeRefs := runGitFixture(t, working, "show-ref")
-	beforeStatus := runGitFixture(t, working, "status", "--porcelain=v1", "-z")
-	beforeRemoteRefs := runGitFixture(t, remote, "show-ref")
+	beforeRefs := runGitFixture(t, gitEnvironment, working, "show-ref")
+	beforeStatus := runGitFixture(t, gitEnvironment, working, "status", "--porcelain=v1", "-z")
+	beforeRemoteRefs := runGitFixture(t, gitEnvironment, remote, "show-ref")
 	beforeFetchHead := snapshotOptionalProbeFile(t, filepath.Join(gitDir, "FETCH_HEAD"))
 	beforeObjects := snapshotProbeObjects(t, filepath.Join(gitDir, "objects"))
 
@@ -96,9 +130,9 @@ func TestGitProbeServiceIntegrationIsReadOnly(t *testing.T) {
 		t.Errorf(".git/objects changed during probe\nbefore: %#v\nafter:  %#v", beforeObjects, afterObjects)
 	}
 	assertProbeBytesEqual(t, ".git/config", beforeConfig, readProbeFixture(t, filepath.Join(gitDir, "config")))
-	assertProbeBytesEqual(t, "working refs", beforeRefs, runGitFixture(t, working, "show-ref"))
-	assertProbeBytesEqual(t, "working status", beforeStatus, runGitFixture(t, working, "status", "--porcelain=v1", "-z"))
-	assertProbeBytesEqual(t, "bare remote refs", beforeRemoteRefs, runGitFixture(t, remote, "show-ref"))
+	assertProbeBytesEqual(t, "working refs", beforeRefs, runGitFixture(t, gitEnvironment, working, "show-ref"))
+	assertProbeBytesEqual(t, "working status", beforeStatus, runGitFixture(t, gitEnvironment, working, "status", "--porcelain=v1", "-z"))
+	assertProbeBytesEqual(t, "bare remote refs", beforeRemoteRefs, runGitFixture(t, gitEnvironment, remote, "show-ref"))
 }
 
 type recordingProbeRunner struct {
@@ -223,19 +257,97 @@ func snapshotProbeObjects(t *testing.T, objectsDir string) []probeObjectHash {
 	return objects
 }
 
-func runGitSetup(t *testing.T, dir string, args ...string) {
+func gitProbeTestEnvironment(t *testing.T) []string {
+	t.Helper()
+	inherited := os.Environ()
+	normal := make([]string, 0, len(inherited))
+	originalGit := make([]string, 0)
+	for _, entry := range inherited {
+		if gitProbeEnvironmentEntry(entry) {
+			originalGit = append(originalGit, entry)
+			continue
+		}
+		normal = append(normal, entry)
+	}
+
+	t.Cleanup(func() {
+		for _, entry := range os.Environ() {
+			if gitProbeEnvironmentEntry(entry) {
+				key, _, _ := strings.Cut(entry, "=")
+				_ = os.Unsetenv(key)
+			}
+		}
+		for _, entry := range originalGit {
+			key, value, _ := strings.Cut(entry, "=")
+			_ = os.Setenv(key, value)
+		}
+	})
+
+	for _, entry := range originalGit {
+		key, _, _ := strings.Cut(entry, "=")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("remove inherited %s: %v", key, err)
+		}
+	}
+	safe := []string{
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=" + os.DevNull,
+		"GIT_CONFIG_SYSTEM=" + os.DevNull,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ALLOW_PROTOCOL=" + gitcmd.AllowedGitProtocols,
+		"GIT_NO_LAZY_FETCH=1",
+	}
+	for _, entry := range safe {
+		key, value, _ := strings.Cut(entry, "=")
+		if err := os.Setenv(key, value); err != nil {
+			t.Fatalf("set controlled %s: %v", key, err)
+		}
+	}
+	return append(normal, safe...)
+}
+
+func gitProbeEnvironmentEntry(entry string) bool {
+	key, _, found := strings.Cut(entry, "=")
+	return found && len(key) >= len("GIT_") && strings.EqualFold(key[:len("GIT_")], "GIT_")
+}
+
+func gitProbeEnvironmentValues(environment []string) map[string]string {
+	values := make(map[string]string)
+	for _, entry := range environment {
+		if !gitProbeEnvironmentEntry(entry) {
+			continue
+		}
+		key, value, _ := strings.Cut(entry, "=")
+		values[strings.ToUpper(key)] = value
+	}
+	return values
+}
+
+func environmentContainsKey(environment []string, candidate string) bool {
+	for _, entry := range environment {
+		key, _, found := strings.Cut(entry, "=")
+		if found && strings.EqualFold(key, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func runGitSetup(t *testing.T, environment []string, dir string, args ...string) {
 	t.Helper()
 	command := exec.Command("git", args...)
 	command.Dir = dir
+	command.Env = append([]string(nil), environment...)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, output)
 	}
 }
 
-func runGitFixture(t *testing.T, dir string, args ...string) []byte {
+func runGitFixture(t *testing.T, environment []string, dir string, args ...string) []byte {
 	t.Helper()
 	command := exec.Command("git", args...)
 	command.Dir = dir
+	command.Env = append([]string(nil), environment...)
 	output, err := command.Output()
 	if err != nil {
 		t.Fatalf("git %v: %v", args, err)
