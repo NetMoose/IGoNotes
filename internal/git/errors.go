@@ -1,0 +1,91 @@
+package git
+
+import (
+	"context"
+	"errors"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+type ErrorCode string
+
+const (
+	CodeUnavailable        ErrorCode = "git_unavailable"
+	CodeUnsupportedVersion ErrorCode = "git_version_unsupported"
+	CodeAuthentication     ErrorCode = "auth_failed"
+	CodeRemoteUnreachable  ErrorCode = "remote_unreachable"
+	CodeIdentityMissing    ErrorCode = "identity_missing"
+	CodeInvalidBranch      ErrorCode = "invalid_branch"
+	CodeRepositoryRoot     ErrorCode = "repository_root_mismatch"
+	CodeRepositoryLocked   ErrorCode = "repository_locked"
+	CodeCommandFailed      ErrorCode = "git_command_failed"
+	CodeTimedOut           ErrorCode = "git_timeout"
+	CodeCanceled           ErrorCode = "git_canceled"
+	CodeNotRepository      ErrorCode = "not_a_git_repository"
+)
+
+type SafeError struct {
+	Code     ErrorCode
+	Message  string
+	Field    string
+	ExitCode int
+
+	diagnostic string
+	cause      error
+}
+
+func (e *SafeError) Error() string {
+	return e.Message
+}
+
+func (e *SafeError) Unwrap() error {
+	return e.cause
+}
+
+func (e *SafeError) Diagnostic() string {
+	return e.diagnostic
+}
+
+var httpUserinfoPattern = regexp.MustCompile(`(?i)(https?://)[^/\s@]+@`)
+
+func redact(text string, secrets []string) string {
+	orderedSecrets := append([]string(nil), secrets...)
+	sort.SliceStable(orderedSecrets, func(i, j int) bool {
+		return len(orderedSecrets[i]) > len(orderedSecrets[j])
+	})
+
+	redacted := text
+	for _, secret := range orderedSecrets {
+		if secret != "" {
+			redacted = strings.ReplaceAll(redacted, secret, "[REDACTED_REMOTE]")
+		}
+	}
+	return httpUserinfoPattern.ReplaceAllString(redacted, `${1}[REDACTED]@`)
+}
+
+func classifyFailure(err error, diagnostic string) *SafeError {
+	lower := strings.ToLower(diagnostic)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return &SafeError{Code: CodeTimedOut, Message: "Git command timed out", cause: context.DeadlineExceeded}
+	case errors.Is(err, context.Canceled):
+		return &SafeError{Code: CodeCanceled, Message: "Git command was canceled", cause: context.Canceled}
+	case strings.Contains(lower, "authentication failed"),
+		strings.Contains(lower, "permission denied (publickey)"),
+		strings.Contains(lower, "could not read username"),
+		strings.Contains(lower, "terminal prompts disabled"):
+		return &SafeError{Code: CodeAuthentication, Message: "Git authentication failed"}
+	case strings.Contains(lower, "could not resolve host"),
+		strings.Contains(lower, "unable to access"),
+		strings.Contains(lower, "repository not found"),
+		strings.Contains(lower, "does not appear to be a git repository"):
+		return &SafeError{Code: CodeRemoteUnreachable, Message: "Git remote is unreachable"}
+	case strings.Contains(lower, "index.lock"):
+		return &SafeError{Code: CodeRepositoryLocked, Message: "Git repository is locked"}
+	case strings.Contains(lower, "not a git repository"):
+		return &SafeError{Code: CodeNotRepository, Message: "Directory is not a Git repository"}
+	default:
+		return &SafeError{Code: CodeCommandFailed, Message: "Git command failed"}
+	}
+}
