@@ -20,7 +20,6 @@ type serviceErrorMapping struct {
 }
 
 var serviceErrorMappings = []serviceErrorMapping{
-	{service.ErrRollbackFailed, http.StatusInternalServerError, "rollback_failed", internalErrorMessage},
 	{service.ErrSetupRequired, http.StatusPreconditionRequired, "setup_required", service.ErrSetupRequired.Error()},
 	{service.ErrSetupAlreadyCompleted, http.StatusConflict, "setup_already_completed", service.ErrSetupAlreadyCompleted.Error()},
 	{service.ErrSetupCannotReopen, http.StatusConflict, "setup_cannot_reopen", service.ErrSetupCannotReopen.Error()},
@@ -48,19 +47,8 @@ func WriteAPIError(w http.ResponseWriter, status int, code, message, field strin
 }
 
 func writeServiceError(w http.ResponseWriter, err error) {
-	for _, mapping := range serviceErrorMappings {
-		if !errors.Is(err, mapping.kind) {
-			continue
-		}
-
-		message := mapping.message
-		field := ""
-		var fieldErr *service.FieldError
-		if mapping.status < http.StatusInternalServerError && errors.As(err, &fieldErr) && errors.Is(fieldErr.Kind, mapping.kind) {
-			message = fieldErr.Message
-			field = fieldErr.Field
-		}
-		WriteAPIError(w, mapping.status, mapping.code, message, field)
+	if errors.Is(err, service.ErrRollbackFailed) {
+		WriteAPIError(w, http.StatusInternalServerError, "rollback_failed", internalErrorMessage, "")
 		return
 	}
 
@@ -87,6 +75,22 @@ func writeServiceError(w http.ResponseWriter, err error) {
 			WriteAPIError(w, status, string(safeErr.Code), safeErr.Message, safeErr.Field)
 			return
 		}
+	}
+
+	for _, mapping := range serviceErrorMappings {
+		if !errors.Is(err, mapping.kind) {
+			continue
+		}
+
+		message := mapping.message
+		field := ""
+		var fieldErr *service.FieldError
+		if mapping.status < http.StatusInternalServerError && errors.As(err, &fieldErr) && errors.Is(fieldErr.Kind, mapping.kind) {
+			message = fieldErr.Message
+			field = fieldErr.Field
+		}
+		WriteAPIError(w, mapping.status, mapping.code, message, field)
+		return
 	}
 
 	WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")

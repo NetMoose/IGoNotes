@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,6 +97,86 @@ func TestWriteServiceErrorUsesOnlySafeErrorPublicFields(t *testing.T) {
 	for _, private := range []string{"user:secret", "example.test", "private.git", "clone"} {
 		if strings.Contains(recorder.Body.String(), private) {
 			t.Errorf("response leaks private wrapper content %q: %q", private, recorder.Body.String())
+		}
+	}
+}
+
+type gitBranchValidatorFunc func(context.Context, string, string) error
+
+func (f gitBranchValidatorFunc) ValidateBranch(ctx context.Context, dir, branch string) error {
+	return f(ctx, dir, branch)
+}
+
+func TestWriteServiceErrorPreservesOperationalGitBranchValidationFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    *gitcmd.SafeError
+		status int
+		want   model.APIError
+	}{
+		{
+			name:   "Git unavailable",
+			err:    &gitcmd.SafeError{Code: gitcmd.CodeUnavailable, Message: "Git executable is unavailable"},
+			status: http.StatusServiceUnavailable,
+			want:   model.APIError{Code: "git_unavailable", Message: "Git executable is unavailable"},
+		},
+		{
+			name:   "Git timeout",
+			err:    &gitcmd.SafeError{Code: gitcmd.CodeTimedOut, Message: "Git command timed out"},
+			status: http.StatusGatewayTimeout,
+			want:   model.APIError{Code: "git_timeout", Message: "Git command timed out"},
+		},
+		{
+			name:   "Git canceled",
+			err:    &gitcmd.SafeError{Code: gitcmd.CodeCanceled, Message: "Git command was canceled"},
+			status: http.StatusRequestTimeout,
+			want:   model.APIError{Code: "git_canceled", Message: "Git command was canceled"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			validator := service.NewGitConfigValidator(gitBranchValidatorFunc(
+				func(context.Context, string, string) error { return test.err },
+			))
+			_, validationErr := validator.Validate(context.Background(), "/private/base", model.GitConfigRequest{
+				GitURL:    "https://example.test/private.git",
+				GitBranch: "main",
+			})
+			var safeErr *gitcmd.SafeError
+			if !errors.As(validationErr, &safeErr) || safeErr != test.err {
+				t.Fatalf("Validate() error = %#v, want operational SafeError %#v", validationErr, test.err)
+			}
+
+			recorder := httptest.NewRecorder()
+			writeServiceError(recorder, fmt.Errorf("validate https://user:secret@example.test/private.git: %w", validationErr))
+
+			assertAPIErrorResponse(t, recorder, test.status, test.want)
+			for _, private := range []string{"user:secret", "example.test", "private.git", "/private/base"} {
+				if strings.Contains(recorder.Body.String(), private) {
+					t.Errorf("response leaks private validation detail %q: %q", private, recorder.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestWriteServiceErrorSafeErrorWinsOverJoinedInvalidBranch(t *testing.T) {
+	err := fmt.Errorf("secret wrapper https://token@example.test/repository.git: %w", errors.Join(
+		&service.FieldError{Kind: service.ErrInvalidGitBranch, Field: "git_branch", Message: "invalid Git branch"},
+		&gitcmd.SafeError{Code: gitcmd.CodeTimedOut, Message: "Git command timed out"},
+	))
+	recorder := httptest.NewRecorder()
+
+	writeServiceError(recorder, err)
+
+	assertAPIErrorResponse(t, recorder, http.StatusGatewayTimeout, model.APIError{
+		Code:    "git_timeout",
+		Message: "Git command timed out",
+	})
+	for _, private := range []string{"secret wrapper", "token", "example.test", "repository.git", "invalid Git branch"} {
+		if strings.Contains(recorder.Body.String(), private) {
+			t.Errorf("response leaks lower-precedence error detail %q: %q", private, recorder.Body.String())
 		}
 	}
 }
