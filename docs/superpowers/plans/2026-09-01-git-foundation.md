@@ -1253,6 +1253,7 @@ Add:
 type GitStatusStore interface {
 	Upsert(context.Context, model.GitStatus) error
 	Get(context.Context, string) (model.GitStatus, bool, error)
+	List(context.Context) ([]model.GitStatus, error)
 	Delete(context.Context, string) error
 }
 
@@ -1266,7 +1267,7 @@ Extend `SettingsService` with `gitValidator` and `gitStatuses`. Keep `NewSetting
 
 - [ ] **Step 4: Implement status compensation**
 
-Snapshot affected status paths before mutation. Apply status delete/upsert before config persistence. If `applyConfigLocked` fails, restore every snapshot. If restoration fails, latch `ErrRollbackFailed` in `s.degraded`, join operation and rollback errors, and log only safe error values. Nil Git dependencies leave existing non-Git base operations unchanged.
+Snapshot affected status paths before mutation. For an existing base, resolve canonical before-images from the complete status snapshot by exact `Base` before considering a lexical-path row: multiple exact-name rows are ambiguous, one supplies its persisted `RepositoryPath`, and only zero permits lexical `Get` for stale-row cleanup. Apply status delete/upsert before config persistence. If `applyConfigLocked` fails, restore every snapshot. If restoration fails, latch `ErrRollbackFailed` in `s.degraded`, join operation and rollback errors, and log only safe error values. Nil Git dependencies leave existing non-Git base operations unchanged.
 
 - [ ] **Step 5: Implement `ConfigureGit`**
 

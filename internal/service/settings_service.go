@@ -23,11 +23,8 @@ type ConfigStore interface {
 type GitStatusStore interface {
 	Upsert(context.Context, model.GitStatus) error
 	Get(context.Context, string) (model.GitStatus, bool, error)
-	Delete(context.Context, string) error
-}
-
-type gitStatusLister interface {
 	List(context.Context) ([]model.GitStatus, error)
+	Delete(context.Context, string) error
 }
 
 type GitStatusReader interface {
@@ -424,34 +421,28 @@ func storedGitStatusPath(path string) string {
 }
 
 func (s *SettingsService) existingGitStatusPath(ctx context.Context, base model.Base) (string, error) {
-	storedPath := storedGitStatusPath(base.Path)
-	_, exists, err := s.gitStatuses.Get(ctx, storedPath)
-	if err != nil {
-		return "", fmt.Errorf("read Git status: %w", err)
-	}
-	if exists {
-		return storedPath, nil
-	}
-	lister, ok := s.gitStatuses.(gitStatusLister)
-	if !ok {
-		return storedPath, nil
-	}
-	statuses, err := lister.List(ctx)
+	statuses, err := s.gitStatuses.List(ctx)
 	if err != nil {
 		return "", fmt.Errorf("list Git statuses: %w", err)
 	}
 	matchedPath := ""
+	matchedCount := 0
 	for _, status := range statuses {
 		if status.Base != base.Name {
 			continue
 		}
-		if matchedPath != "" || status.RepositoryPath == "" {
+		matchedCount++
+		if matchedCount > 1 {
 			return "", errAmbiguousGitStatusIdentity
 		}
 		matchedPath = status.RepositoryPath
 	}
-	if matchedPath != "" {
+	if matchedCount == 1 {
 		return matchedPath, nil
+	}
+	storedPath := storedGitStatusPath(base.Path)
+	if _, _, err := s.gitStatuses.Get(ctx, storedPath); err != nil {
+		return "", fmt.Errorf("read Git status: %w", err)
 	}
 	return storedPath, nil
 }

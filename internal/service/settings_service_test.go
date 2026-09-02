@@ -211,6 +211,32 @@ type fakeGitStatusStore struct {
 	deleteErrs  []error
 }
 
+type exactGitStatusStore struct {
+	calls int
+}
+
+func (s *exactGitStatusStore) Upsert(context.Context, model.GitStatus) error {
+	s.calls++
+	return errors.New("must not upsert at startup")
+}
+
+func (s *exactGitStatusStore) Get(context.Context, string) (model.GitStatus, bool, error) {
+	s.calls++
+	return model.GitStatus{}, false, errors.New("must not get at startup")
+}
+
+func (s *exactGitStatusStore) List(context.Context) ([]model.GitStatus, error) {
+	s.calls++
+	return nil, errors.New("must not list at startup")
+}
+
+func (s *exactGitStatusStore) Delete(context.Context, string) error {
+	s.calls++
+	return errors.New("must not delete at startup")
+}
+
+var _ GitStatusStore = (*exactGitStatusStore)(nil)
+
 func (f *fakeGitStatusStore) Get(_ context.Context, path string) (model.GitStatus, bool, error) {
 	f.getCalls = append(f.getCalls, path)
 	if f.getErr != nil {
@@ -2039,14 +2065,14 @@ func TestNewSettingsServiceWithGitDoesNotCallGitDependencies(t *testing.T) {
 		CurrentBase: "work", SetupCompleted: &completed,
 	}
 	validator := &fakeGitConfigValidator{err: errors.New("must not validate at startup")}
-	statuses := &fakeGitStatusStore{getErr: errors.New("must not read at startup")}
+	statuses := &exactGitStatusStore{}
 
 	service, err := NewSettingsServiceWithGit(&fakeConfigStore{config: &config}, &fakeBaseRuntime{path: basePath}, "", nil, validator, statuses)
 	if err != nil {
 		t.Fatalf("NewSettingsServiceWithGit() error = %v", err)
 	}
-	if service == nil || validator.calls != 0 || len(statuses.getCalls)+statuses.listCalls+len(statuses.upsertCalls)+len(statuses.deleteCalls) != 0 {
-		t.Fatalf("startup Git calls = validator %d get %v list %d upsert %v delete %v", validator.calls, statuses.getCalls, statuses.listCalls, statuses.upsertCalls, statuses.deleteCalls)
+	if service == nil || validator.calls != 0 || statuses.calls != 0 {
+		t.Fatalf("startup Git calls = validator %d store %d", validator.calls, statuses.calls)
 	}
 }
 
@@ -2495,57 +2521,91 @@ func TestSettingsServiceCanonicalGitStatusIdentityAfterSymlinkDisappears(t *test
 	})
 }
 
-func TestSettingsServiceGitStatusIdentityFallbackRejectsAmbiguityAndListFailure(t *testing.T) {
+func TestSettingsServiceGitStatusMutationsRejectAmbiguousBaseBeforeLexicalRow(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		prepare     func(*fakeGitStatusStore, string)
-		wantMessage string
+		name string
+		call func(*SettingsService, string) error
 	}{
-		{
-			name: "ambiguous exact base rows",
-			prepare: func(statuses *fakeGitStatusStore, target string) {
-				statuses.statuses[filepath.Join(target, "duplicate")] = model.GitStatus{Base: "work", RepositoryPath: filepath.Join(target, "duplicate"), State: model.GitStatePaused, ChangedPaths: []string{}}
-			},
-			wantMessage: "ambiguous Git status identity",
-		},
-		{
-			name: "list failure",
-			prepare: func(statuses *fakeGitStatusStore, _ string) {
-				statuses.listErr = errors.New("list failed with private database path")
-			},
-			wantMessage: "list failed with private database path",
-		},
+		{name: "disable", call: func(service *SettingsService, _ string) error {
+			_, err := service.DisableGit(context.Background(), "work")
+			return err
+		}},
+		{name: "update", call: func(service *SettingsService, canonicalPath string) error {
+			_, err := service.UpdateBase("work", model.BaseUpdateRequest{Name: "renamed", Path: canonicalPath})
+			return err
+		}},
+		{name: "forget", call: func(service *SettingsService, _ string) error {
+			_, err := service.ForgetBase("work")
+			return err
+		}},
+		{name: "replace", call: func(service *SettingsService, _ string) error {
+			input := service.GetConfig()
+			input.Bases = input.Bases[:1]
+			_, err := service.ReplaceConfig(input)
+			return err
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			target := t.TempDir()
-			link := filepath.Join(t.TempDir(), "base-link")
-			createSymlinkOrSkip(t, target, link)
+			activePath := t.TempDir()
+			canonicalPath := t.TempDir()
+			lexicalPath := filepath.Join(t.TempDir(), "base-link")
+			createSymlinkOrSkip(t, canonicalPath, lexicalPath)
 			completed := true
-			config := model.Config{Bases: []model.Base{{Name: "work", Path: link}}, CurrentBase: "work", SetupCompleted: &completed}
-			service, store, runtime, validator, statuses := newGitSettingsServiceForConfig(t, config, link)
-			configureTestBaseGit(t, service, validator, "work")
-			test.prepare(statuses, target)
+			work := model.Base{Name: "work", Path: lexicalPath, GitURL: "work.git", GitBranch: "main"}
+			config := model.Config{
+				Bases:          []model.Base{{Name: "active", Path: activePath}, work},
+				CurrentBase:    "active",
+				SetupCompleted: &completed,
+			}
+			service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+			statuses.statuses[lexicalPath] = model.GitStatus{Base: "work", RepositoryPath: lexicalPath, State: model.GitStatePaused, ChangedPaths: []string{}}
+			statuses.statuses[canonicalPath] = model.GitStatus{Base: "work", RepositoryPath: canonicalPath, State: model.GitStateReady, ChangedPaths: []string{}}
 			beforeConfig := service.GetConfig()
 			beforeStatuses := cloneGitStatusesForTest(statuses.statuses)
-			beforeSaves, beforePersists := store.saveCalls, runtime.persistCalls
-			if err := os.Remove(link); err != nil {
-				t.Fatal(err)
-			}
 
-			_, err := service.DisableGit(context.Background(), "work")
-			if err == nil || !strings.Contains(err.Error(), test.wantMessage) {
-				t.Fatalf("DisableGit() error = %v, want message %q", err, test.wantMessage)
+			err := test.call(service, canonicalPath)
+			if !errors.Is(err, errAmbiguousGitStatusIdentity) {
+				t.Fatalf("mutation error = %v, want %v", err, errAmbiguousGitStatusIdentity)
 			}
-			if strings.Contains(err.Error(), target) || strings.Contains(err.Error(), link) {
-				t.Fatalf("DisableGit() error leaked path: %q", err)
+			if !reflect.DeepEqual(service.GetConfig(), beforeConfig) || !reflect.DeepEqual(statuses.statuses, beforeStatuses) {
+				t.Fatalf("ambiguous identity mutated state: config %#v statuses %#v", service.GetConfig(), statuses.statuses)
 			}
-			if !reflect.DeepEqual(service.GetConfig(), beforeConfig) || !reflect.DeepEqual(statuses.statuses, beforeStatuses) || store.saveCalls != beforeSaves || runtime.persistCalls != beforePersists || len(statuses.deleteCalls) != 0 {
-				t.Fatalf("identity failure mutated state: config %#v statuses %#v saves %d persists %d deletes %v", service.GetConfig(), statuses.statuses, store.saveCalls, runtime.persistCalls, statuses.deleteCalls)
+			if store.saveCalls != 0 || runtime.persistCalls != 0 || len(runtime.transactionCalls) != 0 || len(statuses.upsertCalls) != 0 || len(statuses.deleteCalls) != 0 {
+				t.Fatalf("ambiguous identity calls = saves %d persists %d transactions %v upserts %v deletes %v", store.saveCalls, runtime.persistCalls, runtime.transactionCalls, statuses.upsertCalls, statuses.deleteCalls)
 			}
-			if statuses.listCalls != 1 {
-				t.Fatalf("List calls = %d, want 1", statuses.listCalls)
+			if statuses.listCalls != 1 || len(statuses.getCalls) != 0 {
+				t.Fatalf("identity reads = list %d get %v, want list first and no get", statuses.listCalls, statuses.getCalls)
 			}
 		})
+	}
+}
+
+func TestSettingsServiceGitStatusListFailureAbortsBeforeMutation(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "base-link")
+	createSymlinkOrSkip(t, target, link)
+	completed := true
+	config := model.Config{Bases: []model.Base{{Name: "work", Path: link}}, CurrentBase: "work", SetupCompleted: &completed}
+	service, store, runtime, validator, statuses := newGitSettingsServiceForConfig(t, config, link)
+	configureTestBaseGit(t, service, validator, "work")
+	statuses.listErr = errors.New("list failed with private database path")
+	beforeConfig := service.GetConfig()
+	beforeStatuses := cloneGitStatusesForTest(statuses.statuses)
+	beforeSaves, beforePersists := store.saveCalls, runtime.persistCalls
+	beforeGets := len(statuses.getCalls)
+
+	_, err := service.DisableGit(context.Background(), "work")
+	if err == nil || !strings.Contains(err.Error(), "list failed with private database path") {
+		t.Fatalf("DisableGit() error = %v, want list failure", err)
+	}
+	if strings.Contains(err.Error(), target) || strings.Contains(err.Error(), link) {
+		t.Fatalf("DisableGit() error leaked path: %q", err)
+	}
+	if !reflect.DeepEqual(service.GetConfig(), beforeConfig) || !reflect.DeepEqual(statuses.statuses, beforeStatuses) || store.saveCalls != beforeSaves || runtime.persistCalls != beforePersists || len(statuses.deleteCalls) != 0 {
+		t.Fatalf("list failure mutated state: config %#v statuses %#v saves %d persists %d deletes %v", service.GetConfig(), statuses.statuses, store.saveCalls, runtime.persistCalls, statuses.deleteCalls)
+	}
+	if statuses.listCalls != 1 || len(statuses.getCalls) != beforeGets {
+		t.Fatalf("identity reads = list %d get %v, want list before no additional get", statuses.listCalls, statuses.getCalls)
 	}
 }
 
