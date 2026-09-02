@@ -52,6 +52,13 @@ func exitError(code int) error {
 	return &SafeError{Code: CodeCommandFailed, Message: "Git command failed", ExitCode: code, diagnostic: "private git diagnostic"}
 }
 
+func completeRepositoryInspectionSteps(dir string) []runnerStep {
+	return []runnerStep{
+		{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+		{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), err: exitError(1)},
+	}
+}
+
 func TestParseGitVersion(t *testing.T) {
 	tests := []struct {
 		output string
@@ -548,34 +555,35 @@ func TestClientInspectRemoteRejectsMalformedOutput(t *testing.T) {
 func TestClientHistoryRelationUsesOnlyLocalObjects(t *testing.T) {
 	dir := t.TempDir()
 	oid := strings.Repeat("a", 40)
+	completeRepositorySteps := completeRepositoryInspectionSteps(dir)
 	tests := []struct {
 		name  string
 		steps []runnerStep
 		want  string
 	}{
 		{name: "none", want: "none"},
-		{name: "missing object", steps: []runnerStep{{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: exitError(128)}}, want: "unknown"},
-		{name: "remote ancestor", steps: []runnerStep{
+		{name: "missing object", steps: append(append([]runnerStep(nil), completeRepositorySteps...), runnerStep{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: exitError(128)}), want: "unknown"},
+		{name: "remote ancestor", steps: append(append([]runnerStep(nil), completeRepositorySteps...), []runnerStep{
 			{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 			{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD")},
-		}, want: "shared"},
-		{name: "common base", steps: []runnerStep{
+		}...), want: "shared"},
+		{name: "common base", steps: append(append([]runnerStep(nil), completeRepositorySteps...), []runnerStep{
 			{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 			{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(1)},
 			{want: readCommand(dir, "merge-base", "HEAD", oid), result: Result{Stdout: strings.Repeat("b", 40) + "\n"}},
-		}, want: "shared"},
-		{name: "unrelated", steps: []runnerStep{
+		}...), want: "shared"},
+		{name: "unrelated", steps: append(append([]runnerStep(nil), completeRepositorySteps...), []runnerStep{
 			{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 			{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(1)},
 			{want: readCommand(dir, "merge-base", "HEAD", oid), err: exitError(1)},
 			{want: readCommand(dir, "rev-parse", "--is-shallow-repository"), result: Result{Stdout: "false\n"}},
-		}, want: "unrelated"},
-		{name: "shallow unknown", steps: []runnerStep{
+		}...), want: "unrelated"},
+		{name: "shallow unknown", steps: append(append([]runnerStep(nil), completeRepositorySteps...), []runnerStep{
 			{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 			{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(1)},
 			{want: readCommand(dir, "merge-base", "HEAD", oid), err: exitError(1)},
 			{want: readCommand(dir, "rev-parse", "--is-shallow-repository"), result: Result{Stdout: "true\n"}},
-		}, want: "unknown"},
+		}...), want: "unknown"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -590,6 +598,180 @@ func TestClientHistoryRelationUsesOnlyLocalObjects(t *testing.T) {
 			}
 			if got != test.want {
 				t.Fatalf("HistoryRelation() = %q, want %q", got, test.want)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientHistoryRelationStopsForPartialRepository(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	tests := []struct {
+		name  string
+		steps []runnerStep
+	}{
+		{name: "partial clone extension", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), result: Result{Stdout: "origin\n"}},
+		}},
+		{name: "promisor remote", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor true\n"}},
+		}},
+		{name: "one true promisor remote", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.backup.promisor false\nremote.origin.promisor true\n"}},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &porcelainRunnerFake{t: t, steps: test.steps}
+			got, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
+			if err != nil {
+				t.Fatalf("HistoryRelation() error = %v", err)
+			}
+			if got != "unknown" {
+				t.Fatalf("HistoryRelation() = %q, want unknown", got)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientHistoryRelationCompleteRepositoryReachesObjectInspection(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	tests := []struct {
+		name           string
+		extension      runnerStep
+		remotePromisor runnerStep
+	}{
+		{
+			name:           "no config entries",
+			extension:      runnerStep{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			remotePromisor: runnerStep{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), err: exitError(1)},
+		},
+		{
+			name:           "empty extension and false promisors",
+			extension:      runnerStep{want: readCommand(dir, "config", "--get", "extensions.partialClone")},
+			remotePromisor: runnerStep{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor false\nremote.backup.promisor false\n"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+				test.extension,
+				test.remotePromisor,
+				{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: exitError(128)},
+			}}
+			got, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
+			if err != nil {
+				t.Fatalf("HistoryRelation() error = %v", err)
+			}
+			if got != "unknown" {
+				t.Fatalf("HistoryRelation() = %q, want unknown for missing local object", got)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientHistoryRelationPropagatesPartialRepositoryInspectionFailures(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	tests := []struct {
+		name  string
+		steps []runnerStep
+		err   error
+	}{
+		{name: "extension canceled", err: &SafeError{Code: CodeCanceled, Message: "Git command was canceled"}},
+		{name: "extension unavailable", err: &SafeError{Code: CodeUnavailable, Message: "Git executable is unavailable"}},
+		{name: "extension unexpected exit", err: exitError(2)},
+	}
+	for index := range tests {
+		tests[index].steps = []runnerStep{{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: tests[index].err}}
+	}
+	remoteErrors := []struct {
+		name string
+		err  error
+	}{
+		{name: "remote canceled", err: &SafeError{Code: CodeCanceled, Message: "Git command was canceled"}},
+		{name: "remote unavailable", err: &SafeError{Code: CodeUnavailable, Message: "Git executable is unavailable"}},
+		{name: "remote unexpected exit", err: exitError(2)},
+	}
+	for _, remoteError := range remoteErrors {
+		tests = append(tests, struct {
+			name  string
+			steps []runnerStep
+			err   error
+		}{
+			name: remoteError.name,
+			steps: []runnerStep{
+				{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+				{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), err: remoteError.err},
+			},
+			err: remoteError.err,
+		})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &porcelainRunnerFake{t: t, steps: test.steps}
+			_, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
+			if err != test.err {
+				t.Fatalf("HistoryRelation() error = %#v, want unchanged %#v", err, test.err)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientHistoryRelationRejectsMalformedPartialRepositoryConfig(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	tests := []struct {
+		name  string
+		steps []runnerStep
+	}{
+		{name: "extension multiple lines", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), result: Result{Stdout: "origin\nbackup\n"}},
+		}},
+		{name: "extension truncated", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), result: Result{Stdout: "origin", StdoutTruncated: true}},
+		}},
+		{name: "remote empty success", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`)},
+		}},
+		{name: "remote missing value", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor\n"}},
+		}},
+		{name: "remote invalid boolean", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor maybe\n"}},
+		}},
+		{name: "remote control separator", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor\tfalse\n"}},
+		}},
+		{name: "remote malformed extra line", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor false\n\n"}},
+		}},
+		{name: "remote malformed after true", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor true\nmalformed\n"}},
+		}},
+		{name: "remote truncated", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor true", StdoutTruncated: true}},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &porcelainRunnerFake{t: t, steps: test.steps}
+			if _, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid); err == nil {
+				t.Fatal("HistoryRelation() error = nil, want malformed config error")
 			}
 			runner.assertDone()
 		})
@@ -611,12 +793,13 @@ func TestClientHistoryRelationRejectsInvalidShallowInspection(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+			steps := append(completeRepositoryInspectionSteps(dir), []runnerStep{
 				{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 				{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(1)},
 				{want: readCommand(dir, "merge-base", "HEAD", oid), err: exitError(1)},
 				{want: readCommand(dir, "rev-parse", "--is-shallow-repository"), result: test.result},
-			}}
+			}...)
+			runner := &porcelainRunnerFake{t: t, steps: steps}
 			if _, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid); err == nil {
 				t.Fatal("HistoryRelation() error = nil, want invalid shallow output error")
 			}
@@ -640,9 +823,10 @@ func TestClientHistoryRelationPropagatesNonMissingCatFileFailures(t *testing.T) 
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{{
+			steps := append(completeRepositoryInspectionSteps(dir), runnerStep{
 				want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: test.err,
-			}}}
+			})
+			runner := &porcelainRunnerFake{t: t, steps: steps}
 			_, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
 			if err != test.err {
 				t.Fatalf("HistoryRelation() error = %#v, want unchanged %#v", err, test.err)
@@ -675,10 +859,11 @@ func TestClientHistoryRelationRecognizesRealMissingObject(t *testing.T) {
 func TestClientHistoryRelationPropagatesUnexpectedExit(t *testing.T) {
 	dir := t.TempDir()
 	oid := strings.Repeat("a", 40)
-	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+	steps := append(completeRepositoryInspectionSteps(dir), []runnerStep{
 		{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 		{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(2)},
-	}}
+	}...)
+	runner := &porcelainRunnerFake{t: t, steps: steps}
 	if _, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid); err == nil {
 		t.Fatal("HistoryRelation() error = nil, want unexpected Git failure")
 	}
@@ -739,7 +924,8 @@ func TestClientRejectsTruncatedOutput(t *testing.T) {
 	t.Run("history", func(t *testing.T) {
 		dir := t.TempDir()
 		oid := strings.Repeat("a", 40)
-		runner := &porcelainRunnerFake{t: t, steps: []runnerStep{{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), result: Result{StdoutTruncated: true}}}}
+		steps := append(completeRepositoryInspectionSteps(dir), runnerStep{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), result: Result{StdoutTruncated: true}})
+		runner := &porcelainRunnerFake{t: t, steps: steps}
 		_, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
 		assertTruncated(t, err)
 	})

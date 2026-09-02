@@ -342,7 +342,14 @@ func (c *Client) HistoryRelation(ctx context.Context, dir, remoteOID string) (st
 	if !validObjectID(remoteOID) {
 		return "", malformedOutputError()
 	}
-	_, err := c.run(ctx, readOnlyCommand(dir, "cat-file", "-e", remoteOID+"^{commit}"))
+	partial, err := c.partialRepository(ctx, dir)
+	if err != nil {
+		return "", err
+	}
+	if partial {
+		return "unknown", nil
+	}
+	_, err = c.run(ctx, readOnlyCommand(dir, "cat-file", "-e", remoteOID+"^{commit}"))
 	if err != nil {
 		if expectedExit(err, 128) {
 			return "unknown", nil
@@ -380,6 +387,60 @@ func (c *Client) HistoryRelation(ctx context.Context, dir, remoteOID string) (st
 		return "", malformedOutputError()
 	}
 	return "shared", nil
+}
+
+func (c *Client) partialRepository(ctx context.Context, dir string) (bool, error) {
+	extension, err := c.run(ctx, readOnlyCommand(dir, "config", "--get", "extensions.partialClone"))
+	if err != nil {
+		if !expectedExit(err, 1) {
+			return false, err
+		}
+	} else {
+		value := singleLine(extension.Stdout)
+		if containsControlOutputByte(value) {
+			return false, malformedOutputError()
+		}
+		if value != "" {
+			return true, nil
+		}
+	}
+
+	promisors, err := c.run(ctx, readOnlyCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`))
+	if err != nil {
+		if expectedExit(err, 1) {
+			return false, nil
+		}
+		return false, err
+	}
+	output := singleLine(promisors.Stdout)
+	if output == "" {
+		return false, malformedOutputError()
+	}
+	partial := false
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if containsControlOutputByte(line) || len(fields) != 2 || !strings.HasPrefix(fields[0], "remote.") ||
+			!strings.HasSuffix(fields[0], ".promisor") || len(fields[0]) == len("remote..promisor") {
+			return false, malformedOutputError()
+		}
+		switch fields[1] {
+		case "true":
+			partial = true
+		case "false":
+		default:
+			return false, malformedOutputError()
+		}
+	}
+	return partial, nil
+}
+
+func containsControlOutputByte(value string) bool {
+	for index := range len(value) {
+		if value[index] < ' ' || value[index] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) run(ctx context.Context, command Command) (Result, error) {
