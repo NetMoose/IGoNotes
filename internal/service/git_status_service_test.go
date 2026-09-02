@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"IGoNotes/internal/model"
 )
 
 type staticSettingsSnapshot struct{ config model.Config }
 
-func (s staticSettingsSnapshot) GetConfig() model.Config { return cloneConfig(s.config) }
+func (s staticSettingsSnapshot) ReadConfigSnapshot(read func(model.Config) error) error {
+	return read(cloneConfig(s.config))
+}
 
 type fakeGitStatusReader struct {
 	statuses map[string]model.GitStatus
@@ -19,6 +23,54 @@ type fakeGitStatusReader struct {
 	listErr  error
 	gets     []string
 	lists    int
+}
+
+type blockingGitStatusStore struct {
+	mu                sync.Mutex
+	statuses          map[string]model.GitStatus
+	listCalls         int
+	firstListStarted  chan struct{}
+	secondListStarted chan struct{}
+	releaseFirstList  <-chan struct{}
+}
+
+func (s *blockingGitStatusStore) Get(_ context.Context, path string) (model.GitStatus, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status, ok := s.statuses[path]
+	return cloneGitStatusForTest(status), ok, nil
+}
+
+func (s *blockingGitStatusStore) List(_ context.Context) ([]model.GitStatus, error) {
+	s.mu.Lock()
+	s.listCalls++
+	call := s.listCalls
+	result := make([]model.GitStatus, 0, len(s.statuses))
+	for _, status := range s.statuses {
+		result = append(result, cloneGitStatusForTest(status))
+	}
+	s.mu.Unlock()
+	if call == 1 {
+		close(s.firstListStarted)
+		<-s.releaseFirstList
+	} else if call == 2 {
+		close(s.secondListStarted)
+	}
+	return result, nil
+}
+
+func (s *blockingGitStatusStore) Upsert(_ context.Context, status model.GitStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statuses[status.RepositoryPath] = cloneGitStatusForTest(status)
+	return nil
+}
+
+func (s *blockingGitStatusStore) Delete(_ context.Context, path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.statuses, path)
+	return nil
 }
 
 func (f *fakeGitStatusReader) Get(_ context.Context, path string) (model.GitStatus, bool, error) {
@@ -110,5 +162,76 @@ func TestGitStatusServiceForwardsReaderErrors(t *testing.T) {
 	service := NewGitStatusService(staticSettingsSnapshot{config}, &fakeGitStatusReader{listErr: wantErr})
 	if _, err := service.Status(context.Background(), ""); !errors.Is(err, wantErr) {
 		t.Fatalf("Status() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestGitStatusServiceSerializesConfigAndStatusGeneration(t *testing.T) {
+	path := t.TempDir()
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "old", Path: path, GitURL: "work.git", GitBranch: "main"}},
+		CurrentBase:    "old",
+		SetupCompleted: &completed,
+	}
+	release := make(chan struct{})
+	statuses := &blockingGitStatusStore{
+		statuses: map[string]model.GitStatus{
+			path: {Base: "old", RepositoryPath: path, State: model.GitStateReady, ChangedPaths: []string{"old.md"}},
+		},
+		firstListStarted:  make(chan struct{}),
+		secondListStarted: make(chan struct{}),
+		releaseFirstList:  release,
+	}
+	settings, err := NewSettingsServiceWithGit(
+		&fakeConfigStore{config: &config},
+		&fakeBaseRuntime{path: path},
+		"",
+		nil,
+		nil,
+		statuses,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewGitStatusService(settings, statuses)
+	readDone := make(chan struct{})
+	var first model.GitStatusResponse
+	var readErr error
+	go func() {
+		first, readErr = service.Status(context.Background(), "")
+		close(readDone)
+	}()
+	<-statuses.firstListStarted
+
+	mutationDone := make(chan error, 1)
+	go func() {
+		_, err := settings.UpdateBase("old", model.BaseUpdateRequest{Name: "new", Path: path})
+		mutationDone <- err
+	}()
+	select {
+	case <-statuses.secondListStarted:
+		close(release)
+		<-readDone
+		<-mutationDone
+		t.Fatal("rename reached status persistence while aggregation callback was blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-readDone
+	if readErr != nil {
+		t.Fatalf("first Status() error = %v", readErr)
+	}
+	if len(first.Statuses) != 1 || first.Statuses[0].Base != "old" || !reflect.DeepEqual(first.Statuses[0].ChangedPaths, []string{"old.md"}) {
+		t.Fatalf("first Status() = %#v, want coherent old generation", first)
+	}
+	if err := <-mutationDone; err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	second, err := service.Status(context.Background(), "")
+	if err != nil {
+		t.Fatalf("second Status() error = %v", err)
+	}
+	if len(second.Statuses) != 1 || second.Statuses[0].Base != "new" || !reflect.DeepEqual(second.Statuses[0].ChangedPaths, []string{"old.md"}) {
+		t.Fatalf("second Status() = %#v, want coherent new generation", second)
 	}
 }

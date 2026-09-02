@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"IGoNotes/internal/model"
 )
@@ -143,6 +144,12 @@ func (s *SettingsService) GetConfig() model.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return cloneConfig(s.config)
+}
+
+func (s *SettingsService) ReadConfigSnapshot(read func(model.Config) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return read(cloneConfig(s.config))
 }
 
 func (s *SettingsService) SetupCompleted() bool {
@@ -332,24 +339,6 @@ func (s *SettingsService) applyConfigWithGitStatusesLocked(
 	return nil
 }
 
-func (s *SettingsService) applyGitOnlyConfigWithStatusesLocked(
-	ctx context.Context,
-	next model.Config,
-	changes []gitStatusChange,
-) error {
-	for index := range changes {
-		if err := s.writeGitStatusChange(ctx, changes[index]); err != nil {
-			return s.restoreGitStatusesLocked(ctx, changes, fmt.Errorf("update Git status: %w", err))
-		}
-	}
-	config := cloneConfig(next)
-	if err := s.store.Save(&config); err != nil {
-		return s.restoreGitStatusesLocked(ctx, changes, fmt.Errorf("save settings: %w", err))
-	}
-	s.config = cloneConfig(next)
-	return nil
-}
-
 func (s *SettingsService) writeGitStatusChange(ctx context.Context, change gitStatusChange) error {
 	if change.after == nil {
 		return s.gitStatuses.Delete(ctx, change.path)
@@ -359,14 +348,20 @@ func (s *SettingsService) writeGitStatusChange(ctx context.Context, change gitSt
 
 func (s *SettingsService) restoreGitStatusesLocked(ctx context.Context, changes []gitStatusChange, operationErr error) error {
 	var restoreErr error
+	originalCtx := ctx
+	if originalCtx == nil {
+		originalCtx = context.Background()
+	}
 	for index := len(changes) - 1; index >= 0; index-- {
 		change := changes[index]
+		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(originalCtx), 5*time.Second)
 		var err error
 		if change.exists {
-			err = s.gitStatuses.Upsert(ctx, cloneGitStatus(change.before))
+			err = s.gitStatuses.Upsert(restoreCtx, cloneGitStatus(change.before))
 		} else {
-			err = s.gitStatuses.Delete(ctx, change.path)
+			err = s.gitStatuses.Delete(restoreCtx, change.path)
 		}
+		cancel()
 		if err != nil {
 			restoreErr = errors.Join(restoreErr, err)
 		}
@@ -418,6 +413,24 @@ func canonicalGitStatusPath(path string) (string, error) {
 
 func storedGitStatusPath(path string) string {
 	return filepath.Clean(path)
+}
+
+func validateUniqueGitRepositoryPaths(bases []model.Base) error {
+	paths := make(map[string]struct{})
+	for _, base := range bases {
+		if !base.GitConfigured() {
+			continue
+		}
+		path, err := canonicalGitStatusPath(base.Path)
+		if err != nil {
+			return err
+		}
+		if _, exists := paths[path]; exists {
+			return ErrGitRepositoryInUse
+		}
+		paths[path] = struct{}{}
+	}
+	return nil
 }
 
 func (s *SettingsService) existingGitStatusPath(ctx context.Context, base model.Base) (string, error) {
@@ -491,19 +504,6 @@ func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request
 	if !validLiteralGitBranch(normalized.GitBranch) {
 		return model.GitConfigResponse{}, fieldError(ErrInvalidGitBranch, "git_branch", "Git branch is required and must be a literal branch name")
 	}
-	for otherIndex := range s.config.Bases {
-		if otherIndex == index || !s.config.Bases[otherIndex].GitConfigured() {
-			continue
-		}
-		otherPath, pathErr := canonicalGitStatusPath(s.config.Bases[otherIndex].Path)
-		if pathErr != nil {
-			return model.GitConfigResponse{}, pathErr
-		}
-		if otherPath == path {
-			return model.GitConfigResponse{}, ErrGitRepositoryInUse
-		}
-	}
-
 	next := cloneConfig(s.config)
 	base := &next.Bases[index]
 	base.GitURL = normalized.GitURL
@@ -511,6 +511,9 @@ func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request
 	base.AutoSync = normalized.AutoSync
 	base.AutoSyncIntervalMinutes = normalized.AutoSyncIntervalMinutes
 	base.GitCommitMessageTemplate = normalized.GitCommitMessageTemplate
+	if err := validateUniqueGitRepositoryPaths(next.Bases); err != nil {
+		return model.GitConfigResponse{}, err
+	}
 	status := needsReconnectGitStatus(base.Name, path)
 	changes, err := s.prepareGitStatusChanges(ctx, path)
 	if err != nil {
@@ -552,7 +555,7 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 	if err != nil {
 		return model.GitConfigResponse{}, err
 	}
-	if err := s.applyGitOnlyConfigWithStatusesLocked(ctx, next, changes); err != nil {
+	if err := s.applyConfigWithGitStatusesLocked(ctx, next, "", changes); err != nil {
 		return model.GitConfigResponse{}, err
 	}
 	return model.GitConfigResponse{Base: next.Bases[index], Status: unconfiguredGitStatus(base.Name, path)}, nil
@@ -656,6 +659,11 @@ func (s *SettingsService) UpdateBase(oldName string, request model.BaseUpdateReq
 	next := cloneConfig(s.config)
 	next.Bases[index].Name = name
 	next.Bases[index].Path = path
+	if next.Bases[index].GitConfigured() {
+		if err := validateUniqueGitRepositoryPaths(next.Bases); err != nil {
+			return model.SettingsResponse{}, err
+		}
+	}
 	targetPath := ""
 	if s.config.CurrentBase == oldName {
 		next.CurrentBase = name
@@ -735,6 +743,9 @@ func (s *SettingsService) ReplaceConfig(input model.Config) (model.SettingsRespo
 	}
 	matches, err := protectReplaceConfigGitFields(s.config, next)
 	if err != nil {
+		return model.SettingsResponse{}, err
+	}
+	if err := validateUniqueGitRepositoryPaths(next.Bases); err != nil {
 		return model.SettingsResponse{}, err
 	}
 	changes, err := s.prepareReplaceConfigGitStatuses(context.Background(), s.config, next, matches)

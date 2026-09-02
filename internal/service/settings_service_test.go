@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"IGoNotes/internal/model"
 )
@@ -68,6 +69,8 @@ type fakeBaseRuntime struct {
 	matchErr         error
 	events           *orderedEvents
 	commitErr        error
+	persistStarted   chan struct{}
+	persistRelease   <-chan struct{}
 }
 
 func (f *fakeBaseRuntime) GetBasePath() string {
@@ -107,6 +110,12 @@ func (f *fakeBaseRuntime) baseMatches(expectedPath string) (bool, error) {
 
 func (f *fakeBaseRuntime) persistConfig(expectedPath string, store ConfigStore, next *model.Config) (bool, error) {
 	f.persistCalls++
+	if f.persistStarted != nil {
+		close(f.persistStarted)
+	}
+	if f.persistRelease != nil {
+		<-f.persistRelease
+	}
 	if f.persistErr != nil {
 		return false, f.persistErr
 	}
@@ -209,6 +218,8 @@ type fakeGitStatusStore struct {
 	listErr     error
 	upsertErrs  []error
 	deleteErrs  []error
+	upsertHook  func(context.Context, model.GitStatus) error
+	deleteHook  func(context.Context, string) error
 }
 
 type exactGitStatusStore struct {
@@ -258,8 +269,13 @@ func (f *fakeGitStatusStore) List(_ context.Context) ([]model.GitStatus, error) 
 	return statuses, nil
 }
 
-func (f *fakeGitStatusStore) Upsert(_ context.Context, status model.GitStatus) error {
+func (f *fakeGitStatusStore) Upsert(ctx context.Context, status model.GitStatus) error {
 	f.upsertCalls = append(f.upsertCalls, cloneGitStatusForTest(status))
+	if f.upsertHook != nil {
+		if err := f.upsertHook(ctx, status); err != nil {
+			return err
+		}
+	}
 	if err := popFakeError(&f.upsertErrs); err != nil {
 		return err
 	}
@@ -270,8 +286,13 @@ func (f *fakeGitStatusStore) Upsert(_ context.Context, status model.GitStatus) e
 	return nil
 }
 
-func (f *fakeGitStatusStore) Delete(_ context.Context, path string) error {
+func (f *fakeGitStatusStore) Delete(ctx context.Context, path string) error {
 	f.deleteCalls = append(f.deleteCalls, path)
+	if f.deleteHook != nil {
+		if err := f.deleteHook(ctx, path); err != nil {
+			return err
+		}
+	}
 	if err := popFakeError(&f.deleteErrs); err != nil {
 		return err
 	}
@@ -2250,16 +2271,17 @@ func TestSettingsServiceDisableGitClearsOnlyGitFieldsAndDeletesStatus(t *testing
 }
 
 func TestSettingsServiceDisableGitAfterRepositoryPathDisappears(t *testing.T) {
+	activePath := t.TempDir()
 	target := t.TempDir()
 	link := filepath.Join(t.TempDir(), "base-link")
 	createSymlinkOrSkip(t, target, link)
 	completed := true
 	config := model.Config{
-		Bases:       []model.Base{{Name: "work", Path: link}},
-		CurrentBase: "work", SetupCompleted: &completed,
+		Bases:       []model.Base{{Name: "active", Path: activePath}, {Name: "work", Path: link}},
+		CurrentBase: "active", SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config}
-	runtime := &fakeBaseRuntime{path: link}
+	runtime := &fakeBaseRuntime{path: activePath}
 	statuses := &fakeGitStatusStore{statuses: make(map[string]model.GitStatus)}
 	validator := &fakeGitConfigValidator{}
 	service, err := NewSettingsServiceWithGit(store, runtime, "", nil, validator, statuses)
@@ -2292,8 +2314,66 @@ func TestSettingsServiceDisableGitAfterRepositoryPathDisappears(t *testing.T) {
 	if _, orphaned := statuses.statuses[filepath.Clean(link)]; orphaned || statuses.listCalls != 1 {
 		t.Fatalf("lexical orphan/list calls = %t/%d", orphaned, statuses.listCalls)
 	}
-	if runtime.persistCalls != persistCalls || runtime.pathCalls != pathCalls || len(runtime.transactionCalls) != 0 {
-		t.Fatalf("DisableGit runtime calls = persists %d/%d paths %d/%d transactions %v", runtime.persistCalls, persistCalls, runtime.pathCalls, pathCalls, runtime.transactionCalls)
+	if runtime.persistCalls != persistCalls+1 || runtime.pathCalls != pathCalls || len(runtime.transactionCalls) != 0 {
+		t.Fatalf("DisableGit runtime calls = persists %d/%d+1 paths %d/%d transactions %v", runtime.persistCalls, persistCalls, runtime.pathCalls, pathCalls, runtime.transactionCalls)
+	}
+}
+
+func TestSettingsServiceDisableGitWaitsForRuntimePersistence(t *testing.T) {
+	path := t.TempDir()
+	config := configuredGitTestConfig(path, t.TempDir())
+	service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, path)
+	statuses.statuses[path] = model.GitStatus{Base: "active", RepositoryPath: path, State: model.GitStateReady, ChangedPaths: []string{}}
+	release := make(chan struct{})
+	runtime.persistStarted = make(chan struct{})
+	runtime.persistRelease = release
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.DisableGit(context.Background(), "active")
+		done <- err
+	}()
+
+	select {
+	case <-runtime.persistStarted:
+	case err := <-done:
+		t.Fatalf("DisableGit() bypassed runtime persistence with error %v", err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("DisableGit() did not enter runtime persistence")
+	}
+	if store.saveCalls != 0 {
+		t.Fatalf("ConfigStore.Save calls while runtime blocked = %d, want 0", store.saveCalls)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("DisableGit() returned while runtime persistence was blocked: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("DisableGit() error = %v", err)
+	}
+	if runtime.persistCalls != 1 || store.saveCalls != 1 {
+		t.Fatalf("DisableGit persistence calls = runtime %d store %d, want 1/1", runtime.persistCalls, store.saveCalls)
+	}
+}
+
+func TestSettingsServiceDisableGitRuntimeFailureRestoresStatusWithoutDirectSave(t *testing.T) {
+	path := t.TempDir()
+	config := configuredGitTestConfig(path, t.TempDir())
+	service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, path)
+	before := model.GitStatus{Base: "active", RepositoryPath: path, State: model.GitStateReady, ChangedPaths: []string{"note.md"}}
+	statuses.statuses[path] = before
+	runtime.persistErr = errors.New("runtime persistence failed")
+
+	_, err := service.DisableGit(context.Background(), "active")
+	if !errors.Is(err, runtime.persistErr) {
+		t.Fatalf("DisableGit() error = %v, want %v", err, runtime.persistErr)
+	}
+	if !reflect.DeepEqual(statuses.statuses[path], before) || !reflect.DeepEqual(service.GetConfig(), config) {
+		t.Fatalf("runtime failure state = status %#v config %#v", statuses.statuses[path], service.GetConfig())
+	}
+	if runtime.persistCalls != 1 || store.saveCalls != 0 {
+		t.Fatalf("runtime failure persistence calls = runtime %d store %d, want 1/0", runtime.persistCalls, store.saveCalls)
 	}
 }
 
@@ -2388,6 +2468,83 @@ func TestSettingsServiceReplaceConfigGitMatchingRules(t *testing.T) {
 		}
 		assertFieldError(t, err, "bases[1].git_url")
 	})
+}
+
+func TestSettingsServiceRejectsConfiguredPathConvergenceBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure bool
+		call      func(*SettingsService, *fakeGitConfigValidator, string) error
+	}{
+		{name: "configure", configure: false, call: func(service *SettingsService, validator *fakeGitConfigValidator, alias string) error {
+			normalized := model.GitConfigRequest{GitURL: "other.git", GitBranch: "different"}
+			validator.normalized = &normalized
+			_, err := service.ConfigureGit(context.Background(), "other", normalized)
+			return err
+		}},
+		{name: "update", configure: true, call: func(service *SettingsService, _ *fakeGitConfigValidator, alias string) error {
+			_, err := service.UpdateBase("other", model.BaseUpdateRequest{Name: "other", Path: alias})
+			return err
+		}},
+		{name: "replace", configure: true, call: func(service *SettingsService, _ *fakeGitConfigValidator, alias string) error {
+			input := service.GetConfig()
+			input.Bases[1].Path = alias
+			_, err := service.ReplaceConfig(input)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			activePath, otherPath := t.TempDir(), t.TempDir()
+			alias := filepath.Join(t.TempDir(), "active-alias")
+			createSymlinkOrSkip(t, activePath, alias)
+			config := configuredGitTestConfig(activePath, otherPath)
+			if test.configure {
+				setConfiguredGit(&config.Bases[1])
+				config.Bases[1].GitURL = "different.git"
+				config.Bases[1].GitBranch = "different"
+			} else {
+				config.Bases[1].Path = alias
+			}
+			service, store, runtime, validator, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+			beforeConfig := service.GetConfig()
+			beforePathCalls := runtime.pathCalls
+
+			err := test.call(service, validator, alias)
+			if !errors.Is(err, ErrGitRepositoryInUse) {
+				t.Fatalf("mutation error = %v, want ErrGitRepositoryInUse", err)
+			}
+			if !reflect.DeepEqual(service.GetConfig(), beforeConfig) || store.saveCalls != 0 {
+				t.Fatalf("rejected convergence changed config: service %#v saves %d", service.GetConfig(), store.saveCalls)
+			}
+			if statuses.listCalls != 0 || len(statuses.getCalls) != 0 || len(statuses.upsertCalls) != 0 || len(statuses.deleteCalls) != 0 {
+				t.Fatalf("rejected convergence status calls = list %d get %v upsert %v delete %v", statuses.listCalls, statuses.getCalls, statuses.upsertCalls, statuses.deleteCalls)
+			}
+			if runtime.pathCalls != beforePathCalls || runtime.persistCalls != 0 || len(runtime.transactionCalls) != 0 {
+				t.Fatalf("rejected convergence runtime calls = paths %d/%d persists %d transactions %v", runtime.pathCalls, beforePathCalls, runtime.persistCalls, runtime.transactionCalls)
+			}
+		})
+	}
+}
+
+func TestSettingsServiceAllowsNonGitDuplicateCanonicalPaths(t *testing.T) {
+	path := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "base-alias")
+	createSymlinkOrSkip(t, path, alias)
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: path}, {Name: "other", Path: t.TempDir()}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	service, _, _, _, _ := newGitSettingsServiceForConfig(t, config, path)
+
+	response, err := service.UpdateBase("other", model.BaseUpdateRequest{Name: "other", Path: alias})
+	if err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	if response.Config.Bases[1].Path != path {
+		t.Fatalf("other path = %q, want %q", response.Config.Bases[1].Path, path)
+	}
 }
 
 func TestSettingsServiceGitStatusReconciliation(t *testing.T) {
@@ -2724,6 +2881,72 @@ func TestSettingsServiceGitStatusFailuresCompensateBeforeImages(t *testing.T) {
 	})
 }
 
+func TestSettingsServiceGitStatusCompensationSurvivesRequestCancellation(t *testing.T) {
+	oldPath, newPath := t.TempDir(), t.TempDir()
+	config := configuredGitTestConfig(oldPath, t.TempDir())
+	service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, oldPath)
+	before := map[string]model.GitStatus{
+		oldPath: {Base: "active", RepositoryPath: oldPath, State: model.GitStateReady, ChangedPaths: []string{"old.md"}},
+	}
+	statuses.statuses = cloneGitStatusesForTest(before)
+	ctx, cancel := context.WithCancel(context.Background())
+	restoreContextErrs := make([]error, 0, 2)
+	canceled := false
+	statuses.deleteHook = func(writeCtx context.Context, path string) error {
+		if path == oldPath && !canceled {
+			canceled = true
+			cancel()
+			return nil
+		}
+		restoreContextErrs = append(restoreContextErrs, writeCtx.Err())
+		return writeCtx.Err()
+	}
+	statuses.upsertHook = func(writeCtx context.Context, status model.GitStatus) error {
+		if status.RepositoryPath == newPath {
+			return writeCtx.Err()
+		}
+		restoreContextErrs = append(restoreContextErrs, writeCtx.Err())
+		return writeCtx.Err()
+	}
+
+	changes, err := service.prepareUpdateBaseGitStatuses(ctx, config.Bases[0], model.Base{
+		Name:      "active",
+		Path:      newPath,
+		GitURL:    config.Bases[0].GitURL,
+		GitBranch: config.Bases[0].GitBranch,
+	})
+	if err != nil {
+		t.Fatalf("prepareUpdateBaseGitStatuses() error = %v", err)
+	}
+	next := cloneConfig(config)
+	next.Bases[0].Path = newPath
+	err = service.applyConfigWithGitStatusesLocked(ctx, next, newPath, changes)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("applyConfigWithGitStatusesLocked() error = %v, want context cancellation", err)
+	}
+	if service.degraded != nil {
+		t.Fatalf("service degraded = %v", service.degraded)
+	}
+	if !reflect.DeepEqual(restoreContextErrs, []error{nil, nil}) {
+		t.Fatalf("restore context errors = %v, want live contexts", restoreContextErrs)
+	}
+	assertGitMutationRollback(t, service, store, runtime, statuses, config, before, oldPath, 0, 0, 0)
+}
+
+func TestSettingsServiceGitStatusCompensationAcceptsNilContext(t *testing.T) {
+	service, _, _, _, statuses, _ := newGitSettingsService(t)
+	path := t.TempDir()
+	operationErr := errors.New("operation failed")
+
+	err := service.restoreGitStatusesLocked(nil, []gitStatusChange{{path: path}}, operationErr)
+	if !errors.Is(err, operationErr) {
+		t.Fatalf("restoreGitStatusesLocked() error = %v, want %v", err, operationErr)
+	}
+	if !reflect.DeepEqual(statuses.deleteCalls, []string{path}) {
+		t.Fatalf("Delete calls = %v, want %q", statuses.deleteCalls, path)
+	}
+}
+
 func TestSettingsServiceGitCompensationAcrossMutators(t *testing.T) {
 	t.Run("partial configured move failure restores every status before runtime", func(t *testing.T) {
 		oldPath, newPath := t.TempDir(), t.TempDir()
@@ -2756,7 +2979,7 @@ func TestSettingsServiceGitCompensationAcrossMutators(t *testing.T) {
 		if !errors.Is(err, store.saveErr) {
 			t.Fatalf("DisableGit() error = %v, want %v", err, store.saveErr)
 		}
-		assertGitMutationRollback(t, service, store, runtime, statuses, config, before, path, 1, 0, 0)
+		assertGitMutationRollback(t, service, store, runtime, statuses, config, before, path, 1, 1, 0)
 	})
 
 	t.Run("same path rename save failure restores complete status", func(t *testing.T) {

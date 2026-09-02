@@ -85,7 +85,10 @@ func (s *SettingsService) ConfigureGit(context.Context, string, model.GitConfigR
 func (s *SettingsService) DisableGit(context.Context, string) (model.GitConfigResponse, error)
 
 // internal/service/git_status_service.go
-func NewGitStatusService(SettingsSnapshot, GitStatusReader) *GitStatusService
+type GitStatusSettingsSnapshot interface {
+	ReadConfigSnapshot(func(model.Config) error) error
+}
+func NewGitStatusService(GitStatusSettingsSnapshot, GitStatusReader) *GitStatusService
 func (s *GitStatusService) Status(context.Context, string) (model.GitStatusResponse, error)
 ```
 
@@ -1267,7 +1270,7 @@ Extend `SettingsService` with `gitValidator` and `gitStatuses`. Keep `NewSetting
 
 - [ ] **Step 4: Implement status compensation**
 
-Snapshot affected status paths before mutation. For an existing base, resolve canonical before-images from the complete status snapshot by exact `Base` before considering a lexical-path row: multiple exact-name rows are ambiguous, one supplies its persisted `RepositoryPath`, and only zero permits lexical `Get` for stale-row cleanup. Apply status delete/upsert before config persistence. If `applyConfigLocked` fails, restore every snapshot. If restoration fails, latch `ErrRollbackFailed` in `s.degraded`, join operation and rollback errors, and log only safe error values. Nil Git dependencies leave existing non-Git base operations unchanged.
+Snapshot affected status paths before mutation. For an existing base, resolve canonical before-images from the complete status snapshot by exact `Base` before considering a lexical-path row: multiple exact-name rows are ambiguous, one supplies its persisted `RepositoryPath`, and only zero permits lexical `Get` for stale-row cleanup. Apply status delete/upsert before config persistence. If a forward write or `applyConfigLocked` fails, restore every snapshot in reverse order; each reverse write uses `context.WithTimeout(context.WithoutCancel(originalCtx), 5*time.Second)` with its own cancel, falling back to `context.Background()` for a nil original context. If restoration fails, latch `ErrRollbackFailed` in `s.degraded`, join operation and rollback errors, and log only safe error values. Nil Git dependencies leave existing non-Git base operations unchanged.
 
 - [ ] **Step 5: Implement `ConfigureGit`**
 
@@ -1293,7 +1296,7 @@ base.AutoSyncIntervalMinutes = 0
 base.GitCommitMessageTemplate = ""
 ```
 
-Delete persisted status with compensation, save config, return synthesized `unconfigured`, and never inspect/delete `.git` or user files.
+Delete persisted status with compensation, persist config through the standard `applyConfigLocked` runtime guard, return synthesized `unconfigured`, and never inspect/delete `.git` or user files. The guard locks and validates only the active runtime identity, including when disabling an inactive base; it must not inspect the disabled base path.
 
 - [ ] **Step 7: Protect dedicated fields from generic `ReplaceConfig`**
 
@@ -1315,16 +1318,20 @@ Update existing expectations around `settings_service_test.go:1580-1625` and `17
 Create:
 
 ```go
+type GitStatusSettingsSnapshot interface {
+	ReadConfigSnapshot(func(model.Config) error) error
+}
+
 type GitStatusService struct {
-	settings SettingsSnapshot
+	settings GitStatusSettingsSnapshot
 	statuses GitStatusReader
 }
 
-func NewGitStatusService(settings SettingsSnapshot, statuses GitStatusReader) *GitStatusService
+func NewGitStatusService(settings GitStatusSettingsSnapshot, statuses GitStatusReader) *GitStatusService
 func (s *GitStatusService) Status(context.Context, string) (model.GitStatusResponse, error)
 ```
 
-Return config-order statuses; optional exact-name filter returns `ErrBaseNotFound` when absent. Unconfigured bases synthesize `unconfigured` and ignore stale rows. Configured bases without a row synthesize `needs_reconnect`. Always return non-nil `ChangedPaths`. Never run Git.
+`SettingsService.ReadConfigSnapshot` holds `SettingsService.mu.RLock` for the entire callback and supplies a cloned config. Execute filtering and every status `Get`/`List` inside that callback so one response cannot mix config and status generations; the callback must not call `SettingsService`. Return config-order statuses; optional exact-name filter returns `ErrBaseNotFound` when absent. Unconfigured bases synthesize `unconfigured` and ignore stale rows. Configured bases without a row synthesize `needs_reconnect`. Always return non-nil `ChangedPaths`. Never run Git.
 
 - [ ] **Step 10: Run GREEN service tests**
 
