@@ -329,6 +329,24 @@ func (s *SettingsService) applyConfigWithGitStatusesLocked(
 	return nil
 }
 
+func (s *SettingsService) applyGitOnlyConfigWithStatusesLocked(
+	ctx context.Context,
+	next model.Config,
+	changes []gitStatusChange,
+) error {
+	for index := range changes {
+		if err := s.writeGitStatusChange(ctx, changes[index]); err != nil {
+			return s.restoreGitStatusesLocked(ctx, changes, fmt.Errorf("update Git status: %w", err))
+		}
+	}
+	config := cloneConfig(next)
+	if err := s.store.Save(&config); err != nil {
+		return s.restoreGitStatusesLocked(ctx, changes, fmt.Errorf("save settings: %w", err))
+	}
+	s.config = cloneConfig(next)
+	return nil
+}
+
 func (s *SettingsService) writeGitStatusChange(ctx context.Context, change gitStatusChange) error {
 	if change.after == nil {
 		return s.gitStatuses.Delete(ctx, change.path)
@@ -393,6 +411,10 @@ func canonicalGitStatusPath(path string) (string, error) {
 		return "", fmt.Errorf("resolve Git status path: %w", err)
 	}
 	return canonicalPath, nil
+}
+
+func storedGitStatusPath(path string) string {
+	return filepath.Clean(path)
 }
 
 func validLiteralGitBranch(branch string) bool {
@@ -485,10 +507,7 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 	if s.gitStatuses == nil {
 		return model.GitConfigResponse{}, fmt.Errorf("Git status dependency: %w", ErrInvalidConfig)
 	}
-	path, err := canonicalGitStatusPath(s.config.Bases[index].Path)
-	if err != nil {
-		return model.GitConfigResponse{}, err
-	}
+	path := storedGitStatusPath(s.config.Bases[index].Path)
 	next := cloneConfig(s.config)
 	base := &next.Bases[index]
 	base.GitURL = ""
@@ -500,7 +519,7 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 	if err != nil {
 		return model.GitConfigResponse{}, err
 	}
-	if err := s.applyConfigWithGitStatusesLocked(ctx, next, "", changes); err != nil {
+	if err := s.applyGitOnlyConfigWithStatusesLocked(ctx, next, changes); err != nil {
 		return model.GitConfigResponse{}, err
 	}
 	return model.GitConfigResponse{Base: next.Bases[index], Status: unconfiguredGitStatus(base.Name, path)}, nil
@@ -700,14 +719,8 @@ func (s *SettingsService) prepareUpdateBaseGitStatuses(ctx context.Context, curr
 	if s.gitStatuses == nil || current.Name == next.Name && current.Path == next.Path {
 		return nil, nil
 	}
-	oldPath, err := canonicalGitStatusPath(current.Path)
-	if err != nil {
-		return nil, err
-	}
-	newPath, err := canonicalGitStatusPath(next.Path)
-	if err != nil {
-		return nil, err
-	}
+	oldPath := storedGitStatusPath(current.Path)
+	newPath := storedGitStatusPath(next.Path)
 	if oldPath == newPath {
 		if current.Name == next.Name {
 			return nil, nil
@@ -744,11 +757,7 @@ func (s *SettingsService) prepareForgottenBaseGitStatus(ctx context.Context, bas
 	if s.gitStatuses == nil {
 		return nil, nil
 	}
-	path, err := canonicalGitStatusPath(base.Path)
-	if err != nil {
-		return nil, err
-	}
-	return s.prepareGitStatusChanges(ctx, path)
+	return s.prepareGitStatusChanges(ctx, storedGitStatusPath(base.Path))
 }
 
 func protectReplaceConfigGitFields(current, next model.Config) ([]int, error) {
@@ -841,14 +850,8 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 			continue
 		}
 		matchedCurrent[match] = struct{}{}
-		oldPath, err := canonicalGitStatusPath(current.Bases[match].Path)
-		if err != nil {
-			return nil, err
-		}
-		newPath, err := canonicalGitStatusPath(next.Bases[index].Path)
-		if err != nil {
-			return nil, err
-		}
+		oldPath := storedGitStatusPath(current.Bases[match].Path)
+		newPath := storedGitStatusPath(next.Bases[index].Path)
 		oldPaths[index], newPaths[index] = oldPath, newPath
 		if oldPath == newPath {
 			if current.Bases[match].Name != next.Bases[index].Name {
@@ -861,16 +864,13 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 			paths = append(paths, newPath)
 		}
 	}
-	removedPaths := make(map[int]string)
+	removedPaths := make([]string, 0)
 	for index := range current.Bases {
 		if _, ok := matchedCurrent[index]; ok {
 			continue
 		}
-		path, err := canonicalGitStatusPath(current.Bases[index].Path)
-		if err != nil {
-			return nil, err
-		}
-		removedPaths[index] = path
+		path := storedGitStatusPath(current.Bases[index].Path)
+		removedPaths = append(removedPaths, path)
 		paths = append(paths, path)
 	}
 	if len(paths) == 0 {
@@ -879,6 +879,9 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 	changes, err := s.prepareGitStatusChanges(ctx, paths...)
 	if err != nil {
 		return nil, err
+	}
+	for _, path := range removedPaths {
+		gitStatusChangeAt(changes, path).after = nil
 	}
 	for index, match := range matches {
 		if match < 0 || oldPaths[index] == "" {
@@ -897,9 +900,6 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 			status := needsReconnectGitStatus(next.Bases[index].Name, newPaths[index])
 			gitStatusChangeAt(changes, newPaths[index]).after = &status
 		}
-	}
-	for _, path := range removedPaths {
-		gitStatusChangeAt(changes, path).after = nil
 	}
 	return changes, nil
 }
