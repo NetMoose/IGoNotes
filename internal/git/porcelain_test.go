@@ -52,10 +52,14 @@ func exitError(code int) error {
 	return &SafeError{Code: CodeCommandFailed, Message: "Git command failed", ExitCode: code, diagnostic: "private git diagnostic"}
 }
 
+func partialRepositoryKeysCommand(dir string) Command {
+	return readCommand(dir, "config", "--name-only", "--get-regexp", `^remote\..*\.(promisor|partialclonefilter)$`)
+}
+
 func completeRepositoryInspectionSteps(dir string) []runnerStep {
 	return []runnerStep{
 		{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-		{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), err: exitError(1)},
+		{want: partialRepositoryKeysCommand(dir), err: exitError(1)},
 	}
 }
 
@@ -614,13 +618,20 @@ func TestClientHistoryRelationStopsForPartialRepository(t *testing.T) {
 		{name: "partial clone extension", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), result: Result{Stdout: "origin\n"}},
 		}},
+		{name: "empty partial clone extension", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone")},
+		}},
+		{name: "only remote.origin.partialCloneFilter=blob:none", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin.partialclonefilter\n"}},
+		}},
 		{name: "promisor remote", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor true\n"}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin.promisor\n"}},
 		}},
-		{name: "one true promisor remote", steps: []runnerStep{
+		{name: "multiple partial repository keys", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.backup.promisor false\nremote.origin.promisor true\n"}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.backup.promisor\nremote.Origin.partialclonefilter\n"}},
 		}},
 	}
 	for _, test := range tests {
@@ -641,39 +652,19 @@ func TestClientHistoryRelationStopsForPartialRepository(t *testing.T) {
 func TestClientHistoryRelationCompleteRepositoryReachesObjectInspection(t *testing.T) {
 	dir := t.TempDir()
 	oid := strings.Repeat("a", 40)
-	tests := []struct {
-		name           string
-		extension      runnerStep
-		remotePromisor runnerStep
-	}{
-		{
-			name:           "no config entries",
-			extension:      runnerStep{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			remotePromisor: runnerStep{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), err: exitError(1)},
-		},
-		{
-			name:           "empty extension and false promisors",
-			extension:      runnerStep{want: readCommand(dir, "config", "--get", "extensions.partialClone")},
-			remotePromisor: runnerStep{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor false\nremote.backup.promisor false\n"}},
-		},
+	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+		{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
+		{want: partialRepositoryKeysCommand(dir), err: exitError(1)},
+		{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: exitError(128)},
+	}}
+	got, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
+	if err != nil {
+		t.Fatalf("HistoryRelation() error = %v", err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
-				test.extension,
-				test.remotePromisor,
-				{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: exitError(128)},
-			}}
-			got, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
-			if err != nil {
-				t.Fatalf("HistoryRelation() error = %v", err)
-			}
-			if got != "unknown" {
-				t.Fatalf("HistoryRelation() = %q, want unknown for missing local object", got)
-			}
-			runner.assertDone()
-		})
+	if got != "unknown" {
+		t.Fatalf("HistoryRelation() = %q, want unknown for missing local object", got)
 	}
+	runner.assertDone()
 }
 
 func TestClientHistoryRelationPropagatesPartialRepositoryInspectionFailures(t *testing.T) {
@@ -708,7 +699,7 @@ func TestClientHistoryRelationPropagatesPartialRepositoryInspectionFailures(t *t
 			name: remoteError.name,
 			steps: []runnerStep{
 				{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-				{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), err: remoteError.err},
+				{want: partialRepositoryKeysCommand(dir), err: remoteError.err},
 			},
 			err: remoteError.err,
 		})
@@ -732,39 +723,36 @@ func TestClientHistoryRelationRejectsMalformedPartialRepositoryConfig(t *testing
 		name  string
 		steps []runnerStep
 	}{
-		{name: "extension multiple lines", steps: []runnerStep{
-			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), result: Result{Stdout: "origin\nbackup\n"}},
-		}},
 		{name: "extension truncated", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), result: Result{Stdout: "origin", StdoutTruncated: true}},
 		}},
 		{name: "remote empty success", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`)},
+			{want: partialRepositoryKeysCommand(dir)},
 		}},
-		{name: "remote missing value", steps: []runnerStep{
+		{name: "remote unexpected value output", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor\n"}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin.promisor false\n"}},
 		}},
-		{name: "remote invalid boolean", steps: []runnerStep{
+		{name: "remote unrelated key", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor maybe\n"}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin.url\n"}},
 		}},
 		{name: "remote control separator", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor\tfalse\n"}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin\t.promisor\n"}},
 		}},
 		{name: "remote malformed extra line", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor false\n\n"}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin.promisor\n\n"}},
 		}},
-		{name: "remote malformed after true", steps: []runnerStep{
+		{name: "remote malformed after valid key", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor true\nmalformed\n"}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin.promisor\nmalformed\n"}},
 		}},
 		{name: "remote truncated", steps: []runnerStep{
 			{want: readCommand(dir, "config", "--get", "extensions.partialClone"), err: exitError(1)},
-			{want: readCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`), result: Result{Stdout: "remote.origin.promisor true", StdoutTruncated: true}},
+			{want: partialRepositoryKeysCommand(dir), result: Result{Stdout: "remote.origin.promisor", StdoutTruncated: true}},
 		}},
 	}
 	for _, test := range tests {

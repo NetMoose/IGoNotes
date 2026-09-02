@@ -390,48 +390,44 @@ func (c *Client) HistoryRelation(ctx context.Context, dir, remoteOID string) (st
 }
 
 func (c *Client) partialRepository(ctx context.Context, dir string) (bool, error) {
-	extension, err := c.run(ctx, readOnlyCommand(dir, "config", "--get", "extensions.partialClone"))
+	_, err := c.run(ctx, readOnlyCommand(dir, "config", "--get", "extensions.partialClone"))
 	if err != nil {
 		if !expectedExit(err, 1) {
 			return false, err
 		}
 	} else {
-		value := singleLine(extension.Stdout)
-		if containsControlOutputByte(value) {
-			return false, malformedOutputError()
-		}
-		if value != "" {
-			return true, nil
-		}
+		return true, nil
 	}
 
-	promisors, err := c.run(ctx, readOnlyCommand(dir, "config", "--bool", "--get-regexp", `^remote\..*\.promisor$`))
+	partialKeys, err := c.run(ctx, readOnlyCommand(dir, "config", "--name-only", "--get-regexp", `^remote\..*\.(promisor|partialclonefilter)$`))
 	if err != nil {
 		if expectedExit(err, 1) {
 			return false, nil
 		}
 		return false, err
 	}
-	output := singleLine(promisors.Stdout)
+	output := singleLine(partialKeys.Stdout)
 	if output == "" {
 		return false, malformedOutputError()
 	}
-	partial := false
 	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		if containsControlOutputByte(line) || len(fields) != 2 || !strings.HasPrefix(fields[0], "remote.") ||
-			!strings.HasSuffix(fields[0], ".promisor") || len(fields[0]) == len("remote..promisor") {
-			return false, malformedOutputError()
-		}
-		switch fields[1] {
-		case "true":
-			partial = true
-		case "false":
-		default:
+		if containsControlOutputByte(line) || !validPartialRepositoryKey(line) {
 			return false, malformedOutputError()
 		}
 	}
-	return partial, nil
+	return true, nil
+}
+
+func validPartialRepositoryKey(key string) bool {
+	if !strings.HasPrefix(key, "remote.") {
+		return false
+	}
+	for _, suffix := range []string{".promisor", ".partialclonefilter"} {
+		if strings.HasSuffix(key, suffix) {
+			return len(key) > len("remote.")+len(suffix)
+		}
+	}
+	return false
 }
 
 func containsControlOutputByte(value string) bool {
