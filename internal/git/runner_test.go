@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+const helperTimeout = 10 * time.Second
+
 type helperObservation struct {
 	Args []string `json:"args"`
 	Env  []string `json:"env"`
@@ -87,7 +89,7 @@ func TestCommandRunnerPassesArgumentsWithoutShell(t *testing.T) {
 		gotArgs = append([]string(nil), args...)
 		return helperCommand(ctx, "success")
 	}
-	runner := newCommandRunner("git", time.Second, time.Second, 1024, factory)
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024, factory)
 	argument := `origin; touch /tmp/igonotes-must-not-exist`
 	commandArgs := []string{"remote", "get-url", argument}
 
@@ -126,13 +128,17 @@ func TestCommandRunnerReplacesEnvironment(t *testing.T) {
 				cmd.Env = []string{
 					"KEEP=value",
 					"GIT_TERMINAL_PROMPT=1", "GIT_TERMINAL_PROMPT=hostile",
+					"Git_Terminal_Prompt=mixed-hostile",
 					"LC_ALL=hostile", "LC_ALL=also-hostile",
+					"lc_All=mixed-hostile",
 					"GIT_ALLOW_PROTOCOL=ext:file", "GIT_ALLOW_PROTOCOL=ext:ssh",
+					"Git_Allow_Protocol=mixed-hostile",
 					"GIT_OPTIONAL_LOCKS=1", "GIT_OPTIONAL_LOCKS=hostile",
+					"git_optional_locks=mixed-hostile",
 				}
 				return cmd
 			}
-			runner := newCommandRunner("git", time.Second, time.Second, 16*1024, factory)
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, 16*1024, factory)
 
 			result, err := runner.Run(context.Background(), Command{
 				Dir: t.TempDir(), Args: []string{"status"}, ReadOnly: test.readOnly,
@@ -155,10 +161,10 @@ func TestCommandRunnerReplacesEnvironment(t *testing.T) {
 func assertEnvValues(t *testing.T, env []string, key string, want []string) {
 	t.Helper()
 	var got []string
-	prefix := key + "="
 	for _, entry := range env {
-		if strings.HasPrefix(entry, prefix) {
-			got = append(got, strings.TrimPrefix(entry, prefix))
+		entryKey, value, found := strings.Cut(entry, "=")
+		if found && strings.EqualFold(entryKey, key) {
+			got = append(got, value)
 		}
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -199,7 +205,7 @@ func TestCommandRunnerSelectsTimeoutByScope(t *testing.T) {
 }
 
 func TestCommandRunnerPreservesCancellation(t *testing.T) {
-	runner := newCommandRunner("git", time.Second, time.Second, 1024,
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
 		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return helperCommand(ctx, "wait")
 		})
@@ -220,7 +226,7 @@ func TestCommandRunnerPreservesCancellation(t *testing.T) {
 }
 
 func TestCommandRunnerPreservesDeadline(t *testing.T) {
-	runner := newCommandRunner("git", time.Second, time.Second, 1024,
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
 		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return helperCommand(ctx, "wait")
 		})
@@ -239,7 +245,7 @@ func TestCommandRunnerPreservesDeadline(t *testing.T) {
 
 func TestCommandRunnerBoundsOutputWhileConsumingWrites(t *testing.T) {
 	const limit = 32
-	runner := newCommandRunner("git", time.Second, time.Second, limit,
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
 		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return helperCommand(ctx, "output", "4096", "4096")
 		})
@@ -259,7 +265,7 @@ func TestCommandRunnerBoundsOutputWhileConsumingWrites(t *testing.T) {
 func TestCommandRunnerRedactsSuccessAndHTTPUserinfo(t *testing.T) {
 	const secret = "exact-token-value"
 	diagnostic := "token=" + secret + " fetch https://alice:password@example.com/repo.git"
-	runner := newCommandRunner("git", time.Second, time.Second, 1024,
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
 		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return helperCommand(ctx, "stderr", diagnostic)
 		})
@@ -282,7 +288,7 @@ func TestCommandRunnerRedactsBeforeDiagnosticTruncation(t *testing.T) {
 	const limit = 64
 	const secret = "qZ9-very-secret-token"
 	diagnostic := strings.Repeat("x", limit-2) + secret + "tail"
-	runner := newCommandRunner("git", time.Second, time.Second, limit,
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
 		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return helperCommand(ctx, "fail", diagnostic)
 		})
@@ -312,8 +318,60 @@ func TestCommandRunnerRedactsBeforeDiagnosticTruncation(t *testing.T) {
 	}
 }
 
+func TestCommandRunnerRedactsTruncatedHTTPUserinfo(t *testing.T) {
+	const limit = 32
+	const credentialPrefix = "https://userZQ:pa"
+	diagnostic := strings.Repeat("x", limit-len(credentialPrefix)) +
+		"https://userZQ:passXY@example.com/repository.git"
+	tests := []struct {
+		name   string
+		action string
+	}{
+		{name: "successful stderr", action: "stderr"},
+		{name: "failure diagnostic", action: "fail"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					return helperCommand(ctx, test.action, diagnostic)
+				})
+
+			result, err := runner.Run(context.Background(), Command{Dir: t.TempDir()})
+			redacted := result.Stderr
+			if test.action == "stderr" {
+				if err != nil {
+					t.Fatalf("Run() error = %v", err)
+				}
+				if !result.StderrTruncated {
+					t.Fatal("StderrTruncated = false, want true")
+				}
+			} else {
+				var safeErr *SafeError
+				if !errors.As(err, &safeErr) {
+					t.Fatalf("Run() error type = %T, want *SafeError", err)
+				}
+				if result != (Result{}) {
+					t.Fatalf("Run() result = %#v on failure, want zero result", result)
+				}
+				redacted = safeErr.Diagnostic()
+			}
+
+			if len(redacted) > limit {
+				t.Fatalf("redacted diagnostic length = %d, want <= %d", len(redacted), limit)
+			}
+			for _, forbidden := range []string{"userZQ", ":pa", credentialPrefix} {
+				if strings.Contains(redacted, forbidden) {
+					t.Fatalf("redacted diagnostic leaks HTTP credential prefix %q: %q", forbidden, redacted)
+				}
+			}
+		})
+	}
+}
+
 func TestCommandRunnerMapsExecutableNotFound(t *testing.T) {
-	runner := newCommandRunner("igonotes-git-executable-that-does-not-exist", time.Second, time.Second, 1024, exec.CommandContext)
+	runner := newCommandRunner("igonotes-git-executable-that-does-not-exist", helperTimeout, helperTimeout, 1024, exec.CommandContext)
 
 	result, err := runner.Run(context.Background(), Command{Dir: t.TempDir()})
 	if result != (Result{}) {
@@ -329,7 +387,7 @@ func TestCommandRunnerMapsExecutableNotFound(t *testing.T) {
 }
 
 func TestCommandRunnerCapturesExitCodeAndHidesFailureOutput(t *testing.T) {
-	runner := newCommandRunner("git", time.Second, time.Second, 1024,
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
 		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return helperCommand(ctx, "fail", "ordinary failure")
 		})
@@ -363,7 +421,7 @@ func TestCommandRunnerCanonicalizesDirectory(t *testing.T) {
 		gotCommand = cmd
 		return cmd
 	}
-	runner := newCommandRunner("git", time.Second, time.Second, 1024, factory)
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024, factory)
 
 	if _, err := runner.Run(context.Background(), Command{Dir: filepath.Join(parent, ".", "linked")}); err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -393,7 +451,7 @@ func TestCommandRunnerRejectsInvalidDirectory(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			called := false
-			runner := newCommandRunner("git", time.Second, time.Second, 1024,
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
 				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 					called = true
 					return helperCommand(ctx, "success")

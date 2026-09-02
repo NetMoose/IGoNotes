@@ -103,7 +103,9 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 	cmd.Stderr = stderr
 
 	runErr := cmd.Run()
-	diagnostic, diagnosticTruncated := redactAndLimit(stderr.buffer.String(), command.Secrets, r.outputLimit)
+	diagnostic, diagnosticTruncated := redactAndLimit(
+		stderr.buffer.String(), command.Secrets, r.outputLimit, stderr.truncated,
+	)
 	stderrTruncated := stderr.truncated || diagnosticTruncated
 	if runErr == nil {
 		return Result{
@@ -159,16 +161,11 @@ func gitEnvironment(environment []string, readOnly bool) []string {
 	if environment == nil {
 		environment = os.Environ()
 	}
-	keys := map[string]struct{}{
-		"GIT_TERMINAL_PROMPT": {},
-		"LC_ALL":              {},
-		"GIT_ALLOW_PROTOCOL":  {},
-		"GIT_OPTIONAL_LOCKS":  {},
-	}
+	keys := []string{"GIT_TERMINAL_PROMPT", "LC_ALL", "GIT_ALLOW_PROTOCOL", "GIT_OPTIONAL_LOCKS"}
 	filtered := make([]string, 0, len(environment)+4)
 	for _, entry := range environment {
 		key, _, found := strings.Cut(entry, "=")
-		if _, replace := keys[key]; found && replace {
+		if found && containsFold(keys, key) {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -184,6 +181,15 @@ func gitEnvironment(environment []string, readOnly bool) []string {
 	return filtered
 }
 
+func containsFold(values []string, candidate string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func longestString(values []string) int {
 	longest := 0
 	for _, value := range values {
@@ -194,8 +200,11 @@ func longestString(values []string) int {
 	return longest
 }
 
-func redactAndLimit(value string, secrets []string, limit int) (string, bool) {
+func redactAndLimit(value string, secrets []string, limit int, captureTruncated bool) (string, bool) {
 	redacted := redact(value, secrets)
+	if captureTruncated {
+		redacted = truncatedHTTPAuthorityPattern.ReplaceAllString(redacted, `${1}[REDACTED]`)
+	}
 	if len(redacted) <= limit {
 		return redacted, false
 	}

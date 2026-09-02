@@ -47,7 +47,10 @@ func (e *SafeError) Diagnostic() string {
 	return e.diagnostic
 }
 
-var httpUserinfoPattern = regexp.MustCompile(`(?i)(https?://)[^/\s@]+@`)
+var (
+	httpUserinfoPattern           = regexp.MustCompile(`(?i)(https?://)[^/\s@]+@`)
+	truncatedHTTPAuthorityPattern = regexp.MustCompile(`(?i)(https?://)[^/\s@]*$`)
+)
 
 func redact(text string, secrets []string) string {
 	orderedSecrets := append([]string(nil), secrets...)
