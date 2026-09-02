@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -19,6 +20,17 @@ type ConfigStore interface {
 	Save(*model.Config) error
 }
 
+type GitStatusStore interface {
+	Upsert(context.Context, model.GitStatus) error
+	Get(context.Context, string) (model.GitStatus, bool, error)
+	Delete(context.Context, string) error
+}
+
+type GitStatusReader interface {
+	Get(context.Context, string) (model.GitStatus, bool, error)
+	List(context.Context) ([]model.GitStatus, error)
+}
+
 type BaseRuntime interface {
 	GetBasePath() string
 	SwitchBase(string) error
@@ -30,12 +42,14 @@ type BaseRuntime interface {
 type SettingsService struct {
 	// Lock ordering: SettingsService.mu precedes BaseRuntime locks, which precede
 	// ConfigStore.Save. Neither dependency may call back into an earlier layer.
-	mu       sync.RWMutex
-	store    ConfigStore
-	notes    BaseRuntime
-	logger   *log.Logger
-	config   model.Config
-	degraded error
+	mu           sync.RWMutex
+	store        ConfigStore
+	notes        BaseRuntime
+	logger       *log.Logger
+	gitValidator GitConfigValidator
+	gitStatuses  GitStatusStore
+	config       model.Config
+	degraded     error
 }
 
 func NewSettingsService(
@@ -43,6 +57,17 @@ func NewSettingsService(
 	notes BaseRuntime,
 	activeBaseName string,
 	logger *log.Logger,
+) (*SettingsService, error) {
+	return NewSettingsServiceWithGit(store, notes, activeBaseName, logger, nil, nil)
+}
+
+func NewSettingsServiceWithGit(
+	store ConfigStore,
+	notes BaseRuntime,
+	activeBaseName string,
+	logger *log.Logger,
+	gitValidator GitConfigValidator,
+	gitStatuses GitStatusStore,
 ) (*SettingsService, error) {
 	if store == nil {
 		return nil, fmt.Errorf("config store: %w", ErrInvalidConfig)
@@ -104,10 +129,12 @@ func NewSettingsService(
 	}
 
 	return &SettingsService{
-		store:  store,
-		notes:  notes,
-		logger: logger,
-		config: cloneConfig(config),
+		store:        store,
+		notes:        notes,
+		logger:       logger,
+		gitValidator: gitValidator,
+		gitStatuses:  gitStatuses,
+		config:       cloneConfig(config),
 	}, nil
 }
 
@@ -245,6 +272,240 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 	return nil
 }
 
+type gitStatusChange struct {
+	path   string
+	before model.GitStatus
+	exists bool
+	after  *model.GitStatus
+}
+
+func (s *SettingsService) prepareGitStatusChanges(ctx context.Context, paths ...string) ([]gitStatusChange, error) {
+	if s.gitStatuses == nil {
+		return nil, nil
+	}
+	changes := make([]gitStatusChange, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		status, exists, err := s.gitStatuses.Get(ctx, path)
+		if err != nil {
+			return nil, fmt.Errorf("read Git status: %w", err)
+		}
+		changes = append(changes, gitStatusChange{path: path, before: cloneGitStatus(status), exists: exists})
+	}
+	return changes, nil
+}
+
+func gitStatusChangeAt(changes []gitStatusChange, path string) *gitStatusChange {
+	for index := range changes {
+		if changes[index].path == path {
+			return &changes[index]
+		}
+	}
+	return nil
+}
+
+func (s *SettingsService) applyConfigWithGitStatusesLocked(
+	ctx context.Context,
+	next model.Config,
+	targetPath string,
+	changes []gitStatusChange,
+) error {
+	if s.gitStatuses == nil || len(changes) == 0 {
+		return s.applyConfigLocked(next, targetPath)
+	}
+	for index := range changes {
+		if err := s.writeGitStatusChange(ctx, changes[index]); err != nil {
+			operationErr := fmt.Errorf("update Git status: %w", err)
+			return s.restoreGitStatusesLocked(ctx, changes, operationErr)
+		}
+	}
+	if err := s.applyConfigLocked(next, targetPath); err != nil {
+		return s.restoreGitStatusesLocked(ctx, changes, err)
+	}
+	return nil
+}
+
+func (s *SettingsService) writeGitStatusChange(ctx context.Context, change gitStatusChange) error {
+	if change.after == nil {
+		return s.gitStatuses.Delete(ctx, change.path)
+	}
+	return s.gitStatuses.Upsert(ctx, cloneGitStatus(*change.after))
+}
+
+func (s *SettingsService) restoreGitStatusesLocked(ctx context.Context, changes []gitStatusChange, operationErr error) error {
+	var restoreErr error
+	for index := len(changes) - 1; index >= 0; index-- {
+		change := changes[index]
+		var err error
+		if change.exists {
+			err = s.gitStatuses.Upsert(ctx, cloneGitStatus(change.before))
+		} else {
+			err = s.gitStatuses.Delete(ctx, change.path)
+		}
+		if err != nil {
+			restoreErr = errors.Join(restoreErr, err)
+		}
+	}
+	if restoreErr == nil {
+		return operationErr
+	}
+	s.degraded = errors.Join(ErrRollbackFailed, operationErr, fmt.Errorf("restore Git status: %w", restoreErr))
+	s.logger.Print("settings Git status rollback failed")
+	return s.degraded
+}
+
+func cloneGitStatus(status model.GitStatus) model.GitStatus {
+	if status.ChangedPaths != nil {
+		status.ChangedPaths = append([]string{}, status.ChangedPaths...)
+	}
+	if status.Error != nil {
+		cloned := *status.Error
+		status.Error = &cloned
+	}
+	return status
+}
+
+func needsReconnectGitStatus(name, path string) model.GitStatus {
+	return model.GitStatus{
+		Base:           name,
+		RepositoryPath: path,
+		State:          model.GitStateNeedsReconnect,
+		ChangedPaths:   []string{},
+	}
+}
+
+func unconfiguredGitStatus(name, path string) model.GitStatus {
+	return model.GitStatus{
+		Base:           name,
+		RepositoryPath: path,
+		State:          model.GitStateUnconfigured,
+		ChangedPaths:   []string{},
+	}
+}
+
+func canonicalGitStatusPath(path string) (string, error) {
+	canonicalPath, err := canonicalExistingDirectory(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve Git status path: %w", err)
+	}
+	return canonicalPath, nil
+}
+
+func validLiteralGitBranch(branch string) bool {
+	if branch == "" || strings.TrimSpace(branch) != branch || strings.HasPrefix(branch, "-") ||
+		strings.HasPrefix(branch, "refs/") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") ||
+		strings.Contains(branch, "//") || strings.Contains(branch, "..") || strings.Contains(branch, "@{") ||
+		strings.ContainsAny(branch, "~^:?*[\\ ") || containsControl(branch) {
+		return false
+	}
+	switch branch {
+	case "@", "HEAD", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "AUTO_MERGE", "BISECT_HEAD":
+		return false
+	}
+	for _, component := range strings.Split(branch, "/") {
+		if component == "" || component == "." || component == ".." || strings.HasPrefix(component, ".") || strings.HasSuffix(component, ".") || strings.HasSuffix(component, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request model.GitConfigRequest) (model.GitConfigResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.degraded != nil {
+		return model.GitConfigResponse{}, s.degraded
+	}
+	index := baseIndex(s.config.Bases, name)
+	if index < 0 {
+		return model.GitConfigResponse{}, ErrBaseNotFound
+	}
+	if s.gitValidator == nil || s.gitStatuses == nil {
+		return model.GitConfigResponse{}, fmt.Errorf("Git settings dependencies: %w", ErrInvalidConfig)
+	}
+	path, err := canonicalGitStatusPath(s.config.Bases[index].Path)
+	if err != nil {
+		return model.GitConfigResponse{}, err
+	}
+	normalized, err := s.gitValidator.Validate(ctx, path, request)
+	if err != nil {
+		return model.GitConfigResponse{}, err
+	}
+	if !validLiteralGitBranch(normalized.GitBranch) {
+		return model.GitConfigResponse{}, fieldError(ErrInvalidGitBranch, "git_branch", "Git branch is required and must be a literal branch name")
+	}
+	for otherIndex := range s.config.Bases {
+		if otherIndex == index || !s.config.Bases[otherIndex].GitConfigured() {
+			continue
+		}
+		otherPath, pathErr := canonicalGitStatusPath(s.config.Bases[otherIndex].Path)
+		if pathErr != nil {
+			return model.GitConfigResponse{}, pathErr
+		}
+		if otherPath == path {
+			return model.GitConfigResponse{}, ErrGitRepositoryInUse
+		}
+	}
+
+	next := cloneConfig(s.config)
+	base := &next.Bases[index]
+	base.GitURL = normalized.GitURL
+	base.GitBranch = normalized.GitBranch
+	base.AutoSync = normalized.AutoSync
+	base.AutoSyncIntervalMinutes = normalized.AutoSyncIntervalMinutes
+	base.GitCommitMessageTemplate = normalized.GitCommitMessageTemplate
+	status := needsReconnectGitStatus(base.Name, path)
+	changes, err := s.prepareGitStatusChanges(ctx, path)
+	if err != nil {
+		return model.GitConfigResponse{}, err
+	}
+	changes[0].after = &status
+	if err := s.applyConfigWithGitStatusesLocked(ctx, next, "", changes); err != nil {
+		return model.GitConfigResponse{}, err
+	}
+	return model.GitConfigResponse{Base: next.Bases[index], Status: status}, nil
+}
+
+func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.GitConfigResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.degraded != nil {
+		return model.GitConfigResponse{}, s.degraded
+	}
+	index := baseIndex(s.config.Bases, name)
+	if index < 0 {
+		return model.GitConfigResponse{}, ErrBaseNotFound
+	}
+	if s.gitStatuses == nil {
+		return model.GitConfigResponse{}, fmt.Errorf("Git status dependency: %w", ErrInvalidConfig)
+	}
+	path, err := canonicalGitStatusPath(s.config.Bases[index].Path)
+	if err != nil {
+		return model.GitConfigResponse{}, err
+	}
+	next := cloneConfig(s.config)
+	base := &next.Bases[index]
+	base.GitURL = ""
+	base.GitBranch = ""
+	base.AutoSync = false
+	base.AutoSyncIntervalMinutes = 0
+	base.GitCommitMessageTemplate = ""
+	changes, err := s.prepareGitStatusChanges(ctx, path)
+	if err != nil {
+		return model.GitConfigResponse{}, err
+	}
+	if err := s.applyConfigWithGitStatusesLocked(ctx, next, "", changes); err != nil {
+		return model.GitConfigResponse{}, err
+	}
+	return model.GitConfigResponse{Base: next.Bases[index], Status: unconfiguredGitStatus(base.Name, path)}, nil
+}
+
 func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (model.SettingsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,7 +609,11 @@ func (s *SettingsService) UpdateBase(oldName string, request model.BaseUpdateReq
 		next.CurrentBase = name
 		targetPath = path
 	}
-	if err := s.applyConfigLocked(next, targetPath); err != nil {
+	changes, err := s.prepareUpdateBaseGitStatuses(context.Background(), s.config.Bases[index], next.Bases[index])
+	if err != nil {
+		return model.SettingsResponse{}, err
+	}
+	if err := s.applyConfigWithGitStatusesLocked(context.Background(), next, targetPath, changes); err != nil {
 		return model.SettingsResponse{}, err
 	}
 	return s.responseLocked(), nil
@@ -374,7 +639,11 @@ func (s *SettingsService) ForgetBase(name string) (model.SettingsResponse, error
 
 	next := cloneConfig(s.config)
 	next.Bases = append(next.Bases[:index], next.Bases[index+1:]...)
-	if err := s.applyConfigLocked(next, ""); err != nil {
+	changes, err := s.prepareForgottenBaseGitStatus(context.Background(), s.config.Bases[index])
+	if err != nil {
+		return model.SettingsResponse{}, err
+	}
+	if err := s.applyConfigWithGitStatusesLocked(context.Background(), next, "", changes); err != nil {
 		return model.SettingsResponse{}, err
 	}
 	return s.responseLocked(), nil
@@ -412,11 +681,227 @@ func (s *SettingsService) ReplaceConfig(input model.Config) (model.SettingsRespo
 	if err != nil {
 		return model.SettingsResponse{}, err
 	}
+	matches, err := protectReplaceConfigGitFields(s.config, next)
+	if err != nil {
+		return model.SettingsResponse{}, err
+	}
+	changes, err := s.prepareReplaceConfigGitStatuses(context.Background(), s.config, next, matches)
+	if err != nil {
+		return model.SettingsResponse{}, err
+	}
 	index := baseIndex(next.Bases, next.CurrentBase)
-	if err := s.applyConfigLocked(next, next.Bases[index].Path); err != nil {
+	if err := s.applyConfigWithGitStatusesLocked(context.Background(), next, next.Bases[index].Path, changes); err != nil {
 		return model.SettingsResponse{}, err
 	}
 	return s.responseLocked(), nil
+}
+
+func (s *SettingsService) prepareUpdateBaseGitStatuses(ctx context.Context, current, next model.Base) ([]gitStatusChange, error) {
+	if s.gitStatuses == nil || current.Name == next.Name && current.Path == next.Path {
+		return nil, nil
+	}
+	oldPath, err := canonicalGitStatusPath(current.Path)
+	if err != nil {
+		return nil, err
+	}
+	newPath, err := canonicalGitStatusPath(next.Path)
+	if err != nil {
+		return nil, err
+	}
+	if oldPath == newPath {
+		if current.Name == next.Name {
+			return nil, nil
+		}
+		changes, err := s.prepareGitStatusChanges(ctx, oldPath)
+		if err != nil {
+			return nil, err
+		}
+		if !changes[0].exists {
+			return nil, nil
+		}
+		status := cloneGitStatus(changes[0].before)
+		status.Base = next.Name
+		changes[0].after = &status
+		return changes, nil
+	}
+
+	paths := []string{oldPath}
+	if next.GitConfigured() {
+		paths = append(paths, newPath)
+	}
+	changes, err := s.prepareGitStatusChanges(ctx, paths...)
+	if err != nil {
+		return nil, err
+	}
+	if next.GitConfigured() {
+		status := needsReconnectGitStatus(next.Name, newPath)
+		gitStatusChangeAt(changes, newPath).after = &status
+	}
+	return changes, nil
+}
+
+func (s *SettingsService) prepareForgottenBaseGitStatus(ctx context.Context, base model.Base) ([]gitStatusChange, error) {
+	if s.gitStatuses == nil {
+		return nil, nil
+	}
+	path, err := canonicalGitStatusPath(base.Path)
+	if err != nil {
+		return nil, err
+	}
+	return s.prepareGitStatusChanges(ctx, path)
+}
+
+func protectReplaceConfigGitFields(current, next model.Config) ([]int, error) {
+	matches, err := matchReplaceConfigBases(current.Bases, next.Bases)
+	if err != nil {
+		return nil, err
+	}
+	for index, match := range matches {
+		var previous model.Base
+		if match >= 0 {
+			previous = current.Bases[match]
+		}
+		field := firstGitFieldDifference(previous, next.Bases[index])
+		if field != "" {
+			return nil, fieldError(
+				ErrInvalidConfig,
+				fmt.Sprintf("bases[%d].%s", index, field),
+				"Git settings must be changed through /api/git/config",
+			)
+		}
+	}
+	return matches, nil
+}
+
+func matchReplaceConfigBases(current, next []model.Base) ([]int, error) {
+	matches := make([]int, len(next))
+	for index := range matches {
+		matches[index] = -1
+		exact := baseIndex(current, next[index].Name)
+		if exact >= 0 {
+			matches[index] = exact
+			continue
+		}
+		nextPath, err := canonicalGitStatusPath(next[index].Path)
+		if err != nil {
+			return nil, err
+		}
+		unique := -1
+		for currentIndex := range current {
+			currentPath, pathErr := canonicalGitStatusPath(current[currentIndex].Path)
+			if pathErr != nil {
+				return nil, pathErr
+			}
+			if currentPath != nextPath {
+				continue
+			}
+			if unique >= 0 {
+				unique = -1
+				break
+			}
+			unique = currentIndex
+		}
+		matches[index] = unique
+	}
+	return matches, nil
+}
+
+func firstGitFieldDifference(current, next model.Base) string {
+	switch {
+	case current.GitURL != next.GitURL:
+		return "git_url"
+	case current.GitBranch != next.GitBranch:
+		return "git_branch"
+	case current.AutoSync != next.AutoSync:
+		return "auto_sync"
+	case current.AutoSyncIntervalMinutes != next.AutoSyncIntervalMinutes:
+		return "auto_sync_interval_minutes"
+	case current.GitCommitMessageTemplate != next.GitCommitMessageTemplate:
+		return "git_commit_message_template"
+	default:
+		return ""
+	}
+}
+
+func (s *SettingsService) prepareReplaceConfigGitStatuses(
+	ctx context.Context,
+	current model.Config,
+	next model.Config,
+	matches []int,
+) ([]gitStatusChange, error) {
+	if s.gitStatuses == nil {
+		return nil, nil
+	}
+	matchedCurrent := make(map[int]struct{}, len(matches))
+	paths := make([]string, 0)
+	oldPaths := make([]string, len(matches))
+	newPaths := make([]string, len(matches))
+	for index, match := range matches {
+		if match < 0 {
+			continue
+		}
+		matchedCurrent[match] = struct{}{}
+		oldPath, err := canonicalGitStatusPath(current.Bases[match].Path)
+		if err != nil {
+			return nil, err
+		}
+		newPath, err := canonicalGitStatusPath(next.Bases[index].Path)
+		if err != nil {
+			return nil, err
+		}
+		oldPaths[index], newPaths[index] = oldPath, newPath
+		if oldPath == newPath {
+			if current.Bases[match].Name != next.Bases[index].Name {
+				paths = append(paths, oldPath)
+			}
+			continue
+		}
+		paths = append(paths, oldPath)
+		if next.Bases[index].GitConfigured() {
+			paths = append(paths, newPath)
+		}
+	}
+	removedPaths := make(map[int]string)
+	for index := range current.Bases {
+		if _, ok := matchedCurrent[index]; ok {
+			continue
+		}
+		path, err := canonicalGitStatusPath(current.Bases[index].Path)
+		if err != nil {
+			return nil, err
+		}
+		removedPaths[index] = path
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	changes, err := s.prepareGitStatusChanges(ctx, paths...)
+	if err != nil {
+		return nil, err
+	}
+	for index, match := range matches {
+		if match < 0 || oldPaths[index] == "" {
+			continue
+		}
+		change := gitStatusChangeAt(changes, oldPaths[index])
+		if oldPaths[index] == newPaths[index] {
+			if current.Bases[match].Name != next.Bases[index].Name && change.exists {
+				status := cloneGitStatus(change.before)
+				status.Base = next.Bases[index].Name
+				change.after = &status
+			}
+			continue
+		}
+		if next.Bases[index].GitConfigured() {
+			status := needsReconnectGitStatus(next.Bases[index].Name, newPaths[index])
+			gitStatusChangeAt(changes, newPaths[index]).after = &status
+		}
+	}
+	for _, path := range removedPaths {
+		gitStatusChangeAt(changes, path).after = nil
+	}
+	return changes, nil
 }
 
 func normalizeConfig(input model.Config, currentSetup bool) (model.Config, error) {
