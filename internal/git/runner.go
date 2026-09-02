@@ -161,8 +161,8 @@ func gitEnvironment(environment []string, readOnly bool) []string {
 	if environment == nil {
 		environment = os.Environ()
 	}
-	keys := []string{"GIT_TERMINAL_PROMPT", "LC_ALL", "GIT_ALLOW_PROTOCOL", "GIT_OPTIONAL_LOCKS"}
-	filtered := make([]string, 0, len(environment)+4)
+	keys := []string{"GIT_TERMINAL_PROMPT", "LC_ALL", "GIT_ALLOW_PROTOCOL", "GIT_OPTIONAL_LOCKS", "GIT_NO_LAZY_FETCH"}
+	filtered := make([]string, 0, len(environment)+5)
 	for _, entry := range environment {
 		key, _, found := strings.Cut(entry, "=")
 		if found && containsFold(keys, key) {
@@ -174,6 +174,7 @@ func gitEnvironment(environment []string, readOnly bool) []string {
 		"GIT_TERMINAL_PROMPT=0",
 		"LC_ALL=C",
 		"GIT_ALLOW_PROTOCOL="+AllowedGitProtocols,
+		"GIT_NO_LAZY_FETCH=1",
 	)
 	if readOnly {
 		filtered = append(filtered, "GIT_OPTIONAL_LOCKS=0")

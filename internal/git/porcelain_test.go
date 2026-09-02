@@ -198,7 +198,7 @@ func TestClientInspectLocalUsesExactReadOnlyCommands(t *testing.T) {
 	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
 		{want: readCommand(dir, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
 		{want: readCommand(dir, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: gitDir + "\n"}},
-		{want: readCommand(dir, "symbolic-ref", "--quiet", "--short", "HEAD"), result: Result{Stdout: "main\n"}},
+		{want: readCommand(dir, "symbolic-ref", "--quiet", "HEAD"), result: Result{Stdout: "refs/heads/main\n"}},
 		{want: readCommand(dir, "status", "--porcelain=v1", "-z", "--untracked-files=all"), result: Result{Stdout: "?? new note.md\x00"}},
 		{want: readCommand(dir, "remote", "get-url", "origin"), result: Result{Stdout: "https://example.com/notes.git\n"}},
 		{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note Author\n"}},
@@ -230,7 +230,7 @@ func TestClientInspectLocalHandlesExpectedAbsence(t *testing.T) {
 	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
 		{want: readCommand(root, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
 		{want: readCommand(root, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: gitDir + "\n"}},
-		{want: readCommand(root, "symbolic-ref", "--quiet", "--short", "HEAD"), err: exitError(1)},
+		{want: readCommand(root, "symbolic-ref", "--quiet", "HEAD"), err: exitError(1)},
 		{want: readCommand(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")},
 		{want: readCommand(root, "remote", "get-url", "origin"), err: exitError(2)},
 		{want: readCommand(root, "config", "--get", "user.name"), result: Result{Stdout: "Author\n"}},
@@ -245,6 +245,73 @@ func TestClientInspectLocalHandlesExpectedAbsence(t *testing.T) {
 		t.Fatalf("InspectLocal() = %+v, want detached clean repository with expected values absent", got)
 	}
 	runner.assertDone()
+}
+
+func TestClientInspectLocalRejectsMalformedSymbolicRef(t *testing.T) {
+	outputs := []string{
+		"",
+		"main\n",
+		"heads/main\n",
+		"refs/tags/main\n",
+		"refs/heads/\n",
+		"refs/heads/main other\n",
+		"refs/heads/main\x00\n",
+		"refs/heads/main\nrefs/heads/other\n",
+	}
+	for _, output := range outputs {
+		t.Run(output, func(t *testing.T) {
+			root := t.TempDir()
+			gitDir := filepath.Join(root, ".git")
+			if err := os.Mkdir(gitDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+				{want: readCommand(root, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
+				{want: readCommand(root, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: gitDir + "\n"}},
+				{want: readCommand(root, "symbolic-ref", "--quiet", "HEAD"), result: Result{Stdout: output}},
+			}}
+			if _, err := NewClient(runner).InspectLocal(context.Background(), root); err == nil {
+				t.Fatal("InspectLocal() error = nil, want malformed symbolic ref error")
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientInspectLocalDisambiguatesBranchFromSameNamedTag(t *testing.T) {
+	gitExecutable, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("Git unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	runNativeGit(t, gitExecutable, "", "init", "--quiet", "--initial-branch=master", dir)
+	runNativeGit(t, gitExecutable, dir, "config", "user.name", "Test Author")
+	runNativeGit(t, gitExecutable, dir, "config", "user.email", "author@example.com")
+	if err := os.WriteFile(filepath.Join(dir, "note.md"), []byte("note\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runNativeGit(t, gitExecutable, dir, "add", "note.md")
+	runNativeGit(t, gitExecutable, dir, "commit", "--quiet", "-m", "initial")
+	runNativeGit(t, gitExecutable, dir, "tag", "master")
+
+	got, err := NewClient(NewCommandRunner()).InspectLocal(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("InspectLocal() error = %v", err)
+	}
+	if got.CurrentBranch != "master" {
+		t.Fatalf("InspectLocal().CurrentBranch = %q, want master", got.CurrentBranch)
+	}
+}
+
+func runNativeGit(t *testing.T, executable, dir string, args ...string) string {
+	t.Helper()
+	command := exec.Command(executable, args...)
+	command.Dir = dir
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+	return string(output)
 }
 
 func TestClientInspectLocalReturnsNoRepository(t *testing.T) {
@@ -274,7 +341,7 @@ func TestClientInspectLocalCanonicalizesGitDirSymlink(t *testing.T) {
 	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
 		{want: readCommand(root, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
 		{want: readCommand(root, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: linkedGitDir + "\n"}},
-		{want: readCommand(root, "symbolic-ref", "--quiet", "--short", "HEAD"), result: Result{Stdout: "main\n"}},
+		{want: readCommand(root, "symbolic-ref", "--quiet", "HEAD"), result: Result{Stdout: "refs/heads/main\n"}},
 		{want: readCommand(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")},
 		{want: readCommand(root, "remote", "get-url", "origin"), err: exitError(2)},
 		{want: readCommand(root, "config", "--get", "user.name"), err: exitError(1)},
@@ -300,7 +367,7 @@ func TestClientInspectLocalPropagatesUnexpectedOptionalCommandExit(t *testing.T)
 	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
 		{want: readCommand(root, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
 		{want: readCommand(root, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: gitDir + "\n"}},
-		{want: readCommand(root, "symbolic-ref", "--quiet", "--short", "HEAD"), result: Result{Stdout: "main\n"}},
+		{want: readCommand(root, "symbolic-ref", "--quiet", "HEAD"), result: Result{Stdout: "refs/heads/main\n"}},
 		{want: readCommand(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")},
 		{want: readCommand(root, "remote", "get-url", "origin"), err: exitError(23)},
 	}}
@@ -474,7 +541,14 @@ func TestClientHistoryRelationUsesOnlyLocalObjects(t *testing.T) {
 			{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 			{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(1)},
 			{want: readCommand(dir, "merge-base", "HEAD", oid), err: exitError(1)},
+			{want: readCommand(dir, "rev-parse", "--is-shallow-repository"), result: Result{Stdout: "false\n"}},
 		}, want: "unrelated"},
+		{name: "shallow unknown", steps: []runnerStep{
+			{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
+			{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(1)},
+			{want: readCommand(dir, "merge-base", "HEAD", oid), err: exitError(1)},
+			{want: readCommand(dir, "rev-parse", "--is-shallow-repository"), result: Result{Stdout: "true\n"}},
+		}, want: "unknown"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -489,6 +563,35 @@ func TestClientHistoryRelationUsesOnlyLocalObjects(t *testing.T) {
 			}
 			if got != test.want {
 				t.Fatalf("HistoryRelation() = %q, want %q", got, test.want)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientHistoryRelationRejectsInvalidShallowInspection(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	tests := []struct {
+		name   string
+		result Result
+	}{
+		{name: "empty"},
+		{name: "malformed", result: Result{Stdout: "unknown\n"}},
+		{name: "multiple lines", result: Result{Stdout: "false\ntrue\n"}},
+		{name: "truncated stdout", result: Result{Stdout: "false", StdoutTruncated: true}},
+		{name: "truncated stderr", result: Result{StderrTruncated: true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+				{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
+				{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD"), err: exitError(1)},
+				{want: readCommand(dir, "merge-base", "HEAD", oid), err: exitError(1)},
+				{want: readCommand(dir, "rev-parse", "--is-shallow-repository"), result: test.result},
+			}}
+			if _, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid); err == nil {
+				t.Fatal("HistoryRelation() error = nil, want invalid shallow output error")
 			}
 			runner.assertDone()
 		})
@@ -591,7 +694,7 @@ func TestClientRejectsTruncatedOutput(t *testing.T) {
 		runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
 			{want: readCommand(root, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
 			{want: readCommand(root, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: gitDir + "\n"}},
-			{want: readCommand(root, "symbolic-ref", "--quiet", "--short", "HEAD"), result: Result{Stdout: "main\n"}},
+			{want: readCommand(root, "symbolic-ref", "--quiet", "HEAD"), result: Result{Stdout: "refs/heads/main\n"}},
 			{want: readCommand(root, "status", "--porcelain=v1", "-z", "--untracked-files=all"), result: Result{StdoutTruncated: true}},
 		}}
 		_, err := NewClient(runner).InspectLocal(context.Background(), root)

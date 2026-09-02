@@ -170,7 +170,7 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 		return LocalInspection{}, malformedOutputError()
 	}
 
-	branchResult, branchErr := c.run(ctx, readOnlyCommand(dir, "symbolic-ref", "--quiet", "--short", "HEAD"))
+	branchResult, branchErr := c.run(ctx, readOnlyCommand(dir, "symbolic-ref", "--quiet", "HEAD"))
 	detached := false
 	branch := ""
 	if branchErr != nil {
@@ -179,8 +179,10 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 		}
 		detached = true
 	} else {
-		branch = singleLine(branchResult.Stdout)
-		if branch == "" || !validLiteralBranch(branch) {
+		fullRef := strings.TrimSpace(branchResult.Stdout)
+		var found bool
+		branch, found = strings.CutPrefix(fullRef, "refs/heads/")
+		if !found || branch == "" || containsInvalidRefOutputByte(branch) {
 			return LocalInspection{}, malformedOutputError()
 		}
 	}
@@ -237,6 +239,15 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 		IdentityConfigured: strings.TrimSpace(name) != "" && strings.TrimSpace(email) != "",
 		HasCommits:         hasCommits,
 	}, nil
+}
+
+func containsInvalidRefOutputByte(value string) bool {
+	for index := range len(value) {
+		if value[index] <= ' ' || value[index] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) optionalConfig(ctx context.Context, dir, key string) (string, error) {
@@ -350,7 +361,18 @@ func (c *Client) HistoryRelation(ctx context.Context, dir, remoteOID string) (st
 	result, err := c.run(ctx, readOnlyCommand(dir, "merge-base", "HEAD", remoteOID))
 	if err != nil {
 		if expectedExit(err, 1) {
-			return "unrelated", nil
+			shallowResult, shallowErr := c.run(ctx, readOnlyCommand(dir, "rev-parse", "--is-shallow-repository"))
+			if shallowErr != nil {
+				return "", shallowErr
+			}
+			switch singleLine(shallowResult.Stdout) {
+			case "true":
+				return "unknown", nil
+			case "false":
+				return "unrelated", nil
+			default:
+				return "", malformedOutputError()
+			}
 		}
 		return "", err
 	}

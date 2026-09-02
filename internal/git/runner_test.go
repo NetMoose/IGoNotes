@@ -135,6 +135,8 @@ func TestCommandRunnerReplacesEnvironment(t *testing.T) {
 					"Git_Allow_Protocol=mixed-hostile",
 					"GIT_OPTIONAL_LOCKS=1", "GIT_OPTIONAL_LOCKS=hostile",
 					"git_optional_locks=mixed-hostile",
+					"GIT_NO_LAZY_FETCH=0", "GIT_NO_LAZY_FETCH=hostile",
+					"Git_No_Lazy_Fetch=mixed-hostile",
 				}
 				return cmd
 			}
@@ -154,6 +156,7 @@ func TestCommandRunnerReplacesEnvironment(t *testing.T) {
 			assertEnvValues(t, observation.Env, "LC_ALL", []string{"C"})
 			assertEnvValues(t, observation.Env, "GIT_ALLOW_PROTOCOL", []string{AllowedGitProtocols})
 			assertEnvValues(t, observation.Env, "GIT_OPTIONAL_LOCKS", test.wantOptionalLocks)
+			assertEnvValues(t, observation.Env, "GIT_NO_LAZY_FETCH", []string{"1"})
 		})
 	}
 }
