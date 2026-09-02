@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -78,6 +79,10 @@ func TestGitProbeServiceIntegrationIsReadOnly(t *testing.T) {
 	if err := os.Mkdir(working, 0o755); err != nil {
 		t.Fatalf("create working directory: %v", err)
 	}
+	canonicalWorking, err := filepath.EvalSymlinks(working)
+	if err != nil {
+		t.Fatalf("canonicalize working directory: %v", err)
+	}
 	runGitSetup(t, gitEnvironment, root, "init", "--bare", remote)
 	runGitSetup(t, gitEnvironment, working, "init", "--initial-branch=main")
 	runGitSetup(t, gitEnvironment, working, "config", "user.name", "IGoNotes Probe Test")
@@ -104,7 +109,17 @@ func TestGitProbeServiceIntegrationIsReadOnly(t *testing.T) {
 	beforeFetchHead := snapshotOptionalProbeFile(t, filepath.Join(gitDir, "FETCH_HEAD"))
 	beforeObjects := snapshotProbeObjects(t, filepath.Join(gitDir, "objects"))
 
-	settings := probeSettingsStub{config: model.Config{Bases: []model.Base{{Name: "work", Path: working}}, CurrentBase: "work"}}
+	configuredPath := working
+	alias := filepath.Join(root, "configured-working")
+	if err := os.Symlink(working, alias); err != nil {
+		if !errors.Is(err, os.ErrPermission) && !errors.Is(err, os.ErrInvalid) && runtime.GOOS != "windows" {
+			t.Fatalf("create configured base symlink: %v", err)
+		}
+		t.Logf("directory symlinks unsupported or unavailable; using real configured path: %v", err)
+	} else {
+		configuredPath = alias
+	}
+	settings := probeSettingsStub{config: model.Config{Bases: []model.Base{{Name: "work", Path: configuredPath}}, CurrentBase: "work"}}
 	recorder := &recordingProbeRunner{delegate: gitcmd.NewCommandRunner()}
 	client = gitcmd.NewClient(recorder)
 	service := NewGitProbeService(settings, client)
@@ -124,7 +139,7 @@ func TestGitProbeServiceIntegrationIsReadOnly(t *testing.T) {
 		t.Fatalf("selected Probe() = %#v, want configurable shared history", selected)
 	}
 
-	assertProbeCommands(t, recorder.commands, working, remoteURL, remoteOID)
+	assertProbeCommands(t, recorder.commands, canonicalWorking, remoteURL, remoteOID)
 	assertOptionalProbeFileEqual(t, "FETCH_HEAD", beforeFetchHead, snapshotOptionalProbeFile(t, filepath.Join(gitDir, "FETCH_HEAD")))
 	if afterObjects := snapshotProbeObjects(t, filepath.Join(gitDir, "objects")); !slices.Equal(beforeObjects, afterObjects) {
 		t.Errorf(".git/objects changed during probe\nbefore: %#v\nafter:  %#v", beforeObjects, afterObjects)
