@@ -148,7 +148,11 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 	if err != nil {
 		var safeErr *SafeError
 		if errors.As(err, &safeErr) && safeErr.Code == CodeNotRepository {
-			return LocalInspection{}, nil
+			identityConfigured, err := c.identityConfigured(ctx, dir)
+			if err != nil {
+				return LocalInspection{}, err
+			}
+			return LocalInspection{IdentityConfigured: identityConfigured}, nil
 		}
 		return LocalInspection{}, err
 	}
@@ -208,11 +212,7 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 		}
 	}
 
-	name, err := c.optionalConfig(ctx, dir, "user.name")
-	if err != nil {
-		return LocalInspection{}, err
-	}
-	email, err := c.optionalConfig(ctx, dir, "user.email")
+	identityConfigured, err := c.identityConfigured(ctx, dir)
 	if err != nil {
 		return LocalInspection{}, err
 	}
@@ -236,7 +236,7 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 		WorkingTreeClean:   statusResult.Stdout == "",
 		ExistingOriginURL:  origin,
 		PendingOperation:   pending,
-		IdentityConfigured: strings.TrimSpace(name) != "" && strings.TrimSpace(email) != "",
+		IdentityConfigured: identityConfigured,
 		HasCommits:         hasCommits,
 	}, nil
 }
@@ -258,7 +258,25 @@ func (c *Client) optionalConfig(ctx context.Context, dir, key string) (string, e
 		}
 		return "", err
 	}
-	return singleLine(result.Stdout), nil
+	value := singleLine(result.Stdout)
+	for _, character := range value {
+		if character != '\t' && unicode.IsControl(character) {
+			return "", malformedOutputError()
+		}
+	}
+	return value, nil
+}
+
+func (c *Client) identityConfigured(ctx context.Context, dir string) (bool, error) {
+	name, err := c.optionalConfig(ctx, dir, "user.name")
+	if err != nil {
+		return false, err
+	}
+	email, err := c.optionalConfig(ctx, dir, "user.email")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(name) != "" && strings.TrimSpace(email) != "", nil
 }
 
 func pendingOperation(gitDir string) (string, error) {

@@ -352,20 +352,128 @@ func runNativeGit(t *testing.T, executable, dir string, args ...string) string {
 	return string(output)
 }
 
-func TestClientInspectLocalReturnsNoRepository(t *testing.T) {
+func TestClientInspectLocalInspectsIdentityWithoutRepository(t *testing.T) {
 	dir := t.TempDir()
 	notRepository := &SafeError{Code: CodeNotRepository, Message: "Directory is not a Git repository", ExitCode: 128}
-	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{{
-		want: readCommand(dir, "rev-parse", "--show-toplevel"), err: notRepository,
-	}}}
-	got, err := NewClient(runner).InspectLocal(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("InspectLocal() error = %v", err)
+	tests := []struct {
+		name  string
+		steps []runnerStep
+		want  bool
+	}{
+		{name: "both configured", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: " Note Author \n"}},
+			{want: readCommand(dir, "config", "--get", "user.email"), result: Result{Stdout: " author@example.com \n"}},
+		}, want: true},
+		{name: "name missing", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), err: exitError(1)},
+			{want: readCommand(dir, "config", "--get", "user.email"), result: Result{Stdout: "author@example.com\n"}},
+		}},
+		{name: "email missing", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note Author\n"}},
+			{want: readCommand(dir, "config", "--get", "user.email"), err: exitError(1)},
+		}},
+		{name: "whitespace only", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: " \t \n"}},
+			{want: readCommand(dir, "config", "--get", "user.email"), result: Result{Stdout: "author@example.com\n"}},
+		}},
 	}
-	if got != (LocalInspection{}) {
-		t.Fatalf("InspectLocal() = %+v, want no repository", got)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			steps := append([]runnerStep{{want: readCommand(dir, "rev-parse", "--show-toplevel"), err: notRepository}}, test.steps...)
+			runner := &porcelainRunnerFake{t: t, steps: steps}
+			got, err := NewClient(runner).InspectLocal(context.Background(), dir)
+			if err != nil {
+				t.Fatalf("InspectLocal() error = %v", err)
+			}
+			want := LocalInspection{IdentityConfigured: test.want}
+			if got != want {
+				t.Fatalf("InspectLocal() = %+v, want %+v", got, want)
+			}
+			runner.assertDone()
+		})
 	}
-	runner.assertDone()
+}
+
+func TestClientInspectLocalPropagatesIdentityFailureWithoutRepository(t *testing.T) {
+	dir := t.TempDir()
+	notRepository := &SafeError{Code: CodeNotRepository, Message: "Directory is not a Git repository", ExitCode: 128}
+	tests := []struct {
+		name  string
+		steps []runnerStep
+		err   error
+	}{
+		{name: "unexpected name exit", err: exitError(2)},
+		{name: "name canceled", err: &SafeError{Code: CodeCanceled, Message: "Git command was canceled"}},
+		{name: "name timed out", err: &SafeError{Code: CodeTimedOut, Message: "Git command timed out"}},
+		{name: "name unavailable", err: &SafeError{Code: CodeUnavailable, Message: "Git executable is unavailable"}},
+	}
+	for index := range tests {
+		tests[index].steps = []runnerStep{{want: readCommand(dir, "config", "--get", "user.name"), err: tests[index].err}}
+	}
+	emailError := exitError(2)
+	tests = append(tests, struct {
+		name  string
+		steps []runnerStep
+		err   error
+	}{
+		name: "unexpected email exit",
+		steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note Author\n"}},
+			{want: readCommand(dir, "config", "--get", "user.email"), err: emailError},
+		},
+		err: emailError,
+	})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			steps := append([]runnerStep{{want: readCommand(dir, "rev-parse", "--show-toplevel"), err: notRepository}}, test.steps...)
+			runner := &porcelainRunnerFake{t: t, steps: steps}
+			_, err := NewClient(runner).InspectLocal(context.Background(), dir)
+			if err != test.err {
+				t.Fatalf("InspectLocal() error = %#v, want unchanged %#v", err, test.err)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientInspectLocalRejectsUnsafeIdentityOutputWithoutRepository(t *testing.T) {
+	dir := t.TempDir()
+	notRepository := &SafeError{Code: CodeNotRepository, Message: "Directory is not a Git repository", ExitCode: 128}
+	tests := []struct {
+		name    string
+		steps   []runnerStep
+		message string
+	}{
+		{name: "multiline name", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note Author\nOther Author\n"}},
+		}, message: "Git command returned malformed output"},
+		{name: "multiline email", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note Author\n"}},
+			{want: readCommand(dir, "config", "--get", "user.email"), result: Result{Stdout: "one@example.com\ntwo@example.com\n"}},
+		}, message: "Git command returned malformed output"},
+		{name: "nul name", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note\x00Author\n"}},
+		}, message: "Git command returned malformed output"},
+		{name: "truncated name", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note Author", StdoutTruncated: true}},
+		}, message: "Git output exceeded the configured limit"},
+		{name: "truncated email", steps: []runnerStep{
+			{want: readCommand(dir, "config", "--get", "user.name"), result: Result{Stdout: "Note Author\n"}},
+			{want: readCommand(dir, "config", "--get", "user.email"), result: Result{StderrTruncated: true}},
+		}, message: "Git output exceeded the configured limit"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			steps := append([]runnerStep{{want: readCommand(dir, "rev-parse", "--show-toplevel"), err: notRepository}}, test.steps...)
+			runner := &porcelainRunnerFake{t: t, steps: steps}
+			_, err := NewClient(runner).InspectLocal(context.Background(), dir)
+			var safeErr *SafeError
+			if !errors.As(err, &safeErr) || safeErr.Code != CodeCommandFailed || safeErr.Message != test.message {
+				t.Fatalf("InspectLocal() error = %#v, want command failure %q", err, test.message)
+			}
+			runner.assertDone()
+		})
+	}
 }
 
 func TestClientInspectLocalCanonicalizesGitDirSymlink(t *testing.T) {
