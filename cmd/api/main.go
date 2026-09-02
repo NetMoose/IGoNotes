@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"time"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/handlers"
 	"IGoNotes/internal/repository"
 	"IGoNotes/internal/service"
@@ -89,10 +90,17 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 		}
 	}()
 
-	settingsService, err := service.NewSettingsService(configService, noteService, options.base, log.Default())
+	gitRunner := gitcmd.NewCommandRunner()
+	gitClient := gitcmd.NewClient(gitRunner)
+	gitStatusRepo := repository.NewGitStatusRepository(db)
+	gitValidator := service.NewGitConfigValidator(gitClient)
+	settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, options.base, log.Default(), gitValidator, gitStatusRepo)
 	if err != nil {
 		return fmt.Errorf("инициализировать сервис настроек: %w", err)
 	}
+	gitProbeService := service.NewGitProbeService(settingsService, gitClient)
+	gitStatusService := service.NewGitStatusService(settingsService, gitStatusRepo)
+	gitHandler := handlers.NewGitHandler(gitProbeService, settingsService, gitStatusService)
 
 	go func() {
 		log.Println("Запуск первичной синхронизации файловой системы...")
@@ -115,6 +123,7 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	spaHandler := handlers.NewSPAHandler(distFS)
 
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
+	handlers.RegisterGitRoutes(router, gitHandler, settingsService)
 	registerSystemRoutes(router, systemHandler)
 
 	address, url := localServerEndpoint(options.port)

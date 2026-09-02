@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 	"IGoNotes/internal/service"
 )
@@ -33,6 +34,11 @@ var serviceErrorMappings = []serviceErrorMapping{
 	{service.ErrBasePathConflict, http.StatusConflict, "base_path_conflict", service.ErrBasePathConflict.Error()},
 	{service.ErrActiveBase, http.StatusConflict, "active_base", service.ErrActiveBase.Error()},
 	{service.ErrLastBase, http.StatusConflict, "last_base", service.ErrLastBase.Error()},
+	{service.ErrInvalidGitURL, http.StatusUnprocessableEntity, "invalid_git_url", service.ErrInvalidGitURL.Error()},
+	{service.ErrInvalidGitBranch, http.StatusUnprocessableEntity, "invalid_branch", service.ErrInvalidGitBranch.Error()},
+	{service.ErrInvalidGitInterval, http.StatusUnprocessableEntity, "invalid_auto_sync_interval", service.ErrInvalidGitInterval.Error()},
+	{service.ErrInvalidGitTemplate, http.StatusUnprocessableEntity, "invalid_commit_template", service.ErrInvalidGitTemplate.Error()},
+	{service.ErrGitRepositoryInUse, http.StatusConflict, "git_repository_in_use", service.ErrGitRepositoryInUse.Error()},
 }
 
 func WriteAPIError(w http.ResponseWriter, status int, code, message, field string) {
@@ -56,6 +62,31 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		}
 		WriteAPIError(w, mapping.status, mapping.code, message, field)
 		return
+	}
+
+	var safeErr *gitcmd.SafeError
+	if errors.As(err, &safeErr) && safeErr != nil {
+		status := 0
+		switch safeErr.Code {
+		case gitcmd.CodeUnavailable:
+			status = http.StatusServiceUnavailable
+		case gitcmd.CodeUnsupportedVersion, gitcmd.CodeIdentityMissing, gitcmd.CodeInvalidBranch:
+			status = http.StatusUnprocessableEntity
+		case gitcmd.CodeAuthentication:
+			status = http.StatusUnauthorized
+		case gitcmd.CodeRemoteUnreachable:
+			status = http.StatusBadGateway
+		case gitcmd.CodeRepositoryRoot, gitcmd.CodeRepositoryLocked:
+			status = http.StatusConflict
+		case gitcmd.CodeTimedOut:
+			status = http.StatusGatewayTimeout
+		case gitcmd.CodeCanceled:
+			status = http.StatusRequestTimeout
+		}
+		if status != 0 {
+			WriteAPIError(w, status, string(safeErr.Code), safeErr.Message, safeErr.Field)
+			return
+		}
 	}
 
 	WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
