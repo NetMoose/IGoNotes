@@ -198,7 +198,8 @@ func TestInitDBRejectsInvalidMigrationDefinitions(t *testing.T) {
 	migrations = []migration{{version: 1, sql: "SELECT 1"}, {version: 3, sql: "SELECT 1"}}
 	defer func() { migrations = original }()
 
-	db, err := InitDB(filepath.Join(t.TempDir(), "metadata.db"))
+	dbPath := filepath.Join(t.TempDir(), "metadata.db")
+	db, err := InitDB(dbPath)
 	if err == nil || !strings.Contains(err.Error(), "invalid schema migration history") {
 		if db != nil {
 			db.Close()
@@ -208,6 +209,16 @@ func TestInitDBRejectsInvalidMigrationDefinitions(t *testing.T) {
 	if db != nil {
 		db.Close()
 		t.Fatal("InitDB() database is non-nil for invalid migration definitions")
+	}
+
+	reopened := openRawDB(t, dbPath)
+	defer reopened.Close()
+	var schemaObjects int
+	if err := reopened.QueryRow("SELECT count(*) FROM sqlite_master").Scan(&schemaObjects); err != nil {
+		t.Fatalf("inspect rejected database schema: %v", err)
+	}
+	if schemaObjects != 0 {
+		t.Errorf("schema objects after invalid migration definitions = %d, want 0", schemaObjects)
 	}
 }
 

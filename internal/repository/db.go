@@ -71,6 +71,12 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
+	for index, migration := range migrations {
+		if migration.version != index+1 {
+			return nil, fmt.Errorf("invalid schema migration history: migration version %d at position %d", migration.version, index+1)
+		}
+	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -87,12 +93,6 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		)
 	`); err != nil {
 		return fail(fmt.Errorf("failed to initialize schema migrations: %w", err))
-	}
-
-	for index, migration := range migrations {
-		if migration.version != index+1 {
-			return fail(fmt.Errorf("invalid schema migration history: migration version %d at position %d", migration.version, index+1))
-		}
 	}
 
 	rows, err := db.Query("SELECT version FROM schema_migrations ORDER BY version")
