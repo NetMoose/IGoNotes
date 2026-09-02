@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 )
 
@@ -246,11 +247,53 @@ func TestValidateGitConfigRejectsMissingOrInvalidBranch(t *testing.T) {
 		t.Fatalf("branch validator calls = %d, want 0", branchValidator.calls)
 	}
 
-	branchValidator.err = errors.New("git rejected branch")
-	request.GitBranch = "main"
-	_, err = validator.Validate(context.Background(), "/notes", request)
-	if !errors.Is(err, ErrInvalidGitBranch) {
-		t.Fatalf("delegated branch error = %v, want ErrInvalidGitBranch", err)
+	invalidErrors := []error{
+		&gitcmd.SafeError{Code: gitcmd.CodeInvalidBranch, Message: "Invalid Git branch", Field: "git_branch"},
+		ErrInvalidGitBranch,
+	}
+	for _, invalidErr := range invalidErrors {
+		branchValidator.err = invalidErr
+		request.GitBranch = "main"
+		_, err = validator.Validate(context.Background(), "/notes", request)
+		if !errors.Is(err, ErrInvalidGitBranch) {
+			t.Fatalf("delegated branch error = %v, want ErrInvalidGitBranch", err)
+		}
+		var fieldErr *FieldError
+		if !errors.As(err, &fieldErr) || fieldErr.Field != "git_branch" {
+			t.Fatalf("delegated branch error = %#v, want git_branch FieldError", err)
+		}
+	}
+}
+
+func TestValidateGitConfigPreservesBranchValidatorOperationalErrors(t *testing.T) {
+	request := model.GitConfigRequest{
+		GitURL:                  "https://example.com/notes.git",
+		GitBranch:               "main",
+		AutoSyncIntervalMinutes: 5,
+	}
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "unavailable", err: &gitcmd.SafeError{Code: gitcmd.CodeUnavailable, Message: "Git executable is unavailable"}},
+		{name: "timeout", err: &gitcmd.SafeError{Code: gitcmd.CodeTimedOut, Message: "Git command timed out"}},
+		{name: "canceled", err: &gitcmd.SafeError{Code: gitcmd.CodeCanceled, Message: "Git command was canceled"}},
+		{name: "generic operational error", err: errors.New("branch validation operation failed")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			branchValidator := &branchValidatorFake{err: test.err}
+			_, err := NewGitConfigValidator(branchValidator).Validate(context.Background(), "/notes", request)
+			if err != test.err {
+				t.Fatalf("Validate() error = %#v, want exact operational error %#v", err, test.err)
+			}
+			if errors.Is(err, ErrInvalidGitBranch) {
+				t.Fatalf("Validate() error = %#v, must not wrap ErrInvalidGitBranch", err)
+			}
+			if branchValidator.calls != 1 {
+				t.Fatalf("branch validator calls = %d, want 1", branchValidator.calls)
+			}
+		})
 	}
 }
 

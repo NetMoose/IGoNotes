@@ -11,6 +11,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 )
 
@@ -64,7 +65,11 @@ func (v *gitConfigValidator) Validate(ctx context.Context, dir string, request m
 		return model.GitConfigRequest{}, fieldError(ErrInvalidGitBranch, "git_branch", "invalid Git branch")
 	}
 	if err := v.branches.ValidateBranch(ctx, dir, request.GitBranch); err != nil {
-		return model.GitConfigRequest{}, fieldErrorWithCause(ErrInvalidGitBranch, err, "git_branch", "invalid Git branch")
+		var safeErr *gitcmd.SafeError
+		if errors.Is(err, ErrInvalidGitBranch) || (errors.As(err, &safeErr) && safeErr.Code == gitcmd.CodeInvalidBranch) {
+			return model.GitConfigRequest{}, fieldErrorWithCause(ErrInvalidGitBranch, err, "git_branch", "invalid Git branch")
+		}
+		return model.GitConfigRequest{}, err
 	}
 	if err := ValidateGitInterval(request.AutoSync, request.AutoSyncIntervalMinutes); err != nil {
 		return model.GitConfigRequest{}, fieldError(ErrInvalidGitInterval, "auto_sync_interval_minutes", "invalid auto sync interval")
