@@ -71,10 +71,12 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		case gitcmd.CodeCanceled:
 			status = http.StatusRequestTimeout
 		}
-		if status != 0 {
-			WriteAPIError(w, status, string(safeErr.Code), safeErr.Message, safeErr.Field)
+		if status == 0 {
+			WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 			return
 		}
+		WriteAPIError(w, status, string(safeErr.Code), safeErr.Message, safeErr.Field)
+		return
 	}
 
 	for _, mapping := range serviceErrorMappings {

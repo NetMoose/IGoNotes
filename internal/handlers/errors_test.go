@@ -181,6 +181,42 @@ func TestWriteServiceErrorSafeErrorWinsOverJoinedInvalidBranch(t *testing.T) {
 	}
 }
 
+func TestWriteServiceErrorUnknownSafeErrorFailsClosedBeforeServiceMappings(t *testing.T) {
+	err := fmt.Errorf("clone https://user:secret@example.test/private.git: %w", errors.Join(
+		&service.FieldError{
+			Kind:    service.ErrInvalidGitBranch,
+			Field:   "secret_branch_field",
+			Message: "secret invalid branch detail",
+		},
+		&gitcmd.SafeError{
+			Code:    gitcmd.CodeCommandFailed,
+			Message: "secret Git diagnostic",
+			Field:   "secret_git_field",
+		},
+	))
+	recorder := httptest.NewRecorder()
+
+	writeServiceError(recorder, err)
+
+	assertAPIErrorResponse(t, recorder, http.StatusInternalServerError, model.APIError{
+		Code:    "internal_error",
+		Message: internalErrorMessage,
+	})
+	for _, private := range []string{
+		"user:secret",
+		"example.test",
+		"private.git",
+		"secret_branch_field",
+		"secret invalid branch detail",
+		"secret Git diagnostic",
+		"secret_git_field",
+	} {
+		if strings.Contains(recorder.Body.String(), private) {
+			t.Errorf("response leaks unknown Git error detail %q: %q", private, recorder.Body.String())
+		}
+	}
+}
+
 func TestWriteAPIError(t *testing.T) {
 	recorder := httptest.NewRecorder()
 
