@@ -45,6 +45,9 @@ func TestValidateGitURLPolicy(t *testing.T) {
 		"../notes.git",
 		"notes.git",
 		"path with spaces/notes.git",
+		"./repos/team:notes.git",
+		"../repos/team:notes.git",
+		"/srv/repos/team:notes.git",
 	}
 	for _, value := range accepted {
 		t.Run("accept_"+value, func(t *testing.T) {
@@ -96,6 +99,8 @@ func TestValidateGitURLPolicy(t *testing.T) {
 		"[2001:db8::1]:",
 		"git@[2001:db8::1]notes.git",
 		"host::notes.git",
+		"./repos/team::notes.git",
+		"./repos/team://notes.git",
 		"not a scheme://example.com/notes.git",
 	}
 	for _, value := range rejected {

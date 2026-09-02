@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -58,6 +59,8 @@ func TestParseGitVersion(t *testing.T) {
 	}{
 		{output: "git version 2.28.0\n", want: Version{Major: 2, Minor: 28, Patch: 0, Raw: "git version 2.28.0"}},
 		{output: "git version 2.43.0.windows.1\n", want: Version{Major: 2, Minor: 43, Patch: 0, Raw: "git version 2.43.0.windows.1"}},
+		{output: "git version 2.39.5 (Apple Git-154)\n", want: Version{Major: 2, Minor: 39, Patch: 5, Raw: "git version 2.39.5 (Apple Git-154)"}},
+		{output: "git version 2.41.0.vendor-build\n", want: Version{Major: 2, Minor: 41, Patch: 0, Raw: "git version 2.41.0.vendor-build"}},
 	}
 	for _, test := range tests {
 		got, err := parseGitVersion(test.output)
@@ -69,7 +72,7 @@ func TestParseGitVersion(t *testing.T) {
 		}
 	}
 
-	for _, output := range []string{"", "git version", "git version two.28.0", "git version 2.28"} {
+	for _, output := range []string{"", "git version", "prefix git version 2.39.5", "git version two.28.0", "git version 2.two.0", "git version 2.28", "git version 2.28.patch", "git version 2.39.5\nunexpected"} {
 		if _, err := parseGitVersion(output); err == nil {
 			t.Errorf("parseGitVersion(%q) error = nil, want malformed output", output)
 		}
@@ -140,6 +143,32 @@ func TestValidateBranchConvertsGitRejection(t *testing.T) {
 	err := NewClient(runner).ValidateBranch(context.Background(), dir, "main")
 	assertInvalidBranchError(t, err)
 	runner.assertDone()
+}
+
+func TestValidateBranchPropagatesUnexpectedRunnerFailures(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: &SafeError{Code: CodeCanceled, Message: "Git command was canceled"}},
+		{name: "timed out", err: &SafeError{Code: CodeTimedOut, Message: "Git command timed out"}},
+		{name: "unavailable", err: &SafeError{Code: CodeUnavailable, Message: "Git executable is unavailable"}},
+		{name: "unexpected command exit", err: exitError(2)},
+		{name: "non Git failure", err: errors.New("runner failed")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{{
+				want: readCommand(dir, "check-ref-format", "refs/heads/main"), err: test.err,
+			}}}
+			err := NewClient(runner).ValidateBranch(context.Background(), dir, "main")
+			if err != test.err {
+				t.Fatalf("ValidateBranch() error = %#v, want unchanged %#v", err, test.err)
+			}
+			runner.assertDone()
+		})
+	}
 }
 
 func assertInvalidBranchError(t *testing.T, err error) {
@@ -234,6 +263,34 @@ func TestClientInspectLocalReturnsNoRepository(t *testing.T) {
 	runner.assertDone()
 }
 
+func TestClientInspectLocalCanonicalizesGitDirSymlink(t *testing.T) {
+	root := t.TempDir()
+	realGitDir := t.TempDir()
+	linkParent := t.TempDir()
+	linkedGitDir := filepath.Join(linkParent, "linked-git-dir")
+	if err := os.Symlink(realGitDir, linkedGitDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	runner := &porcelainRunnerFake{t: t, steps: []runnerStep{
+		{want: readCommand(root, "rev-parse", "--show-toplevel"), result: Result{Stdout: root + "\n"}},
+		{want: readCommand(root, "rev-parse", "--absolute-git-dir"), result: Result{Stdout: linkedGitDir + "\n"}},
+		{want: readCommand(root, "symbolic-ref", "--quiet", "--short", "HEAD"), result: Result{Stdout: "main\n"}},
+		{want: readCommand(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")},
+		{want: readCommand(root, "remote", "get-url", "origin"), err: exitError(2)},
+		{want: readCommand(root, "config", "--get", "user.name"), err: exitError(1)},
+		{want: readCommand(root, "config", "--get", "user.email"), err: exitError(1)},
+		{want: readCommand(root, "rev-parse", "--verify", "HEAD"), err: exitError(128)},
+	}}
+	got, err := NewClient(runner).InspectLocal(context.Background(), root)
+	if err != nil {
+		t.Fatalf("InspectLocal() error = %v", err)
+	}
+	if got.GitDir != realGitDir {
+		t.Fatalf("InspectLocal().GitDir = %q, want canonical %q", got.GitDir, realGitDir)
+	}
+	runner.assertDone()
+}
+
 func TestClientInspectLocalPropagatesUnexpectedOptionalCommandExit(t *testing.T) {
 	root := t.TempDir()
 	gitDir := filepath.Join(root, ".git")
@@ -251,6 +308,81 @@ func TestClientInspectLocalPropagatesUnexpectedOptionalCommandExit(t *testing.T)
 		t.Fatal("InspectLocal() error = nil, want unexpected origin failure")
 	}
 	runner.assertDone()
+}
+
+func TestPendingOperationMarkers(t *testing.T) {
+	tests := []struct {
+		name   string
+		marker string
+		want   string
+	}{
+		{name: "none"},
+		{name: "merge", marker: "MERGE_HEAD", want: "merge"},
+		{name: "rebase merge", marker: "rebase-merge", want: "rebase"},
+		{name: "rebase apply", marker: "rebase-apply", want: "rebase"},
+		{name: "cherry pick", marker: "CHERRY_PICK_HEAD", want: "cherry-pick"},
+		{name: "revert", marker: "REVERT_HEAD", want: "revert"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gitDir := t.TempDir()
+			if test.marker != "" {
+				marker := filepath.Join(gitDir, test.marker)
+				var err error
+				if strings.HasPrefix(test.marker, "rebase-") {
+					err = os.Mkdir(marker, 0o700)
+				} else {
+					err = os.WriteFile(marker, []byte("oid\n"), 0o600)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := pendingOperation(gitDir)
+			if err != nil {
+				t.Fatalf("pendingOperation() error = %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("pendingOperation() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPendingOperationUsesDeterministicPrecedence(t *testing.T) {
+	tests := []struct {
+		name    string
+		markers []string
+		want    string
+	}{
+		{name: "merge first", markers: []string{"REVERT_HEAD", "rebase-apply", "CHERRY_PICK_HEAD", "MERGE_HEAD"}, want: "merge"},
+		{name: "rebase before cherry pick", markers: []string{"REVERT_HEAD", "CHERRY_PICK_HEAD", "rebase-apply"}, want: "rebase"},
+		{name: "cherry pick before revert", markers: []string{"REVERT_HEAD", "CHERRY_PICK_HEAD"}, want: "cherry-pick"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gitDir := t.TempDir()
+			for _, name := range test.markers {
+				marker := filepath.Join(gitDir, name)
+				var err error
+				if strings.HasPrefix(name, "rebase-") {
+					err = os.Mkdir(marker, 0o700)
+				} else {
+					err = os.WriteFile(marker, []byte("oid\n"), 0o600)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := pendingOperation(gitDir)
+			if err != nil {
+				t.Fatalf("pendingOperation() error = %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("pendingOperation() = %q, want %q", got, test.want)
+			}
+		})
+	}
 }
 
 func TestClientInspectRemoteParsesAllRefs(t *testing.T) {
@@ -328,7 +460,7 @@ func TestClientHistoryRelationUsesOnlyLocalObjects(t *testing.T) {
 		want  string
 	}{
 		{name: "none", want: "none"},
-		{name: "missing object", steps: []runnerStep{{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: exitError(1)}}, want: "unknown"},
+		{name: "missing object", steps: []runnerStep{{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: exitError(128)}}, want: "unknown"},
 		{name: "remote ancestor", steps: []runnerStep{
 			{want: readCommand(dir, "cat-file", "-e", oid+"^{commit}")},
 			{want: readCommand(dir, "merge-base", "--is-ancestor", oid, "HEAD")},
@@ -360,6 +492,53 @@ func TestClientHistoryRelationUsesOnlyLocalObjects(t *testing.T) {
 			}
 			runner.assertDone()
 		})
+	}
+}
+
+func TestClientHistoryRelationPropagatesNonMissingCatFileFailures(t *testing.T) {
+	dir := t.TempDir()
+	oid := strings.Repeat("a", 40)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: &SafeError{Code: CodeCanceled, Message: "Git command was canceled"}},
+		{name: "timed out", err: &SafeError{Code: CodeTimedOut, Message: "Git command timed out"}},
+		{name: "unavailable", err: &SafeError{Code: CodeUnavailable, Message: "Git executable is unavailable"}},
+		{name: "wrong command exit", err: exitError(1)},
+		{name: "unexpected command exit", err: exitError(23)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &porcelainRunnerFake{t: t, steps: []runnerStep{{
+				want: readCommand(dir, "cat-file", "-e", oid+"^{commit}"), err: test.err,
+			}}}
+			_, err := NewClient(runner).HistoryRelation(context.Background(), dir, oid)
+			if err != test.err {
+				t.Fatalf("HistoryRelation() error = %#v, want unchanged %#v", err, test.err)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestClientHistoryRelationRecognizesRealMissingObject(t *testing.T) {
+	gitExecutable, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("Git unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	command := exec.Command(gitExecutable, "init", "--quiet", dir)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("initialize temporary repository: %v: %s", err, output)
+	}
+
+	got, err := NewClient(NewCommandRunner()).HistoryRelation(context.Background(), dir, strings.Repeat("a", 40))
+	if err != nil {
+		t.Fatalf("HistoryRelation() error = %v", err)
+	}
+	if got != "unknown" {
+		t.Fatalf("HistoryRelation() = %q, want unknown", got)
 	}
 }
 

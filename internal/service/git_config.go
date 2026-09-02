@@ -101,6 +101,10 @@ func ValidateGitURL(value string) error {
 		return ErrInvalidGitURL
 	}
 	if strings.Contains(value, ":") {
+		colon := strings.IndexByte(value, ':')
+		if separator := strings.IndexAny(value, `/\`); separator >= 0 && separator < colon {
+			return nil
+		}
 		if validateSCPLike(value) {
 			return nil
 		}

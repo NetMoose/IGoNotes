@@ -66,20 +66,39 @@ func (c *Client) Version(ctx context.Context, dir string) (Version, error) {
 func parseGitVersion(output string) (Version, error) {
 	raw := strings.TrimSpace(output)
 	const prefix = "git version "
-	if !strings.HasPrefix(raw, prefix) {
+	if !strings.HasPrefix(raw, prefix) || strings.ContainsAny(raw, "\r\n") {
 		return Version{}, malformedOutputError()
 	}
 	parts := strings.Split(strings.TrimPrefix(raw, prefix), ".")
 	if len(parts) < 3 {
 		return Version{}, malformedOutputError()
 	}
+	patchEnd := 0
+	for patchEnd < len(parts[2]) && parts[2][patchEnd] >= '0' && parts[2][patchEnd] <= '9' {
+		patchEnd++
+	}
+	if !decimalDigits(parts[0]) || !decimalDigits(parts[1]) || patchEnd == 0 {
+		return Version{}, malformedOutputError()
+	}
 	major, majorErr := strconv.Atoi(parts[0])
 	minor, minorErr := strconv.Atoi(parts[1])
-	patch, patchErr := strconv.Atoi(parts[2])
+	patch, patchErr := strconv.Atoi(parts[2][:patchEnd])
 	if majorErr != nil || minorErr != nil || patchErr != nil || major < 0 || minor < 0 || patch < 0 {
 		return Version{}, malformedOutputError()
 	}
 	return Version{Major: major, Minor: minor, Patch: patch, Raw: raw}, nil
+}
+
+func decimalDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := range len(value) {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) ValidateBranch(ctx context.Context, dir, branch string) error {
@@ -88,11 +107,10 @@ func (c *Client) ValidateBranch(ctx context.Context, dir, branch string) error {
 	}
 	_, err := c.run(ctx, readOnlyCommand(dir, "check-ref-format", "refs/heads/"+branch))
 	if err != nil {
-		var safeErr *SafeError
-		if errors.As(err, &safeErr) && safeErr.Message == "Git output exceeded the configured limit" {
-			return err
+		if expectedExit(err, 1) {
+			return invalidBranchError()
 		}
-		return invalidBranchError()
+		return err
 	}
 	return nil
 }
@@ -147,7 +165,10 @@ func (c *Client) InspectLocal(ctx context.Context, dir string) (LocalInspection,
 	if gitDir == "" || !filepath.IsAbs(gitDir) {
 		return LocalInspection{}, malformedOutputError()
 	}
-	gitDir = filepath.Clean(gitDir)
+	gitDir, err = canonicalDirectory(gitDir)
+	if err != nil {
+		return LocalInspection{}, malformedOutputError()
+	}
 
 	branchResult, branchErr := c.run(ctx, readOnlyCommand(dir, "symbolic-ref", "--quiet", "--short", "HEAD"))
 	detached := false
@@ -312,7 +333,7 @@ func (c *Client) HistoryRelation(ctx context.Context, dir, remoteOID string) (st
 	}
 	_, err := c.run(ctx, readOnlyCommand(dir, "cat-file", "-e", remoteOID+"^{commit}"))
 	if err != nil {
-		if expectedExit(err, 1) {
+		if expectedExit(err, 128) {
 			return "unknown", nil
 		}
 		return "", err
@@ -363,7 +384,7 @@ func singleLine(output string) string {
 
 func expectedExit(err error, code int) bool {
 	var safeErr *SafeError
-	return errors.As(err, &safeErr) && safeErr.ExitCode == code
+	return errors.As(err, &safeErr) && safeErr.Code == CodeCommandFailed && safeErr.ExitCode == code
 }
 
 func validObjectID(value string) bool {
