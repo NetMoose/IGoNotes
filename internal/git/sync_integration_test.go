@@ -380,6 +380,50 @@ func TestSyncConflictReindexesAndSkipsPush(t *testing.T) {
 	}
 }
 
+func TestSyncRejectsOrphanedUnmergedIndexBeforeAdd(t *testing.T) {
+	fixture, options, operation := makeSyncConflict(t)
+	if err := os.Remove(filepath.Join(fixture.root, ".git", "MERGE_HEAD")); err != nil {
+		t.Fatal(err)
+	}
+	options = syncOptions(fixture, operation.RemoteOID)
+	options.Operation.ID = "22222222222222222222222222222222"
+	indexBefore := fixture.git(fixture.root, "ls-files", "--stage")
+	statusBefore := fixture.git(fixture.root, "status", "--porcelain=v1")
+	contentsBefore, err := os.ReadFile(filepath.Join(fixture.root, "remote.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+
+	_, err = runSync(t, fixture, runner, options, nil, nil)
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || !reflect.DeepEqual(conflict.Paths, []string{"remote.md"}) {
+		t.Fatalf("Sync() error = %#v, conflict = %#v", err, conflict)
+	}
+	if !errorHasSafeCode(err, CodeOperationInterrupted) {
+		t.Fatalf("Sync() error = %#v, want operation_interrupted context", err)
+	}
+	for _, command := range runner.commands {
+		if len(command.Args) == 0 {
+			continue
+		}
+		switch command.Args[0] {
+		case "add", "commit", "merge", "push":
+			t.Fatalf("mutation ran for orphaned unmerged index: %#v", command)
+		}
+	}
+	if indexAfter := fixture.git(fixture.root, "ls-files", "--stage"); indexAfter != indexBefore {
+		t.Fatalf("index changed:\n%s\nwant:\n%s", indexAfter, indexBefore)
+	}
+	if statusAfter := fixture.git(fixture.root, "status", "--porcelain=v1"); statusAfter != statusBefore {
+		t.Fatalf("worktree status changed: %q -> %q", statusBefore, statusAfter)
+	}
+	contentsAfter, err := os.ReadFile(filepath.Join(fixture.root, "remote.md"))
+	if err != nil || !reflect.DeepEqual(contentsAfter, contentsBefore) {
+		t.Fatalf("worktree contents changed: %q -> %q, %v", contentsBefore, contentsAfter, err)
+	}
+}
+
 func TestSyncSHA256UsesFullExactOIDs(t *testing.T) {
 	probe := t.TempDir()
 	if output, err := runFixtureGit(probe, "init", "--object-format=sha256", "--initial-branch", "main"); err != nil {

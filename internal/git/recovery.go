@@ -57,55 +57,94 @@ func (s *Service) RecoverLocal(ctx context.Context, options RecoveryOptions) (Re
 	if managedExists {
 		result.RemoteOID = managed
 	}
+	result.RemoteOID, err = s.recoveryRemoteOID(ctx, path, options.Operation, head, managed, managedExists)
+	trustErr := err
 
-	if local.PendingOperation == "merge" {
-		mergeHead, exists, mergeErr := s.optionalCommitOID(ctx, path, "MERGE_HEAD")
-		if mergeErr != nil {
-			return RecoveryResult{HeadOID: head, RemoteOID: result.RemoteOID, Blocking: true}, mergeErr
-		}
-		if !exists {
-			return RecoveryResult{HeadOID: head, RemoteOID: result.RemoteOID, Blocking: true},
-				&SafeError{Code: CodeOperationInterrupted, Message: "Git merge state is incomplete"}
-		}
-		paths, pathsErr := s.unmergedPaths(ctx, path)
-		result.MergeHeadOID = mergeHead
-		result.ConflictPaths = paths
+	mergeHead, mergeExists, paths, mergeStateErr := s.inspectMergeState(ctx, path)
+	result.MergeHeadOID = mergeHead
+	result.ConflictPaths = paths
+	if mergeStateErr != nil {
 		result.Blocking = true
-		if len(paths) != 0 || pathsErr != nil {
-			conflictErr := newConflictError(paths)
-			if pathsErr != nil {
-				return result, errors.Join(conflictErr, pathsErr)
-			}
-			return result, conflictErr
+		return result, errors.Join(newConflictError(paths), interruptedMergeState(), mergeStateErr, trustErr)
+	}
+	if len(paths) != 0 {
+		result.Blocking = true
+		conflictErr := newConflictError(paths)
+		if !mergeExists {
+			return result, errors.Join(conflictErr, interruptedMergeState(), trustErr)
 		}
-		return result, &SafeError{Code: CodeOperationInterrupted, Message: "Git merge is awaiting completion"}
+		return result, errors.Join(conflictErr, trustErr)
+	}
+	if local.PendingOperation == "merge" || mergeExists {
+		result.Blocking = true
+		return result, errors.Join(
+			&SafeError{Code: CodeOperationInterrupted, Message: "Git merge is awaiting completion"}, trustErr,
+		)
 	}
 	if local.PendingOperation != "" {
 		result.Blocking = true
-		return result, &SafeError{Code: CodeOperationInterrupted, Message: "Git repository has an unfinished operation"}
+		return result, errors.Join(
+			&SafeError{Code: CodeOperationInterrupted, Message: "Git repository has an unfinished operation"}, trustErr,
+		)
 	}
-
-	if operation := options.Operation; operation != nil {
-		if operation.PushOID != "" && managedExists && managed == operation.PushOID && head == operation.PushOID {
-			result.RemoteOID = operation.PushOID
-			return result, nil
-		}
-		if operation.CandidateOID != "" && operation.RemoteOID != operation.CandidateOID {
-			private, privateExists, privateErr := s.optionalRefOID(ctx, path, "refs/igonotes/fetch/"+operation.ID)
-			if privateErr != nil {
-				result.RemoteOID = ""
-				result.Blocking = true
-				return result, privateErr
-			}
-			if !managedExists || managed != operation.CandidateOID || !privateExists || private != operation.CandidateOID {
-				result.RemoteOID = ""
-				result.Blocking = true
-				return result, &SafeError{Code: CodeNeedsReconnect, Message: "Git trusted remote recovery is ambiguous"}
-			}
-			result.RemoteOID = operation.CandidateOID
-		}
+	if trustErr != nil {
+		result.Blocking = true
+		return result, trustErr
 	}
 	return result, nil
+}
+
+func (s *Service) recoveryRemoteOID(
+	ctx context.Context,
+	path string,
+	operation *Operation,
+	head string,
+	managed string,
+	managedExists bool,
+) (string, error) {
+	if operation == nil {
+		if managedExists {
+			return managed, nil
+		}
+		return "", nil
+	}
+	if operation.RemoteOID != "" && managedExists && managed == operation.RemoteOID {
+		return operation.RemoteOID, nil
+	}
+	if operation.PushOID != "" && managedExists && managed == operation.PushOID && head == operation.PushOID {
+		return operation.PushOID, nil
+	}
+	candidateGap, err := s.provenRecoveryCandidate(ctx, path, operation, managed, managedExists)
+	if err != nil {
+		return "", err
+	}
+	if candidateGap {
+		return operation.CandidateOID, nil
+	}
+	if operation.RemoteOID != "" || operation.CandidateOID != "" {
+		return "", &SafeError{Code: CodeNeedsReconnect, Message: "Git trusted remote recovery is ambiguous"}
+	}
+	if managedExists {
+		return managed, nil
+	}
+	return "", nil
+}
+
+func (s *Service) provenRecoveryCandidate(
+	ctx context.Context,
+	path string,
+	operation *Operation,
+	managed string,
+	managedExists bool,
+) (bool, error) {
+	if operation.CandidateOID == "" || !managedExists || managed != operation.CandidateOID {
+		return false, nil
+	}
+	private, privateExists, err := s.optionalRefOID(ctx, path, "refs/igonotes/fetch/"+operation.ID)
+	if err != nil {
+		return false, err
+	}
+	return privateExists && private == operation.CandidateOID, nil
 }
 
 func (s *Service) validateRecovery(options RecoveryOptions) (string, error) {

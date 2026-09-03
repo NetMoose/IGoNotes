@@ -298,6 +298,16 @@ func (s *Service) runSyncWorktree(
 		if err := requireCallbackPath(path, callbackPath); err != nil {
 			return err
 		}
+		_, mergeExists, unmerged, inspectErr := s.inspectMergeState(ctx, path)
+		if inspectErr != nil || mergeExists || len(unmerged) != 0 {
+			checkpoint.value.ConflictPaths = unmerged
+			conflictErr := newConflictError(unmerged)
+			var stateErr error
+			if inspectErr != nil || !mergeExists || len(unmerged) == 0 {
+				stateErr = interruptedMergeState()
+			}
+			return errors.Join(conflictErr, stateErr, inspectErr, checkpoint.save(ctx, StageMerging))
+		}
 		local, err := s.inspectSafeLocal(ctx, path)
 		if err != nil {
 			return err
@@ -363,6 +373,62 @@ func (s *Service) runSyncWorktree(
 	return err
 }
 
+func (s *Service) inspectMergeState(ctx context.Context, path string) (string, bool, []string, error) {
+	gitDir, gitDirErr := s.syncGitDirectory(ctx, path)
+	markerExists := false
+	var markerErr error
+	if gitDirErr == nil {
+		markerExists, markerErr = mergeMarkerExists(gitDir)
+	}
+	mergeHead, mergeExists, mergeErr := s.optionalCommitOID(ctx, path, "MERGE_HEAD")
+	paths, pathsErr := s.unmergedPaths(ctx, path)
+	markerStillExists := markerExists
+	var markerRecheckErr error
+	if gitDirErr == nil {
+		markerStillExists, markerRecheckErr = mergeMarkerExists(gitDir)
+	}
+	if gitDirErr == nil && markerErr == nil && markerRecheckErr == nil &&
+		(markerExists != mergeExists || markerStillExists != mergeExists) {
+		markerErr = malformedOutputError()
+	}
+	return mergeHead, mergeExists, paths, errors.Join(gitDirErr, markerErr, markerRecheckErr, mergeErr, pathsErr)
+}
+
+func mergeMarkerExists(gitDir string) (bool, error) {
+	_, err := os.Lstat(filepath.Join(gitDir, "MERGE_HEAD"))
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, &SafeError{Code: CodeCommandFailed, Message: "Git repository inspection failed", cause: err}
+	}
+}
+
+func (s *Service) syncGitDirectory(ctx context.Context, path string) (string, error) {
+	result, err := s.connectRunLocal(ctx, path, true, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return "", err
+	}
+	if result.StdoutTruncated || result.StderrTruncated || strings.Contains(result.Stdout, "\n\n") {
+		return "", malformedOutputError()
+	}
+	gitDir := singleLine(result.Stdout)
+	if gitDir == "" || !filepath.IsAbs(gitDir) {
+		return "", malformedOutputError()
+	}
+	canonical, err := canonicalDirectory(gitDir)
+	if err != nil {
+		return "", &SafeError{Code: CodeCommandFailed, Message: "Git repository inspection failed", cause: err}
+	}
+	return canonical, nil
+}
+
+func interruptedMergeState() error {
+	return &SafeError{Code: CodeOperationInterrupted, Message: "Git merge state is ambiguous or unfinished"}
+}
+
 func (s *Service) mergeSyncCandidate(
 	ctx context.Context,
 	path, branch, candidate string,
@@ -389,17 +455,21 @@ func (s *Service) mergeSyncCandidate(
 	_, mergeErr := s.connectRunLocal(ctx, path, false,
 		"merge", "--no-edit", "-m", "IGoNotes: merge origin/"+branch, candidate)
 	if mergeErr != nil {
-		paths, inspectErr := s.unmergedPaths(ctx, path)
+		_, mergeExists, paths, inspectErr := s.inspectMergeState(ctx, path)
 		checkpoint.value.ConflictPaths = paths
 		if inspectErr != nil {
-			return errors.Join(newConflictError(paths), inspectErr, checkpoint.save(ctx, StageMerging))
+			return errors.Join(newConflictError(paths), interruptedMergeState(), inspectErr, checkpoint.save(ctx, StageMerging))
 		}
-		if len(paths) != 0 {
+		if mergeExists || len(paths) != 0 {
 			conflictErr := newConflictError(paths)
-			if progressErr := checkpoint.save(ctx, StageMerging); progressErr != nil {
-				return errors.Join(conflictErr, progressErr)
+			var stateErr error
+			if !mergeExists || len(paths) == 0 {
+				stateErr = interruptedMergeState()
 			}
-			return conflictErr
+			if progressErr := checkpoint.save(ctx, StageMerging); progressErr != nil {
+				return errors.Join(conflictErr, stateErr, progressErr)
+			}
+			return errors.Join(conflictErr, stateErr)
 		}
 		return mergeErr
 	}

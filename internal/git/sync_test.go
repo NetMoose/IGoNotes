@@ -3,6 +3,8 @@ package git
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -82,6 +84,24 @@ func servicePushes(commands []Command) []Command {
 		}
 	}
 	return pushes
+}
+
+func errorHasSafeCode(err error, code ErrorCode) bool {
+	if safeErr, ok := err.(*SafeError); ok && safeErr.Code == code {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if errorHasSafeCode(child, code) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return errorHasSafeCode(wrapped.Unwrap(), code)
+	}
+	return false
 }
 
 func TestSyncRejectsManagedRefAndStatusMismatch(t *testing.T) {
@@ -292,5 +312,217 @@ func TestSyncConflictInspectionFailurePreservesTypedConflict(t *testing.T) {
 	var conflict *ConflictError
 	if !errors.As(err, &conflict) || !errors.Is(err, inspectionErr) {
 		t.Fatalf("Sync() error = %#v, want joined typed conflict", err)
+	}
+}
+
+func TestSyncMergeFailureStateMatrix(t *testing.T) {
+	hookErr := errors.New("merge hook failed")
+	for _, test := range []struct {
+		name             string
+		beforeMerge      bool
+		afterMerge       func(*connectFixture)
+		wantPaths        []string
+		wantConflict     bool
+		wantInterrupted  bool
+		wantOriginalFail bool
+	}{
+		{name: "merge head and unmerged", wantPaths: []string{"remote.md"}, wantConflict: true},
+		{name: "unmerged without merge head", afterMerge: func(f *connectFixture) {
+			if err := os.Remove(filepath.Join(f.root, ".git", "MERGE_HEAD")); err != nil {
+				t.Fatal(err)
+			}
+		}, wantPaths: []string{"remote.md"}, wantConflict: true, wantInterrupted: true},
+		{name: "merge head without unmerged", afterMerge: func(f *connectFixture) {
+			f.git(f.root, "add", "--all", "--", ".")
+		}, wantConflict: true, wantInterrupted: true},
+		{name: "neither", beforeMerge: true, wantOriginalFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, options := preparedSyncFixture(t)
+			fixture.write("remote.md", "local conflict\n")
+			seedRemoteAdvance(t, fixture, "remote.md", "remote conflict\n")
+			runner := &interceptRunner{delegate: NewCommandRunner()}
+			if test.beforeMerge {
+				runner.before = func(command Command) error {
+					if len(command.Args) > 0 && command.Args[0] == "merge" {
+						return hookErr
+					}
+					return nil
+				}
+			}
+			if test.afterMerge != nil {
+				runner.after = func(command Command, result Result, err error) (Result, error) {
+					if len(command.Args) > 0 && command.Args[0] == "merge" && err != nil {
+						test.afterMerge(fixture)
+					}
+					return result, err
+				}
+			}
+			result, err := runSync(t, fixture, runner, options, nil, nil)
+			var conflict *ConflictError
+			if gotConflict := errors.As(err, &conflict); gotConflict != test.wantConflict {
+				t.Fatalf("Sync() error = %#v, conflict = %#v, want conflict %v", err, conflict, test.wantConflict)
+			}
+			if test.wantConflict && !reflect.DeepEqual(conflict.Paths, test.wantPaths) {
+				t.Fatalf("Conflict paths = %#v, want %#v", conflict.Paths, test.wantPaths)
+			}
+			if errorHasSafeCode(err, CodeOperationInterrupted) != test.wantInterrupted {
+				t.Fatalf("Sync() error = %#v, want interrupted %v", err, test.wantInterrupted)
+			}
+			if test.wantOriginalFail && !errors.Is(err, hookErr) {
+				t.Fatalf("Sync() error = %#v, want original merge failure", err)
+			}
+			if len(servicePushes(runner.commands)) != 0 || result.PushOID != "" {
+				t.Fatalf("merge failure pushed: result %#v, pushes %#v", result, servicePushes(runner.commands))
+			}
+		})
+	}
+}
+
+func TestSyncMergeFailureInspectionFailuresFailClosed(t *testing.T) {
+	inspectionErr := errors.New("merge state inspection failed")
+	for _, test := range []struct {
+		name   string
+		match  func([]string) bool
+		result Result
+		err    error
+	}{
+		{name: "merge head command", match: func(args []string) bool {
+			return reflect.DeepEqual(args, []string{"rev-parse", "--verify", "MERGE_HEAD^{commit}"})
+		}, err: inspectionErr},
+		{name: "merge head malformed", match: func(args []string) bool {
+			return reflect.DeepEqual(args, []string{"rev-parse", "--verify", "MERGE_HEAD^{commit}"})
+		}, result: Result{Stdout: "not-an-oid\n"}},
+		{name: "unmerged truncated", match: func(args []string) bool {
+			return reflect.DeepEqual(args, []string{"ls-files", "-u", "-z"})
+		}, result: Result{StdoutTruncated: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, options := preparedSyncFixture(t)
+			fixture.write("remote.md", "local conflict\n")
+			seedRemoteAdvance(t, fixture, "remote.md", "remote conflict\n")
+			runner := &interceptRunner{delegate: NewCommandRunner()}
+			mergeFailed := false
+			intercepted := false
+			runner.after = func(command Command, result Result, err error) (Result, error) {
+				if len(command.Args) > 0 && command.Args[0] == "merge" && err != nil {
+					mergeFailed = true
+				}
+				if mergeFailed && !intercepted && test.match(command.Args) {
+					intercepted = true
+					return test.result, test.err
+				}
+				return result, err
+			}
+			_, err := runSync(t, fixture, runner, options, nil, nil)
+			var conflict *ConflictError
+			if !intercepted || !errors.As(err, &conflict) || !errorHasSafeCode(err, CodeOperationInterrupted) {
+				t.Fatalf("Sync() error = %#v, conflict = %#v, intercepted = %v", err, conflict, intercepted)
+			}
+			if test.err != nil && !errors.Is(err, test.err) {
+				t.Fatalf("Sync() error = %#v, want inspection failure", err)
+			}
+			if len(servicePushes(runner.commands)) != 0 {
+				t.Fatal("push ran after merge-state inspection failure")
+			}
+		})
+	}
+}
+
+func TestSyncMergeFailureMalformedMergeHeadFailsClosed(t *testing.T) {
+	fixture, options := preparedSyncFixture(t)
+	fixture.write("remote.md", "local conflict\n")
+	seedRemoteAdvance(t, fixture, "remote.md", "remote conflict\n")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	corrupted := false
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if len(command.Args) > 0 && command.Args[0] == "merge" && err != nil {
+			if writeErr := os.WriteFile(filepath.Join(fixture.root, ".git", "MERGE_HEAD"), []byte("not-an-oid\n"), 0o600); writeErr != nil {
+				t.Fatal(writeErr)
+			}
+			corrupted = true
+		}
+		return result, err
+	}
+	_, err := runSync(t, fixture, runner, options, nil, nil)
+	var conflict *ConflictError
+	if !corrupted || !errors.As(err, &conflict) || !errorHasSafeCode(err, CodeCommandFailed) ||
+		!errorHasSafeCode(err, CodeOperationInterrupted) {
+		t.Fatalf("Sync() error = %#v, conflict = %#v, corrupted = %v", err, conflict, corrupted)
+	}
+	if len(servicePushes(runner.commands)) != 0 {
+		t.Fatal("push ran after malformed MERGE_HEAD")
+	}
+}
+
+func TestSyncMergeFailureDetectsMergeHeadRemovalDuringInspection(t *testing.T) {
+	fixture, options := preparedSyncFixture(t)
+	fixture.write("remote.md", "local conflict\n")
+	seedRemoteAdvance(t, fixture, "remote.md", "remote conflict\n")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	mergeFailed := false
+	removed := false
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if len(command.Args) > 0 && command.Args[0] == "merge" && err != nil {
+			mergeFailed = true
+		}
+		if mergeFailed && !removed && err == nil &&
+			reflect.DeepEqual(command.Args, []string{"rev-parse", "--verify", "MERGE_HEAD^{commit}"}) {
+			if removeErr := os.Remove(filepath.Join(fixture.root, ".git", "MERGE_HEAD")); removeErr != nil {
+				t.Fatal(removeErr)
+			}
+			removed = true
+		}
+		return result, err
+	}
+	_, err := runSync(t, fixture, runner, options, nil, nil)
+	var conflict *ConflictError
+	if !removed || !errors.As(err, &conflict) || !errorHasSafeCode(err, CodeOperationInterrupted) {
+		t.Fatalf("Sync() error = %#v, conflict = %#v, removed = %v", err, conflict, removed)
+	}
+	if len(servicePushes(runner.commands)) != 0 {
+		t.Fatal("push ran after MERGE_HEAD inspection race")
+	}
+}
+
+func TestSyncPreAddUnmergedInspectionFailureFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result Result
+		err    error
+	}{
+		{name: "command failure", err: errors.New("index inspection failed")},
+		{name: "truncated", result: Result{StdoutTruncated: true}},
+		{name: "malformed", result: Result{Stdout: "not nul terminated"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, options := preparedSyncFixture(t)
+			fixture.write("local.md", "must remain uncommitted\n")
+			runner := &interceptRunner{delegate: NewCommandRunner()}
+			intercepted := false
+			runner.after = func(command Command, result Result, err error) (Result, error) {
+				if !intercepted && reflect.DeepEqual(command.Args, []string{"ls-files", "-u", "-z"}) {
+					intercepted = true
+					return test.result, test.err
+				}
+				return result, err
+			}
+			_, err := runSync(t, fixture, runner, options, nil, nil)
+			var conflict *ConflictError
+			if !intercepted || !errors.As(err, &conflict) {
+				t.Fatalf("Sync() error = %#v, intercepted = %v", err, intercepted)
+			}
+			if test.err != nil && !errors.Is(err, test.err) {
+				t.Fatalf("Sync() error = %#v, want inspection cause", err)
+			}
+			if len(servicePushes(runner.commands)) != 0 {
+				t.Fatal("push ran after failed pre-add inspection")
+			}
+			for _, command := range runner.commands {
+				if len(command.Args) > 0 && (command.Args[0] == "add" || command.Args[0] == "commit") {
+					t.Fatalf("local snapshot mutation ran after failed inspection: %#v", command)
+				}
+			}
+		})
 	}
 }
