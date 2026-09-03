@@ -556,6 +556,26 @@ func TestInitializeRetryAfterUnbornCheckoutBeforeBranchRef(t *testing.T) {
 	assertUnbornPopulationRetry(t, fixture, options, candidate, true)
 }
 
+func TestInitializeRetryAfterTrustedCandidateCheckpointBeforeCheckout(t *testing.T) {
+	fixture, options, candidate := preparePreCheckoutPopulationGap(t, "after-trust")
+	excludes := filepath.Join(filepath.Dir(fixture.root), "home", "recovery-excludes")
+	if err := os.WriteFile(excludes, []byte("ignored-recovery.tmp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git(filepath.Dir(fixture.root), "config", "--global", "core.excludesFile", excludes)
+	fixture.write("ignored-recovery.tmp", "preserve ignored\n")
+	assertPreCheckoutPopulationRetry(t, fixture, options, candidate)
+	contents, err := os.ReadFile(filepath.Join(fixture.root, "ignored-recovery.tmp"))
+	if err != nil || string(contents) != "preserve ignored\n" {
+		t.Fatalf("ignored recovery file changed: contents=%q error=%v", contents, err)
+	}
+}
+
+func TestInitializeRetryAfterPreCheckoutCheckpointBeforeCheckout(t *testing.T) {
+	fixture, options, candidate := preparePreCheckoutPopulationGap(t, "before-checkout")
+	assertPreCheckoutPopulationRetry(t, fixture, options, candidate)
+}
+
 func TestInitializeRetryAfterUnbornBranchRefBeforeCheckpoint(t *testing.T) {
 	fixture, options, candidate := prepareUnbornPopulationGap(t, "branch-ref")
 	assertUnbornPopulationRetry(t, fixture, options, candidate, false)
@@ -589,6 +609,111 @@ func TestInitializeUnbornRecoveryFailsClosedOnMismatch(t *testing.T) {
 		}
 		assertNoServicePush(t, runner.commands)
 	})
+
+	t.Run("clean unborn gained untracked file", func(t *testing.T) {
+		fixture, options, _ := preparePreCheckoutPopulationGap(t, "after-trust")
+		fixture.write("local-untracked.md", "preserve me\n")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeOperationInterrupted)
+		contents, readErr := os.ReadFile(filepath.Join(fixture.root, "local-untracked.md"))
+		if readErr != nil || string(contents) != "preserve me\n" {
+			t.Fatalf("untracked file changed: contents=%q error=%v", contents, readErr)
+		}
+		for _, command := range runner.commands {
+			if len(command.Args) != 0 && (command.Args[0] == "add" || command.Args[0] == "commit" || command.Args[0] == "checkout") {
+				t.Fatalf("untracked mismatch triggered mutation: %q", command.Args)
+			}
+		}
+		assertNoServicePush(t, runner.commands)
+	})
+}
+
+func preparePreCheckoutPopulationGap(t *testing.T, crashPoint string) (*connectFixture, InitializeOptions, string) {
+	t.Helper()
+	fixture := newConnectFixture(t)
+	candidate := fixture.seedRemote()
+	options := fixture.options()
+	interrupted := errors.New("simulated pre-checkout interruption")
+	trustedPublished := false
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	runner.before = func(command Command) error {
+		if crashPoint == "after-trust" && trustedPublished && reflect.DeepEqual(command.Args,
+			[]string{"symbolic-ref", "--quiet", "--short", "HEAD"}) {
+			return interrupted
+		}
+		if crashPoint == "before-checkout" && len(command.Args) != 0 && command.Args[0] == "checkout" {
+			return interrupted
+		}
+		return nil
+	}
+	_, err := initializeWithRunner(t, fixture, runner, options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+		applyCheckpoint(&options.Operation, checkpoint)
+		if checkpoint.Stage == StageFetching && checkpoint.CandidateOID == candidate && checkpoint.RemoteOID == candidate {
+			trustedPublished = true
+		}
+		return nil
+	})
+	if !errors.Is(err, interrupted) {
+		t.Fatalf("first Initialize() error = %v, want interruption at %s", err, crashPoint)
+	}
+	wantStage := StageFetching
+	if crashPoint == "before-checkout" {
+		wantStage = StageSwitching
+	}
+	if options.Operation.Stage != wantStage || options.Operation.CandidateOID != candidate ||
+		options.Operation.RemoteOID != candidate || options.Operation.LocalOID != "" ||
+		options.Operation.BackupRef != "" || options.Operation.PushOID != "" {
+		t.Fatalf("durable operation at %s gap = %#v", crashPoint, options.Operation)
+	}
+	if index := fixture.git(fixture.root, "ls-files", "--cached", "-z"); index != "" {
+		t.Fatalf("index at %s gap = %q, want empty", crashPoint, index)
+	}
+	if untracked := fixture.git(fixture.root, "ls-files", "--others", "--exclude-standard", "-z"); untracked != "" {
+		t.Fatalf("untracked files at %s gap = %q, want empty", crashPoint, untracked)
+	}
+	privateOID := fixture.git(fixture.root, "rev-parse", "--verify", "refs/igonotes/fetch/"+options.Operation.ID)
+	managedOID := fixture.git(fixture.root, "rev-parse", "--verify", managedRemoteRef("main"))
+	if privateOID != candidate || managedOID != candidate {
+		t.Fatalf("candidate refs at %s gap: checkpoint=%q private=%q managed=%q", crashPoint, candidate, privateOID, managedOID)
+	}
+	assertNoServicePush(t, runner.commands)
+	return fixture, options, candidate
+}
+
+func assertPreCheckoutPopulationRetry(t *testing.T, fixture *connectFixture, options InitializeOptions, candidate string) {
+	t.Helper()
+	remoteCount := fixture.git(filepath.Dir(fixture.root), "--git-dir", fixture.remote, "rev-list", "--count", "refs/heads/main")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	result, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+	if err != nil {
+		t.Fatalf("retry error = %v", err)
+	}
+	if result.HeadOID != candidate || result.RemoteOID != candidate || result.PushOID != candidate || result.BackupRef != "" {
+		t.Fatalf("retry result = %#v, want exact candidate %q without backup", result, candidate)
+	}
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", "HEAD^{commit}"); got != candidate {
+		t.Fatalf("HEAD = %q, want candidate %q", got, candidate)
+	}
+	if count := fixture.git(filepath.Dir(fixture.root), "--git-dir", fixture.remote, "rev-list", "--count", "refs/heads/main"); count != remoteCount {
+		t.Fatalf("remote commit count = %s, want unchanged %s", count, remoteCount)
+	}
+	if refs := fixture.git(fixture.root, "for-each-ref", "--format=%(refname)", "refs/igonotes/backups"); refs != "" {
+		t.Fatalf("unexpected backup refs after pre-checkout recovery: %q", refs)
+	}
+	assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "checkout", candidate, "--", "."))
+	assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+		"update-ref", "refs/heads/main", candidate, zeroObjectID))
+	for _, command := range runner.commands {
+		if len(command.Args) == 0 {
+			continue
+		}
+		if command.Args[0] == "add" || command.Args[0] == "commit" || command.Args[0] == "merge" ||
+			(command.Args[0] == "update-ref" && containsArg(command.Args, "--create-reflog")) {
+			t.Fatalf("pre-checkout retry misclassified remote population: %q", command.Args)
+		}
+	}
+	assertExactPush(t, runner.commands, fixture, candidate)
 }
 
 func prepareUnbornPopulationGap(t *testing.T, crashPoint string) (*connectFixture, InitializeOptions, string) {

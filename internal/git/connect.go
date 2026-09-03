@@ -81,6 +81,7 @@ type remotePopulationRecovery uint8
 
 const (
 	remotePopulationNone remotePopulationRecovery = iota
+	remotePopulationPreCheckout
 	remotePopulationUnborn
 	remotePopulationBranchCreated
 )
@@ -561,26 +562,58 @@ func (s *Service) detectRemotePopulationRecovery(
 	if err != nil {
 		return remotePopulationNone, err
 	}
-	state := remotePopulationNone
 	switch {
 	case !hasHEAD && !branchExists && !local.DetachedHead && local.CurrentBranch == options.Snapshot.Branch:
-		state = remotePopulationUnborn
+		empty, err := s.emptyUnbornIndexAndWorktree(ctx, path)
+		if err != nil {
+			return remotePopulationNone, err
+		}
+		if empty {
+			return remotePopulationPreCheckout, nil
+		}
+		equal, err := s.indexAndWorktreeEqualCommit(ctx, path, operation.CandidateOID)
+		if err != nil {
+			return remotePopulationNone, err
+		}
+		if equal {
+			return remotePopulationUnborn, nil
+		}
+		return remotePopulationNone, &SafeError{Code: CodeOperationInterrupted, Message: "Git worktree changed during branch population recovery"}
 	case hasHEAD && branchExists && headOID == operation.CandidateOID && branchOID == operation.CandidateOID &&
 		!local.DetachedHead && local.CurrentBranch == options.Snapshot.Branch:
-		state = remotePopulationBranchCreated
+		equal, err := s.indexAndWorktreeEqualCommit(ctx, path, operation.CandidateOID)
+		if err != nil {
+			return remotePopulationNone, err
+		}
+		if !equal {
+			return remotePopulationNone, &SafeError{Code: CodeOperationInterrupted, Message: "Git worktree changed during branch population recovery"}
+		}
+		return remotePopulationBranchCreated, nil
 	case operation.Stage == StageSwitching:
 		return remotePopulationNone, &SafeError{Code: CodeOperationInterrupted, Message: "Git branch state changed during population recovery"}
 	default:
 		return remotePopulationNone, nil
 	}
-	equal, err := s.indexAndWorktreeEqualCommit(ctx, path, operation.CandidateOID)
-	if err != nil {
-		return remotePopulationNone, err
+}
+
+func (s *Service) emptyUnbornIndexAndWorktree(ctx context.Context, path string) (bool, error) {
+	for _, args := range [][]string{
+		{"ls-files", "--cached", "-z"},
+		{"ls-files", "--others", "--exclude-standard", "-z"},
+	} {
+		result, err := s.runLocal(ctx, path, true, args...)
+		if err != nil {
+			return false, err
+		}
+		paths, err := parseNULPaths(result)
+		if err != nil {
+			return false, err
+		}
+		if len(paths) != 0 {
+			return false, nil
+		}
 	}
-	if !equal {
-		return remotePopulationNone, &SafeError{Code: CodeOperationInterrupted, Message: "Git worktree changed during branch population recovery"}
-	}
-	return state, nil
+	return true, nil
 }
 
 func (s *Service) indexAndWorktreeEqualCommit(ctx context.Context, path, oid string) (bool, error) {
@@ -957,7 +990,33 @@ func (s *Service) selectAndMerge(
 		}
 	}
 
-	if actual.population == remotePopulationUnborn {
+	if actual.population == remotePopulationPreCheckout {
+		collision, err := s.ignoredCheckoutCollision(ctx, path, actual.fetchedOID)
+		if err != nil {
+			return err
+		}
+		if collision {
+			return &SafeError{Code: CodeOperationInterrupted, Message: "Git checkout would overwrite ignored local files"}
+		}
+		if err := checkpoint.save(ctx, StageSwitching); err != nil {
+			return err
+		}
+		if _, err := s.runLocal(ctx, path, false, "checkout", actual.fetchedOID, "--", "."); err != nil {
+			return err
+		}
+		if err := checkpoint.save(ctx, StageSwitching); err != nil {
+			return err
+		}
+		if _, err := s.runLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectID); err != nil {
+			return err
+		}
+		if err := checkpoint.save(ctx, StageSwitching); err != nil {
+			return err
+		}
+		branchExists = true
+		branchOID = actual.fetchedOID
+		currentBranch = branch
+	} else if actual.population == remotePopulationUnborn {
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
 			return err
 		}
