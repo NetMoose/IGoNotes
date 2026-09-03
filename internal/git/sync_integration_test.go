@@ -424,6 +424,98 @@ func TestSyncRejectsOrphanedUnmergedIndexBeforeAdd(t *testing.T) {
 	}
 }
 
+func TestSyncPreExistingMergeConflictUsesWorktreeHandoff(t *testing.T) {
+	fixture, options, operation := makeSyncConflict(t)
+	options = syncOptions(fixture, operation.RemoteOID)
+	options.Operation.ID = "33333333333333333333333333333333"
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	callbackCalled := false
+	gatePublished := false
+	handoffInsideCallback := false
+	transaction := func(_ context.Context, mutate func(string) error) error {
+		callbackCalled = true
+		inside := true
+		err := mutate(fixture.root)
+		var conflict *ConflictError
+		if errors.As(err, &conflict) {
+			gatePublished = true
+			handoffInsideCallback = inside
+		}
+		inside = false
+		return err
+	}
+
+	result, err := runSync(t, fixture, runner, options, transaction, nil)
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || !reflect.DeepEqual(conflict.Paths, []string{"remote.md"}) ||
+		!reflect.DeepEqual(result.ConflictPaths, []string{"remote.md"}) {
+		t.Fatalf("Sync() = %#v, %#v", result, err)
+	}
+	if !callbackCalled || !gatePublished || !handoffInsideCallback {
+		t.Fatalf("handoff callback=%v gate=%v inside=%v", callbackCalled, gatePublished, handoffInsideCallback)
+	}
+	assertNoSyncNetworkOrWorktreeMutation(t, runner.commands)
+}
+
+func TestSyncPreExistingResolvedMergeUsesTypedWorktreeHandoff(t *testing.T) {
+	fixture, options, operation := makeSyncConflict(t)
+	fixture.git(fixture.root, "add", "--all", "--", ".")
+	options = syncOptions(fixture, operation.RemoteOID)
+	options.Operation.ID = "44444444444444444444444444444444"
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	callbackCalled := false
+	transaction := func(_ context.Context, mutate func(string) error) error {
+		callbackCalled = true
+		return mutate(fixture.root)
+	}
+
+	_, err := runSync(t, fixture, runner, options, transaction, nil)
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || len(conflict.Paths) != 0 || !errorHasSafeCode(err, CodeOperationInterrupted) {
+		t.Fatalf("Sync() error = %#v, conflict = %#v", err, conflict)
+	}
+	if !callbackCalled {
+		t.Fatal("pre-existing resolved merge did not enter worktree callback")
+	}
+	assertNoSyncNetworkOrWorktreeMutation(t, runner.commands)
+}
+
+func TestSyncPreExistingNonMergeOperationSkipsWorktreeAndNetwork(t *testing.T) {
+	fixture, options := preparedSyncFixture(t)
+	head := fixture.git(fixture.root, "rev-parse", "HEAD")
+	marker := filepath.Join(fixture.root, ".git", "CHERRY_PICK_HEAD")
+	if err := os.WriteFile(marker, []byte(head+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	callbackCalled := false
+	_, err := runSync(t, fixture, runner, options, func(_ context.Context, mutate func(string) error) error {
+		callbackCalled = true
+		return mutate(fixture.root)
+	}, nil)
+	assertSafeCode(t, err, CodeRepositoryLocked)
+	if callbackCalled {
+		t.Fatal("non-merge pending operation entered worktree callback")
+	}
+	assertNoSyncNetworkOrWorktreeMutation(t, runner.commands)
+}
+
+func assertNoSyncNetworkOrWorktreeMutation(t *testing.T, commands []Command) {
+	t.Helper()
+	for _, command := range commands {
+		if command.Scope == NetworkOperation {
+			t.Fatalf("unexpected network command: %#v", command)
+		}
+		if len(command.Args) == 0 {
+			continue
+		}
+		switch command.Args[0] {
+		case "fetch", "add", "commit", "merge", "push":
+			t.Fatalf("unexpected sync mutation: %#v", command)
+		}
+	}
+}
+
 func TestSyncSHA256UsesFullExactOIDs(t *testing.T) {
 	probe := t.TempDir()
 	if output, err := runFixtureGit(probe, "init", "--object-format=sha256", "--initial-branch", "main"); err != nil {

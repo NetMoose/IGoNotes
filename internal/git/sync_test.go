@@ -526,3 +526,36 @@ func TestSyncPreAddUnmergedInspectionFailureFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+func TestSyncPreExistingMergeInspectionFailurePreservesWorktreeHandoff(t *testing.T) {
+	fixture, options, operation := makeSyncConflict(t)
+	options = syncOptions(fixture, operation.RemoteOID)
+	options.Operation.ID = "55555555555555555555555555555555"
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	inspectionErr := errors.New("pre-existing merge inspection failed")
+	insideCallback := false
+	intercepted := false
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if insideCallback && !intercepted && reflect.DeepEqual(command.Args, []string{"ls-files", "-u", "-z"}) {
+			intercepted = true
+			return Result{}, inspectionErr
+		}
+		return result, err
+	}
+	handoffInsideCallback := false
+	transaction := func(_ context.Context, mutate func(string) error) error {
+		insideCallback = true
+		err := mutate(fixture.root)
+		var conflict *ConflictError
+		handoffInsideCallback = insideCallback && errors.As(err, &conflict)
+		insideCallback = false
+		return err
+	}
+
+	_, err := runSync(t, fixture, runner, options, transaction, nil)
+	var conflict *ConflictError
+	if !intercepted || !handoffInsideCallback || !errors.As(err, &conflict) || !errors.Is(err, inspectionErr) {
+		t.Fatalf("Sync() error = %#v, conflict = %#v, intercepted=%v handoff=%v", err, conflict, intercepted, handoffInsideCallback)
+	}
+	assertNoSyncNetworkOrWorktreeMutation(t, runner.commands)
+}

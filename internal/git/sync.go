@@ -71,11 +71,16 @@ func (s *Service) Sync(
 	if err := s.porcelain.ValidateBranch(ctx, path, options.Snapshot.Branch); err != nil {
 		return OperationResult{}, err
 	}
-	if err := s.preflightSync(ctx, path, options); err != nil {
+	preExistingMerge, err := s.preflightSync(ctx, path, options)
+	if err != nil {
 		return OperationResult{}, err
 	}
 
 	checkpoint := newSyncCheckpoint(options, progress)
+	if preExistingMerge {
+		err := s.handoffPreExistingMerge(ctx, path, worktree, checkpoint)
+		return syncOperationResult(syncPass{}, checkpoint.value, options.LastRemoteOID), err
+	}
 	trusted := options.LastRemoteOID
 	var latest OperationResult
 	for attempt := 0; attempt < 2; attempt++ {
@@ -178,21 +183,48 @@ func (s *Service) validateSync(
 	return path, nil
 }
 
-func (s *Service) preflightSync(ctx context.Context, path string, options SyncOptions) error {
-	local, err := s.inspectSafeLocal(ctx, path)
+func (s *Service) preflightSync(ctx context.Context, path string, options SyncOptions) (bool, error) {
+	if err := requireConnectBase(ctx, path); err != nil {
+		return false, err
+	}
+	local, err := s.porcelain.InspectLocal(ctx, path)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if local.HasRepository && local.RepositoryRoot != path {
+		return false, &SafeError{Code: CodeRepositoryRoot, Message: "Git repository root does not match the base directory"}
+	}
+	if local.PendingOperation != "" && local.PendingOperation != "merge" {
+		return false, &SafeError{Code: CodeRepositoryLocked, Message: "Git repository has a pending operation"}
+	}
+	if local.HasRepository {
+		locked, lockErr := syncIndexLocked(local.GitDir)
+		if lockErr != nil {
+			return false, &SafeError{Code: CodeCommandFailed, Message: "Git repository inspection failed", cause: lockErr}
+		}
+		if locked {
+			return false, &SafeError{Code: CodeRepositoryLocked, Message: "Git repository is locked"}
+		}
+	}
+	if local.PendingOperation == "merge" {
+		return true, nil
+	}
+	if !local.IdentityConfigured {
+		return false, &SafeError{Code: CodeIdentityMissing, Message: "Git identity is not configured"}
 	}
 	if !local.HasRepository {
-		return &SafeError{Code: CodeNeedsReconnect, Message: "Git base directory must be reconnected"}
+		return false, &SafeError{Code: CodeNeedsReconnect, Message: "Git base directory must be reconnected"}
 	}
 	if local.DetachedHead || local.CurrentBranch != options.Snapshot.Branch {
-		return &SafeError{Code: CodeNeedsReconnect, Message: "Configured Git branch is not selected"}
+		return false, &SafeError{Code: CodeNeedsReconnect, Message: "Configured Git branch is not selected"}
 	}
 	if err := s.requireOrigin(ctx, path, options.Snapshot.URL); err != nil {
-		return err
+		return false, err
 	}
-	return s.requireSyncTrust(ctx, path, options.Snapshot.Branch, options.LastRemoteOID)
+	if err := s.requireSyncTrust(ctx, path, options.Snapshot.Branch, options.LastRemoteOID); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *Service) fetchSyncCandidate(
@@ -298,15 +330,8 @@ func (s *Service) runSyncWorktree(
 		if err := requireCallbackPath(path, callbackPath); err != nil {
 			return err
 		}
-		_, mergeExists, unmerged, inspectErr := s.inspectMergeState(ctx, path)
-		if inspectErr != nil || mergeExists || len(unmerged) != 0 {
-			checkpoint.value.ConflictPaths = unmerged
-			conflictErr := newConflictError(unmerged)
-			var stateErr error
-			if inspectErr != nil || !mergeExists || len(unmerged) == 0 {
-				stateErr = interruptedMergeState()
-			}
-			return errors.Join(conflictErr, stateErr, inspectErr, checkpoint.save(ctx, StageMerging))
+		if err := s.preAddMergeState(ctx, path, false, checkpoint); err != nil {
+			return err
 		}
 		local, err := s.inspectSafeLocal(ctx, path)
 		if err != nil {
@@ -371,6 +396,39 @@ func (s *Service) runSyncWorktree(
 		checkpoint.value.ConflictPaths = append([]string(nil), conflict.Paths...)
 	}
 	return err
+}
+
+func (s *Service) handoffPreExistingMerge(
+	ctx context.Context,
+	path string,
+	worktree WorktreeTransaction,
+	checkpoint *syncCheckpoint,
+) error {
+	return runWorktree(ctx, worktree, func(callbackPath string) error {
+		if err := requireCallbackPath(path, callbackPath); err != nil {
+			return err
+		}
+		return s.preAddMergeState(ctx, path, true, checkpoint)
+	})
+}
+
+func (s *Service) preAddMergeState(
+	ctx context.Context,
+	path string,
+	knownMerge bool,
+	checkpoint *syncCheckpoint,
+) error {
+	_, mergeExists, unmerged, inspectErr := s.inspectMergeState(ctx, path)
+	if inspectErr == nil && !knownMerge && !mergeExists && len(unmerged) == 0 {
+		return nil
+	}
+	checkpoint.value.ConflictPaths = unmerged
+	conflictErr := newConflictError(unmerged)
+	var stateErr error
+	if inspectErr != nil || !mergeExists || len(unmerged) == 0 {
+		stateErr = interruptedMergeState()
+	}
+	return errors.Join(conflictErr, stateErr, inspectErr, checkpoint.save(ctx, StageMerging))
 }
 
 func (s *Service) inspectMergeState(ctx context.Context, path string) (string, bool, []string, error) {
