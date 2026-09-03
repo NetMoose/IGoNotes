@@ -597,6 +597,103 @@ func TestSettingsServiceForgetBaseRetainsCanonicalConflictForLoadedAlias(t *test
 	}
 }
 
+func TestSettingsServiceConflictSnapshotPrecedesPersistenceForRemovedAlias(t *testing.T) {
+	activePath := t.TempDir()
+	originalPath := t.TempDir()
+	retargetedPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	createSymlinkOrSkip(t, originalPath, aliasPath)
+	completed := true
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: activePath},
+			{Name: "work", Path: aliasPath},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	settings, store, _, _, _ := newGitSettingsServiceForConfig(t, config, activePath)
+	settings.coordinator.SetConflict(originalPath, true)
+	settings.coordinator.SetConflict(retargetedPath, true)
+	store.saveStarted = make(chan struct{})
+	release := make(chan struct{})
+	store.saveRelease = release
+	var releaseOnce sync.Once
+	releaseSave := func() { releaseOnce.Do(func() { close(release) }) }
+	done := make(chan error, 1)
+	drained := false
+	t.Cleanup(func() {
+		releaseSave()
+		if !drained {
+			<-done
+		}
+	})
+	go func() {
+		_, err := settings.ForgetBase("work")
+		done <- err
+	}()
+	<-store.saveStarted
+	retargetSymlink(t, aliasPath, retargetedPath)
+	releaseSave()
+	err := <-done
+	drained = true
+	if err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(originalPath); err != nil {
+		t.Errorf("original conflict after publication = %v, want nil", err)
+	}
+	if err := settings.coordinator.CheckMutation(retargetedPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retargeted conflict after publication = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestSettingsServiceConflictSnapshotPrecedesPersistenceForRetainedAlias(t *testing.T) {
+	originalPath := t.TempDir()
+	retargetedPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	createSymlinkOrSkip(t, originalPath, aliasPath)
+	completed := true
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "work", Path: originalPath},
+			{Name: "alias", Path: aliasPath},
+		},
+		CurrentBase:    "alias",
+		SetupCompleted: &completed,
+	}
+	settings, store, _, _, _ := newGitSettingsServiceForConfig(t, config, aliasPath)
+	settings.coordinator.SetConflict(originalPath, true)
+	store.saveStarted = make(chan struct{})
+	release := make(chan struct{})
+	store.saveRelease = release
+	var releaseOnce sync.Once
+	releaseSave := func() { releaseOnce.Do(func() { close(release) }) }
+	done := make(chan error, 1)
+	drained := false
+	t.Cleanup(func() {
+		releaseSave()
+		if !drained {
+			<-done
+		}
+	})
+	go func() {
+		_, err := settings.ForgetBase("work")
+		done <- err
+	}()
+	<-store.saveStarted
+	retargetSymlink(t, aliasPath, retargetedPath)
+	releaseSave()
+	err := <-done
+	drained = true
+	if err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(originalPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("original conflict retained through pre-save alias = %v, want ErrGitConflictPending", err)
+	}
+}
+
 func newConflictSettingsService(t *testing.T) (*SettingsService, *fakeConfigStore, *BaseOperationCoordinator, string, string) {
 	t.Helper()
 	activePath := t.TempDir()

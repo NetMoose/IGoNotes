@@ -260,6 +260,7 @@ func createBaseDirectory(prepared preparedBase) error {
 }
 
 func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string) error {
+	conflicts := captureConflictReconciliationSnapshot(s.config, next)
 	expectedPath, err := configuredBasePath(next, next.CurrentBase)
 	if err != nil {
 		return err
@@ -269,7 +270,7 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 		return fmt.Errorf("save settings: %w", err)
 	}
 	if matches {
-		s.publishConfigLocked(next)
+		s.publishConfigLocked(next, conflicts)
 		return nil
 	}
 	if targetPath == "" {
@@ -295,27 +296,52 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 		return operationErr
 	}
 
-	s.publishConfigLocked(next)
+	s.publishConfigLocked(next, conflicts)
 	return nil
 }
 
-func (s *SettingsService) publishConfigLocked(next model.Config) {
-	previous := s.config
-	s.config = cloneConfig(next)
+type conflictReconciliationSnapshot struct {
+	pathsToClear []string
+}
+
+func captureConflictReconciliationSnapshot(current, next model.Config) conflictReconciliationSnapshot {
+	identities := make(map[string]string, len(current.Bases)+len(next.Bases))
+	resolveIdentity := func(path string) string {
+		cleanedPath := filepath.Clean(path)
+		if identity, ok := identities[cleanedPath]; ok {
+			return identity
+		}
+		identity := conflictPathIdentity(cleanedPath)
+		identities[cleanedPath] = identity
+		return identity
+	}
 	retainedPaths := make(map[string]struct{}, len(next.Bases))
 	for _, base := range next.Bases {
 		if base.Path != "" {
-			retainedPaths[conflictPathIdentity(base.Path)] = struct{}{}
+			retainedPaths[resolveIdentity(base.Path)] = struct{}{}
 		}
 	}
-	for _, base := range previous.Bases {
+	pathsToClear := make([]string, 0, len(current.Bases))
+	seen := make(map[string]struct{}, len(current.Bases))
+	for _, base := range current.Bases {
 		if base.Path == "" {
 			continue
 		}
-		path := conflictPathIdentity(base.Path)
+		path := resolveIdentity(base.Path)
 		if _, retained := retainedPaths[path]; !retained {
-			s.coordinator.SetConflict(path, false)
+			if _, duplicate := seen[path]; !duplicate {
+				pathsToClear = append(pathsToClear, path)
+				seen[path] = struct{}{}
+			}
 		}
+	}
+	return conflictReconciliationSnapshot{pathsToClear: pathsToClear}
+}
+
+func (s *SettingsService) publishConfigLocked(next model.Config, conflicts conflictReconciliationSnapshot) {
+	s.config = cloneConfig(next)
+	for _, path := range conflicts.pathsToClear {
+		s.coordinator.SetConflict(path, false)
 	}
 }
 
