@@ -72,7 +72,7 @@ func (h *NoteHandler) GetNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := h.NoteService.GetNoteContent(id)
+	response, err := h.NoteService.GetNote(id)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
@@ -86,11 +86,7 @@ func (h *NoteHandler) GetNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"id":      id,
-		"content": content,
-	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 // GetRawFile обрабатывает GET /api/raw?path=...
@@ -140,7 +136,12 @@ func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.NoteService.SaveNoteContent(req.ID, req.Content); err != nil {
+	response, err := h.NoteService.SaveNote(req)
+	if err != nil {
+		if errors.Is(err, service.ErrNoteChanged) || errors.Is(err, service.ErrGitConflictPending) {
+			writeServiceError(w, err)
+			return
+		}
 		if errors.Is(err, os.ErrNotExist) {
 			WriteAPIError(w, http.StatusNotFound, "note_not_found", "Note not found", "id")
 			return
@@ -153,8 +154,7 @@ func (h *NoteHandler) SaveNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status": "saved"}`))
+	writeJSON(w, http.StatusOK, response)
 }
 
 // CreateNote обрабатывает POST /api/notes
@@ -199,6 +199,10 @@ func (h *NoteHandler) CreateNote(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "parent_id")
 			return
 		}
+		if errors.Is(err, service.ErrGitConflictPending) {
+			writeServiceError(w, err)
+			return
+		}
 		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
@@ -228,6 +232,10 @@ func (h *NoteHandler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, service.ErrInvalidNotePath) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
+			return
+		}
+		if errors.Is(err, service.ErrGitConflictPending) {
+			writeServiceError(w, err)
 			return
 		}
 		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
@@ -274,6 +282,10 @@ func (h *NoteHandler) RenameNote(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusBadRequest, "invalid_path", "Invalid path", "id")
 			return
 		}
+		if errors.Is(err, service.ErrGitConflictPending) {
+			writeServiceError(w, err)
+			return
+		}
 		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}
@@ -316,6 +328,10 @@ func (h *NoteHandler) UploadAsset(w http.ResponseWriter, r *http.Request) {
 
 	relPath, err := h.NoteService.SaveAsset(file, header.Filename)
 	if err != nil {
+		if errors.Is(err, service.ErrGitConflictPending) {
+			writeServiceError(w, err)
+			return
+		}
 		WriteAPIError(w, http.StatusInternalServerError, "internal_error", internalErrorMessage, "")
 		return
 	}

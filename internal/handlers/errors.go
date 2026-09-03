@@ -20,6 +20,8 @@ type serviceErrorMapping struct {
 }
 
 var serviceErrorMappings = []serviceErrorMapping{
+	{service.ErrGitConflictPending, http.StatusConflict, "git_conflict_pending", service.ErrGitConflictPending.Error()},
+	{service.ErrNoteChanged, http.StatusConflict, "note_changed", service.ErrNoteChanged.Error()},
 	{service.ErrSetupRequired, http.StatusPreconditionRequired, "setup_required", service.ErrSetupRequired.Error()},
 	{service.ErrSetupAlreadyCompleted, http.StatusConflict, "setup_already_completed", service.ErrSetupAlreadyCompleted.Error()},
 	{service.ErrSetupCannotReopen, http.StatusConflict, "setup_cannot_reopen", service.ErrSetupCannotReopen.Error()},

@@ -105,6 +105,171 @@ func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 	})
 }
 
+func TestNoteHandlerGetNoteReturnsRevision(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "idea.md"), []byte("# Idea\n"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	handler := newFilesystemNoteHandlerAt(t, base, service.NewBaseOperationCoordinator())
+	recorder := httptest.NewRecorder()
+
+	handler.GetNote(recorder, httptest.NewRequest(http.MethodGet, "/api/note?id=idea.md", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response model.NoteContentResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; body=%q", err, recorder.Body.String())
+	}
+	want := model.NoteContentResponse{
+		ID:       "idea.md",
+		Content:  "# Idea\n",
+		Revision: "sha256:25ec1fffebeb4b54346d7df2c71511065bf99f571ac1c615e3fc1d4ce17ca5f9",
+	}
+	if response != want {
+		t.Errorf("response = %#v, want %#v", response, want)
+	}
+}
+
+func TestNoteHandlerSaveNoteWithoutExpectedRevisionReturnsRevision(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("original"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	handler := newFilesystemNoteHandlerAt(t, base, service.NewBaseOperationCoordinator())
+	recorder := httptest.NewRecorder()
+
+	handler.SaveNote(recorder, httptest.NewRequest(http.MethodPost, "/api/save", strings.NewReader(`{"id":"note.md","content":"updated"}`)))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response model.SaveNoteResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; body=%q", err, recorder.Body.String())
+	}
+	if response.Status != "saved" || response.Revision == "" {
+		t.Errorf("response = %#v, want saved status and non-empty revision", response)
+	}
+	assertHandlerFileContent(t, filepath.Join(base, "note.md"), "updated")
+}
+
+func TestNoteHandlerSaveNoteRejectsStaleExpectedRevision(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("original"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	handler := newFilesystemNoteHandlerAt(t, base, service.NewBaseOperationCoordinator())
+	recorder := httptest.NewRecorder()
+
+	handler.SaveNote(recorder, httptest.NewRequest(http.MethodPost, "/api/save", strings.NewReader(`{"id":"note.md","content":"updated","expected_revision":"sha256:stale"}`)))
+
+	assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "note_changed", Message: "note changed"})
+	assertHandlerFileContent(t, filepath.Join(base, "note.md"), "original")
+}
+
+func TestNoteHandlerSaveNoteRejectsPendingGitConflict(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("original"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	coordinator := service.NewBaseOperationCoordinator()
+	handler := newFilesystemNoteHandlerAt(t, base, coordinator)
+	coordinator.SetConflict(base, true)
+	recorder := httptest.NewRecorder()
+
+	handler.SaveNote(recorder, httptest.NewRequest(http.MethodPost, "/api/save", strings.NewReader(`{"id":"note.md","content":"updated"}`)))
+
+	assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "git_conflict_pending", Message: "git conflict pending"})
+	assertHandlerFileContent(t, filepath.Join(base, "note.md"), "original")
+}
+
+func TestNoteHandlerMutationHandlersRejectPendingGitConflictWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name            string
+		request         func(t *testing.T) *http.Request
+		call            func(*NoteHandler, http.ResponseWriter, *http.Request)
+		assertUnchanged func(t *testing.T, base string)
+	}{
+		{
+			name: "create",
+			request: func(t *testing.T) *http.Request {
+				return httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"name":"new","type":"file"}`))
+			},
+			call: func(handler *NoteHandler, w http.ResponseWriter, r *http.Request) {
+				handler.CreateNote(w, r)
+			},
+			assertUnchanged: func(t *testing.T, base string) {
+				if _, err := os.Stat(filepath.Join(base, "new.md")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("new note Stat() error = %v, want os.ErrNotExist", err)
+				}
+			},
+		},
+		{
+			name: "delete",
+			request: func(t *testing.T) *http.Request {
+				return httptest.NewRequest(http.MethodDelete, "/api/note?id=note.md", nil)
+			},
+			call: func(handler *NoteHandler, w http.ResponseWriter, r *http.Request) {
+				handler.DeleteNote(w, r)
+			},
+		},
+		{
+			name: "rename",
+			request: func(t *testing.T) *http.Request {
+				return httptest.NewRequest(http.MethodPut, "/api/rename", strings.NewReader(`{"id":"note.md","new_name":"renamed"}`))
+			},
+			call: func(handler *NoteHandler, w http.ResponseWriter, r *http.Request) {
+				handler.RenameNote(w, r)
+			},
+			assertUnchanged: func(t *testing.T, base string) {
+				if _, err := os.Stat(filepath.Join(base, "renamed.md")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("renamed note Stat() error = %v, want os.ErrNotExist", err)
+				}
+			},
+		},
+		{
+			name: "upload asset",
+			request: func(t *testing.T) *http.Request {
+				body, contentType := multipartUploadBody(t, "image.png", []byte("image"))
+				request := httptest.NewRequest(http.MethodPost, "/api/assets", body)
+				request.Header.Set("Content-Type", contentType)
+				return request
+			},
+			call: func(handler *NoteHandler, w http.ResponseWriter, r *http.Request) {
+				handler.UploadAsset(w, r)
+			},
+			assertUnchanged: func(t *testing.T, base string) {
+				if _, err := os.Stat(filepath.Join(base, "assets")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("assets directory Stat() error = %v, want os.ErrNotExist", err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("original"), 0o600); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
+			}
+			coordinator := service.NewBaseOperationCoordinator()
+			handler := newFilesystemNoteHandlerAt(t, base, coordinator)
+			coordinator.SetConflict(base, true)
+			recorder := httptest.NewRecorder()
+
+			test.call(handler, recorder, test.request(t))
+
+			assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "git_conflict_pending", Message: "git conflict pending"})
+			assertHandlerFileContent(t, filepath.Join(base, "note.md"), "original")
+			if test.assertUnchanged != nil {
+				test.assertUnchanged(t, base)
+			}
+		})
+	}
+}
+
 func TestNoteHandlerGetNotesSanitizesInitialSyncFailure(t *testing.T) {
 	wantErr := errors.New("index update failed")
 	repo := &failingInitialSyncRepository{
@@ -385,5 +550,27 @@ func TestNoteHandlerGetRawFileDoesNotFollowEscapingSymlink(t *testing.T) {
 
 func newFilesystemNoteHandler(t *testing.T) *NoteHandler {
 	t.Helper()
-	return NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, t.TempDir(), service.NewBaseOperationCoordinator()))
+	return newFilesystemNoteHandlerAt(t, t.TempDir(), service.NewBaseOperationCoordinator())
+}
+
+func newFilesystemNoteHandlerAt(t *testing.T, base string, coordinator *service.BaseOperationCoordinator) *NoteHandler {
+	t.Helper()
+	notes := service.NewNoteService(handlerNoteRepository{}, base, coordinator)
+	t.Cleanup(func() {
+		if err := notes.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v", err)
+		}
+	})
+	return NewNoteHandler(notes)
+}
+
+func assertHandlerFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", path, err)
+	}
+	if got := string(content); got != want {
+		t.Errorf("file content = %q, want %q", got, want)
+	}
 }
