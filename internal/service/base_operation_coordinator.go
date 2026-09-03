@@ -13,8 +13,10 @@ type conflictPathSet map[string]struct{}
 
 // BaseOperationCoordinator serializes base lifecycle and Git operations.
 // Lock ordering is coordinator -> SettingsService.mu -> NoteService.baseMu ->
-// repository/SQLite. Conflict snapshots are immutable after publication so
-// mutation checks remain lock-free and never acquire operations.
+// repository/SQLite. Repository and filesystem callbacks must never call back
+// into SettingsService, NoteService, or BaseOperationCoordinator. Conflict
+// snapshots are immutable after publication so mutation checks remain lock-free
+// and never acquire operations.
 type BaseOperationCoordinator struct {
 	operations sync.Mutex
 	conflicts  atomic.Pointer[conflictPathSet]
