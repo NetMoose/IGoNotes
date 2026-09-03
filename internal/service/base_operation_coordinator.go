@@ -84,7 +84,9 @@ func (c *BaseOperationCoordinator) clearConflictForIdentity(canonicalBasePath st
 		if current != nil {
 			next = make(conflictPathSet, len(*current))
 			for path, entry := range *current {
-				if path != basePath && !sameFileIdentity(identity, entry.identity) {
+				matchesIdentity := sameFileIdentity(identity, entry.identity)
+				matchesFallback := path == basePath && identity == nil && entry.identity == nil
+				if !matchesIdentity && !matchesFallback {
 					next[path] = entry
 				}
 			}

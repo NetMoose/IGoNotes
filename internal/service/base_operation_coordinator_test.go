@@ -141,6 +141,98 @@ func TestBaseOperationCoordinatorCapturedClearUsesSuppliedIdentity(t *testing.T)
 	}
 }
 
+func TestBaseOperationCoordinatorCapturedClearPreservesReboundCachedIdentity(t *testing.T) {
+	root := t.TempDir()
+	originalPath := filepath.Join(root, "base")
+	retainedAlias := filepath.Join(root, "retained")
+	if err := os.Mkdir(originalPath, 0o755); err != nil {
+		t.Fatalf("Mkdir(original) error = %v", err)
+	}
+	originalInfo, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatalf("Stat(original) error = %v", err)
+	}
+	coordinator := NewBaseOperationCoordinator()
+	coordinator.SetConflict(originalPath, true)
+	if err := os.Rename(originalPath, retainedAlias); err != nil {
+		t.Fatalf("Rename(original) error = %v", err)
+	}
+	if err := os.Mkdir(originalPath, 0o755); err != nil {
+		t.Fatalf("Mkdir(replacement) error = %v", err)
+	}
+	replacementInfo, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatalf("Stat(replacement) error = %v", err)
+	}
+
+	coordinator.clearConflictForIdentity(originalPath, replacementInfo)
+
+	if err := coordinator.CheckMutation(originalPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("CheckMutation(original path) error = %v, want retained ErrGitConflictPending", err)
+	}
+	if err := coordinator.checkMutationForIdentity(retainedAlias, originalInfo); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("checkMutationForIdentity(retained O) error = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestBaseOperationCoordinatorCapturedClearExactIdentityRules(t *testing.T) {
+	t.Run("captured nil preserves cached identity", func(t *testing.T) {
+		path := t.TempDir()
+		coordinator := NewBaseOperationCoordinator()
+		coordinator.SetConflict(path, true)
+
+		coordinator.clearConflictForIdentity(path, nil)
+
+		if err := coordinator.CheckMutation(path); !errors.Is(err, ErrGitConflictPending) {
+			t.Fatalf("CheckMutation() error = %v, want retained ErrGitConflictPending", err)
+		}
+	})
+
+	t.Run("matching identity clears", func(t *testing.T) {
+		path := t.TempDir()
+		identity, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat() error = %v", err)
+		}
+		coordinator := NewBaseOperationCoordinator()
+		coordinator.SetConflict(path, true)
+
+		coordinator.clearConflictForIdentity(path, identity)
+
+		if err := coordinator.CheckMutation(path); err != nil {
+			t.Fatalf("CheckMutation() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("nil identities clear exact fallback", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing")
+		coordinator := NewBaseOperationCoordinator()
+		coordinator.SetConflict(path, true)
+
+		coordinator.clearConflictForIdentity(path, nil)
+
+		if err := coordinator.CheckMutation(path); err != nil {
+			t.Fatalf("CheckMutation() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("captured identity preserves cached nil fallback", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing")
+		identity, err := os.Stat(t.TempDir())
+		if err != nil {
+			t.Fatalf("Stat() error = %v", err)
+		}
+		coordinator := NewBaseOperationCoordinator()
+		coordinator.SetConflict(path, true)
+
+		coordinator.clearConflictForIdentity(path, identity)
+
+		if err := coordinator.CheckMutation(path); !errors.Is(err, ErrGitConflictPending) {
+			t.Fatalf("CheckMutation() error = %v, want retained ErrGitConflictPending", err)
+		}
+	})
+}
+
 func TestBaseOperationCoordinatorSerializesOperations(t *testing.T) {
 	coordinator := NewBaseOperationCoordinator()
 	coordinator.Lock()
