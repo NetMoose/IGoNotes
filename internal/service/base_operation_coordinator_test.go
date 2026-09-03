@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -24,9 +25,49 @@ func TestBaseOperationCoordinatorZeroValueSupportsConflictPolicy(t *testing.T) {
 	if err := coordinator.CheckMutation(basePath); !errors.Is(err, ErrGitConflictPending) {
 		t.Fatalf("CheckMutation() error = %v, want ErrGitConflictPending", err)
 	}
+	if err := coordinator.checkMutationForIdentity(basePath, nil); !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("checkMutationForIdentity() error = %v, want ErrGitConflictPending", err)
+	}
 	coordinator.SetConflict(basePath, false)
 	if err := coordinator.CheckMutation(basePath); err != nil {
 		t.Fatalf("CheckMutation() after clearing error = %v, want nil", err)
+	}
+}
+
+func TestBaseOperationCoordinatorMatchesCachedPhysicalIdentity(t *testing.T) {
+	physical := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(physical, alias); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+	pinnedInfo, err := os.Stat(alias)
+	if err != nil {
+		t.Fatalf("Stat(alias) error = %v", err)
+	}
+	coordinator := NewBaseOperationCoordinator()
+	coordinator.SetConflict(physical, true)
+	differentSpelling := filepath.Join(t.TempDir(), "different-spelling")
+
+	if err := coordinator.CheckMutation(differentSpelling); err != nil {
+		t.Fatalf("CheckMutation() exact-only error = %v, want nil", err)
+	}
+	if err := coordinator.checkMutationForIdentity(differentSpelling, pinnedInfo); !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("checkMutationForIdentity() error = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestBaseOperationCoordinatorClearsPhysicalConflictAliases(t *testing.T) {
+	physical := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(physical, alias); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+	coordinator := NewBaseOperationCoordinator()
+	coordinator.SetConflict(alias, true)
+	coordinator.SetConflict(physical, false)
+
+	if err := coordinator.CheckMutation(alias); err != nil {
+		t.Fatalf("CheckMutation(alias) after physical clear error = %v, want nil", err)
 	}
 }
 
@@ -94,6 +135,9 @@ func TestBaseOperationCoordinatorConcurrentConflictUpdatesPreservePaths(t *testi
 	var writers sync.WaitGroup
 	for i := range pathCount {
 		paths[i] = filepath.Join(root, fmt.Sprintf("base-%d", i))
+		if err := os.Mkdir(paths[i], 0o755); err != nil {
+			t.Fatalf("Mkdir(%q) error = %v", paths[i], err)
+		}
 		writers.Add(1)
 		go func(path string) {
 			defer writers.Done()

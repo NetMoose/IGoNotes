@@ -50,6 +50,7 @@ type NoteService struct {
 	coordinator      *BaseOperationCoordinator
 	basePath         string
 	conflictBasePath string
+	conflictBaseInfo fs.FileInfo
 	baseRoot         *os.Root
 	baseErr          error
 	closeErr         error
@@ -82,7 +83,7 @@ func NewNoteService(repo noteRepository, basePath string, coordinator *BaseOpera
 	if basePath != "" {
 		service.baseRoot, service.baseErr = os.OpenRoot(basePath)
 		if service.baseErr == nil {
-			service.conflictBasePath, service.baseErr = canonicalPinnedRootPath(service.baseRoot, basePath)
+			service.conflictBasePath, service.conflictBaseInfo, service.baseErr = canonicalPinnedRootIdentity(service.baseRoot, basePath)
 			if service.baseErr != nil {
 				service.closeErr = errors.Join(service.closeErr, service.baseRoot.Close())
 				service.baseRoot = nil
@@ -186,12 +187,8 @@ func (s *NoteService) persistConfig(expectedPath string, store ConfigStore, next
 	if !matches {
 		return false, nil
 	}
-	if next.CurrentBase != "" {
-		index := baseIndex(next.Bases, next.CurrentBase)
-		if index < 0 {
-			return false, ErrBaseNotFound
-		}
-		next.Bases[index].Path = canonicalExpected
+	if err := pinConfigCurrentBasePath(next, canonicalExpected); err != nil {
+		return false, err
 	}
 	config := cloneConfig(*next)
 	if err := store.Save(&config); err != nil {
@@ -244,6 +241,27 @@ func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, ne
 		}
 		return fmt.Errorf("switch runtime base: %w", operationErr), nil
 	}
+	previousConfig := cloneConfig(*previous)
+	if err := pinConfigCurrentBasePath(&previousConfig, s.conflictBasePath); err != nil {
+		operationErr := fmt.Errorf("pin previous settings path: %w", err)
+		if rollbackErr := candidate.rollback(); rollbackErr != nil {
+			s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+			s.failClosedLocked(operationErr, fmt.Errorf("rollback note index: %w", rollbackErr))
+			return operationErr, rollbackErr
+		}
+		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+		return operationErr, nil
+	}
+	if err := pinConfigCurrentBasePath(next, candidate.conflictBasePath); err != nil {
+		operationErr := fmt.Errorf("pin target settings path: %w", err)
+		if rollbackErr := candidate.rollback(); rollbackErr != nil {
+			s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+			s.failClosedLocked(operationErr, fmt.Errorf("rollback note index: %w", rollbackErr))
+			return operationErr, rollbackErr
+		}
+		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
+		return operationErr, nil
+	}
 	config := cloneConfig(*next)
 	if err := store.Save(&config); err != nil {
 		operationErr := fmt.Errorf("save settings: %w", err)
@@ -259,7 +277,6 @@ func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, ne
 		operationErr := fmt.Errorf("commit note index: %w", err)
 		rollbackErr := commitOutcomeError(candidate.rollback())
 		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
-		previousConfig := cloneConfig(*previous)
 		if err := store.Save(&previousConfig); err != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore settings: %w", err))
 		}
@@ -270,9 +287,22 @@ func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, ne
 	return nil, nil
 }
 
+func pinConfigCurrentBasePath(config *model.Config, pinnedPath string) error {
+	if config.CurrentBase == "" {
+		return nil
+	}
+	index := baseIndex(config.Bases, config.CurrentBase)
+	if index < 0 {
+		return ErrBaseNotFound
+	}
+	config.Bases[index].Path = pinnedPath
+	return nil
+}
+
 type baseSwitchCandidate struct {
 	path             string
 	conflictBasePath string
+	conflictBaseInfo fs.FileInfo
 	root             *os.Root
 	commit           func() error
 	rollback         func() error
@@ -290,9 +320,10 @@ func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandida
 		}
 	}
 	conflictBasePath := ""
+	var conflictBaseInfo fs.FileInfo
 	if candidate != nil {
 		var err error
-		conflictBasePath, err = canonicalPinnedRootPath(candidate, cleanTarget)
+		conflictBasePath, conflictBaseInfo, err = canonicalPinnedRootIdentity(candidate, cleanTarget)
 		if err != nil {
 			return nil, errors.Join(err, closeRoot(candidate)), nil
 		}
@@ -312,6 +343,7 @@ func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandida
 	return &baseSwitchCandidate{
 		path:             cleanTarget,
 		conflictBasePath: conflictBasePath,
+		conflictBaseInfo: conflictBaseInfo,
 		root:             candidate,
 		commit:           commit,
 		rollback:         rollback,
@@ -322,6 +354,7 @@ func (s *NoteService) publishBaseSwitchLocked(candidate *baseSwitchCandidate) {
 	oldRoot := s.baseRoot
 	s.basePath = candidate.path
 	s.conflictBasePath = candidate.conflictBasePath
+	s.conflictBaseInfo = candidate.conflictBaseInfo
 	s.baseRoot = candidate.root
 	s.baseErr = nil
 	// Publication has succeeded, so an old descriptor close error is deferred to Close.
@@ -357,24 +390,24 @@ func closeRoot(root *os.Root) error {
 	return root.Close()
 }
 
-func canonicalPinnedRootPath(root *os.Root, basePath string) (string, error) {
+func canonicalPinnedRootIdentity(root *os.Root, basePath string) (string, fs.FileInfo, error) {
 	canonicalPath, err := canonicalExistingDirectory(basePath)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	pinnedInfo, pinnedErr := root.Stat(".")
 	canonicalInfo, canonicalErr := os.Stat(canonicalPath)
 	if err := errors.Join(pinnedErr, canonicalErr); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if !os.SameFile(pinnedInfo, canonicalInfo) {
-		return "", ErrRuntimePathChanged
+		return "", nil, ErrRuntimePathChanged
 	}
-	return canonicalPath, nil
+	return canonicalPath, pinnedInfo, nil
 }
 
 func (s *NoteService) checkMutationLocked() error {
-	return s.coordinator.CheckMutation(s.conflictBasePath)
+	return s.coordinator.checkMutationForIdentity(s.conflictBasePath, s.conflictBaseInfo)
 }
 
 func (s *NoteService) replaceIndexLocked() error {

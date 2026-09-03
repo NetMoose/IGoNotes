@@ -845,6 +845,144 @@ func TestSettingsServiceSuccessfulBlockedSavePublishesCandidateAfterCommit(t *te
 	}
 }
 
+func TestSettingsServiceBlockedSwitchPinsTargetAliasGeneration(t *testing.T) {
+	oldBase := t.TempDir()
+	targetBase := t.TempDir()
+	retargetedBase := t.TempDir()
+	writeTestNote(t, oldBase, "old.md", "old")
+	writeTestNote(t, targetBase, "target.md", "target")
+	writeTestNote(t, retargetedBase, "retargeted.md", "retargeted")
+	alias := filepath.Join(t.TempDir(), "target-link")
+	createSymlinkOrSkip(t, targetBase, alias)
+	repo := &fakeNoteRepository{}
+	notes := newTestNoteService(t, repo, oldBase)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: oldBase}, {Name: "target", Path: alias}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	storeConfig := cloneConfig(config)
+	store := &fakeConfigStore{config: &storeConfig, saveStarted: make(chan struct{})}
+	release := make(chan struct{})
+	store.saveRelease = release
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	settings.coordinator.SetConflict(retargetedBase, true)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := settings.SwitchBase("target")
+		done <- err
+	}()
+	<-store.saveStarted
+	retargetSymlink(t, alias, retargetedBase)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("SwitchBase() error = %v", err)
+	}
+
+	published := settings.GetConfig()
+	if got := published.Bases[baseIndex(published.Bases, "target")].Path; got != targetBase {
+		t.Errorf("published target path = %q, want pinned %q", got, targetBase)
+	}
+	if store.config == nil || !reflect.DeepEqual(*store.config, published) {
+		t.Errorf("persisted config = %#v, want published generation %#v", store.config, published)
+	}
+	if got := notes.GetBasePath(); got != targetBase {
+		t.Errorf("runtime path = %q, want pinned %q", got, targetBase)
+	}
+	if _, err := notes.GetNoteContent("target.md"); err != nil {
+		t.Errorf("pinned target read error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(retargetedBase); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retargeted conflict = %v, want ErrGitConflictPending", err)
+	}
+
+	restartCoordinator := NewBaseOperationCoordinator()
+	restartNotes := NewNoteService(&fakeNoteRepository{}, targetBase, restartCoordinator)
+	defer restartNotes.Close()
+	restarted, err := NewSettingsService(store, restartNotes, restartCoordinator, "", nil)
+	if err != nil {
+		t.Fatalf("restart NewSettingsService() error = %v", err)
+	}
+	if got := restarted.GetConfig().Bases[baseIndex(restarted.GetConfig().Bases, "target")].Path; got != targetBase {
+		t.Errorf("restart target path = %q, want %q", got, targetBase)
+	}
+}
+
+func TestSettingsServiceCommitFailurePinsCompensationAliasGeneration(t *testing.T) {
+	oldBase := t.TempDir()
+	targetBase := t.TempDir()
+	retargetedBase := t.TempDir()
+	writeTestNote(t, oldBase, "old.md", "old")
+	writeTestNote(t, targetBase, "target.md", "target")
+	alias := filepath.Join(t.TempDir(), "active-link")
+	createSymlinkOrSkip(t, oldBase, alias)
+	commitErr := errors.New("index commit failed")
+	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md"}}, commitErr: commitErr}
+	notes := newTestNoteService(t, repo, alias)
+	completed := true
+	original := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: alias}, {Name: "target", Path: targetBase}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	storeConfig := cloneConfig(original)
+	store := &fakeConfigStore{config: &storeConfig, saveStarted: make(chan struct{})}
+	release := make(chan struct{})
+	store.saveRelease = release
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	settings.coordinator.SetConflict(retargetedBase, true)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := settings.SwitchBase("target")
+		done <- err
+	}()
+	<-store.saveStarted
+	retargetSymlink(t, alias, retargetedBase)
+	close(release)
+	if err := <-done; !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, commitErr) {
+		t.Fatalf("SwitchBase() error = %v, want fail-closed commit error", err)
+	}
+
+	if got := settings.GetConfig(); !reflect.DeepEqual(got, original) {
+		t.Errorf("in-memory config = %#v, want unchanged original %#v", got, original)
+	}
+	if store.config == nil || store.config.CurrentBase != "active" {
+		t.Fatalf("persisted compensation = %#v, want active generation", store.config)
+	}
+	if got := store.config.Bases[baseIndex(store.config.Bases, "active")].Path; got != oldBase {
+		t.Errorf("persisted compensated path = %q, want pinned %q", got, oldBase)
+	}
+	if store.saveCalls != 2 {
+		t.Errorf("Save calls = %d, want candidate and compensation", store.saveCalls)
+	}
+	if err := settings.coordinator.CheckMutation(retargetedBase); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retargeted conflict = %v, want ErrGitConflictPending", err)
+	}
+
+	restartCoordinator := NewBaseOperationCoordinator()
+	restartNotes := NewNoteService(&fakeNoteRepository{}, oldBase, restartCoordinator)
+	defer restartNotes.Close()
+	restarted, err := NewSettingsService(store, restartNotes, restartCoordinator, "", nil)
+	if err != nil {
+		t.Fatalf("restart NewSettingsService() error = %v", err)
+	}
+	if got := restarted.GetConfig().Bases[baseIndex(restarted.GetConfig().Bases, "active")].Path; got != oldBase {
+		t.Errorf("restart active path = %q, want %q", got, oldBase)
+	}
+}
+
 func TestSettingsServiceCandidateIndexFailureSkipsSaveAndPreservesOldRuntime(t *testing.T) {
 	oldBase := t.TempDir()
 	target := t.TempDir()

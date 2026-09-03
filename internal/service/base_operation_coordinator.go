@@ -2,6 +2,8 @@ package service
 
 import (
 	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -9,7 +11,11 @@ import (
 
 var ErrGitConflictPending = errors.New("git conflict pending")
 
-type conflictPathSet map[string]struct{}
+type conflictPathEntry struct {
+	identity fs.FileInfo
+}
+
+type conflictPathSet map[string]conflictPathEntry
 
 // BaseOperationCoordinator serializes base lifecycle and Git operations.
 // Lock ordering is coordinator -> SettingsService.mu -> NoteService.baseMu ->
@@ -43,19 +49,24 @@ func (c *BaseOperationCoordinator) SetConflict(canonicalBasePath string, pending
 		return
 	}
 	basePath := filepath.Clean(canonicalBasePath)
+	identity, _ := os.Stat(basePath)
 	for {
 		current := c.conflicts.Load()
 		next := make(conflictPathSet)
 		if current != nil {
 			next = make(conflictPathSet, len(*current)+1)
-			for path := range *current {
-				next[path] = struct{}{}
+			for path, entry := range *current {
+				next[path] = entry
 			}
 		}
 		if pending {
-			next[basePath] = struct{}{}
+			next[basePath] = conflictPathEntry{identity: identity}
 		} else {
-			delete(next, basePath)
+			for path, entry := range next {
+				if path == basePath || sameFileIdentity(identity, entry.identity) {
+					delete(next, path)
+				}
+			}
 		}
 		if c.conflicts.CompareAndSwap(current, &next) {
 			return
@@ -76,4 +87,29 @@ func (c *BaseOperationCoordinator) CheckMutation(canonicalBasePath string) error
 		return ErrGitConflictPending
 	}
 	return nil
+}
+
+func (c *BaseOperationCoordinator) checkMutationForIdentity(canonicalBasePath string, identity fs.FileInfo) error {
+	if canonicalBasePath == "" && identity == nil {
+		return nil
+	}
+	conflicts := c.conflicts.Load()
+	if conflicts == nil {
+		return nil
+	}
+	if _, pending := (*conflicts)[filepath.Clean(canonicalBasePath)]; pending {
+		return ErrGitConflictPending
+	}
+	if identity != nil {
+		for _, entry := range *conflicts {
+			if sameFileIdentity(identity, entry.identity) {
+				return ErrGitConflictPending
+			}
+		}
+	}
+	return nil
+}
+
+func sameFileIdentity(left, right fs.FileInfo) bool {
+	return left != nil && right != nil && os.SameFile(left, right)
 }

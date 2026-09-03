@@ -24,6 +24,7 @@ type fakeConfigStore struct {
 	saveErrs    []error
 	saveCalls   int
 	saveStarted chan struct{}
+	saveStart   sync.Once
 	saveRelease <-chan struct{}
 	events      *orderedEvents
 }
@@ -45,7 +46,7 @@ func (f *fakeConfigStore) Save(config *model.Config) error {
 		f.events.record("save")
 	}
 	if f.saveStarted != nil {
-		close(f.saveStarted)
+		f.saveStart.Do(func() { close(f.saveStarted) })
 	}
 	if f.saveRelease != nil {
 		<-f.saveRelease

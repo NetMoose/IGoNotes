@@ -316,6 +316,47 @@ func TestNoteServiceConflictPolicyPinsConstructorSymlinkIdentity(t *testing.T) {
 	assertFileContent(t, filepath.Join(outside, "note.md"), []byte("outside"))
 }
 
+func TestNoteServiceConflictPolicyMatchesPhysicalConflictAlias(t *testing.T) {
+	physical := t.TempDir()
+	writeTestNote(t, physical, "note.md", "original")
+	alias := filepath.Join(t.TempDir(), "conflict-alias")
+	requireSymlink(t, physical, alias)
+	coordinator := NewBaseOperationCoordinator()
+	service := newTestNoteServiceWithCoordinator(t, &fakeNoteRepository{}, physical, coordinator)
+	coordinator.SetConflict(alias, true)
+
+	if err := service.SaveNoteContent("note.md", "changed"); !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("SaveNoteContent() error = %v, want ErrGitConflictPending", err)
+	}
+	assertFileContent(t, filepath.Join(physical, "note.md"), []byte("original"))
+}
+
+func TestNoteServiceConflictPolicyMatchesPhysicalCaseAlias(t *testing.T) {
+	parent := t.TempDir()
+	physical := filepath.Join(parent, "CaseBase")
+	if err := os.Mkdir(physical, 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	writeTestNote(t, physical, "note.md", "original")
+	alias := filepath.Join(parent, "casebase")
+	physicalInfo, err := os.Stat(physical)
+	if err != nil {
+		t.Fatalf("Stat(physical) error = %v", err)
+	}
+	aliasInfo, err := os.Stat(alias)
+	if err != nil || !os.SameFile(physicalInfo, aliasInfo) {
+		t.Skip("filesystem does not expose case-distinct names for one directory")
+	}
+	coordinator := NewBaseOperationCoordinator()
+	service := newTestNoteServiceWithCoordinator(t, &fakeNoteRepository{}, alias, coordinator)
+	coordinator.SetConflict(physical, true)
+
+	if err := service.SaveNoteContent("note.md", "changed"); !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("SaveNoteContent() error = %v, want ErrGitConflictPending", err)
+	}
+	assertFileContent(t, filepath.Join(physical, "note.md"), []byte("original"))
+}
+
 func TestNewNoteServicePanicsWithNilCoordinator(t *testing.T) {
 	defer func() {
 		if got := recover(); got != "service.NewNoteService: nil BaseOperationCoordinator" {
