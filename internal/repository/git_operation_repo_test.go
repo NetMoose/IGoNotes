@@ -96,6 +96,150 @@ func TestGitOperationRepositoryCreateCheckpointFinish(t *testing.T) {
 	}
 }
 
+func TestGitOperationRepositoryFinishPreservesAdmissionAndCheckpointData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "metadata.db")
+	db, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	ctx := context.Background()
+	repo := NewGitOperationRepository(db)
+	createdAt := time.Date(2026, time.September, 3, 8, 9, 10, 123456789, time.UTC)
+	admitted := completeGitOperation("preserve-finish", "/notes/admitted", createdAt)
+	admitted.BaseName = "admitted-base"
+	admitted.ConfigFingerprint = "admitted-config"
+	admitted.RemoteFingerprint = "admitted-remote"
+	admitted.Kind = gitcmd.OperationInitialize
+	admitted.Branch = "admitted-branch"
+	if err := repo.CreateQueued(ctx, admitted); err != nil {
+		t.Fatalf("CreateQueued() error = %v", err)
+	}
+
+	checkpoint := gitcmd.Checkpoint{
+		Stage:         gitcmd.StagePushing,
+		BackupRef:     "refs/igonotes/backups/checkpoint",
+		LocalOID:      "1111111111111111111111111111111111111111",
+		CandidateOID:  "2222222222222222222222222222222222222222",
+		RemoteOID:     "3333333333333333333333333333333333333333",
+		PushOID:       "4444444444444444444444444444444444444444",
+		ChangedPaths:  []string{"checkpoint/z.md", "checkpoint/a.md", "checkpoint/z.md"},
+		ConflictPaths: []string{"conflict/z.md", "conflict/a.md", "conflict/z.md"},
+	}
+	if err := repo.Checkpoint(ctx, admitted.ID, checkpoint); err != nil {
+		t.Fatalf("Checkpoint() error = %v", err)
+	}
+
+	finishedAt := time.Date(2026, time.September, 3, 8, 10, 11, 987654321, time.UTC)
+	stale := admitted
+	stale.BaseName = "moved-base"
+	stale.RepoPath = "/notes/moved"
+	stale.ConfigFingerprint = "moved-config"
+	stale.RemoteFingerprint = "moved-remote"
+	stale.Kind = gitcmd.OperationSync
+	stale.Branch = "moved-branch"
+	stale.CreatedAt = createdAt.Add(24 * time.Hour)
+	stale.State = gitcmd.OperationConflict
+	stale.Stage = gitcmd.StageCompleted
+	stale.BackupRef = ""
+	stale.LocalOID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	stale.CandidateOID = ""
+	stale.RemoteOID = "cccccccccccccccccccccccccccccccccccccccc"
+	stale.PushOID = ""
+	stale.ChangedPaths = nil
+	stale.ConflictPaths = nil
+	stale.Error = &gitcmd.SafeError{
+		Code: gitcmd.CodeGitConflict, Message: "Git merge has conflicts", Field: "git_branch", ExitCode: 1,
+	}
+	stale.UpdatedAt = finishedAt
+	if err := repo.Finish(ctx, stale); err != nil {
+		t.Fatalf("Finish() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	db, err = InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen InitDB() error = %v", err)
+	}
+	defer db.Close()
+	repo = NewGitOperationRepository(db)
+	got, found, err := repo.LatestByPath(ctx, admitted.RepoPath)
+	if err != nil || !found {
+		t.Fatalf("LatestByPath() = %#v, %v, %v", got, found, err)
+	}
+	want := admitted
+	want.State = stale.State
+	want.Stage = stale.Stage
+	want.BackupRef = checkpoint.BackupRef
+	want.LocalOID = checkpoint.LocalOID
+	want.CandidateOID = checkpoint.CandidateOID
+	want.RemoteOID = checkpoint.RemoteOID
+	want.PushOID = checkpoint.PushOID
+	want.ChangedPaths = []string{"checkpoint/a.md", "checkpoint/z.md"}
+	want.ConflictPaths = []string{"conflict/a.md", "conflict/z.md"}
+	want.Error = stale.Error
+	want.UpdatedAt = finishedAt
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("finished operation mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+	if err := repo.Finish(ctx, stale); !errors.Is(err, ErrGitOperationTransition) {
+		t.Fatalf("repeated Finish() error = %v, want ErrGitOperationTransition", err)
+	}
+}
+
+func TestGitOperationRepositoryFinishExplicitEmptyPathsAndFillsMissingCheckpointData(t *testing.T) {
+	repo, db := openTestGitOperationRepository(t)
+	defer db.Close()
+	ctx := context.Background()
+	operation := completeGitOperation("finish-empty-paths", "/notes/finish-empty", time.Now().UTC())
+	operation.BackupRef = ""
+	operation.LocalOID = ""
+	operation.CandidateOID = ""
+	operation.RemoteOID = ""
+	operation.PushOID = ""
+	if err := repo.CreateQueued(ctx, operation); err != nil {
+		t.Fatalf("CreateQueued() error = %v", err)
+	}
+	if err := repo.Checkpoint(ctx, operation.ID, gitcmd.Checkpoint{
+		Stage:         gitcmd.StageMerging,
+		ChangedPaths:  []string{"changed.md"},
+		ConflictPaths: []string{"conflict.md"},
+	}); err != nil {
+		t.Fatalf("Checkpoint() error = %v", err)
+	}
+
+	operation.State = gitcmd.OperationSucceeded
+	operation.Stage = gitcmd.StageCompleted
+	operation.BackupRef = "refs/igonotes/backups/terminal"
+	operation.LocalOID = "1111111111111111111111111111111111111111"
+	operation.CandidateOID = "2222222222222222222222222222222222222222"
+	operation.RemoteOID = "3333333333333333333333333333333333333333"
+	operation.PushOID = "4444444444444444444444444444444444444444"
+	operation.ChangedPaths = []string{}
+	operation.ConflictPaths = []string{}
+	operation.Error = nil
+	operation.UpdatedAt = operation.CreatedAt.Add(time.Second)
+	if err := repo.Finish(ctx, operation); err != nil {
+		t.Fatalf("Finish() error = %v", err)
+	}
+
+	got, found, err := repo.LatestByPath(ctx, operation.RepoPath)
+	if err != nil || !found {
+		t.Fatalf("LatestByPath() = %#v, %v, %v", got, found, err)
+	}
+	if got.BackupRef != operation.BackupRef || got.LocalOID != operation.LocalOID ||
+		got.CandidateOID != operation.CandidateOID || got.RemoteOID != operation.RemoteOID || got.PushOID != operation.PushOID {
+		t.Errorf("terminal checkpoint fills = %q/%q/%q/%q/%q", got.BackupRef, got.LocalOID, got.CandidateOID, got.RemoteOID, got.PushOID)
+	}
+	if got.ChangedPaths == nil || len(got.ChangedPaths) != 0 {
+		t.Errorf("ChangedPaths = %#v, want non-nil empty", got.ChangedPaths)
+	}
+	if got.ConflictPaths == nil || len(got.ConflictPaths) != 0 {
+		t.Errorf("ConflictPaths = %#v, want non-nil empty", got.ConflictPaths)
+	}
+}
+
 func TestGitOperationRepositoryPreservesUTCNanosecondCreationTime(t *testing.T) {
 	repo, db := openTestGitOperationRepository(t)
 	defer db.Close()

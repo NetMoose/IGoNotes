@@ -85,28 +85,42 @@ func (r *GitOperationRepository) Finish(ctx context.Context, operation gitcmd.Op
 	if operation.State != gitcmd.OperationSucceeded && operation.State != gitcmd.OperationFailed && operation.State != gitcmd.OperationConflict {
 		return fmt.Errorf("finish Git operation %q: %w", operation.ID, ErrGitOperationTransition)
 	}
-	changedPaths, err := encodeOperationPaths(operation.ChangedPaths)
-	if err != nil {
-		return fmt.Errorf("finish Git operation %q: encode changed paths: %w", operation.ID, err)
+	changedPaths := ""
+	changedPathsSpecified := operation.ChangedPaths != nil
+	if changedPathsSpecified {
+		var err error
+		changedPaths, err = encodeOperationPaths(operation.ChangedPaths)
+		if err != nil {
+			return fmt.Errorf("finish Git operation %q: encode changed paths: %w", operation.ID, err)
+		}
 	}
-	conflictPaths, err := encodeOperationPaths(operation.ConflictPaths)
-	if err != nil {
-		return fmt.Errorf("finish Git operation %q: encode conflict paths: %w", operation.ID, err)
+	conflictPaths := ""
+	conflictPathsSpecified := operation.ConflictPaths != nil
+	if conflictPathsSpecified {
+		var err error
+		conflictPaths, err = encodeOperationPaths(operation.ConflictPaths)
+		if err != nil {
+			return fmt.Errorf("finish Git operation %q: encode conflict paths: %w", operation.ID, err)
+		}
 	}
 	errorCode, errorMessage, errorField, errorExitCode := operationErrorFields(operation.Error)
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE git_operations SET
-			base_name = ?, repo_path = ?, config_fingerprint = ?, remote_fingerprint = ?,
-			kind = ?, state = ?, stage = ?, branch = ?, backup_ref = ?, local_oid = ?,
-			candidate_oid = ?, remote_oid = ?, push_oid = ?, changed_paths_json = ?,
-			conflict_paths_json = ?, error_code = ?, error_message = ?, error_field = ?,
-			error_exit_code = ?, updated_at = ?
+			state = ?, stage = ?,
+			backup_ref = CASE WHEN backup_ref = '' THEN ? ELSE backup_ref END,
+			local_oid = CASE WHEN local_oid = '' THEN ? ELSE local_oid END,
+			candidate_oid = CASE WHEN candidate_oid = '' THEN ? ELSE candidate_oid END,
+			remote_oid = CASE WHEN remote_oid = '' THEN ? ELSE remote_oid END,
+			push_oid = CASE WHEN push_oid = '' THEN ? ELSE push_oid END,
+			changed_paths_json = CASE WHEN ? THEN ? ELSE changed_paths_json END,
+			conflict_paths_json = CASE WHEN ? THEN ? ELSE conflict_paths_json END,
+			error_code = ?, error_message = ?, error_field = ?, error_exit_code = ?, updated_at = ?
 		WHERE operation_id = ? AND state IN ('queued', 'running')
-	`, operation.BaseName, operation.RepoPath, operation.ConfigFingerprint,
-		operation.RemoteFingerprint, operation.Kind, operation.State, operation.Stage,
-		operation.Branch, operation.BackupRef, operation.LocalOID, operation.CandidateOID,
-		operation.RemoteOID, operation.PushOID, changedPaths, conflictPaths, errorCode,
-		errorMessage, errorField, errorExitCode, formatOperationTime(operation.UpdatedAt), operation.ID)
+	`, operation.State, operation.Stage, operation.BackupRef, operation.LocalOID,
+		operation.CandidateOID, operation.RemoteOID, operation.PushOID,
+		changedPathsSpecified, changedPaths, conflictPathsSpecified, conflictPaths,
+		errorCode, errorMessage, errorField, errorExitCode,
+		formatOperationTime(operation.UpdatedAt), operation.ID)
 	if err != nil {
 		return fmt.Errorf("finish Git operation %q: %w", operation.ID, err)
 	}
