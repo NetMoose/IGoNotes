@@ -61,6 +61,43 @@ var migrations = []migration{
 			CREATE INDEX git_status_base_name_idx ON git_status(base_name);
 		`,
 	},
+	{
+		version: 3,
+		sql: `
+			CREATE TABLE git_operations (
+				operation_id TEXT PRIMARY KEY,
+				base_name TEXT NOT NULL,
+				repo_path TEXT NOT NULL,
+				config_fingerprint TEXT NOT NULL,
+				remote_fingerprint TEXT NOT NULL,
+				kind TEXT NOT NULL CHECK (kind IN ('initialize', 'sync')),
+				state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'conflict')),
+				stage TEXT NOT NULL,
+				branch TEXT NOT NULL,
+				backup_ref TEXT NOT NULL DEFAULT '',
+				local_oid TEXT NOT NULL DEFAULT '',
+				candidate_oid TEXT NOT NULL DEFAULT '',
+				remote_oid TEXT NOT NULL DEFAULT '',
+				push_oid TEXT NOT NULL DEFAULT '',
+				changed_paths_json TEXT NOT NULL DEFAULT '[]',
+				conflict_paths_json TEXT NOT NULL DEFAULT '[]',
+				error_code TEXT NOT NULL DEFAULT '',
+				error_message TEXT NOT NULL DEFAULT '',
+				error_field TEXT NOT NULL DEFAULT '',
+				error_exit_code INTEGER NOT NULL DEFAULT 0,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE UNIQUE INDEX git_operations_one_active_path
+			ON git_operations(repo_path)
+			WHERE state IN ('queued', 'running');
+
+			CREATE INDEX git_operations_unfinished
+			ON git_operations(state, updated_at)
+			WHERE state IN ('queued', 'running');
+		`,
+	},
 }
 
 // InitDB инициализирует подключение к SQLite и создает таблицы

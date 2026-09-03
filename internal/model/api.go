@@ -137,8 +137,15 @@ type GitStatus struct {
 }
 
 type GitConfigResponse struct {
-	Base   Base      `json:"base"`
-	Status GitStatus `json:"status"`
+	Base      Base                  `json:"base"`
+	Status    GitStatus             `json:"status"`
+	Operation *GitOperationResponse `json:"operation,omitempty"`
+}
+
+type GitOperationResponse struct {
+	OperationID  string `json:"operation_id"`
+	Status       string `json:"status"`
+	Deduplicated bool   `json:"deduplicated"`
 }
 
 type GitStatusResponse struct {

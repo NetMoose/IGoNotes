@@ -113,7 +113,7 @@ func TestGitDTOContracts(t *testing.T) {
 			"LastAttempt": "last_attempt,omitempty", "LastSuccess": "last_success,omitempty", "ChangedPaths": "changed_paths",
 			"RemoteOID": "remote_oid,omitempty", "Error": "error,omitempty",
 		}},
-		{GitConfigResponse{}, map[string]string{"Base": "base", "Status": "status"}},
+		{GitConfigResponse{}, map[string]string{"Base": "base", "Status": "status", "Operation": "operation,omitempty"}},
 		{GitStatusResponse{}, map[string]string{"Statuses": "statuses"}},
 	}
 
@@ -157,5 +157,45 @@ func TestGitStatusJSONRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip mismatch:\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+func TestGitOperationResponseJSON(t *testing.T) {
+	want := `{"operation_id":"0123456789abcdef","status":"queued","deduplicated":true}`
+	got, err := json.Marshal(GitOperationResponse{
+		OperationID:  "0123456789abcdef",
+		Status:       "queued",
+		Deduplicated: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal GitOperationResponse: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("GitOperationResponse JSON = %s, want %s", got, want)
+	}
+}
+
+func TestGitConfigResponseIncludesAcceptedOperation(t *testing.T) {
+	response := GitConfigResponse{
+		Base:   Base{Name: "notes"},
+		Status: GitStatus{Base: "notes", State: GitStateInitializing},
+		Operation: &GitOperationResponse{
+			OperationID: "0123456789abcdef",
+			Status:      "queued",
+		},
+	}
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal GitConfigResponse: %v", err)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode GitConfigResponse JSON: %v", err)
+	}
+	for _, field := range []string{"base", "status", "operation"} {
+		if _, ok := got[field]; !ok {
+			t.Errorf("GitConfigResponse JSON is missing %q: %s", field, data)
+		}
 	}
 }

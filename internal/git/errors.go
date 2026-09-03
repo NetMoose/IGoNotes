@@ -11,18 +11,27 @@ import (
 type ErrorCode string
 
 const (
-	CodeUnavailable        ErrorCode = "git_unavailable"
-	CodeUnsupportedVersion ErrorCode = "git_version_unsupported"
-	CodeAuthentication     ErrorCode = "auth_failed"
-	CodeRemoteUnreachable  ErrorCode = "remote_unreachable"
-	CodeIdentityMissing    ErrorCode = "identity_missing"
-	CodeInvalidBranch      ErrorCode = "invalid_branch"
-	CodeRepositoryRoot     ErrorCode = "repository_root_mismatch"
-	CodeRepositoryLocked   ErrorCode = "repository_locked"
-	CodeCommandFailed      ErrorCode = "git_command_failed"
-	CodeTimedOut           ErrorCode = "git_timeout"
-	CodeCanceled           ErrorCode = "git_canceled"
-	CodeNotRepository      ErrorCode = "not_a_git_repository"
+	CodeUnavailable            ErrorCode = "git_unavailable"
+	CodeUnsupportedVersion     ErrorCode = "git_version_unsupported"
+	CodeAuthentication         ErrorCode = "auth_failed"
+	CodeRemoteUnreachable      ErrorCode = "remote_unreachable"
+	CodeIdentityMissing        ErrorCode = "identity_missing"
+	CodeInvalidBranch          ErrorCode = "invalid_branch"
+	CodeRepositoryRoot         ErrorCode = "repository_root_mismatch"
+	CodeRepositoryLocked       ErrorCode = "repository_locked"
+	CodeCommandFailed          ErrorCode = "git_command_failed"
+	CodeTimedOut               ErrorCode = "git_timeout"
+	CodeCanceled               ErrorCode = "git_canceled"
+	CodeNotRepository          ErrorCode = "not_a_git_repository"
+	CodeOriginMismatch         ErrorCode = "origin_mismatch"
+	CodeBranchDeleted          ErrorCode = "branch_deleted"
+	CodeRemoteHistoryRewritten ErrorCode = "remote_history_rewritten"
+	CodePushRejected           ErrorCode = "push_rejected"
+	CodeGitConflict            ErrorCode = "git_conflict"
+	CodeNeedsReconnect         ErrorCode = "needs_reconnect"
+	CodeConfirmationRequired   ErrorCode = "git_confirmation_required"
+	CodeOperationInterrupted   ErrorCode = "operation_interrupted"
+	CodeBackupMismatch         ErrorCode = "backup_mismatch"
 )
 
 type SafeError struct {
@@ -88,6 +97,10 @@ func classifyFailure(err error, diagnostic string) *SafeError {
 		return &SafeError{Code: CodeRepositoryLocked, Message: "Git repository is locked"}
 	case strings.Contains(lower, "not a git repository"):
 		return &SafeError{Code: CodeNotRepository, Message: "Directory is not a Git repository"}
+	case strings.Contains(lower, "non-fast-forward"),
+		strings.Contains(lower, "fetch first"),
+		strings.Contains(lower, "remote contains work"):
+		return &SafeError{Code: CodePushRejected, Message: "Git push was rejected"}
 	default:
 		return &SafeError{Code: CodeCommandFailed, Message: "Git command failed"}
 	}

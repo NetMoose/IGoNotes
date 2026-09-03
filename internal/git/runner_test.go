@@ -740,25 +740,55 @@ func TestSafeErrorNeverLeaksDiagnostic(t *testing.T) {
 
 func TestSafeErrorCodes(t *testing.T) {
 	want := map[ErrorCode]string{
-		CodeUnavailable:        "git_unavailable",
-		CodeUnsupportedVersion: "git_version_unsupported",
-		CodeAuthentication:     "auth_failed",
-		CodeRemoteUnreachable:  "remote_unreachable",
-		CodeIdentityMissing:    "identity_missing",
-		CodeInvalidBranch:      "invalid_branch",
-		CodeRepositoryRoot:     "repository_root_mismatch",
-		CodeRepositoryLocked:   "repository_locked",
-		CodeCommandFailed:      "git_command_failed",
-		CodeTimedOut:           "git_timeout",
-		CodeCanceled:           "git_canceled",
-		CodeNotRepository:      "not_a_git_repository",
+		CodeUnavailable:            "git_unavailable",
+		CodeUnsupportedVersion:     "git_version_unsupported",
+		CodeAuthentication:         "auth_failed",
+		CodeRemoteUnreachable:      "remote_unreachable",
+		CodeIdentityMissing:        "identity_missing",
+		CodeInvalidBranch:          "invalid_branch",
+		CodeRepositoryRoot:         "repository_root_mismatch",
+		CodeRepositoryLocked:       "repository_locked",
+		CodeCommandFailed:          "git_command_failed",
+		CodeTimedOut:               "git_timeout",
+		CodeCanceled:               "git_canceled",
+		CodeNotRepository:          "not_a_git_repository",
+		CodeOriginMismatch:         "origin_mismatch",
+		CodeBranchDeleted:          "branch_deleted",
+		CodeRemoteHistoryRewritten: "remote_history_rewritten",
+		CodePushRejected:           "push_rejected",
+		CodeGitConflict:            "git_conflict",
+		CodeNeedsReconnect:         "needs_reconnect",
+		CodeConfirmationRequired:   "git_confirmation_required",
+		CodeOperationInterrupted:   "operation_interrupted",
+		CodeBackupMismatch:         "backup_mismatch",
 	}
-	if len(want) != 12 {
-		t.Fatalf("error code coverage = %d, want 12", len(want))
+	if len(want) != 21 {
+		t.Fatalf("error code coverage = %d, want 21", len(want))
 	}
 	for code, value := range want {
 		if string(code) != value {
 			t.Errorf("error code = %q, want %q", code, value)
 		}
+	}
+}
+
+func TestClassifyFailureNonFastForward(t *testing.T) {
+	tests := []struct {
+		name       string
+		diagnostic string
+		want       ErrorCode
+	}{
+		{name: "non-fast-forward", diagnostic: "! [rejected] main -> main (non-fast-forward)", want: CodePushRejected},
+		{name: "fetch first", diagnostic: "Updates were rejected because the remote contains work that you do not have locally.\nhint: You may want to first integrate the remote changes (e.g., 'git pull ...') before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details.", want: CodePushRejected},
+		{name: "authentication takes precedence", diagnostic: "Authentication failed; push rejected (non-fast-forward)", want: CodeAuthentication},
+		{name: "transport takes precedence", diagnostic: "unable to access remote; Updates were rejected because the remote contains work", want: CodeRemoteUnreachable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := classifyFailure(errors.New("exit"), test.diagnostic)
+			if got.Code != test.want {
+				t.Fatalf("classifyFailure() code = %q, want %q", got.Code, test.want)
+			}
+		})
 	}
 }
