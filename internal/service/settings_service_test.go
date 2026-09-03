@@ -526,6 +526,76 @@ func TestSettingsServiceForgetBaseClearsRemovedConflict(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceForgetBaseUsesCapturedConflictIdentity(t *testing.T) {
+	root := t.TempDir()
+	activePath := filepath.Join(root, "active")
+	removedPath := filepath.Join(root, "removed")
+	displacedPath := filepath.Join(root, "removed-original")
+	if err := os.Mkdir(activePath, 0o755); err != nil {
+		t.Fatalf("Mkdir(active) error = %v", err)
+	}
+	if err := os.Mkdir(removedPath, 0o755); err != nil {
+		t.Fatalf("Mkdir(removed) error = %v", err)
+	}
+	writeTestNote(t, activePath, "note.md", "original")
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: activePath}, {Name: "removed", Path: removedPath}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	coordinator := NewBaseOperationCoordinator()
+	notes := newTestNoteServiceWithCoordinator(t, &fakeNoteRepository{}, activePath, coordinator)
+	storeConfig := cloneConfig(config)
+	store := &fakeConfigStore{config: &storeConfig, saveStarted: make(chan struct{})}
+	release := make(chan struct{})
+	store.saveRelease = release
+	settings, err := NewSettingsService(store, notes, coordinator, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	coordinator.SetConflict(activePath, true)
+	coordinator.SetConflict(removedPath, true)
+
+	var releaseOnce sync.Once
+	releaseSave := func() { releaseOnce.Do(func() { close(release) }) }
+	done := make(chan error, 1)
+	drained := false
+	t.Cleanup(func() {
+		releaseSave()
+		if !drained {
+			<-done
+		}
+	})
+	go func() {
+		_, err := settings.ForgetBase("removed")
+		done <- err
+	}()
+	<-store.saveStarted
+	if err := os.Rename(removedPath, displacedPath); err != nil {
+		t.Fatalf("Rename(removed) error = %v", err)
+	}
+	if err := os.Symlink(activePath, removedPath); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+	releaseSave()
+	if err := <-done; err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	drained = true
+
+	if err := coordinator.CheckMutation(removedPath); err != nil {
+		t.Errorf("removed exact conflict = %v, want nil", err)
+	}
+	if err := coordinator.CheckMutation(activePath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("active conflict = %v, want ErrGitConflictPending", err)
+	}
+	if err := notes.SaveNoteContent("note.md", "changed"); !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("SaveNoteContent() error = %v, want ErrGitConflictPending", err)
+	}
+	assertFileContent(t, filepath.Join(activePath, "note.md"), []byte("original"))
+}
+
 func TestSettingsServiceFailedPersistenceRetainsConflict(t *testing.T) {
 	settings, store, coordinator, _, otherPath := newConflictSettingsService(t)
 	saveErr := errors.New("save failed")

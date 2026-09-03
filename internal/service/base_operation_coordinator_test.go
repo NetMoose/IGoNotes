@@ -62,12 +62,82 @@ func TestBaseOperationCoordinatorClearsPhysicalConflictAliases(t *testing.T) {
 	if err := os.Symlink(physical, alias); err != nil {
 		t.Skipf("Symlink() unavailable: %v", err)
 	}
+	captured, err := os.Stat(physical)
+	if err != nil {
+		t.Fatalf("Stat(physical) error = %v", err)
+	}
 	coordinator := NewBaseOperationCoordinator()
 	coordinator.SetConflict(alias, true)
-	coordinator.SetConflict(physical, false)
+	coordinator.clearConflictForIdentity(physical, captured)
 
 	if err := coordinator.CheckMutation(alias); err != nil {
 		t.Fatalf("CheckMutation(alias) after physical clear error = %v, want nil", err)
+	}
+}
+
+func TestBaseOperationCoordinatorPublicClearDoesNotResolveReboundPath(t *testing.T) {
+	root := t.TempDir()
+	removedPath := filepath.Join(root, "removed")
+	displacedPath := filepath.Join(root, "removed-original")
+	retainedPath := filepath.Join(root, "retained")
+	if err := os.Mkdir(removedPath, 0o755); err != nil {
+		t.Fatalf("Mkdir(removed) error = %v", err)
+	}
+	if err := os.Mkdir(retainedPath, 0o755); err != nil {
+		t.Fatalf("Mkdir(retained) error = %v", err)
+	}
+	coordinator := NewBaseOperationCoordinator()
+	coordinator.SetConflict(removedPath, true)
+	coordinator.SetConflict(retainedPath, true)
+	if err := os.Rename(removedPath, displacedPath); err != nil {
+		t.Fatalf("Rename(removed) error = %v", err)
+	}
+	if err := os.Symlink(retainedPath, removedPath); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+
+	coordinator.SetConflict(removedPath, false)
+
+	if err := coordinator.CheckMutation(removedPath); err != nil {
+		t.Errorf("removed exact conflict = %v, want nil", err)
+	}
+	if err := coordinator.CheckMutation(retainedPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retained conflict = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestBaseOperationCoordinatorCapturedClearUsesSuppliedIdentity(t *testing.T) {
+	root := t.TempDir()
+	removedPath := filepath.Join(root, "removed")
+	displacedPath := filepath.Join(root, "removed-original")
+	retainedPath := filepath.Join(root, "retained")
+	if err := os.Mkdir(removedPath, 0o755); err != nil {
+		t.Fatalf("Mkdir(removed) error = %v", err)
+	}
+	if err := os.Mkdir(retainedPath, 0o755); err != nil {
+		t.Fatalf("Mkdir(retained) error = %v", err)
+	}
+	captured, err := os.Stat(removedPath)
+	if err != nil {
+		t.Fatalf("Stat(removed) error = %v", err)
+	}
+	coordinator := NewBaseOperationCoordinator()
+	coordinator.SetConflict(removedPath, true)
+	coordinator.SetConflict(retainedPath, true)
+	if err := os.Rename(removedPath, displacedPath); err != nil {
+		t.Fatalf("Rename(removed) error = %v", err)
+	}
+	if err := os.Symlink(retainedPath, removedPath); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+
+	coordinator.clearConflictForIdentity(removedPath, captured)
+
+	if err := coordinator.CheckMutation(removedPath); err != nil {
+		t.Errorf("removed exact conflict = %v, want nil", err)
+	}
+	if err := coordinator.CheckMutation(retainedPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retained conflict = %v, want ErrGitConflictPending", err)
 	}
 }
 

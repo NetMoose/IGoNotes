@@ -310,7 +310,7 @@ func (s *SettingsService) applyConfigWithConflictSnapshotLocked(
 }
 
 type conflictReconciliationSnapshot struct {
-	pathsToClear []string
+	entriesToClear []conflictPathResolution
 }
 
 type conflictPathResolution struct {
@@ -357,7 +357,6 @@ func captureConflictReconciliationSnapshot(current, next model.Config, stableGit
 	if unknownRetainedPath {
 		return conflictReconciliationSnapshot{}
 	}
-	pathsToClear := make([]string, 0, len(current.Bases))
 	clearIdentities := make([]conflictPathResolution, 0, len(current.Bases))
 	for _, base := range current.Bases {
 		if base.Path == "" {
@@ -369,16 +368,14 @@ func captureConflictReconciliationSnapshot(current, next model.Config, stableGit
 		}
 		duplicate := conflictIdentityIndex(clearIdentities, identity)
 		if duplicate < 0 {
-			pathsToClear = append(pathsToClear, identity.path)
 			clearIdentities = append(clearIdentities, identity)
 			continue
 		}
 		if identity.preferred && !clearIdentities[duplicate].preferred {
-			pathsToClear[duplicate] = identity.path
 			clearIdentities[duplicate] = identity
 		}
 	}
-	return conflictReconciliationSnapshot{pathsToClear: pathsToClear}
+	return conflictReconciliationSnapshot{entriesToClear: clearIdentities}
 }
 
 func containsConflictIdentity(identities []conflictPathResolution, target conflictPathResolution) bool {
@@ -403,8 +400,8 @@ func sameConflictIdentity(left, right conflictPathResolution) bool {
 
 func (s *SettingsService) publishConfigLocked(next model.Config, conflicts conflictReconciliationSnapshot) {
 	s.config = cloneConfig(next)
-	for _, path := range conflicts.pathsToClear {
-		s.coordinator.SetConflict(path, false)
+	for _, entry := range conflicts.entriesToClear {
+		s.coordinator.clearConflictForIdentity(entry.path, entry.info)
 	}
 }
 

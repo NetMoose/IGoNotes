@@ -49,7 +49,10 @@ func (c *BaseOperationCoordinator) SetConflict(canonicalBasePath string, pending
 		return
 	}
 	basePath := filepath.Clean(canonicalBasePath)
-	identity, _ := os.Stat(basePath)
+	var identity fs.FileInfo
+	if pending {
+		identity, _ = os.Stat(basePath)
+	}
 	for {
 		current := c.conflicts.Load()
 		next := make(conflictPathSet)
@@ -62,9 +65,27 @@ func (c *BaseOperationCoordinator) SetConflict(canonicalBasePath string, pending
 		if pending {
 			next[basePath] = conflictPathEntry{identity: identity}
 		} else {
-			for path, entry := range next {
-				if path == basePath || sameFileIdentity(identity, entry.identity) {
-					delete(next, path)
+			delete(next, basePath)
+		}
+		if c.conflicts.CompareAndSwap(current, &next) {
+			return
+		}
+	}
+}
+
+func (c *BaseOperationCoordinator) clearConflictForIdentity(canonicalBasePath string, identity fs.FileInfo) {
+	if canonicalBasePath == "" {
+		return
+	}
+	basePath := filepath.Clean(canonicalBasePath)
+	for {
+		current := c.conflicts.Load()
+		next := make(conflictPathSet)
+		if current != nil {
+			next = make(conflictPathSet, len(*current))
+			for path, entry := range *current {
+				if path != basePath && !sameFileIdentity(identity, entry.identity) {
+					next[path] = entry
 				}
 			}
 		}
