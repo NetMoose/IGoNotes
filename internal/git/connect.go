@@ -74,7 +74,16 @@ type connectActual struct {
 	pushOID       string
 	backupRef     string
 	changedPaths  []string
+	population    remotePopulationRecovery
 }
+
+type remotePopulationRecovery uint8
+
+const (
+	remotePopulationNone remotePopulationRecovery = iota
+	remotePopulationUnborn
+	remotePopulationBranchCreated
+)
 
 func (s *Service) Initialize(
 	ctx context.Context,
@@ -94,7 +103,11 @@ func (s *Service) Initialize(
 		return OperationResult{}, err
 	}
 	actual.hadRepository = local.HasRepository
-	if err := s.preflightInitializeRefs(ctx, path, options, local); err != nil {
+	postPushGap, err := s.provenPostPushGap(ctx, path, options, local)
+	if err != nil {
+		return OperationResult{}, err
+	}
+	if err := s.preflightInitializeRefs(ctx, path, options, local, postPushGap); err != nil {
 		return OperationResult{}, err
 	}
 
@@ -113,8 +126,15 @@ func (s *Service) Initialize(
 	if actual.remoteOID != "" && !validObjectID(actual.remoteOID) {
 		return OperationResult{}, malformedOutputError()
 	}
+	if postPushGap && actual.remoteOID != options.Operation.PushOID {
+		return OperationResult{}, &SafeError{Code: CodeOperationInterrupted, Message: "Git remote changed after the confirmed push"}
+	}
 	if options.Operation.PushOID != "" && actual.remoteOID == options.Operation.PushOID {
 		return s.finishAcceptedInitialize(ctx, path, options, worktree, checkpoint, actual.remoteOID)
+	}
+	actual.population, err = s.detectRemotePopulationRecovery(ctx, path, options, local, actual.remoteOID)
+	if err != nil {
+		return OperationResult{}, err
 	}
 
 	err = runWorktree(ctx, worktree, func(callbackPath string) error {
@@ -146,7 +166,9 @@ func (s *Service) Initialize(
 
 		var snapshotOID string
 		var changed []string
-		if options.Operation.LocalOID != "" && options.Operation.BackupRef != "" {
+		if actual.population != remotePopulationNone {
+			// The fetched tree is remote state, not a local snapshot to commit or back up.
+		} else if options.Operation.LocalOID != "" && options.Operation.BackupRef != "" {
 			// A durable backup checkpoint identifies the original snapshot even if a
 			// switch or merge completed before its following checkpoint was stored.
 			snapshotOID, err = s.commitOID(ctx, path, options.Operation.LocalOID)
@@ -170,11 +192,13 @@ func (s *Service) Initialize(
 		actual.changedPaths = changed
 		checkpoint.value.LocalOID = snapshotOID
 		checkpoint.value.ChangedPaths = changed
-		if err := checkpoint.save(ctx, StageSnapshotting); err != nil {
-			return err
+		if actual.population == remotePopulationNone {
+			if err := checkpoint.save(ctx, StageSnapshotting); err != nil {
+				return err
+			}
 		}
 
-		needsBackup := snapshotOID != "" && ((!actual.remoteEmpty) ||
+		needsBackup := actual.population == remotePopulationNone && snapshotOID != "" && ((!actual.remoteEmpty) ||
 			(actual.hadRepository && (current.DetachedHead || current.CurrentBranch != options.Snapshot.Branch)))
 		if needsBackup {
 			backupRef, err := s.ensureBackup(ctx, path, options.Operation, snapshotOID, checkpoint)
@@ -190,25 +214,29 @@ func (s *Service) Initialize(
 	}
 
 	if !actual.remoteEmpty {
-		if err := checkpoint.save(ctx, StageFetching); err != nil {
-			return OperationResult{}, err
-		}
-		fetchRef := "refs/igonotes/fetch/" + options.Operation.ID
-		refspec := "+refs/heads/" + options.Snapshot.Branch + ":" + fetchRef
-		if _, err := s.runNetwork(ctx, path, options.Snapshot.URL, false,
-			"fetch", "--no-tags", "--show-forced-updates", "origin", refspec); err != nil {
-			return OperationResult{}, err
-		}
-		actual.fetchedOID, err = s.commitOID(ctx, path, fetchRef)
-		if err != nil {
-			return OperationResult{}, err
-		}
-		if actual.fetchedOID != actual.remoteOID {
-			return OperationResult{}, &SafeError{Code: CodeOperationInterrupted, Message: "Git remote changed during initialization"}
-		}
-		checkpoint.value.CandidateOID = actual.fetchedOID
-		if err := checkpoint.save(ctx, StageFetching); err != nil {
-			return OperationResult{}, err
+		if actual.population != remotePopulationNone {
+			actual.fetchedOID = options.Operation.CandidateOID
+		} else {
+			if err := checkpoint.save(ctx, StageFetching); err != nil {
+				return OperationResult{}, err
+			}
+			fetchRef := "refs/igonotes/fetch/" + options.Operation.ID
+			refspec := "+refs/heads/" + options.Snapshot.Branch + ":" + fetchRef
+			if _, err := s.runNetwork(ctx, path, options.Snapshot.URL, false,
+				"fetch", "--no-tags", "--show-forced-updates", "origin", refspec); err != nil {
+				return OperationResult{}, err
+			}
+			actual.fetchedOID, err = s.commitOID(ctx, path, fetchRef)
+			if err != nil {
+				return OperationResult{}, err
+			}
+			if actual.fetchedOID != actual.remoteOID {
+				return OperationResult{}, &SafeError{Code: CodeOperationInterrupted, Message: "Git remote changed during initialization"}
+			}
+			checkpoint.value.CandidateOID = actual.fetchedOID
+			if err := checkpoint.save(ctx, StageFetching); err != nil {
+				return OperationResult{}, err
+			}
 		}
 	}
 
@@ -399,6 +427,7 @@ func (s *Service) preflightInitializeRefs(
 	path string,
 	options InitializeOptions,
 	local LocalInspection,
+	postPushGap bool,
 ) error {
 	if !local.HasRepository {
 		if options.LastRemoteOID != "" || options.Operation.BackupRef != "" {
@@ -443,6 +472,9 @@ func (s *Service) preflightInitializeRefs(
 	if options.LastRemoteOID == "" {
 		return nil
 	}
+	if postPushGap && managedExists && managedOID == options.Operation.PushOID {
+		return nil
+	}
 	if managedExists && managedOID == options.LastRemoteOID {
 		return nil
 	}
@@ -450,6 +482,132 @@ func (s *Service) preflightInitializeRefs(
 		return nil
 	}
 	return remoteHistoryRewritten()
+}
+
+func (s *Service) provenPostPushGap(
+	ctx context.Context,
+	path string,
+	options InitializeOptions,
+	local LocalInspection,
+) (bool, error) {
+	operation := options.Operation
+	if !local.HasRepository || local.DetachedHead || local.CurrentBranch != options.Snapshot.Branch ||
+		operation.Stage != StagePushing || operation.CandidateOID == "" || operation.RemoteOID != operation.CandidateOID ||
+		operation.PushOID == "" || operation.PushOID == operation.CandidateOID {
+		return false, nil
+	}
+	privateOID, privateExists, err := s.optionalRefOID(ctx, path, "refs/igonotes/fetch/"+operation.ID)
+	if err != nil {
+		return false, err
+	}
+	if !privateExists || privateOID != operation.CandidateOID {
+		return false, nil
+	}
+	managedOID, managedExists, err := s.optionalRefOID(ctx, path, managedRemoteRef(options.Snapshot.Branch))
+	if err != nil {
+		return false, err
+	}
+	if !managedExists || managedOID != operation.PushOID {
+		return false, nil
+	}
+	headOID, hasHEAD, err := s.optionalCommitOID(ctx, path, "HEAD")
+	if err != nil {
+		return false, err
+	}
+	if !hasHEAD || headOID != operation.PushOID {
+		return false, nil
+	}
+	ancestor, err := s.isAncestor(ctx, path, operation.CandidateOID, operation.PushOID)
+	if err != nil {
+		return false, err
+	}
+	return ancestor, nil
+}
+
+func (s *Service) detectRemotePopulationRecovery(
+	ctx context.Context,
+	path string,
+	options InitializeOptions,
+	local LocalInspection,
+	remoteOID string,
+) (remotePopulationRecovery, error) {
+	operation := options.Operation
+	if operation.Stage != StageSwitching && operation.Stage != StageFetching {
+		return remotePopulationNone, nil
+	}
+	if operation.LocalOID != "" || operation.BackupRef != "" || operation.PushOID != "" ||
+		operation.CandidateOID == "" || operation.RemoteOID != operation.CandidateOID {
+		return remotePopulationNone, nil
+	}
+	if remoteOID != operation.CandidateOID {
+		return remotePopulationNone, &SafeError{Code: CodeOperationInterrupted, Message: "Git remote changed during branch population recovery"}
+	}
+	privateOID, privateExists, err := s.optionalRefOID(ctx, path, "refs/igonotes/fetch/"+operation.ID)
+	if err != nil {
+		return remotePopulationNone, err
+	}
+	managedOID, managedExists, err := s.optionalRefOID(ctx, path, managedRemoteRef(options.Snapshot.Branch))
+	if err != nil {
+		return remotePopulationNone, err
+	}
+	if !privateExists || privateOID != operation.CandidateOID || !managedExists || managedOID != operation.CandidateOID {
+		return remotePopulationNone, remoteHistoryRewritten()
+	}
+	branchOID, branchExists, err := s.optionalCommitOID(ctx, path, "refs/heads/"+options.Snapshot.Branch)
+	if err != nil {
+		return remotePopulationNone, err
+	}
+	headOID, hasHEAD, err := s.optionalCommitOID(ctx, path, "HEAD")
+	if err != nil {
+		return remotePopulationNone, err
+	}
+	state := remotePopulationNone
+	switch {
+	case !hasHEAD && !branchExists && !local.DetachedHead && local.CurrentBranch == options.Snapshot.Branch:
+		state = remotePopulationUnborn
+	case hasHEAD && branchExists && headOID == operation.CandidateOID && branchOID == operation.CandidateOID &&
+		!local.DetachedHead && local.CurrentBranch == options.Snapshot.Branch:
+		state = remotePopulationBranchCreated
+	case operation.Stage == StageSwitching:
+		return remotePopulationNone, &SafeError{Code: CodeOperationInterrupted, Message: "Git branch state changed during population recovery"}
+	default:
+		return remotePopulationNone, nil
+	}
+	equal, err := s.indexAndWorktreeEqualCommit(ctx, path, operation.CandidateOID)
+	if err != nil {
+		return remotePopulationNone, err
+	}
+	if !equal {
+		return remotePopulationNone, &SafeError{Code: CodeOperationInterrupted, Message: "Git worktree changed during branch population recovery"}
+	}
+	return state, nil
+}
+
+func (s *Service) indexAndWorktreeEqualCommit(ctx context.Context, path, oid string) (bool, error) {
+	for _, args := range [][]string{
+		{"diff", "--cached", "--quiet", "--exit-code", oid, "--"},
+		{"diff", "--quiet", "--exit-code", oid, "--"},
+	} {
+		result, err := s.runLocal(ctx, path, true, args...)
+		if err != nil {
+			if expectedExit(err, 1) {
+				return false, nil
+			}
+			return false, err
+		}
+		if result.StdoutTruncated || result.StderrTruncated || result.Stdout != "" {
+			return false, malformedOutputError()
+		}
+	}
+	result, err := s.runLocal(ctx, path, true, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return false, err
+	}
+	paths, err := parseNULPaths(result)
+	if err != nil {
+		return false, err
+	}
+	return len(paths) == 0, nil
 }
 
 func (s *Service) ensureOrigin(
@@ -785,8 +943,36 @@ func (s *Service) selectAndMerge(
 	if err != nil {
 		return err
 	}
+	if actual.population != remotePopulationNone {
+		local, err := s.inspectSafeLocal(ctx, path)
+		if err != nil {
+			return err
+		}
+		population, err := s.detectRemotePopulationRecovery(ctx, path, options, local, actual.fetchedOID)
+		if err != nil {
+			return err
+		}
+		if population != actual.population {
+			return &SafeError{Code: CodeOperationInterrupted, Message: "Git branch state changed during population recovery"}
+		}
+	}
 
-	if !branchExists && !actual.remoteEmpty && actual.snapshotOID == "" && !detached && currentBranch == branch {
+	if actual.population == remotePopulationUnborn {
+		if err := checkpoint.save(ctx, StageSwitching); err != nil {
+			return err
+		}
+		if _, err := s.runLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectID); err != nil {
+			return err
+		}
+		if err := checkpoint.save(ctx, StageSwitching); err != nil {
+			return err
+		}
+		branchExists = true
+		branchOID = actual.fetchedOID
+		currentBranch = branch
+	} else if actual.population == remotePopulationBranchCreated {
+		// The selected branch already points at the validated fetched candidate.
+	} else if !branchExists && !actual.remoteEmpty && actual.snapshotOID == "" && !detached && currentBranch == branch {
 		collision, err := s.ignoredCheckoutCollision(ctx, path, actual.fetchedOID)
 		if err != nil {
 			return err

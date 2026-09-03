@@ -349,6 +349,115 @@ func TestInitializePushTimeoutIsRecognizedOnRetry(t *testing.T) {
 	}
 }
 
+func TestInitializeRetryRecoversCompletedCheckpointGap(t *testing.T) {
+	fixture, options, candidate, pushOID, initialCommands := prepareCompletedCheckpointGap(t)
+	commitCount := fixture.git(fixture.root, "rev-list", "--count", "HEAD")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	completed := false
+	result, err := initializeWithRunner(t, fixture, runner, options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+		if checkpoint.Stage == StageCompleted {
+			completed = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry error = %v", err)
+	}
+	if !completed || result.PushOID != pushOID || result.RemoteOID != pushOID || fixture.remoteOID() != pushOID {
+		t.Fatalf("retry result = %#v completed=%v remote=%q, want accepted push %q", result, completed, fixture.remoteOID(), pushOID)
+	}
+	if got := fixture.git(fixture.root, "rev-list", "--count", "HEAD"); got != commitCount {
+		t.Fatalf("commit count after retry = %s, want unchanged %s", got, commitCount)
+	}
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", managedRemoteRef("main")); got != pushOID {
+		t.Fatalf("managed ref = %q, want pushed OID %q", got, pushOID)
+	}
+	if options.Operation.Stage != StagePushing || options.Operation.CandidateOID != candidate || options.Operation.PushOID != pushOID {
+		t.Fatalf("durable gap operation = %#v", options.Operation)
+	}
+	assertNoServicePush(t, runner.commands)
+	pushes := 0
+	for _, command := range initialCommands {
+		if len(command.Args) != 0 && command.Args[0] == "push" {
+			pushes++
+		}
+	}
+	if pushes != 1 {
+		t.Fatalf("initial push count = %d, want 1", pushes)
+	}
+}
+
+func TestInitializeCompletedCheckpointGapMismatchesFailClosed(t *testing.T) {
+	t.Run("managed ref mismatch", func(t *testing.T) {
+		fixture, options, _, pushOID, _ := prepareCompletedCheckpointGap(t)
+		fixture.git(fixture.root, "update-ref", managedRemoteRef("main"), pushOID+"^{tree}", pushOID)
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeRemoteHistoryRewritten)
+		assertNoServicePush(t, runner.commands)
+	})
+
+	t.Run("HEAD mismatch", func(t *testing.T) {
+		fixture, options, _, _, _ := prepareCompletedCheckpointGap(t)
+		fixture.write("post-gap-drift.md", "drift\n")
+		fixture.git(fixture.root, "add", "--all", "--", ".")
+		fixture.git(fixture.root, "commit", "-m", "post-gap drift")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeRemoteHistoryRewritten)
+		assertNoServicePush(t, runner.commands)
+	})
+
+	t.Run("remote mismatch", func(t *testing.T) {
+		fixture, options, candidate, pushOID, _ := prepareCompletedCheckpointGap(t)
+		fixture.git(filepath.Dir(fixture.root), "--git-dir", fixture.remote, "update-ref", "refs/heads/main", candidate, pushOID)
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeOperationInterrupted)
+		assertExactCommand(t, runner.commands, networkCommand(fixture.root, true, fixture.remote,
+			"ls-remote", "--symref", fixture.remote))
+		assertNoServicePush(t, runner.commands)
+	})
+}
+
+func prepareCompletedCheckpointGap(t *testing.T) (*connectFixture, InitializeOptions, string, string, []Command) {
+	t.Helper()
+	fixture := newConnectFixture(t)
+	candidate := fixture.seedRemote()
+	fixture.initLocal("local")
+	fixture.git(fixture.root, "fetch", fixture.remote, "refs/heads/main")
+	fixture.git(fixture.root, "update-ref", managedRemoteRef("main"), candidate, zeroObjectID)
+	options := fixture.options()
+	options.LastRemoteOID = candidate
+	completedErr := errors.New("final completed checkpoint unavailable")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	_, err := initializeWithRunner(t, fixture, runner, options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+		if checkpoint.Stage == StageCompleted {
+			return completedErr
+		}
+		applyCheckpoint(&options.Operation, checkpoint)
+		return nil
+	})
+	if !errors.Is(err, completedErr) {
+		t.Fatalf("first Initialize() error = %v, want final completed checkpoint failure", err)
+	}
+	pushOID := options.Operation.PushOID
+	if options.Operation.Stage != StagePushing || options.Operation.CandidateOID != candidate ||
+		options.Operation.RemoteOID != candidate || pushOID == "" || pushOID == candidate {
+		t.Fatalf("durable operation = %#v, want B=%q and distinct C", options.Operation, candidate)
+	}
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", managedRemoteRef("main")); got != pushOID {
+		t.Fatalf("managed ref after CAS = %q, want C=%q", got, pushOID)
+	}
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", "HEAD^{commit}"); got != pushOID {
+		t.Fatalf("HEAD after CAS = %q, want C=%q", got, pushOID)
+	}
+	if fixture.remoteOID() != pushOID {
+		t.Fatalf("remote after confirmed push = %q, want C=%q", fixture.remoteOID(), pushOID)
+	}
+	return fixture, options, candidate, pushOID, append([]Command(nil), runner.commands...)
+}
+
 func TestInitializeRechecksRemoteBeforePush(t *testing.T) {
 	fixture := newConnectFixture(t)
 	original := fixture.seedRemote()
@@ -440,6 +549,164 @@ func TestInitializeRetryRecoversBackupWhenCheckpointLags(t *testing.T) {
 	if _, err := fixture.initialize(options, nil, nil); err != nil {
 		t.Fatalf("retry error = %v", err)
 	}
+}
+
+func TestInitializeRetryAfterUnbornCheckoutBeforeBranchRef(t *testing.T) {
+	fixture, options, candidate := prepareUnbornPopulationGap(t, "checkout")
+	assertUnbornPopulationRetry(t, fixture, options, candidate, true)
+}
+
+func TestInitializeRetryAfterUnbornBranchRefBeforeCheckpoint(t *testing.T) {
+	fixture, options, candidate := prepareUnbornPopulationGap(t, "branch-ref")
+	assertUnbornPopulationRetry(t, fixture, options, candidate, false)
+}
+
+func TestInitializeUnbornRecoveryFailsClosedOnMismatch(t *testing.T) {
+	t.Run("private candidate mismatch", func(t *testing.T) {
+		fixture, options, candidate := prepareUnbornPopulationGap(t, "checkout")
+		privateRef := "refs/igonotes/fetch/" + options.Operation.ID
+		fixture.git(fixture.root, "update-ref", privateRef, candidate+"^{tree}", candidate)
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeRemoteHistoryRewritten)
+		assertNoServicePush(t, runner.commands)
+	})
+
+	t.Run("worktree differs from candidate", func(t *testing.T) {
+		fixture, options, _ := prepareUnbornPopulationGap(t, "checkout")
+		fixture.write("remote.md", "local drift preserved\n")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeOperationInterrupted)
+		contents, readErr := os.ReadFile(filepath.Join(fixture.root, "remote.md"))
+		if readErr != nil || string(contents) != "local drift preserved\n" {
+			t.Fatalf("local drift changed: contents=%q error=%v", contents, readErr)
+		}
+		for _, command := range runner.commands {
+			if len(command.Args) != 0 && (command.Args[0] == "commit" || command.Args[0] == "merge") {
+				t.Fatalf("mismatched recovery mutated history: %q", command.Args)
+			}
+		}
+		assertNoServicePush(t, runner.commands)
+	})
+}
+
+func prepareUnbornPopulationGap(t *testing.T, crashPoint string) (*connectFixture, InitializeOptions, string) {
+	t.Helper()
+	fixture := newConnectFixture(t)
+	candidate := fixture.seedRemote()
+	options := fixture.options()
+	interrupted := errors.New("simulated unborn population interruption")
+	branchRefCreated := false
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if err != nil {
+			return result, err
+		}
+		if crashPoint == "checkout" && len(command.Args) != 0 && command.Args[0] == "checkout" {
+			return Result{}, interrupted
+		}
+		if crashPoint == "branch-ref" && isSelectedBranchRefUpdate(command, "main") {
+			branchRefCreated = true
+		}
+		return result, nil
+	}
+	_, err := initializeWithRunner(t, fixture, runner, options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+		if branchRefCreated {
+			return interrupted
+		}
+		applyCheckpoint(&options.Operation, checkpoint)
+		return nil
+	})
+	if !errors.Is(err, interrupted) {
+		t.Fatalf("first Initialize() error = %v, want interruption at %s", err, crashPoint)
+	}
+	if options.Operation.Stage != StageSwitching || options.Operation.CandidateOID != candidate ||
+		options.Operation.RemoteOID != candidate || options.Operation.LocalOID != "" || options.Operation.BackupRef != "" {
+		t.Fatalf("durable operation at %s gap = %#v", crashPoint, options.Operation)
+	}
+	privateOID := fixture.git(fixture.root, "rev-parse", "--verify", "refs/igonotes/fetch/"+options.Operation.ID)
+	managedOID := fixture.git(fixture.root, "rev-parse", "--verify", managedRemoteRef("main"))
+	if privateOID != candidate || managedOID != candidate {
+		t.Fatalf("candidate refs at %s gap: checkpoint=%q private=%q managed=%q", crashPoint, candidate, privateOID, managedOID)
+	}
+	assertNoServicePush(t, runner.commands)
+	return fixture, options, candidate
+}
+
+func assertUnbornPopulationRetry(
+	t *testing.T,
+	fixture *connectFixture,
+	options InitializeOptions,
+	candidate string,
+	wantBranchUpdate bool,
+) {
+	t.Helper()
+	remoteCount := fixture.git(filepath.Dir(fixture.root), "--git-dir", fixture.remote, "rev-list", "--count", "refs/heads/main")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	lastStage := Stage("")
+	branchUpdateRan := false
+	checkpointBeforeBranchUpdate := false
+	checkpointAfterBranchUpdate := false
+	runner.before = func(command Command) error {
+		if isSelectedBranchRefUpdate(command, "main") {
+			branchUpdateRan = true
+			checkpointBeforeBranchUpdate = lastStage == StageSwitching
+		}
+		return nil
+	}
+	result, err := initializeWithRunner(t, fixture, runner, options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+		lastStage = checkpoint.Stage
+		if branchUpdateRan && checkpoint.Stage == StageSwitching {
+			checkpointAfterBranchUpdate = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry error = %v", err)
+	}
+	if result.HeadOID != candidate || result.RemoteOID != candidate || result.PushOID != candidate || result.BackupRef != "" {
+		t.Fatalf("retry result = %#v, want exact candidate %q without backup", result, candidate)
+	}
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", "HEAD^{commit}"); got != candidate {
+		t.Fatalf("HEAD = %q, want candidate %q", got, candidate)
+	}
+	if got := fixture.git(filepath.Dir(fixture.root), "--git-dir", fixture.remote, "rev-list", "--count", "refs/heads/main"); got != remoteCount {
+		t.Fatalf("remote commit count = %s, want unchanged %s", got, remoteCount)
+	}
+	if refs := fixture.git(fixture.root, "for-each-ref", "--format=%(refname)", "refs/igonotes/backups"); refs != "" {
+		t.Fatalf("unexpected backup refs after recovery: %q", refs)
+	}
+	assertExactCommand(t, runner.commands, localCommand(fixture.root, true,
+		"diff", "--cached", "--quiet", "--exit-code", candidate, "--"))
+	assertExactCommand(t, runner.commands, localCommand(fixture.root, true,
+		"diff", "--quiet", "--exit-code", candidate, "--"))
+	assertExactCommand(t, runner.commands, localCommand(fixture.root, true,
+		"ls-files", "--others", "--exclude-standard", "-z"))
+	branchUpdates := 0
+	for _, command := range runner.commands {
+		if len(command.Args) == 0 {
+			continue
+		}
+		if command.Args[0] == "add" || command.Args[0] == "commit" || command.Args[0] == "merge" || command.Args[0] == "checkout" ||
+			(command.Args[0] == "update-ref" && containsArg(command.Args, "--create-reflog")) {
+			t.Fatalf("retry misclassified remote population: %q", command.Args)
+		}
+		if isSelectedBranchRefUpdate(command, "main") {
+			branchUpdates++
+		}
+	}
+	wantUpdates := 0
+	if wantBranchUpdate {
+		wantUpdates = 1
+	}
+	if branchUpdates != wantUpdates {
+		t.Fatalf("branch update count = %d, want %d", branchUpdates, wantUpdates)
+	}
+	if wantBranchUpdate && (!checkpointBeforeBranchUpdate || !checkpointAfterBranchUpdate) {
+		t.Fatalf("branch update checkpoints: before=%v after=%v", checkpointBeforeBranchUpdate, checkpointAfterBranchUpdate)
+	}
+	assertExactPush(t, runner.commands, fixture, candidate)
 }
 
 func TestInitializeRetryRecoversTrustedRefWhenCheckpointLags(t *testing.T) {
