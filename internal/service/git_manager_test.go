@@ -976,6 +976,132 @@ func TestGitManagerFailurePreservesHistoricalStatusFields(t *testing.T) {
 	}
 }
 
+func TestGitManagerFailureRetainsCheckpointTrustAfterProgressStatusWriteFailure(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "old remote")
+	oldOID := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "push", "--no-verify", "origin", "main")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oldOID)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "commit", "-am", "new remote")
+	newOID := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "push", "--no-verify", "origin", "main")
+	runManagerGit(t, root, "reset", "--hard", oldOID)
+
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	client := gitcmd.NewClient(delegate)
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, client, client)
+	seedManagerTrust(t, fixture, base, oldOID)
+	lastAttempt := time.Date(2026, 9, 2, 7, 0, 0, 0, time.UTC)
+	lastSuccess := time.Date(2026, 9, 1, 6, 0, 0, 0, time.UTC)
+	previous := model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateReady,
+		OperationID: "previous-operation", Stage: string(gitcmd.StageCompleted), Ahead: 7, Behind: 3,
+		ConsecutiveFailures: 4, LastAttempt: &lastAttempt, LastSuccess: &lastSuccess,
+		ChangedPaths: []string{"historical.md"}, RemoteOID: oldOID,
+	}
+	if err := fixture.statuses.Upsert(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC)
+	fixture.manager.now = func() time.Time { return failedAt }
+	queued, _, err := fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointPaths := []string{"checkpoint-a.md", "checkpoint-z.md"}
+	if err := fixture.operations.Checkpoint(context.Background(), queued.ID, gitcmd.Checkpoint{
+		Stage: gitcmd.StageQueued, RemoteOID: oldOID, ChangedPaths: checkpointPaths,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(fmt.Sprintf(`CREATE TRIGGER reject_checkpoint_status BEFORE UPDATE ON git_status
+		WHEN NEW.state = 'syncing' AND NEW.remote_oid = '%s'
+		BEGIN SELECT RAISE(ABORT, 'status unavailable'); END`, newOID)); err != nil {
+		t.Fatal(err)
+	}
+
+	type terminalEvent struct {
+		call int32
+		err  error
+	}
+	terminal := make(chan terminalEvent, 2)
+	var terminalCalls atomic.Int32
+	fixture.manager.beforeTerminalPublication = func() {
+		call := terminalCalls.Add(1)
+		var err error
+		if call == 1 {
+			_, err = fixture.db.Exec(`UPDATE git_status SET changed_paths_json = '["historical.md"]' WHERE repository_path = ?`, root)
+		}
+		terminal <- terminalEvent{call: call, err: err}
+	}
+	waitIdle := func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			fixture.manager.mu.Lock()
+			_, busy := fixture.manager.inFlight[root]
+			fixture.manager.mu.Unlock()
+			if !busy {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("Git manager did not finish operation")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := fixture.manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if event := <-terminal; event.call != 1 || event.err != nil {
+		t.Fatalf("first terminal hook = %#v", event)
+	}
+	waitIdle()
+
+	operation, found, err := fixture.operations.LatestByPath(context.Background(), root)
+	if err != nil || !found || operation.ID != queued.ID || operation.State != gitcmd.OperationFailed ||
+		operation.Stage != gitcmd.StageFetching || operation.Error == nil || operation.Error.Code != gitcmd.CodeCommandFailed ||
+		operation.RemoteOID != newOID || operation.PushOID != "" || !reflect.DeepEqual(operation.ChangedPaths, checkpointPaths) {
+		t.Fatalf("failed checkpoint operation = %#v, %v, %v", operation, found, err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStateError || status.OperationID != queued.ID ||
+		status.Stage != string(gitcmd.StageFetching) || status.Error == nil || status.Error.Code != string(gitcmd.CodeCommandFailed) ||
+		status.RemoteOID != newOID || !reflect.DeepEqual(status.ChangedPaths, checkpointPaths) {
+		t.Fatalf("failed checkpoint status = %#v, %v, %v", status, found, err)
+	}
+	if status.LastAttempt == nil || !status.LastAttempt.Equal(failedAt) || status.LastSuccess == nil || !status.LastSuccess.Equal(lastSuccess) ||
+		status.Ahead != previous.Ahead || status.Behind != previous.Behind || status.ConsecutiveFailures != previous.ConsecutiveFailures {
+		t.Fatalf("failed checkpoint status erased history: before %#v, after %#v", previous, status)
+	}
+
+	if _, err := fixture.db.Exec("DROP TRIGGER reject_checkpoint_status"); err != nil {
+		t.Fatal(err)
+	}
+	next, deduplicated, err := fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
+	if err != nil || deduplicated || next.RemoteOID != newOID {
+		t.Fatalf("QueueSync() after checkpoint failure = %#v, %v, %v", next, deduplicated, err)
+	}
+	if event := <-terminal; event.call != 2 || event.err != nil {
+		t.Fatalf("second terminal hook = %#v", event)
+	}
+	waitIdle()
+	completed, found, err := fixture.operations.LatestByPath(context.Background(), root)
+	if err != nil || !found || completed.ID != next.ID || completed.State != gitcmd.OperationSucceeded || completed.RemoteOID != newOID {
+		t.Fatalf("subsequent sync operation = %#v, %v, %v", completed, found, err)
+	}
+}
+
 type mergeConflictRunner struct {
 	gitDir string
 	oid    string

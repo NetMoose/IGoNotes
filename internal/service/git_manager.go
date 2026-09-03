@@ -478,7 +478,11 @@ func (m *GitManager) finishFailure(
 ) (bool, error) {
 	ctx := context.WithoutCancel(m.lifetimeCtx)
 	operation, lookupErr := m.latestOperation(ctx, operation)
+	checkpointChangedPaths := append([]string(nil), operation.ChangedPaths...)
 	applyManagerResult(&operation, result)
+	if len(operation.ChangedPaths) == 0 && len(checkpointChangedPaths) != 0 {
+		operation.ChangedPaths = checkpointChangedPaths
+	}
 	now := m.now().UTC()
 	operation.UpdatedAt = now
 	operation.Error = safeErr
@@ -501,15 +505,18 @@ func (m *GitManager) finishFailure(
 		status.Stage = string(operation.Stage)
 		status.LastAttempt = &now
 		status.Error = &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field}
-		if !statusFound {
+		if operation.RemoteOID != "" {
 			status.RemoteOID = operation.RemoteOID
+		}
+		if len(operation.ChangedPaths) != 0 {
+			status.ChangedPaths = sortedManagerPaths(operation.ChangedPaths)
 		}
 		if result.RemoteOID != "" {
 			status.RemoteOID = result.RemoteOID
 		}
 		if conflict != nil {
 			status.ChangedPaths = append([]string(nil), operation.ConflictPaths...)
-		} else if result.ChangedPaths != nil {
+		} else if len(result.ChangedPaths) != 0 {
 			status.ChangedPaths = sortedManagerPaths(result.ChangedPaths)
 		}
 		statusErr = m.statuses.Upsert(ctx, status)
