@@ -3,17 +3,24 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 )
 
@@ -2735,6 +2742,288 @@ func TestNewSettingsServiceWithGitDoesNotCallGitDependencies(t *testing.T) {
 	if service == nil || validator.calls != 0 || statuses.calls != 0 {
 		t.Fatalf("startup Git calls = validator %d store %d", validator.calls, statuses.calls)
 	}
+}
+
+func TestSettingsServiceConfigureGitForInitializeReturnsSavedSnapshot(t *testing.T) {
+	canonicalPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "notes-link")
+	createSymlinkOrSkip(t, canonicalPath, aliasPath)
+	completed := true
+	config := model.Config{
+		Bases:          []model.Base{{Name: "work", Path: aliasPath}},
+		CurrentBase:    "work",
+		SetupCompleted: &completed,
+	}
+	service, store, _, validator, _ := newGitSettingsServiceForConfig(t, config, aliasPath)
+	normalized := model.GitConfigRequest{
+		GitURL:                   "ssh://git@example.test/team/notes.git",
+		GitBranch:                "feature/editor",
+		AutoSync:                 true,
+		AutoSyncIntervalMinutes:  17,
+		GitCommitMessageTemplate: "sync {{count}}",
+	}
+	validator.normalized = &normalized
+
+	response, snapshot, err := service.ConfigureGitForInitialize(context.Background(), "work", model.GitConfigRequest{
+		GitURL:    "raw-url",
+		GitBranch: "raw-branch",
+	})
+	if err != nil {
+		t.Fatalf("ConfigureGitForInitialize() error = %v", err)
+	}
+	want := gitcmd.ConfiguredBase{
+		Name:            "work",
+		Path:            canonicalPath,
+		URL:             normalized.GitURL,
+		Branch:          normalized.GitBranch,
+		AutoSync:        normalized.AutoSync,
+		IntervalMinutes: normalized.AutoSyncIntervalMinutes,
+		CommitTemplate:  normalized.GitCommitMessageTemplate,
+	}
+	want.Fingerprint = settingsTestFingerprint(
+		want.Name, want.Path, want.URL, want.Branch,
+		strconv.FormatBool(want.AutoSync), strconv.Itoa(want.IntervalMinutes), want.CommitTemplate,
+	)
+	want.RemoteFingerprint = settingsTestFingerprint(want.Path, want.URL, want.Branch)
+	if snapshot != want {
+		t.Fatalf("ConfigureGitForInitialize() snapshot = %#v, want %#v", snapshot, want)
+	}
+	if store.saveCalls != 1 || store.config == nil || !reflect.DeepEqual(response.Base, store.config.Bases[0]) {
+		t.Fatalf("saved publication = response %#v store %#v saves %d", response.Base, store.config, store.saveCalls)
+	}
+	if response.Base.Path != aliasPath || response.Base.GitURL != snapshot.URL || response.Base.GitBranch != snapshot.Branch {
+		t.Fatalf("response/snapshot publication mismatch = response %#v snapshot %#v", response.Base, snapshot)
+	}
+}
+
+func TestSettingsServiceConfigureGitForInitializeDoesNotPersistConfirmations(t *testing.T) {
+	service, store, _, validator, _, _ := newGitSettingsService(t)
+	request := model.GitConfigRequest{
+		GitURL:    "work.git",
+		GitBranch: "main",
+		Confirmations: model.GitConfirmations{
+			CreateRepository: true,
+			ReplaceOrigin:    true,
+			CreateBranch:     true,
+			MergeHistories:   true,
+		},
+	}
+	validator.normalized = &request
+
+	response, snapshot, err := service.ConfigureGitForInitialize(context.Background(), "work", request)
+	if err != nil {
+		t.Fatalf("ConfigureGitForInitialize() error = %v", err)
+	}
+	data, err := json.Marshal(store.config)
+	if err != nil {
+		t.Fatalf("Marshal(saved config) error = %v", err)
+	}
+	if strings.Contains(string(data), "confirmation") {
+		t.Fatalf("saved config persisted one-time confirmations: %s", data)
+	}
+	if !reflect.DeepEqual(validator.request.Confirmations, request.Confirmations) {
+		t.Errorf("validator confirmations = %#v, want %#v", validator.request.Confirmations, request.Confirmations)
+	}
+	if response.Base.GitURL != request.GitURL || snapshot.URL != request.GitURL {
+		t.Fatalf("saved Git URL = response %q snapshot %q, want %q", response.Base.GitURL, snapshot.URL, request.GitURL)
+	}
+}
+
+func TestSettingsServiceConfigureGitForInitializeRejectsConflictBeforeSave(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(*SettingsService) error
+	}{
+		{name: "initialize entry point", call: func(service *SettingsService) error {
+			_, _, err := service.ConfigureGitForInitialize(context.Background(), "work", model.GitConfigRequest{GitURL: "changed.git", GitBranch: "main"})
+			return err
+		}},
+		{name: "existing entry point", call: func(service *SettingsService) error {
+			_, err := service.ConfigureGit(context.Background(), "work", model.GitConfigRequest{GitURL: "changed.git", GitBranch: "main"})
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, runtime, validator, statuses, original := newGitSettingsService(t)
+			path := original.Bases[0].Path
+			service.coordinator.SetConflict(path, true)
+
+			err := test.call(service)
+			if !errors.Is(err, ErrGitConflictPending) {
+				t.Fatalf("configure error = %v, want ErrGitConflictPending", err)
+			}
+			if validator.calls != 0 || len(statuses.getCalls)+len(statuses.upsertCalls)+len(statuses.deleteCalls) != 0 || store.saveCalls != 0 || runtime.persistCalls != 0 {
+				t.Fatalf("conflicted configure called dependencies: validator %d status %v/%v/%v saves %d persists %d", validator.calls, statuses.getCalls, statuses.upsertCalls, statuses.deleteCalls, store.saveCalls, runtime.persistCalls)
+			}
+			if !reflect.DeepEqual(service.GetConfig(), original) || !reflect.DeepEqual(*store.config, original) {
+				t.Fatalf("conflicted configure mutated config: service %#v store %#v", service.GetConfig(), store.config)
+			}
+		})
+	}
+}
+
+func TestSettingsServiceConfigureGitPreservesTrustedOIDForSameRemote(t *testing.T) {
+	path := t.TempDir()
+	config := configuredGitTestConfig(path, t.TempDir())
+	service, _, _, validator, statuses := newGitSettingsServiceForConfig(t, config, path)
+	previous := model.GitStatus{
+		Base: "active", RepositoryPath: path, State: model.GitStateReady,
+		RemoteOID: "0123456789abcdef", ChangedPaths: []string{"note.md"}, Ahead: 2, Behind: 1,
+	}
+	statuses.statuses[path] = previous
+	normalized := model.GitConfigRequest{
+		GitURL: config.Bases[0].GitURL, GitBranch: config.Bases[0].GitBranch,
+		AutoSync: false, AutoSyncIntervalMinutes: 45, GitCommitMessageTemplate: "changed template",
+	}
+	validator.normalized = &normalized
+
+	response, err := service.ConfigureGit(context.Background(), "active", normalized)
+	if err != nil {
+		t.Fatalf("ConfigureGit() error = %v", err)
+	}
+	if response.Status.RemoteOID != previous.RemoteOID || statuses.statuses[path].RemoteOID != previous.RemoteOID {
+		t.Fatalf("trusted RemoteOID = response %q stored %q, want %q", response.Status.RemoteOID, statuses.statuses[path].RemoteOID, previous.RemoteOID)
+	}
+	if response.Status.State != model.GitStateNeedsReconnect || response.Status.Ahead != 0 || response.Status.Behind != 0 || len(response.Status.ChangedPaths) != 0 {
+		t.Fatalf("reconfigured status = %#v, want reset needs_reconnect with retained trust", response.Status)
+	}
+}
+
+func TestSettingsServiceConfigureGitClearsTrustedOIDForChangedRemote(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*model.GitConfigRequest)
+	}{
+		{name: "URL", mutate: func(request *model.GitConfigRequest) { request.GitURL = "changed.git" }},
+		{name: "branch", mutate: func(request *model.GitConfigRequest) { request.GitBranch = "changed" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir()
+			config := configuredGitTestConfig(path, t.TempDir())
+			service, _, _, validator, statuses := newGitSettingsServiceForConfig(t, config, path)
+			statuses.statuses[path] = model.GitStatus{
+				Base: "active", RepositoryPath: path, State: model.GitStateReady,
+				RemoteOID: "trusted-before-change", ChangedPaths: []string{},
+			}
+			normalized := model.GitConfigRequest{GitURL: config.Bases[0].GitURL, GitBranch: config.Bases[0].GitBranch}
+			test.mutate(&normalized)
+			validator.normalized = &normalized
+
+			response, err := service.ConfigureGit(context.Background(), "active", normalized)
+			if err != nil {
+				t.Fatalf("ConfigureGit() error = %v", err)
+			}
+			if response.Status.RemoteOID != "" || statuses.statuses[path].RemoteOID != "" {
+				t.Fatalf("changed remote retained trust: response %#v stored %#v", response.Status, statuses.statuses[path])
+			}
+		})
+	}
+}
+
+func TestSettingsServiceDisableGitRejectsConflict(t *testing.T) {
+	path := t.TempDir()
+	config := configuredGitTestConfig(path, t.TempDir())
+	service, store, runtime, validator, statuses := newGitSettingsServiceForConfig(t, config, path)
+	beforeStatus := model.GitStatus{Base: "active", RepositoryPath: path, State: model.GitStateConflict, RemoteOID: "trusted", ChangedPaths: []string{"note.md"}}
+	statuses.statuses[path] = beforeStatus
+	service.coordinator.SetConflict(path, true)
+
+	_, err := service.DisableGit(context.Background(), "active")
+	if !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("DisableGit() error = %v, want ErrGitConflictPending", err)
+	}
+	if validator.calls != 0 || len(statuses.getCalls)+statuses.listCalls+len(statuses.upsertCalls)+len(statuses.deleteCalls) != 0 || store.saveCalls != 0 || runtime.persistCalls != 0 {
+		t.Fatalf("conflicted disable called dependencies: status %v/%d/%v/%v saves %d persists %d", statuses.getCalls, statuses.listCalls, statuses.upsertCalls, statuses.deleteCalls, store.saveCalls, runtime.persistCalls)
+	}
+	if !reflect.DeepEqual(service.GetConfig(), config) || !reflect.DeepEqual(*store.config, config) || !reflect.DeepEqual(statuses.statuses[path], beforeStatus) {
+		t.Fatalf("conflicted disable mutated state: service %#v store %#v status %#v", service.GetConfig(), store.config, statuses.statuses[path])
+	}
+}
+
+func TestSettingsServiceGitSnapshotIsDetachedAndReportsActive(t *testing.T) {
+	activePath := t.TempDir()
+	activeAlias := filepath.Join(t.TempDir(), "active-link")
+	createSymlinkOrSkip(t, activePath, activeAlias)
+	inactivePath := t.TempDir()
+	config := configuredGitTestConfig(activeAlias, inactivePath)
+	setConfiguredGit(&config.Bases[1])
+	config.Bases[1].GitURL = "other.git"
+	service, _, _, _, _ := newGitSettingsServiceForConfig(t, config, activeAlias)
+
+	snapshot, active, err := service.GitSnapshot("active")
+	if err != nil {
+		t.Fatalf("GitSnapshot(active) error = %v", err)
+	}
+	if !active || snapshot.Path != activePath || snapshot.Name != "active" || snapshot.URL != config.Bases[0].GitURL || snapshot.Branch != config.Bases[0].GitBranch {
+		t.Fatalf("GitSnapshot(active) = %#v, active %t", snapshot, active)
+	}
+	wantFingerprint := settingsTestFingerprint(
+		snapshot.Name, snapshot.Path, snapshot.URL, snapshot.Branch,
+		strconv.FormatBool(snapshot.AutoSync), strconv.Itoa(snapshot.IntervalMinutes), snapshot.CommitTemplate,
+	)
+	if snapshot.Fingerprint != wantFingerprint || snapshot.RemoteFingerprint != settingsTestFingerprint(snapshot.Path, snapshot.URL, snapshot.Branch) {
+		t.Fatalf("GitSnapshot fingerprints = %q / %q", snapshot.Fingerprint, snapshot.RemoteFingerprint)
+	}
+
+	snapshot.Name, snapshot.Path, snapshot.URL, snapshot.Fingerprint = "mutated", "mutated", "mutated", "mutated"
+	again, againActive, err := service.GitSnapshot("active")
+	if err != nil {
+		t.Fatalf("second GitSnapshot(active) error = %v", err)
+	}
+	if !againActive || again.Name != "active" || again.Path != activePath || again.URL != config.Bases[0].GitURL || again.Fingerprint != wantFingerprint {
+		t.Fatalf("GitSnapshot aliases returned value: %#v active %t", again, againActive)
+	}
+	_, inactive, err := service.GitSnapshot("other")
+	if err != nil || inactive {
+		t.Fatalf("GitSnapshot(other) active/error = %t/%v, want false/nil", inactive, err)
+	}
+}
+
+func TestSettingsServiceGitSnapshotRejectsUnknownOrIncompleteBase(t *testing.T) {
+	activePath := t.TempDir()
+	missingPath := filepath.Join(t.TempDir(), "missing")
+	completed := true
+	configuredMissing := model.Base{Name: "missing-path", Path: missingPath}
+	setConfiguredGit(&configuredMissing)
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: activePath},
+			{Name: "incomplete", Path: t.TempDir(), GitURL: "work.git"},
+			configuredMissing,
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	service, _, _, _, _ := newGitSettingsServiceForConfig(t, config, activePath)
+
+	for _, test := range []struct {
+		name string
+		base string
+		kind error
+	}{
+		{name: "unknown", base: "unknown", kind: ErrBaseNotFound},
+		{name: "incomplete", base: "incomplete", kind: ErrInvalidConfig},
+		{name: "missing path", base: "missing-path", kind: ErrInvalidPath},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, active, err := service.GitSnapshot(test.base)
+			if !errors.Is(err, test.kind) {
+				t.Fatalf("GitSnapshot(%q) error = %v, want %v", test.base, err, test.kind)
+			}
+			if snapshot != (gitcmd.ConfiguredBase{}) || active {
+				t.Fatalf("GitSnapshot(%q) = %#v, active %t; want zero/false", test.base, snapshot, active)
+			}
+		})
+	}
+}
+
+func settingsTestFingerprint(values ...string) string {
+	hash := sha256.New()
+	for _, value := range values {
+		_ = binary.Write(hash, binary.BigEndian, uint64(len(value)))
+		_, _ = io.WriteString(hash, value)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func TestSettingsServiceConfigureGitNormalizesAndResetsStatus(t *testing.T) {

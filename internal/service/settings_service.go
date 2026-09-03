@@ -2,15 +2,21 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 )
 
@@ -657,30 +663,31 @@ func validLiteralGitBranch(branch string) bool {
 	return true
 }
 
-func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request model.GitConfigRequest) (model.GitConfigResponse, error) {
-	s.lockMutation()
-	defer s.unlockMutation()
-
+func (s *SettingsService) configureGitLocked(ctx context.Context, name string, request model.GitConfigRequest) (model.GitConfigResponse, gitcmd.ConfiguredBase, error) {
 	if s.degraded != nil {
-		return model.GitConfigResponse{}, s.degraded
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, s.degraded
 	}
 	index := baseIndex(s.config.Bases, name)
 	if index < 0 {
-		return model.GitConfigResponse{}, ErrBaseNotFound
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, ErrBaseNotFound
 	}
 	if s.gitValidator == nil || s.gitStatuses == nil {
-		return model.GitConfigResponse{}, fmt.Errorf("Git settings dependencies: %w", ErrInvalidConfig)
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, fmt.Errorf("Git settings dependencies: %w", ErrInvalidConfig)
 	}
-	path, err := canonicalGitStatusPath(s.config.Bases[index].Path)
+	currentBase := s.config.Bases[index]
+	path, err := canonicalGitStatusPath(currentBase.Path)
 	if err != nil {
-		return model.GitConfigResponse{}, err
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, err
+	}
+	if err := s.coordinator.CheckMutation(path); err != nil {
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, err
 	}
 	normalized, err := s.gitValidator.Validate(ctx, path, request)
 	if err != nil {
-		return model.GitConfigResponse{}, err
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, err
 	}
 	if !validLiteralGitBranch(normalized.GitBranch) {
-		return model.GitConfigResponse{}, fieldError(ErrInvalidGitBranch, "git_branch", "Git branch is required and must be a literal branch name")
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, fieldError(ErrInvalidGitBranch, "git_branch", "Git branch is required and must be a literal branch name")
 	}
 	next := cloneConfig(s.config)
 	base := &next.Bases[index]
@@ -690,18 +697,37 @@ func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request
 	base.AutoSyncIntervalMinutes = normalized.AutoSyncIntervalMinutes
 	base.GitCommitMessageTemplate = normalized.GitCommitMessageTemplate
 	if err := validateUniqueGitRepositoryPaths(next.Bases); err != nil {
-		return model.GitConfigResponse{}, err
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, err
 	}
 	status := needsReconnectGitStatus(base.Name, path)
 	changes, err := s.prepareGitStatusChanges(ctx, path)
 	if err != nil {
-		return model.GitConfigResponse{}, err
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, err
+	}
+	if changes[0].exists && sameGitRemote(currentBase, path, *base, path) {
+		status.RemoteOID = changes[0].before.RemoteOID
 	}
 	changes[0].after = &status
 	if err := s.applyConfigWithGitStatusesLocked(ctx, next, "", changes); err != nil {
-		return model.GitConfigResponse{}, err
+		return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, err
 	}
-	return model.GitConfigResponse{Base: next.Bases[index], Status: status}, nil
+	snapshot := configuredBaseAtPath(s.config.Bases[index], path)
+	return model.GitConfigResponse{Base: next.Bases[index], Status: status}, snapshot, nil
+}
+
+func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request model.GitConfigRequest) (model.GitConfigResponse, error) {
+	s.lockMutation()
+	defer s.unlockMutation()
+
+	response, _, err := s.configureGitLocked(ctx, name, request)
+	return response, err
+}
+
+func (s *SettingsService) ConfigureGitForInitialize(ctx context.Context, name string, request model.GitConfigRequest) (model.GitConfigResponse, gitcmd.ConfiguredBase, error) {
+	s.lockMutation()
+	defer s.unlockMutation()
+
+	return s.configureGitLocked(ctx, name, request)
 }
 
 func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.GitConfigResponse, error) {
@@ -718,9 +744,20 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 	if s.gitStatuses == nil {
 		return model.GitConfigResponse{}, fmt.Errorf("Git status dependency: %w", ErrInvalidConfig)
 	}
+	canonicalPath, canonicalErr := canonicalGitStatusPath(s.config.Bases[index].Path)
+	if canonicalErr == nil {
+		if err := s.coordinator.CheckMutation(canonicalPath); err != nil {
+			return model.GitConfigResponse{}, err
+		}
+	}
 	path, owned, err := s.existingGitStatusPath(ctx, s.config.Bases[index])
 	if err != nil {
 		return model.GitConfigResponse{}, err
+	}
+	if canonicalErr != nil || path != canonicalPath {
+		if err := s.coordinator.CheckMutation(path); err != nil {
+			return model.GitConfigResponse{}, err
+		}
 	}
 	next := cloneConfig(s.config)
 	base := &next.Bases[index]
@@ -740,6 +777,74 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 		return model.GitConfigResponse{}, err
 	}
 	return model.GitConfigResponse{Base: next.Bases[index], Status: unconfiguredGitStatus(base.Name, path)}, nil
+}
+
+func (s *SettingsService) GitSnapshot(name string) (gitcmd.ConfiguredBase, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	index := baseIndex(s.config.Bases, name)
+	if index < 0 {
+		return gitcmd.ConfiguredBase{}, false, ErrBaseNotFound
+	}
+	snapshot, err := configuredBase(s.config.Bases[index])
+	if err != nil {
+		return gitcmd.ConfiguredBase{}, false, err
+	}
+	return snapshot, s.config.CurrentBase == name, nil
+}
+
+func configuredBase(base model.Base) (gitcmd.ConfiguredBase, error) {
+	if !base.GitConfigured() {
+		return gitcmd.ConfiguredBase{}, fmt.Errorf("Git settings for base %q: %w", base.Name, ErrInvalidConfig)
+	}
+	path, err := canonicalExistingDirectory(base.Path)
+	if err != nil {
+		return gitcmd.ConfiguredBase{}, fieldErrorWithCause(ErrInvalidPath, err, "path", "resolve Git base path")
+	}
+	return configuredBaseAtPath(base, path), nil
+}
+
+func configuredBaseAtPath(base model.Base, canonicalPath string) gitcmd.ConfiguredBase {
+	snapshot := gitcmd.ConfiguredBase{
+		Name:            base.Name,
+		Path:            canonicalPath,
+		URL:             base.GitURL,
+		Branch:          base.GitBranch,
+		AutoSync:        base.AutoSync,
+		IntervalMinutes: base.AutoSyncIntervalMinutes,
+		CommitTemplate:  base.GitCommitMessageTemplate,
+	}
+	snapshot.Fingerprint = gitSettingsFingerprint(
+		snapshot.Name,
+		snapshot.Path,
+		snapshot.URL,
+		snapshot.Branch,
+		strconv.FormatBool(snapshot.AutoSync),
+		strconv.Itoa(snapshot.IntervalMinutes),
+		snapshot.CommitTemplate,
+	)
+	snapshot.RemoteFingerprint = gitRemoteFingerprint(snapshot.Path, snapshot.URL, snapshot.Branch)
+	return snapshot
+}
+
+func sameGitRemote(current model.Base, currentPath string, next model.Base, nextPath string) bool {
+	return current.GitConfigured() && next.GitConfigured() &&
+		gitRemoteFingerprint(currentPath, current.GitURL, current.GitBranch) ==
+			gitRemoteFingerprint(nextPath, next.GitURL, next.GitBranch)
+}
+
+func gitRemoteFingerprint(path, url, branch string) string {
+	return gitSettingsFingerprint(path, url, branch)
+}
+
+func gitSettingsFingerprint(values ...string) string {
+	hash := sha256.New()
+	for _, value := range values {
+		_ = binary.Write(hash, binary.BigEndian, uint64(len(value)))
+		_, _ = io.WriteString(hash, value)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (model.SettingsResponse, error) {
