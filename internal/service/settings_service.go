@@ -305,18 +305,31 @@ func (s *SettingsService) publishConfigLocked(next model.Config) {
 	retainedPaths := make(map[string]struct{}, len(next.Bases))
 	for _, base := range next.Bases {
 		if base.Path != "" {
-			retainedPaths[filepath.Clean(base.Path)] = struct{}{}
+			retainedPaths[conflictPathIdentity(base.Path)] = struct{}{}
 		}
 	}
 	for _, base := range previous.Bases {
 		if base.Path == "" {
 			continue
 		}
-		path := filepath.Clean(base.Path)
+		path := conflictPathIdentity(base.Path)
 		if _, retained := retainedPaths[path]; !retained {
 			s.coordinator.SetConflict(path, false)
 		}
 	}
+}
+
+func conflictPathIdentity(path string) string {
+	cleanedPath := filepath.Clean(path)
+	absPath, err := filepath.Abs(cleanedPath)
+	if err != nil {
+		return cleanedPath
+	}
+	canonicalPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return cleanedPath
+	}
+	return filepath.Clean(canonicalPath)
 }
 
 type gitStatusChange struct {

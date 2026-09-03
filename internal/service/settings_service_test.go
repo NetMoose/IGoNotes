@@ -324,37 +324,37 @@ func cloneGitStatusForTest(status model.GitStatus) model.GitStatus {
 func TestSettingsServiceMutationsWaitAtCoordinatorBeforeSettingsLock(t *testing.T) {
 	mutations := []struct {
 		name string
-		call func(*SettingsService, string, string) error
+		call func(*SettingsService, model.Config, string, string) error
 	}{
-		{name: "complete setup", call: func(settings *SettingsService, _, mutationPath string) error {
+		{name: "complete setup", call: func(settings *SettingsService, _ model.Config, _, mutationPath string) error {
 			_, err := settings.CompleteSetup(model.BaseMutationRequest{Mode: "connect", Name: "setup", Path: mutationPath})
 			return err
 		}},
-		{name: "add base", call: func(settings *SettingsService, _, mutationPath string) error {
+		{name: "add base", call: func(settings *SettingsService, _ model.Config, _, mutationPath string) error {
 			_, err := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: mutationPath})
 			return err
 		}},
-		{name: "switch base", call: func(settings *SettingsService, _, _ string) error {
+		{name: "switch base", call: func(settings *SettingsService, _ model.Config, _, _ string) error {
 			_, err := settings.SwitchBase("other")
 			return err
 		}},
-		{name: "update base", call: func(settings *SettingsService, otherPath, _ string) error {
+		{name: "update base", call: func(settings *SettingsService, _ model.Config, otherPath, _ string) error {
 			_, err := settings.UpdateBase("other", model.BaseUpdateRequest{Name: "renamed", Path: otherPath})
 			return err
 		}},
-		{name: "forget base", call: func(settings *SettingsService, _, _ string) error {
+		{name: "forget base", call: func(settings *SettingsService, _ model.Config, _, _ string) error {
 			_, err := settings.ForgetBase("other")
 			return err
 		}},
-		{name: "replace config", call: func(settings *SettingsService, _, _ string) error {
-			_, err := settings.ReplaceConfig(settings.GetConfig())
+		{name: "replace config", call: func(settings *SettingsService, replacement model.Config, _, _ string) error {
+			_, err := settings.ReplaceConfig(replacement)
 			return err
 		}},
-		{name: "configure git", call: func(settings *SettingsService, _, _ string) error {
+		{name: "configure git", call: func(settings *SettingsService, _ model.Config, _, _ string) error {
 			_, err := settings.ConfigureGit(context.Background(), "active", model.GitConfigRequest{GitURL: "git@example.test:notes.git", GitBranch: "main"})
 			return err
 		}},
-		{name: "disable git", call: func(settings *SettingsService, _, _ string) error {
+		{name: "disable git", call: func(settings *SettingsService, _ model.Config, _, _ string) error {
 			_, err := settings.DisableGit(context.Background(), "active")
 			return err
 		}},
@@ -364,6 +364,7 @@ func TestSettingsServiceMutationsWaitAtCoordinatorBeforeSettingsLock(t *testing.
 		t.Run(mutation.name, func(t *testing.T) {
 			coordinator := NewBaseOperationCoordinator()
 			settings, otherPath := newConfiguredSettingsServiceWithCoordinator(t, coordinator)
+			replacement := settings.GetConfig()
 			mutationPath := t.TempDir()
 			coordinator.Lock()
 			t.Cleanup(func() {
@@ -376,7 +377,7 @@ func TestSettingsServiceMutationsWaitAtCoordinatorBeforeSettingsLock(t *testing.
 			done := make(chan error, 1)
 			go func() {
 				close(started)
-				done <- mutation.call(settings, otherPath, mutationPath)
+				done <- mutation.call(settings, replacement, otherPath, mutationPath)
 			}()
 			<-started
 			for range 10 {
@@ -538,6 +539,61 @@ func TestSettingsServiceReplaceConfigClearsRemovedConflict(t *testing.T) {
 	}
 	if err := coordinator.CheckMutation(otherPath); err != nil {
 		t.Errorf("removed replacement path conflict = %v, want nil", err)
+	}
+}
+
+func TestSettingsServiceForgetBaseClearsCanonicalConflictForLoadedSymlink(t *testing.T) {
+	activePath := t.TempDir()
+	repositoryPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	createSymlinkOrSkip(t, repositoryPath, aliasPath)
+	completed := true
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: activePath},
+			{Name: "work", Path: aliasPath},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	settings, _, _, validator, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+	configureTestBaseGit(t, settings, validator, "work")
+	if _, exists := statuses.statuses[repositoryPath]; !exists {
+		t.Fatalf("ConfigureGit() did not publish canonical status path %q", repositoryPath)
+	}
+	settings.coordinator.SetConflict(repositoryPath, true)
+
+	if _, err := settings.ForgetBase("work"); err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(repositoryPath); err != nil {
+		t.Errorf("canonical conflict after forgetting symlinked base = %v, want nil", err)
+	}
+}
+
+func TestSettingsServiceForgetBaseRetainsCanonicalConflictForLoadedAlias(t *testing.T) {
+	repositoryPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	createSymlinkOrSkip(t, repositoryPath, aliasPath)
+	completed := true
+	work := model.Base{Name: "work", Path: repositoryPath}
+	setConfiguredGit(&work)
+	config := model.Config{
+		Bases: []model.Base{
+			work,
+			{Name: "alias", Path: aliasPath},
+		},
+		CurrentBase:    "alias",
+		SetupCompleted: &completed,
+	}
+	settings, _, _, _, _ := newGitSettingsServiceForConfig(t, config, aliasPath)
+	settings.coordinator.SetConflict(repositoryPath, true)
+
+	if _, err := settings.ForgetBase("work"); err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(repositoryPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("conflict retained through physical alias = %v, want ErrGitConflictPending", err)
 	}
 }
 
