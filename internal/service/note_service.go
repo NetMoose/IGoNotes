@@ -499,28 +499,11 @@ func (s *NoteService) GetTree() ([]model.NoteNode, error) {
 
 // GetNoteContent читает содержимое заметки с диска
 func (s *NoteService) GetNoteContent(id string) (string, error) {
-	cleanID, err := cleanRelativeNotePath(id, false)
+	response, err := s.GetNote(id)
 	if err != nil {
 		return "", err
 	}
-	if s.beforeReadLock != nil {
-		s.beforeReadLock()
-	}
-	s.baseMu.RLock()
-	defer s.baseMu.RUnlock()
-
-	if s.baseErr != nil {
-		return "", s.baseErr
-	}
-	if s.basePath == "" {
-		return "", os.ErrNotExist
-	}
-
-	data, err := s.baseRoot.ReadFile(rootPath(cleanID))
-	if err != nil {
-		return "", normalizeRootError(err)
-	}
-	return string(data), nil
+	return response.Content, nil
 }
 
 // GetAbsoluteFilePath возвращает информационный полный путь, не являющийся безопасным дескриптором файла.
@@ -647,32 +630,8 @@ func isRootEscapeError(err error) bool {
 
 // SaveNoteContent сохраняет содержимое заметки на диск
 func (s *NoteService) SaveNoteContent(id string, content string) error {
-	cleanID, err := cleanRelativeNotePath(id, false)
-	if err != nil {
-		return err
-	}
-	s.baseMu.Lock()
-	defer s.baseMu.Unlock()
-
-	if s.baseErr != nil {
-		return s.baseErr
-	}
-	if s.basePath == "" {
-		return os.ErrNotExist
-	}
-	if err := s.checkMutationLocked(); err != nil {
-		return err
-	}
-
-	parent := path.Dir(cleanID)
-	if err := ensureRootDir(s.baseRoot, parent); err != nil {
-		return err
-	}
-	if err := s.baseRoot.WriteFile(rootPath(cleanID), []byte(content), 0644); err != nil {
-		return normalizeRootError(err)
-	}
-
-	return nil
+	_, err := s.SaveNote(model.SaveNoteRequest{ID: id, Content: content})
+	return err
 }
 
 // CreateNode создает новый файл или папку

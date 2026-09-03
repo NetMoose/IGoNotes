@@ -22,8 +22,20 @@ type CreateNoteRequest struct {
 }
 
 type SaveNoteRequest struct {
-	ID      string `json:"id"`
-	Content string `json:"content"`
+	ID               string  `json:"id"`
+	Content          string  `json:"content"`
+	ExpectedRevision *string `json:"expected_revision,omitempty"`
+}
+
+type NoteContentResponse struct {
+	ID       string `json:"id"`
+	Content  string `json:"content"`
+	Revision string `json:"revision"`
+}
+
+type SaveNoteResponse struct {
+	Status   string `json:"status"`
+	Revision string `json:"revision"`
 }
 
 type RenameRequest struct {
