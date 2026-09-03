@@ -25,7 +25,7 @@ func (s *countingConfigStore) Save(config *model.Config) error {
 	return s.ConfigService.Save(config)
 }
 
-func newProductionNoteService(t *testing.T, basePath string) *NoteService {
+func newProductionNoteService(t *testing.T, basePath string, coordinator *BaseOperationCoordinator) *NoteService {
 	t.Helper()
 	db, err := repository.InitDB(filepath.Join(t.TempDir(), "metadata.db"))
 	if err != nil {
@@ -36,7 +36,7 @@ func newProductionNoteService(t *testing.T, basePath string) *NoteService {
 			t.Errorf("database Close() error = %v, want nil", err)
 		}
 	})
-	notes := NewNoteService(repository.NewNoteRepository(db), basePath)
+	notes := NewNoteService(repository.NewNoteRepository(db), basePath, coordinator)
 	t.Cleanup(func() {
 		if err := notes.Close(); err != nil {
 			t.Errorf("NoteService.Close() error = %v, want nil", err)
@@ -99,9 +99,10 @@ func TestEmptyConfigStartupCanCompleteSetup(t *testing.T) {
 				t.Fatalf("ResolveStartupBase() = %q, want empty path", basePath)
 			}
 
-			notes := newProductionNoteService(t, basePath)
+			coordinator := NewBaseOperationCoordinator()
+			notes := newProductionNoteService(t, basePath, coordinator)
 			store := &countingConfigStore{ConfigService: configService}
-			settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+			settings, err := NewSettingsService(store, notes, coordinator, "", nil)
 			if err != nil {
 				t.Fatalf("NewSettingsService() error = %v, want nil", err)
 			}
@@ -165,7 +166,8 @@ func TestExplicitIncompleteEmptyConfigStartupDoesNotMigrate(t *testing.T) {
 		t.Fatalf("ResolveStartupBase() error = %v, want nil", err)
 	}
 	store := &countingConfigStore{ConfigService: configService}
-	settings, err := NewSettingsService(store, newProductionNoteService(t, basePath), NewBaseOperationCoordinator(), "", nil)
+	coordinator := NewBaseOperationCoordinator()
+	settings, err := NewSettingsService(store, newProductionNoteService(t, basePath, coordinator), coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v, want nil", err)
 	}

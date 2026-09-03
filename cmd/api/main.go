@@ -83,7 +83,8 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	}()
 
 	noteRepo := repository.NewNoteRepository(db)
-	noteService := service.NewNoteService(noteRepo, basePath)
+	coordinator := service.NewBaseOperationCoordinator()
+	noteService := service.NewNoteService(noteRepo, basePath, coordinator)
 	defer func() {
 		if err := noteService.Close(); err != nil {
 			returnErr = errors.Join(returnErr, fmt.Errorf("закрыть базу заметок: %w", err))
@@ -94,7 +95,6 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	gitClient := gitcmd.NewClient(gitRunner)
 	gitStatusRepo := repository.NewGitStatusRepository(db)
 	gitValidator := service.NewGitConfigValidator(gitClient)
-	coordinator := service.NewBaseOperationCoordinator()
 	settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, coordinator, options.base, log.Default(), gitValidator, gitStatusRepo)
 	if err != nil {
 		return fmt.Errorf("инициализировать сервис настроек: %w", err)

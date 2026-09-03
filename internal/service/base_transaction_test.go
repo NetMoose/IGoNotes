@@ -168,7 +168,7 @@ func TestSettingsServiceConfigOnlyPersistenceBlocksConcurrentSync(t *testing.T) 
 	persistStarted := make(chan struct{})
 	persistRelease := make(chan struct{})
 	store := &fakeConfigStore{config: &config, saveStarted: persistStarted, saveRelease: persistRelease}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -339,7 +339,7 @@ func TestSettingsServiceIdentitySavePublishesCanonicalPathOnlyAfterSuccess(t *te
 			originalRoot := notes.baseRoot
 			config := cloneConfig(original)
 			store := &fakeConfigStore{config: &config, saveErr: test.saveErr}
-			settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+			settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 			if err != nil {
 				t.Fatalf("NewSettingsService() error = %v", err)
 			}
@@ -401,7 +401,7 @@ func newSettingsWithReplacedActivePath(t *testing.T) (*SettingsService, *fakeCon
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -441,7 +441,7 @@ func TestNewSettingsServiceMigrationBlocksConcurrentSync(t *testing.T) {
 		err     error
 	}, 1)
 	go func() {
-		service, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+		service, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 		constructorDone <- struct {
 			service *SettingsService
 			err     error
@@ -523,7 +523,7 @@ func TestNewSettingsServiceMigrationRejectsReplacedActivePath(t *testing.T) {
 	}
 	store := &fakeConfigStore{config: &original}
 
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if settings != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", settings)
 	}
@@ -563,7 +563,7 @@ func TestNewSettingsServiceRejectsReplacedActiveIdentity(t *testing.T) {
 	}
 	store := &fakeConfigStore{config: &original}
 
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if settings != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", settings)
 	}
@@ -746,7 +746,7 @@ func TestSettingsServiceSwitchingMutationsKeepNoteReadsAtomicWithSave(t *testing
 			store := &fakeConfigStore{config: &config, saveErr: errors.New("save failed"), saveStarted: make(chan struct{})}
 			release := make(chan struct{})
 			store.saveRelease = release
-			settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+			settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 			if err != nil {
 				t.Fatalf("NewSettingsService() error = %v", err)
 			}
@@ -808,7 +808,7 @@ func TestSettingsServiceSuccessfulBlockedSavePublishesCandidateAfterCommit(t *te
 	store := &fakeConfigStore{config: &config, saveStarted: make(chan struct{})}
 	release := make(chan struct{})
 	store.saveRelease = release
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -859,7 +859,7 @@ func TestSettingsServiceCandidateIndexFailureSkipsSaveAndPreservesOldRuntime(t *
 	completed := true
 	config := model.Config{Bases: []model.Base{{Name: "active", Path: oldBase}, {Name: "target", Path: target}}, CurrentBase: "active", SetupCompleted: &completed}
 	store := &fakeConfigStore{config: &config}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -897,7 +897,7 @@ func TestSettingsServiceRollbackRetainsPinnedRuntimeAcrossOldPathReplacement(t *
 	store := &fakeConfigStore{config: &config, saveErr: errors.New("save failed"), saveStarted: make(chan struct{})}
 	release := make(chan struct{})
 	store.saveRelease = release
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -943,7 +943,7 @@ func TestSettingsServiceCanonicalEquivalentSwitchPublishesCanonicalPathTransacti
 			t.Fatalf("SyncFS() error = %v", err)
 		}
 		store := &fakeConfigStore{config: &config}
-		settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+		settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 		if err != nil {
 			t.Fatalf("NewSettingsService() error = %v", err)
 		}
@@ -973,7 +973,7 @@ func TestSettingsServiceCanonicalEquivalentSwitchPublishesCanonicalPathTransacti
 		store := &fakeConfigStore{config: &originalConfig, saveErr: errors.New("save failed"), saveStarted: make(chan struct{})}
 		release := make(chan struct{})
 		store.saveRelease = release
-		settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+		settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 		if err != nil {
 			t.Fatalf("NewSettingsService() error = %v", err)
 		}
@@ -1016,7 +1016,7 @@ func TestSettingsServiceRealRuntimeRollbackFailureDegradesMutations(t *testing.T
 	completed := true
 	config := model.Config{Bases: []model.Base{{Name: "active", Path: oldBase}, {Name: "target", Path: target}}, CurrentBase: "active", SetupCompleted: &completed}
 	store := &fakeConfigStore{config: &config, saveErr: persistErr}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}

@@ -79,13 +79,14 @@ func (s *countingGitStatusStore) Delete(context.Context, string) error {
 func TestGitFoundationConstructionDoesNotExecuteGitOrAccessStatuses(t *testing.T) {
 	setupCompleted := false
 	store := &gitWiringConfigStore{config: model.Config{SetupCompleted: &setupCompleted}}
-	notes := service.NewNoteService(gitWiringNoteRepository{}, "")
+	coordinator := service.NewBaseOperationCoordinator()
+	notes := service.NewNoteService(gitWiringNoteRepository{}, "", coordinator)
 	runner := &countingGitRunner{}
 	client := gitcmd.NewClient(runner)
 	validator := service.NewGitConfigValidator(client)
 	statuses := &countingGitStatusStore{}
 
-	settings, err := service.NewSettingsServiceWithGit(store, notes, service.NewBaseOperationCoordinator(), "", nil, validator, statuses)
+	settings, err := service.NewSettingsServiceWithGit(store, notes, coordinator, "", nil, validator, statuses)
 	if err != nil {
 		t.Fatalf("NewSettingsServiceWithGit() error = %v", err)
 	}
@@ -110,11 +111,12 @@ func TestRunServerWiresGitFoundationBeforeSystemRoutesAndServing(t *testing.T) {
 	}
 
 	orderedSnippets := []string{
+		"coordinator := service.NewBaseOperationCoordinator()",
+		"noteService := service.NewNoteService(noteRepo, basePath, coordinator)",
 		"gitRunner := gitcmd.NewCommandRunner()",
 		"gitClient := gitcmd.NewClient(gitRunner)",
 		"gitStatusRepo := repository.NewGitStatusRepository(db)",
 		"gitValidator := service.NewGitConfigValidator(gitClient)",
-		"coordinator := service.NewBaseOperationCoordinator()",
 		"settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, coordinator, options.base, log.Default(), gitValidator, gitStatusRepo)",
 		"gitProbeService := service.NewGitProbeService(settingsService, gitClient)",
 		"gitStatusService := service.NewGitStatusService(settingsService, gitStatusRepo)",
@@ -164,6 +166,9 @@ func TestRunServerGitWiringHasNoStartupExecution(t *testing.T) {
 	}
 	if strings.Contains(runServerSource, "service.NewSettingsService(") {
 		t.Error("runServer uses plain NewSettingsService instead of NewSettingsServiceWithGit")
+	}
+	if got := strings.Count(runServerSource, "service.NewBaseOperationCoordinator()"); got != 1 {
+		t.Errorf("runServer coordinator constructions = %d, want exactly 1", got)
 	}
 }
 

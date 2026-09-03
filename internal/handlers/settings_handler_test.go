@@ -35,12 +35,13 @@ func newSettingsHandlerFixture(t *testing.T) settingsHandlerFixture {
 		}
 	})
 
-	notes := service.NewNoteService(repository.NewNoteRepository(db), "")
+	coordinator := service.NewBaseOperationCoordinator()
+	notes := service.NewNoteService(repository.NewNoteRepository(db), "", coordinator)
 	if err := notes.SyncFS(); err != nil {
 		t.Fatalf("NoteService.SyncFS() error = %v", err)
 	}
 	config := service.NewConfigService(filepath.Join(root, "config", "config.json"))
-	settings, err := service.NewSettingsService(config, notes, service.NewBaseOperationCoordinator(), "", nil)
+	settings, err := service.NewSettingsService(config, notes, coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("service.NewSettingsService() error = %v", err)
 	}

@@ -211,6 +211,120 @@ func (r *fakeNoteRepository) DeleteNode(id string) error {
 	return nil
 }
 
+func TestNoteServiceConflictPolicyBlocksOrdinaryMutations(t *testing.T) {
+	tests := []struct {
+		name               string
+		mutate             func(*NoteService) error
+		assertNoSideEffect func(*testing.T, string)
+	}{
+		{
+			name: "save note content",
+			mutate: func(service *NoteService) error {
+				return service.SaveNoteContent("note.md", "changed")
+			},
+			assertNoSideEffect: func(t *testing.T, base string) {
+				assertFileContent(t, filepath.Join(base, "note.md"), []byte("original"))
+			},
+		},
+		{
+			name: "create node",
+			mutate: func(service *NoteService) error {
+				_, err := service.CreateNode("", "created", "file")
+				return err
+			},
+			assertNoSideEffect: func(t *testing.T, base string) {
+				if _, err := os.Stat(filepath.Join(base, "created.md")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("created note Stat() error = %v, want os.ErrNotExist", err)
+				}
+			},
+		},
+		{
+			name: "delete node",
+			mutate: func(service *NoteService) error {
+				return service.DeleteNode("note.md")
+			},
+			assertNoSideEffect: func(t *testing.T, base string) {
+				assertFileContent(t, filepath.Join(base, "note.md"), []byte("original"))
+			},
+		},
+		{
+			name: "rename node",
+			mutate: func(service *NoteService) error {
+				return service.RenameNode("note.md", "renamed")
+			},
+			assertNoSideEffect: func(t *testing.T, base string) {
+				assertFileContent(t, filepath.Join(base, "note.md"), []byte("original"))
+				if _, err := os.Stat(filepath.Join(base, "renamed.md")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("renamed note Stat() error = %v, want os.ErrNotExist", err)
+				}
+			},
+		},
+		{
+			name: "save asset",
+			mutate: func(service *NoteService) error {
+				_, err := service.SaveAsset(strings.NewReader("image"), "image.png")
+				return err
+			},
+			assertNoSideEffect: func(t *testing.T, base string) {
+				if _, err := os.Stat(filepath.Join(base, "assets")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("assets directory Stat() error = %v, want os.ErrNotExist", err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			writeTestNote(t, base, "note.md", "original")
+			repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "note.md", Name: "note", Path: "note.md", Type: "file"}}}
+			coordinator := NewBaseOperationCoordinator()
+			service := newTestNoteServiceWithCoordinator(t, repo, base, coordinator)
+			coordinator.SetConflict(base, true)
+
+			if err := test.mutate(service); !errors.Is(err, ErrGitConflictPending) {
+				t.Fatalf("mutation error = %v, want ErrGitConflictPending", err)
+			}
+			test.assertNoSideEffect(t, base)
+			assertRepositoryIDs(t, repo, "note.md")
+			if content, err := service.GetNoteContent("note.md"); err != nil || content != "original" {
+				t.Errorf("GetNoteContent() = %q, %v; want original, nil", content, err)
+			}
+		})
+	}
+}
+
+func TestNoteServiceConflictPolicyPinsConstructorSymlinkIdentity(t *testing.T) {
+	physical := t.TempDir()
+	writeTestNote(t, physical, "note.md", "physical")
+	outside := t.TempDir()
+	writeTestNote(t, outside, "note.md", "outside")
+	alias := filepath.Join(t.TempDir(), "base")
+	requireSymlink(t, physical, alias)
+	coordinator := NewBaseOperationCoordinator()
+	service := newTestNoteServiceWithCoordinator(t, &fakeNoteRepository{}, alias, coordinator)
+	coordinator.SetConflict(physical, true)
+	retargetSymlink(t, alias, outside)
+
+	if err := service.SaveNoteContent("note.md", "changed"); !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("SaveNoteContent() error = %v, want ErrGitConflictPending", err)
+	}
+	if got := service.GetBasePath(); got != alias {
+		t.Errorf("GetBasePath() = %q, want logical alias %q", got, alias)
+	}
+	assertFileContent(t, filepath.Join(physical, "note.md"), []byte("physical"))
+	assertFileContent(t, filepath.Join(outside, "note.md"), []byte("outside"))
+}
+
+func TestNewNoteServicePanicsWithNilCoordinator(t *testing.T) {
+	defer func() {
+		if got := recover(); got != "service.NewNoteService: nil BaseOperationCoordinator" {
+			t.Fatalf("NewNoteService() panic = %v, want clear nil coordinator message", got)
+		}
+	}()
+	NewNoteService(&fakeNoteRepository{}, "", nil)
+}
+
 func TestNoteServiceSwitchBasePublishesIndexedTarget(t *testing.T) {
 	oldBase := t.TempDir()
 	target := t.TempDir()
@@ -1298,7 +1412,12 @@ func scanNotesPath(t *testing.T, base string) ([]model.NoteNode, error) {
 
 func newTestNoteService(t *testing.T, repo noteRepository, base string) *NoteService {
 	t.Helper()
-	service := NewNoteService(repo, base)
+	return newTestNoteServiceWithCoordinator(t, repo, base, NewBaseOperationCoordinator())
+}
+
+func newTestNoteServiceWithCoordinator(t *testing.T, repo noteRepository, base string, coordinator *BaseOperationCoordinator) *NoteService {
+	t.Helper()
+	service := NewNoteService(repo, base, coordinator)
 	t.Cleanup(func() {
 		if err := service.Close(); err != nil {
 			t.Errorf("NoteService.Close() error = %v", err)

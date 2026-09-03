@@ -831,7 +831,7 @@ func TestNewSettingsServiceMigratesStructurallyEmptyConfig(t *testing.T) {
 	store := &fakeConfigStore{config: &model.Config{}}
 	notes := newTestNoteService(t, &fakeNoteRepository{}, "")
 
-	service, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	service, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -853,12 +853,13 @@ func TestNewSettingsServiceMigrationRejectsClosedRuntimeWithoutSave(t *testing.T
 		CurrentBase: "active",
 	}
 	store := &fakeConfigStore{config: &original}
-	notes := NewNoteService(&fakeNoteRepository{}, basePath)
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(&fakeNoteRepository{}, basePath, coordinator)
 	if err := notes.Close(); err != nil {
 		t.Fatalf("NoteService.Close() error = %v", err)
 	}
 
-	service, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	service, err := NewSettingsService(store, notes, coordinator, "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -878,7 +879,7 @@ func TestSettingsServiceEmptyHealthyRuntimePersistsConfigOnlyMutation(t *testing
 	config := model.Config{SetupCompleted: &completed}
 	store := &fakeConfigStore{config: &config}
 	notes := newTestNoteService(t, &fakeNoteRepository{}, "")
-	service, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	service, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}

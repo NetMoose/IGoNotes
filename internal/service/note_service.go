@@ -46,12 +46,15 @@ func (f *LockedFile) Close() error {
 }
 
 type NoteService struct {
-	repo     noteRepository
-	basePath string
-	baseRoot *os.Root
-	baseErr  error
-	closeErr error
-	// baseMu is acquired before repository/SQL; repositories and scanners never call NoteService.
+	repo             noteRepository
+	coordinator      *BaseOperationCoordinator
+	basePath         string
+	conflictBasePath string
+	baseRoot         *os.Root
+	baseErr          error
+	closeErr         error
+	// Lock ordering is coordinator -> SettingsService.mu -> baseMu -> repository/SQLite.
+	// Ordinary mutations only read the coordinator's lock-free conflict snapshot under baseMu.
 	baseMu           sync.RWMutex
 	initialSyncDone  chan struct{}
 	initialSyncErr   error
@@ -64,9 +67,13 @@ type NoteService struct {
 }
 
 // NewNoteService создает новый экземпляр NoteService
-func NewNoteService(repo noteRepository, basePath string) *NoteService {
+func NewNoteService(repo noteRepository, basePath string, coordinator *BaseOperationCoordinator) *NoteService {
+	if coordinator == nil {
+		panic("service.NewNoteService: nil BaseOperationCoordinator")
+	}
 	service := &NoteService{
 		repo:            repo,
+		coordinator:     coordinator,
 		basePath:        basePath,
 		initialSyncDone: make(chan struct{}),
 		scan:            scanNotes,
@@ -74,6 +81,13 @@ func NewNoteService(repo noteRepository, basePath string) *NoteService {
 	}
 	if basePath != "" {
 		service.baseRoot, service.baseErr = os.OpenRoot(basePath)
+		if service.baseErr == nil {
+			service.conflictBasePath, service.baseErr = canonicalPinnedRootPath(service.baseRoot, basePath)
+			if service.baseErr != nil {
+				service.closeErr = errors.Join(service.closeErr, service.baseRoot.Close())
+				service.baseRoot = nil
+			}
+		}
 	}
 	return service
 }
@@ -175,6 +189,7 @@ func (s *NoteService) persistConfig(expectedPath string, store ConfigStore, next
 		return true, err
 	}
 	s.basePath = canonicalExpected
+	s.conflictBasePath = canonicalExpected
 	return true, nil
 }
 
@@ -242,10 +257,11 @@ func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, ne
 }
 
 type baseSwitchCandidate struct {
-	path     string
-	root     *os.Root
-	commit   func() error
-	rollback func() error
+	path             string
+	conflictBasePath string
+	root             *os.Root
+	commit           func() error
+	rollback         func() error
 }
 
 func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandidate, error, error) {
@@ -257,6 +273,14 @@ func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandida
 		candidate, err = s.openRoot(cleanTarget)
 		if err != nil {
 			return nil, err, nil
+		}
+	}
+	conflictBasePath := ""
+	if candidate != nil {
+		var err error
+		conflictBasePath, err = canonicalPinnedRootPath(candidate, cleanTarget)
+		if err != nil {
+			return nil, errors.Join(err, closeRoot(candidate)), nil
 		}
 	}
 	nodes, err := s.scan(candidate)
@@ -271,12 +295,19 @@ func (s *NoteService) prepareBaseSwitchLocked(target string) (*baseSwitchCandida
 		}
 		return nil, operationErr, rollbackErr
 	}
-	return &baseSwitchCandidate{path: cleanTarget, root: candidate, commit: commit, rollback: rollback}, nil, nil
+	return &baseSwitchCandidate{
+		path:             cleanTarget,
+		conflictBasePath: conflictBasePath,
+		root:             candidate,
+		commit:           commit,
+		rollback:         rollback,
+	}, nil, nil
 }
 
 func (s *NoteService) publishBaseSwitchLocked(candidate *baseSwitchCandidate) {
 	oldRoot := s.baseRoot
 	s.basePath = candidate.path
+	s.conflictBasePath = candidate.conflictBasePath
 	s.baseRoot = candidate.root
 	s.baseErr = nil
 	// Publication has succeeded, so an old descriptor close error is deferred to Close.
@@ -310,6 +341,26 @@ func closeRoot(root *os.Root) error {
 		return nil
 	}
 	return root.Close()
+}
+
+func canonicalPinnedRootPath(root *os.Root, basePath string) (string, error) {
+	canonicalPath, err := canonicalExistingDirectory(basePath)
+	if err != nil {
+		return "", err
+	}
+	pinnedInfo, pinnedErr := root.Stat(".")
+	canonicalInfo, canonicalErr := os.Stat(canonicalPath)
+	if err := errors.Join(pinnedErr, canonicalErr); err != nil {
+		return "", err
+	}
+	if !os.SameFile(pinnedInfo, canonicalInfo) {
+		return "", ErrRuntimePathChanged
+	}
+	return canonicalPath, nil
+}
+
+func (s *NoteService) checkMutationLocked() error {
+	return s.coordinator.CheckMutation(s.conflictBasePath)
 }
 
 func (s *NoteService) replaceIndexLocked() error {
@@ -609,6 +660,9 @@ func (s *NoteService) SaveNoteContent(id string, content string) error {
 	if s.basePath == "" {
 		return os.ErrNotExist
 	}
+	if err := s.checkMutationLocked(); err != nil {
+		return err
+	}
 
 	parent := path.Dir(cleanID)
 	if err := ensureRootDir(s.baseRoot, parent); err != nil {
@@ -663,6 +717,9 @@ func (s *NoteService) CreateNode(parentID, name, nodeType string) (*model.NoteNo
 	}
 	if s.basePath == "" {
 		return nil, os.ErrNotExist
+	}
+	if err := s.checkMutationLocked(); err != nil {
+		return nil, err
 	}
 
 	// Проверяем существование файла/папки
@@ -733,6 +790,9 @@ func (s *NoteService) DeleteNode(id string) error {
 	if s.basePath == "" {
 		return os.ErrInvalid
 	}
+	if err := s.checkMutationLocked(); err != nil {
+		return err
+	}
 	if err := s.baseRoot.RemoveAll(rootPath(cleanID)); err != nil {
 		return normalizeRootError(err)
 	}
@@ -754,6 +814,9 @@ func (s *NoteService) RenameNode(id, newName string) error {
 	}
 	if s.basePath == "" || newName == "" {
 		return os.ErrInvalid
+	}
+	if err := s.checkMutationLocked(); err != nil {
+		return err
 	}
 	if _, err := s.baseRoot.Lstat(rootPath(cleanID)); err != nil {
 		return normalizeRootError(err)
@@ -817,6 +880,9 @@ func (s *NoteService) SaveAsset(file io.Reader, originalFilename string) (string
 	}
 	if s.basePath == "" {
 		return "", os.ErrNotExist
+	}
+	if err := s.checkMutationLocked(); err != nil {
+		return "", err
 	}
 	assetsDir := path.Join("assets", "images")
 	if err := ensureRootDir(s.baseRoot, assetsDir); err != nil {

@@ -34,7 +34,8 @@ func TestSettingsServiceFailedSavePreservesExactSQLiteIndexTransaction(t *testin
 	target := t.TempDir()
 	writeTestNote(t, oldBase, "disk-only.md", "not in the stale index")
 	writeTestNote(t, target, "candidate.md", "candidate")
-	notes := NewNoteService(repository.NewNoteRepository(db), oldBase)
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(repository.NewNoteRepository(db), oldBase, coordinator)
 	defer notes.Close()
 	completed := true
 	config := model.Config{
@@ -43,7 +44,7 @@ func TestSettingsServiceFailedSavePreservesExactSQLiteIndexTransaction(t *testin
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config, saveErr: errors.New("save failed")}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -79,7 +80,7 @@ func TestSettingsServiceSaveErrRollbackFailedDoesNotLatchDegradedState(t *testin
 	}
 	saveCause := errors.New("store-specific rollback marker")
 	store := &fakeConfigStore{config: &config, saveErr: errors.Join(ErrRollbackFailed, saveCause)}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -107,7 +108,8 @@ func TestNoteServiceRollbackFailureFailsAllOperationsClosed(t *testing.T) {
 	writeTestNote(t, target, "new.md", "new")
 	rollbackErr := errors.New("index rollback failed")
 	repo := &fakeNoteRepository{rollbackErr: rollbackErr}
-	notes := NewNoteService(repo, oldBase)
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(repo, oldBase, coordinator)
 	if err := notes.SyncFS(); err != nil {
 		t.Fatalf("SyncFS() error = %v", err)
 	}
@@ -118,7 +120,7 @@ func TestNoteServiceRollbackFailureFailsAllOperationsClosed(t *testing.T) {
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config, saveErr: errors.New("save failed")}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -171,7 +173,8 @@ func TestNoteServiceIndexCommitFailureFailsClosedWithExactOrder(t *testing.T) {
 	commitErr := errors.New("index commit failed")
 	events := &orderedEvents{}
 	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md"}}, commitErr: commitErr, events: events}
-	notes := NewNoteService(repo, oldBase)
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(repo, oldBase, coordinator)
 	defer notes.Close()
 	var candidateRoot *os.Root
 	notes.openRoot = func(path string) (*os.Root, error) {
@@ -186,7 +189,7 @@ func TestNoteServiceIndexCommitFailureFailsClosedWithExactOrder(t *testing.T) {
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config, events: events}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -233,7 +236,7 @@ func TestSettingsServicePreparationRollbackFailureDegradesWithoutSave(t *testing
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -271,7 +274,7 @@ func TestNewSettingsServiceMigrationRejectsFailedRuntimeWithoutSave(t *testing.T
 	}
 	store := &fakeConfigStore{config: &original}
 
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if settings != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", settings)
 	}
@@ -298,7 +301,7 @@ func TestSettingsServicePreparationFailureWithSuccessfulRollbackRemainsOperation
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -371,7 +374,7 @@ func TestSettingsServiceConfigOnlyMutationsRejectFailedRuntimeWithoutSave(t *tes
 				SetupCompleted: &completed,
 			}
 			store := &fakeConfigStore{config: &config}
-			settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+			settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 			if err != nil {
 				t.Fatalf("NewSettingsService() error = %v", err)
 			}
@@ -396,7 +399,8 @@ func TestSettingsServiceConfigOnlyMutationsRejectFailedRuntimeWithoutSave(t *tes
 func TestSettingsServiceConfigOnlyMutationRejectsClosedRuntimeWithoutSave(t *testing.T) {
 	activePath := t.TempDir()
 	addedPath := t.TempDir()
-	notes := NewNoteService(&fakeNoteRepository{}, activePath)
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(&fakeNoteRepository{}, activePath, coordinator)
 	completed := true
 	config := model.Config{
 		Bases:          []model.Base{{Name: "active", Path: activePath}},
@@ -404,7 +408,7 @@ func TestSettingsServiceConfigOnlyMutationRejectsClosedRuntimeWithoutSave(t *tes
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -438,7 +442,7 @@ func TestSettingsServiceConfigStoreRollbackSentinelDoesNotPoisonRuntime(t *testi
 	}
 	storeErr := fmt.Errorf("write config: %w", ErrRollbackFailed)
 	store := &fakeConfigStore{config: &config, saveErr: storeErr}
-	settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}

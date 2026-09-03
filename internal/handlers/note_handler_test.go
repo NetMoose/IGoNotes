@@ -82,7 +82,7 @@ func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(base, "existing.md"), []byte("existing"), 0644); err != nil {
 			t.Fatalf("os.WriteFile() error = %v", err)
 		}
-		handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base))
+		handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator()))
 		recorder := httptest.NewRecorder()
 		handler.CreateNote(recorder, httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"name":"existing","type":"file"}`)))
 
@@ -94,7 +94,7 @@ func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 		if err := os.WriteFile(base, []byte("file"), 0o600); err != nil {
 			t.Fatalf("os.WriteFile() error = %v", err)
 		}
-		handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base))
+		handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator()))
 		recorder := httptest.NewRecorder()
 		handler.GetRawFile(recorder, httptest.NewRequest(http.MethodGet, "/api/raw?path=asset.txt", nil))
 
@@ -115,7 +115,7 @@ func TestNoteHandlerGetNotesSanitizesInitialSyncFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "new.md"), []byte("new"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
-	notes := service.NewNoteService(repo, base)
+	notes := service.NewNoteService(repo, base, service.NewBaseOperationCoordinator())
 	t.Cleanup(func() {
 		if err := notes.Close(); err != nil {
 			t.Errorf("NoteService.Close() error = %v", err)
@@ -166,7 +166,7 @@ func TestNoteHandlerUploadAssetRejectsOversizedTotalRequest(t *testing.T) {
 	base := t.TempDir()
 	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
-	notes := service.NewNoteService(handlerNoteRepository{}, base)
+	notes := service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator())
 	t.Cleanup(func() {
 		if err := notes.Close(); err != nil {
 			t.Errorf("NoteService.Close() error = %v", err)
@@ -199,7 +199,7 @@ func TestNoteHandlerUploadAssetRejectsOversizedMultipartEpilogue(t *testing.T) {
 	base := t.TempDir()
 	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
-	notes := service.NewNoteService(handlerNoteRepository{}, base)
+	notes := service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator())
 	t.Cleanup(func() {
 		if err := notes.Close(); err != nil {
 			t.Errorf("NoteService.Close() error = %v", err)
@@ -235,7 +235,7 @@ func TestNoteHandlerUploadAssetRejectsOversizedMultipartEpilogue(t *testing.T) {
 
 func TestNoteHandlerUploadAssetSavesSmallFileWithWhitespaceEpilogue(t *testing.T) {
 	base := t.TempDir()
-	notes := service.NewNoteService(handlerNoteRepository{}, base)
+	notes := service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator())
 	t.Cleanup(func() {
 		if err := notes.Close(); err != nil {
 			t.Errorf("NoteService.Close() error = %v", err)
@@ -334,7 +334,7 @@ func TestNoteHandlerGetRawFileServesDescriptorAndClosesIt(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "asset.txt"), content, 0644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
-	noteService := service.NewNoteService(handlerNoteRepository{}, base)
+	noteService := service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator())
 	handler := NewNoteHandler(noteService)
 	recorder := httptest.NewRecorder()
 
@@ -372,7 +372,7 @@ func TestNoteHandlerGetRawFileDoesNotFollowEscapingSymlink(t *testing.T) {
 		}
 		t.Fatalf("os.Symlink() error = %v", err)
 	}
-	handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base))
+	handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator()))
 	recorder := httptest.NewRecorder()
 
 	handler.GetRawFile(recorder, httptest.NewRequest(http.MethodGet, "/api/raw?path=escape.txt", nil))
@@ -385,5 +385,5 @@ func TestNoteHandlerGetRawFileDoesNotFollowEscapingSymlink(t *testing.T) {
 
 func newFilesystemNoteHandler(t *testing.T) *NoteHandler {
 	t.Helper()
-	return NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, t.TempDir()))
+	return NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, t.TempDir(), service.NewBaseOperationCoordinator()))
 }
