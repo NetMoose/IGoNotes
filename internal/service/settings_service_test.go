@@ -694,6 +694,95 @@ func TestSettingsServiceConflictSnapshotPrecedesPersistenceForRetainedAlias(t *t
 	}
 }
 
+func TestSettingsServiceBrokenRemovedGitAliasUsesStatusConflictIdentity(t *testing.T) {
+	activePath := t.TempDir()
+	repositoryPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	createSymlinkOrSkip(t, repositoryPath, aliasPath)
+	completed := true
+	work := model.Base{Name: "work", Path: aliasPath}
+	setConfiguredGit(&work)
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: activePath}, work},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	settings, _, _, _, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+	statuses.statuses[repositoryPath] = model.GitStatus{Base: "work", RepositoryPath: repositoryPath, State: model.GitStateConflict}
+	settings.coordinator.SetConflict(repositoryPath, true)
+	if err := os.Remove(aliasPath); err != nil {
+		t.Fatalf("Remove symlink error = %v", err)
+	}
+
+	if _, err := settings.ForgetBase("work"); err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(repositoryPath); err != nil {
+		t.Errorf("canonical conflict after forgetting broken Git alias = %v, want nil", err)
+	}
+	if _, exists := statuses.statuses[repositoryPath]; exists {
+		t.Error("forgotten Git status remains")
+	}
+}
+
+func TestSettingsServiceRetargetedRemovedGitAliasClearsStatusConflictIdentity(t *testing.T) {
+	activePath := t.TempDir()
+	originalPath := t.TempDir()
+	retargetedPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	createSymlinkOrSkip(t, originalPath, aliasPath)
+	completed := true
+	work := model.Base{Name: "work", Path: aliasPath}
+	setConfiguredGit(&work)
+	config := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: activePath}, work},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	settings, _, _, _, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+	statuses.statuses[originalPath] = model.GitStatus{Base: "work", RepositoryPath: originalPath, State: model.GitStateConflict}
+	settings.coordinator.SetConflict(originalPath, true)
+	settings.coordinator.SetConflict(retargetedPath, true)
+	retargetSymlink(t, aliasPath, retargetedPath)
+
+	if _, err := settings.ForgetBase("work"); err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(originalPath); err != nil {
+		t.Errorf("original status conflict after forgetting retargeted alias = %v, want nil", err)
+	}
+	if err := settings.coordinator.CheckMutation(retargetedPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retargeted conflict after forgetting alias = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestSettingsServiceBrokenRetainedAliasConservativelyKeepsConflict(t *testing.T) {
+	repositoryPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	createSymlinkOrSkip(t, repositoryPath, aliasPath)
+	completed := true
+	work := model.Base{Name: "work", Path: repositoryPath}
+	setConfiguredGit(&work)
+	config := model.Config{
+		Bases:          []model.Base{work, {Name: "alias", Path: aliasPath}},
+		CurrentBase:    "alias",
+		SetupCompleted: &completed,
+	}
+	settings, _, _, _, statuses := newGitSettingsServiceForConfig(t, config, aliasPath)
+	statuses.statuses[repositoryPath] = model.GitStatus{Base: "work", RepositoryPath: repositoryPath, State: model.GitStateConflict}
+	settings.coordinator.SetConflict(repositoryPath, true)
+	if err := os.Remove(aliasPath); err != nil {
+		t.Fatalf("Remove symlink error = %v", err)
+	}
+
+	if _, err := settings.ForgetBase("work"); err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := settings.coordinator.CheckMutation(repositoryPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("conflict with unknown retained alias = %v, want ErrGitConflictPending", err)
+	}
+}
+
 func newConflictSettingsService(t *testing.T) (*SettingsService, *fakeConfigStore, *BaseOperationCoordinator, string, string) {
 	t.Helper()
 	activePath := t.TempDir()
