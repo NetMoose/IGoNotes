@@ -106,7 +106,12 @@ func (r *GitOperationRepository) Finish(ctx context.Context, operation gitcmd.Op
 	errorCode, errorMessage, errorField, errorExitCode := operationErrorFields(operation.Error)
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE git_operations SET
-			state = ?, stage = ?,
+			state = ?,
+			stage = CASE
+				WHEN ? = 'completed' THEN 'completed'
+				WHEN stage = 'queued' AND ? <> '' THEN ?
+				ELSE stage
+			END,
 			backup_ref = CASE WHEN backup_ref = '' THEN ? ELSE backup_ref END,
 			local_oid = CASE WHEN local_oid = '' THEN ? ELSE local_oid END,
 			candidate_oid = CASE WHEN candidate_oid = '' THEN ? ELSE candidate_oid END,
@@ -116,7 +121,8 @@ func (r *GitOperationRepository) Finish(ctx context.Context, operation gitcmd.Op
 			conflict_paths_json = CASE WHEN ? THEN ? ELSE conflict_paths_json END,
 			error_code = ?, error_message = ?, error_field = ?, error_exit_code = ?, updated_at = ?
 		WHERE operation_id = ? AND state IN ('queued', 'running')
-	`, operation.State, operation.Stage, operation.BackupRef, operation.LocalOID,
+	`, operation.State, operation.Stage, operation.Stage, operation.Stage,
+		operation.BackupRef, operation.LocalOID,
 		operation.CandidateOID, operation.RemoteOID, operation.PushOID,
 		changedPathsSpecified, changedPaths, conflictPathsSpecified, conflictPaths,
 		errorCode, errorMessage, errorField, errorExitCode,

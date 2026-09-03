@@ -91,6 +91,7 @@ func TestGitOperationRepositoryCreateCheckpointFinish(t *testing.T) {
 	}
 	want.ChangedPaths = []string{"a.md", "b.md"}
 	want.ConflictPaths = []string{"conflict/a.md", "conflict/z.md"}
+	want.Stage = checkpoint.Stage
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("reopened operation mismatch:\n got: %#v\nwant: %#v", got, want)
 	}
@@ -138,8 +139,7 @@ func TestGitOperationRepositoryFinishPreservesAdmissionAndCheckpointData(t *test
 	stale.Kind = gitcmd.OperationSync
 	stale.Branch = "moved-branch"
 	stale.CreatedAt = createdAt.Add(24 * time.Hour)
-	stale.State = gitcmd.OperationConflict
-	stale.Stage = gitcmd.StageCompleted
+	stale.State = gitcmd.OperationFailed
 	stale.BackupRef = ""
 	stale.LocalOID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	stale.CandidateOID = ""
@@ -148,7 +148,7 @@ func TestGitOperationRepositoryFinishPreservesAdmissionAndCheckpointData(t *test
 	stale.ChangedPaths = nil
 	stale.ConflictPaths = nil
 	stale.Error = &gitcmd.SafeError{
-		Code: gitcmd.CodeGitConflict, Message: "Git merge has conflicts", Field: "git_branch", ExitCode: 1,
+		Code: gitcmd.CodeOperationInterrupted, Message: "Git operation was interrupted", ExitCode: 1,
 	}
 	stale.UpdatedAt = finishedAt
 	if err := repo.Finish(ctx, stale); err != nil {
@@ -170,7 +170,7 @@ func TestGitOperationRepositoryFinishPreservesAdmissionAndCheckpointData(t *test
 	}
 	want := admitted
 	want.State = stale.State
-	want.Stage = stale.Stage
+	want.Stage = checkpoint.Stage
 	want.BackupRef = checkpoint.BackupRef
 	want.LocalOID = checkpoint.LocalOID
 	want.CandidateOID = checkpoint.CandidateOID
@@ -185,6 +185,37 @@ func TestGitOperationRepositoryFinishPreservesAdmissionAndCheckpointData(t *test
 	}
 	if err := repo.Finish(ctx, stale); !errors.Is(err, ErrGitOperationTransition) {
 		t.Fatalf("repeated Finish() error = %v, want ErrGitOperationTransition", err)
+	}
+}
+
+func TestGitOperationRepositoryFinishAdvancesCheckpointStageToCompleted(t *testing.T) {
+	repo, db := openTestGitOperationRepository(t)
+	defer db.Close()
+	ctx := context.Background()
+	operation := completeGitOperation("finish-completed", "/notes/finish-completed", time.Now().UTC())
+	if err := repo.CreateQueued(ctx, operation); err != nil {
+		t.Fatalf("CreateQueued() error = %v", err)
+	}
+	if err := repo.Checkpoint(ctx, operation.ID, gitcmd.Checkpoint{Stage: gitcmd.StagePushing}); err != nil {
+		t.Fatalf("Checkpoint() error = %v", err)
+	}
+
+	operation.State = gitcmd.OperationSucceeded
+	operation.Stage = gitcmd.StageCompleted
+	operation.ChangedPaths = nil
+	operation.ConflictPaths = nil
+	operation.Error = nil
+	operation.UpdatedAt = operation.CreatedAt.Add(time.Second)
+	if err := repo.Finish(ctx, operation); err != nil {
+		t.Fatalf("Finish() error = %v", err)
+	}
+
+	got, found, err := repo.LatestByPath(ctx, operation.RepoPath)
+	if err != nil || !found {
+		t.Fatalf("LatestByPath() = %#v, %v, %v", got, found, err)
+	}
+	if got.State != gitcmd.OperationSucceeded || got.Stage != gitcmd.StageCompleted {
+		t.Fatalf("terminal state/stage = %q/%q, want succeeded/completed", got.State, got.Stage)
 	}
 }
 
