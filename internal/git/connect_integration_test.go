@@ -17,12 +17,17 @@ import (
 const testOperationID = "0123456789abcdef0123456789abcdef"
 
 type connectFixture struct {
-	t      *testing.T
-	root   string
-	remote string
+	t            *testing.T
+	root         string
+	remote       string
+	objectFormat string
 }
 
 func newConnectFixture(t *testing.T) *connectFixture {
+	return newConnectFixtureWithObjectFormat(t, "")
+}
+
+func newConnectFixtureWithObjectFormat(t *testing.T, objectFormat string) *connectFixture {
 	t.Helper()
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -31,13 +36,17 @@ func newConnectFixture(t *testing.T) *connectFixture {
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	fixture := &connectFixture{t: t, root: filepath.Join(root, "notes"), remote: filepath.Join(root, "remote.git")}
+	fixture := &connectFixture{t: t, root: filepath.Join(root, "notes"), remote: filepath.Join(root, "remote.git"), objectFormat: objectFormat}
 	if err := os.Mkdir(fixture.root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	fixture.git(root, "config", "--global", "user.name", "IGoNotes Test")
 	fixture.git(root, "config", "--global", "user.email", "igonotes@example.invalid")
-	fixture.git(root, "init", "--bare", "--initial-branch", "main", fixture.remote)
+	args := []string{"init", "--bare", "--initial-branch", "main"}
+	if objectFormat != "" {
+		args = append(args, "--object-format="+objectFormat)
+	}
+	fixture.git(root, append(args, fixture.remote)...)
 	return fixture
 }
 
@@ -74,7 +83,11 @@ func (f *connectFixture) seedRemote() string {
 	if err := os.Mkdir(seed, 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	f.git(seed, "init", "--initial-branch", "main")
+	args := []string{"init", "--initial-branch", "main"}
+	if f.objectFormat != "" {
+		args = append(args, "--object-format="+f.objectFormat)
+	}
+	f.git(seed, args...)
 	f.git(seed, "config", "user.name", "IGoNotes Test")
 	f.git(seed, "config", "user.email", "igonotes@example.invalid")
 	if err := os.WriteFile(filepath.Join(seed, "remote.md"), []byte("remote\n"), 0o600); err != nil {
@@ -89,7 +102,11 @@ func (f *connectFixture) seedRemote() string {
 
 func (f *connectFixture) initLocal(branch string) string {
 	f.t.Helper()
-	f.git(f.root, "init", "--initial-branch", branch)
+	args := []string{"init", "--initial-branch", branch}
+	if f.objectFormat != "" {
+		args = append(args, "--object-format="+f.objectFormat)
+	}
+	f.git(f.root, args...)
 	f.git(f.root, "config", "user.name", "IGoNotes Test")
 	f.git(f.root, "config", "user.email", "igonotes@example.invalid")
 	f.write("local.md", "local\n")
@@ -367,6 +384,97 @@ func TestInitializeRewritesOriginOnlyWithConfirmation(t *testing.T) {
 	}
 }
 
+func TestInitializeRejectsAndNormalizesOriginPushURL(t *testing.T) {
+	fixture := newConnectFixture(t)
+	fixture.initLocal("main")
+	malicious := filepath.Join(filepath.Dir(fixture.root), "malicious.git")
+	fixture.git(filepath.Dir(fixture.root), "init", "--bare", "--initial-branch", "main", malicious)
+	fixture.git(fixture.root, "remote", "add", "origin", fixture.remote)
+	fixture.git(fixture.root, "config", "--add", "remote.origin.pushurl", malicious)
+	fixture.git(fixture.root, "config", "--add", "remote.origin.pushurl", malicious)
+	options := fixture.options()
+	options.Confirmations.ReplaceOrigin = false
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+
+	_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+	assertSafeCode(t, err, CodeOriginMismatch)
+	if strings.Contains(err.Error(), malicious) {
+		t.Fatalf("origin mismatch disclosed unknown destination: %v", err)
+	}
+	assertNoServicePush(t, runner.commands)
+	for _, command := range runner.commands {
+		if containsArg(command.Args, malicious) || containsArg(command.Secrets, malicious) {
+			t.Fatalf("unknown destination escaped origin inspection: %#v", command)
+		}
+		if !command.ReadOnly {
+			t.Fatalf("origin mutated without confirmation: %q", command.Args)
+		}
+	}
+	if got := fixture.git(fixture.root, "remote", "get-url", "--all", "--push", "origin"); got != malicious+"\n"+malicious {
+		t.Fatalf("push URL changed without confirmation: %q", got)
+	}
+
+	options.Confirmations.ReplaceOrigin = true
+	normalizeRunner := &interceptRunner{delegate: NewCommandRunner()}
+	if _, err := initializeWithRunner(t, fixture, normalizeRunner, options, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertExactCommand(t, normalizeRunner.commands, localSecretCommand(fixture.root, false, fixture.remote,
+		"remote", "set-url", "origin", fixture.remote))
+	assertExactCommand(t, normalizeRunner.commands, localSecretCommand(fixture.root, false, fixture.remote,
+		"config", "--replace-all", "remote.origin.url", fixture.remote))
+	assertExactCommand(t, normalizeRunner.commands, localCommand(fixture.root, false,
+		"config", "--unset-all", "remote.origin.pushurl"))
+	assertExactCommand(t, normalizeRunner.commands, localCommand(fixture.root, true,
+		"remote", "get-url", "--all", "--push", "origin"))
+	if got := fixture.git(fixture.root, "remote", "get-url", "--all", "origin"); got != fixture.remote {
+		t.Fatalf("fetch URL = %q, want %q", got, fixture.remote)
+	}
+	if got := fixture.git(fixture.root, "remote", "get-url", "--all", "--push", "origin"); got != fixture.remote {
+		t.Fatalf("effective push URL = %q, want %q", got, fixture.remote)
+	}
+	if output, err := runFixtureGit(fixture.root, "config", "--get-all", "remote.origin.pushurl"); err == nil || output != "" {
+		t.Fatalf("explicit push URL remains: output %q, error %v", output, err)
+	}
+	fixture.remoteOID()
+	if output, err := runFixtureGit(filepath.Dir(fixture.root), "--git-dir", malicious, "show-ref"); err == nil || output != "" {
+		t.Fatalf("malicious repository changed: output %q, error %v", output, err)
+	}
+}
+
+func TestInitializeRejectsLateOriginPushURLBeforePush(t *testing.T) {
+	fixture := newConnectFixture(t)
+	fixture.initLocal("main")
+	malicious := filepath.Join(filepath.Dir(fixture.root), "malicious.git")
+	fixture.git(filepath.Dir(fixture.root), "init", "--bare", "--initial-branch", "main", malicious)
+	options := fixture.options()
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	injected := false
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if !injected && len(command.Args) > 0 && command.Args[0] == "ls-remote" &&
+			reflect.DeepEqual(command.Args[1:], []string{"--symref", "origin"}) {
+			fixture.git(fixture.root, "config", "--add", "remote.origin.pushurl", malicious)
+			injected = true
+		}
+		return result, err
+	}
+
+	_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+	assertSafeCode(t, err, CodeOriginMismatch)
+	if !injected {
+		t.Fatal("late push URL was not injected")
+	}
+	assertNoServicePush(t, runner.commands)
+}
+
+func runFixtureGit(dir string, args ...string) (string, error) {
+	command := exec.Command("git", args...)
+	command.Dir = dir
+	command.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+	output, err := command.CombinedOutput()
+	return strings.TrimSpace(string(output)), err
+}
+
 func TestInitializeRejectsMissingSelectedBranchOnNonemptyRemote(t *testing.T) {
 	fixture := newConnectFixture(t)
 	fixture.seedRemote()
@@ -454,12 +562,84 @@ func TestInitializeUnbornCheckoutPreservesIgnoredCollision(t *testing.T) {
 	fixture.git(filepath.Dir(fixture.root), "config", "--global", "core.excludesFile", excludes)
 	fixture.write("ignored.md", "local\n")
 
-	_, err := fixture.initialize(fixture.options(), nil, nil)
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
 	if err == nil {
 		t.Fatal("Initialize() error = nil, want checkout collision")
 	}
 	contents, readErr := os.ReadFile(filepath.Join(fixture.root, "ignored.md"))
 	if readErr != nil || string(contents) != "local\n" {
 		t.Fatalf("ignored collision changed: contents %q error %v", contents, readErr)
+	}
+	assertNoCheckout(t, runner.commands)
+	assertNoRefMutation(t, runner.commands)
+}
+
+func TestInitializeUnbornCheckoutRejectsIgnoredPrefixCollision(t *testing.T) {
+	fixture := newConnectFixture(t)
+	fixture.seedRemote()
+	seed := filepath.Join(filepath.Dir(fixture.root), "seed")
+	if err := os.WriteFile(filepath.Join(seed, "dir"), []byte("remote leaf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git(seed, "add", "--all", "--", ".")
+	fixture.git(seed, "commit", "-m", "remote prefix leaf")
+	fixture.git(seed, "push", "origin", "HEAD:main")
+	excludes := filepath.Join(filepath.Dir(fixture.root), "home", "excludes")
+	if err := os.WriteFile(excludes, []byte("dir/local.md\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git(filepath.Dir(fixture.root), "config", "--global", "core.excludesFile", excludes)
+	fixture.write("dir/local.md", "preserve local bytes\n")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+	assertSafeCode(t, err, CodeOperationInterrupted)
+	contents, readErr := os.ReadFile(filepath.Join(fixture.root, "dir", "local.md"))
+	if readErr != nil || string(contents) != "preserve local bytes\n" {
+		t.Fatalf("ignored descendant changed: contents %q error %v", contents, readErr)
+	}
+	assertNoCheckout(t, runner.commands)
+	assertNoRefMutation(t, runner.commands)
+}
+
+func TestInitializeUnbornCheckoutRejectsNoteCreatedDuringFetch(t *testing.T) {
+	fixture := newConnectFixture(t)
+	fixture.seedRemote()
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	created := false
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if err == nil && !created && len(command.Args) > 0 && command.Args[0] == "fetch" {
+			fixture.write("remote.md", "created during fetch\n")
+			created = true
+		}
+		return result, err
+	}
+
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+	assertSafeCode(t, err, CodeOperationInterrupted)
+	contents, readErr := os.ReadFile(filepath.Join(fixture.root, "remote.md"))
+	if readErr != nil || string(contents) != "created during fetch\n" {
+		t.Fatalf("new note changed: contents %q error %v", contents, readErr)
+	}
+	assertNoCheckout(t, runner.commands)
+	assertNoRefMutation(t, runner.commands)
+}
+
+func assertNoCheckout(t *testing.T, commands []Command) {
+	t.Helper()
+	for _, command := range commands {
+		if len(command.Args) > 0 && command.Args[0] == "checkout" {
+			t.Fatalf("unexpected checkout command: %q", command.Args)
+		}
+	}
+}
+
+func assertNoRefMutation(t *testing.T, commands []Command) {
+	t.Helper()
+	for _, command := range commands {
+		if len(command.Args) > 0 && command.Args[0] == "update-ref" {
+			t.Fatalf("unexpected ref mutation: %q", command.Args)
+		}
 	}
 }

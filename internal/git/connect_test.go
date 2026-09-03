@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -83,6 +84,163 @@ func TestConflictErrorIsSafeSortedAndCloned(t *testing.T) {
 	}
 }
 
+func TestInitializeSHA256UsesObjectFormatWidthForZeroCAS(t *testing.T) {
+	probe := t.TempDir()
+	if output, err := runFixtureGit(probe, "init", "--object-format=sha256", "--initial-branch", "main"); err != nil {
+		lower := strings.ToLower(output)
+		if strings.Contains(lower, "unknown option") || strings.Contains(lower, "unsupported") || strings.Contains(lower, "not support") {
+			t.Skipf("installed Git does not support SHA-256 repositories: %v (%s)", err, output)
+		}
+		t.Fatalf("could not probe SHA-256 repository support: %v (%s)", err, output)
+	}
+	zero64 := strings.Repeat("0", 64)
+
+	t.Run("branch and trusted refs", func(t *testing.T) {
+		fixture := newConnectFixtureWithObjectFormat(t, "sha256")
+		candidate := fixture.seedRemote()
+		fixture.git(fixture.root, "init", "--object-format=sha256", "--initial-branch", "main")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+			"update-ref", "refs/heads/main", candidate, zero64))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+			"update-ref", managedRemoteRef("main"), candidate, zero64))
+		if result.PushOID != candidate {
+			t.Fatalf("PushOID = %q, want %q", result.PushOID, candidate)
+		}
+	})
+
+	t.Run("backup ref", func(t *testing.T) {
+		fixture := newConnectFixtureWithObjectFormat(t, "sha256")
+		fixture.seedRemote()
+		localOID := fixture.initLocal("local")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", "--create-reflog", "-m",
+			"IGoNotes initial-connect backup", result.BackupRef, localOID, zero64))
+	})
+
+	t.Run("post-push managed ref", func(t *testing.T) {
+		fixture := newConnectFixtureWithObjectFormat(t, "sha256")
+		localOID := fixture.initLocal("main")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+			"update-ref", managedRemoteRef("main"), localOID, zero64))
+		if result.PushOID != localOID || fixture.remoteOID() != localOID {
+			t.Fatalf("push result = %#v, local = %q", result, localOID)
+		}
+	})
+}
+
+func TestInitializeRejectsBaseIdentityReplacementBeforeMutation(t *testing.T) {
+	for _, mutation := range []string{"add", "commit", "backup-ref", "push", "parent-repository"} {
+		t.Run(mutation, func(t *testing.T) {
+			fixture := newConnectFixture(t)
+			switch mutation {
+			case "add", "commit", "parent-repository":
+				fixture.write("note.md", "local note\n")
+			case "backup-ref":
+				fixture.seedRemote()
+				fixture.initLocal("local")
+			case "push":
+				fixture.initLocal("main")
+			}
+			runner := &interceptRunner{delegate: NewCommandRunner()}
+			swapped := false
+			swappedAt := 0
+			replacementHead := ""
+			swap := func(parent bool) {
+				if swapped {
+					return
+				}
+				swapped = true
+				swappedAt = len(runner.commands)
+				original := fixture.root + "-original"
+				if err := os.Rename(fixture.root, original); err != nil {
+					t.Fatal(err)
+				}
+				if parent {
+					parentPath := filepath.Dir(fixture.root)
+					fixture.git(parentPath, "init", "--initial-branch", "parent")
+					fixture.git(parentPath, "config", "user.name", "IGoNotes Test")
+					fixture.git(parentPath, "config", "user.email", "igonotes@example.invalid")
+					if err := os.Mkdir(fixture.root, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
+				replacement := fixture.root + "-replacement"
+				if err := os.Mkdir(replacement, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				fixture.git(replacement, "init", "--initial-branch", "replacement")
+				fixture.git(replacement, "config", "user.name", "IGoNotes Test")
+				fixture.git(replacement, "config", "user.email", "igonotes@example.invalid")
+				if err := os.WriteFile(filepath.Join(replacement, "replacement.md"), []byte("replacement\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				fixture.git(replacement, "add", "--all", "--", ".")
+				fixture.git(replacement, "commit", "-m", "replacement")
+				replacementHead = fixture.git(replacement, "rev-parse", "HEAD")
+				if err := os.Rename(replacement, fixture.root); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runner.after = func(command Command, result Result, err error) (Result, error) {
+				if mutation == "commit" && reflect.DeepEqual(command.Args, []string{"diff", "--cached", "--name-only", "-z"}) {
+					swap(false)
+				}
+				if mutation == "push" && reflect.DeepEqual(command.Args, []string{"ls-remote", "--symref", "origin"}) {
+					swap(false)
+				}
+				return result, err
+			}
+			progress := func(_ context.Context, checkpoint Checkpoint) error {
+				if mutation == "add" && checkpoint.Stage == StageSnapshotting {
+					swap(false)
+				}
+				if mutation == "parent-repository" && checkpoint.Stage == StageSnapshotting {
+					swap(true)
+				}
+				if mutation == "backup-ref" && checkpoint.Stage == StageBackingUp && checkpoint.BackupRef != "" {
+					swap(false)
+				}
+				return nil
+			}
+
+			_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, progress)
+			if !swapped {
+				t.Fatal("base path was not replaced")
+			}
+			var safeErr *SafeError
+			if !errors.As(err, &safeErr) || (safeErr.Code != CodeNeedsReconnect && safeErr.Code != CodeRepositoryRoot) {
+				t.Fatalf("Initialize() error = %#v, want identity error", err)
+			}
+			if len(runner.commands) != swappedAt {
+				t.Fatalf("commands ran after replacement: %#v", runner.commands[swappedAt:])
+			}
+			if replacementHead != "" {
+				if got := fixture.git(fixture.root, "rev-parse", "HEAD"); got != replacementHead {
+					t.Fatalf("replacement HEAD = %q, want %q", got, replacementHead)
+				}
+				if status := fixture.git(fixture.root, "status", "--porcelain"); status != "" {
+					t.Fatalf("replacement worktree changed: %q", status)
+				}
+			}
+		})
+	}
+}
+
 func TestInitializeConflictCheckpointFailurePreservesTypedConflict(t *testing.T) {
 	fixture := newConnectFixture(t)
 	fixture.seedRemote()
@@ -105,6 +263,91 @@ func TestInitializeConflictCheckpointFailurePreservesTypedConflict(t *testing.T)
 		t.Fatalf("Initialize() error = %#v, want joined checkpoint error", err)
 	}
 	assertNoServicePush(t, runner.commands)
+}
+
+func TestInitializeConflictWithNewlineFilenamePreservesTypedGate(t *testing.T) {
+	fixture := newConnectFixture(t)
+	fixture.seedRemote()
+	seed := filepath.Join(filepath.Dir(fixture.root), "seed")
+	name := "line\nbreak.md"
+	if err := os.WriteFile(filepath.Join(seed, name), []byte("remote secret contents\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git(seed, "add", "--all", "--", ".")
+	fixture.git(seed, "commit", "-m", "newline remote")
+	fixture.git(seed, "push", "origin", "HEAD:main")
+	fixture.initLocal("local")
+	fixture.write(name, "local secret contents\n")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || !reflect.DeepEqual(conflict.Paths, []string{name}) {
+		t.Fatalf("Initialize() error = %#v, conflict = %#v", err, conflict)
+	}
+	if strings.Contains(err.Error(), "secret contents") {
+		t.Fatalf("conflict error disclosed file contents: %v", err)
+	}
+	encoded, marshalErr := json.Marshal(conflict)
+	if marshalErr != nil || !json.Valid(encoded) || !strings.Contains(string(encoded), `line\nbreak.md`) {
+		t.Fatalf("JSON conflict = %q, error %v", encoded, marshalErr)
+	}
+	assertNoServicePush(t, runner.commands)
+}
+
+func TestInitializeConflictInspectionFailurePreservesTypedGate(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		inspectionErr error
+		truncate      bool
+	}{
+		{name: "command failure", inspectionErr: errors.New("conflict inspection unavailable")},
+		{name: "truncated over 64KiB listing", truncate: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newConnectFixture(t)
+			fixture.seedRemote()
+			fixture.initLocal("local")
+			fixture.write("remote.md", "local collision\n")
+			checkpointErr := errors.New("checkpoint unavailable")
+			runner := &interceptRunner{delegate: NewCommandRunner()}
+			mergeFailed := false
+			runner.after = func(command Command, result Result, err error) (Result, error) {
+				if len(command.Args) > 0 && command.Args[0] == "merge" && err != nil {
+					mergeFailed = true
+				}
+				if len(command.Args) >= 3 && reflect.DeepEqual(command.Args[:3], []string{"ls-files", "-u", "-z"}) {
+					if test.inspectionErr != nil {
+						return Result{}, test.inspectionErr
+					}
+					result.Stdout += strings.Repeat("x", DefaultOutputLimit)
+					result.StdoutTruncated = true
+				}
+				return result, err
+			}
+
+			_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, func(_ context.Context, checkpoint Checkpoint) error {
+				if checkpoint.Stage == StageMerging && mergeFailed {
+					return checkpointErr
+				}
+				return nil
+			})
+			var conflict *ConflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("Initialize() error = %#v, want typed conflict", err)
+			}
+			if test.inspectionErr != nil && !errors.Is(err, test.inspectionErr) {
+				t.Fatalf("Initialize() error = %#v, want inspection error", err)
+			}
+			if len(conflict.Paths) != 0 && !reflect.DeepEqual(conflict.Paths, []string{"remote.md"}) {
+				t.Fatalf("partial conflict paths = %#v", conflict.Paths)
+			}
+			if !errors.Is(err, checkpointErr) {
+				t.Fatalf("Initialize() error = %#v, want checkpoint error", err)
+			}
+			assertNoServicePush(t, runner.commands)
+		})
+	}
 }
 
 func TestInitializeRetryReusesJournaledBackupRef(t *testing.T) {
@@ -426,7 +669,7 @@ func prepareCompletedCheckpointGap(t *testing.T) (*connectFixture, InitializeOpt
 	candidate := fixture.seedRemote()
 	fixture.initLocal("local")
 	fixture.git(fixture.root, "fetch", fixture.remote, "refs/heads/main")
-	fixture.git(fixture.root, "update-ref", managedRemoteRef("main"), candidate, zeroObjectID)
+	fixture.git(fixture.root, "update-ref", managedRemoteRef("main"), candidate, strings.Repeat("0", 40))
 	options := fixture.options()
 	options.LastRemoteOID = candidate
 	completedErr := errors.New("final completed checkpoint unavailable")
@@ -703,7 +946,7 @@ func assertPreCheckoutPopulationRetry(t *testing.T, fixture *connectFixture, opt
 	}
 	assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "checkout", candidate, "--", "."))
 	assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
-		"update-ref", "refs/heads/main", candidate, zeroObjectID))
+		"update-ref", "refs/heads/main", candidate, strings.Repeat("0", 40)))
 	for _, command := range runner.commands {
 		if len(command.Args) == 0 {
 			continue
@@ -916,7 +1159,7 @@ func prepareTrustedRemoteAdvance(t *testing.T) (*connectFixture, InitializeOptio
 	trustedOID := fixture.seedRemote()
 	fixture.initLocal("local")
 	fixture.git(fixture.root, "fetch", fixture.remote, "refs/heads/main")
-	fixture.git(fixture.root, "update-ref", managedRemoteRef("main"), trustedOID, zeroObjectID)
+	fixture.git(fixture.root, "update-ref", managedRemoteRef("main"), trustedOID, strings.Repeat("0", 40))
 	seed := filepath.Join(filepath.Dir(fixture.root), "seed")
 	if err := os.WriteFile(filepath.Join(seed, "advanced-for-crash.md"), []byte("advanced\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1138,7 +1381,7 @@ func TestInitializeExactCommandContract(t *testing.T) {
 		assertExactCommand(t, commands, localCommand(fixture.root, true, "diff", "--cached", "--quiet", "--exit-code"))
 		assertExactCommand(t, commands, localCommand(fixture.root, true, "diff", "--cached", "--name-only", "-z"))
 		assertExactCommand(t, commands, localCommand(fixture.root, false, "commit", "-m", initialCommitMessage))
-		assertExactCommand(t, commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), result.PushOID, zeroObjectID))
+		assertExactCommand(t, commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), result.PushOID, strings.Repeat("0", 40)))
 		assertExactPush(t, commands, fixture, result.PushOID)
 		assertNoForbiddenServiceCommands(t, commands)
 	})
@@ -1169,8 +1412,8 @@ func TestInitializeExactCommandContract(t *testing.T) {
 		assertExactCommand(t, runner.commands, networkCommand(fixture.root, true, fixture.remote,
 			"ls-remote", "--exit-code", "--heads", "origin", "refs/heads/main"))
 		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "checkout", remoteOID, "--", "."))
-		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", "refs/heads/main", remoteOID, zeroObjectID))
-		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), remoteOID, zeroObjectID))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", "refs/heads/main", remoteOID, strings.Repeat("0", 40)))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), remoteOID, strings.Repeat("0", 40)))
 		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), result.PushOID, remoteOID))
 		assertExactPush(t, runner.commands, fixture, result.PushOID)
 		assertNoForbiddenServiceCommands(t, runner.commands)
@@ -1187,7 +1430,7 @@ func TestInitializeExactCommandContract(t *testing.T) {
 		}
 		snapshotOID := fixture.git(fixture.root, "rev-parse", "--verify", result.BackupRef+"^{commit}")
 		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
-			"update-ref", "--create-reflog", "-m", "IGoNotes initial-connect backup", result.BackupRef, snapshotOID, zeroObjectID))
+			"update-ref", "--create-reflog", "-m", "IGoNotes initial-connect backup", result.BackupRef, snapshotOID, strings.Repeat("0", 40)))
 		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "switch", "-c", "main", remoteOID))
 		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
 			"merge", "--no-edit", "-m", localMergeMessage, "--allow-unrelated-histories", snapshotOID))
@@ -1304,6 +1547,8 @@ func TestInitializeValidatesInputsBeforeMutation(t *testing.T) {
 		{name: "empty URL", mutate: func(options *InitializeOptions) { options.Snapshot.URL = "" }},
 		{name: "empty branch", mutate: func(options *InitializeOptions) { options.Snapshot.Branch = "" }},
 		{name: "invalid operation ID", mutate: func(options *InitializeOptions) { options.Operation.ID = "../unsafe" }},
+		{name: "invalid 39-character OID", mutate: func(options *InitializeOptions) { options.Operation.CandidateOID = strings.Repeat("a", 39) }},
+		{name: "invalid 64-character nonhex OID", mutate: func(options *InitializeOptions) { options.Operation.CandidateOID = strings.Repeat("a", 63) + "z" }},
 		{name: "wrong kind", mutate: func(options *InitializeOptions) { options.Operation.Kind = OperationSync }},
 	}
 	for _, test := range tests {

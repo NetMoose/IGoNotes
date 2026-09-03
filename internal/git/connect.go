@@ -15,7 +15,6 @@ const (
 	backupTimestampLayout = "20060102T150405.000000000Z"
 	initialCommitMessage  = "IGoNotes: initial snapshot"
 	localMergeMessage     = "IGoNotes: merge local snapshot"
-	zeroObjectID          = "0000000000000000000000000000000000000000"
 )
 
 type ConflictError struct {
@@ -86,6 +85,13 @@ const (
 	remotePopulationBranchCreated
 )
 
+type connectBaseIdentityKey struct{}
+
+type connectBaseIdentity struct {
+	path string
+	info os.FileInfo
+}
+
 func (s *Service) Initialize(
 	ctx context.Context,
 	options InitializeOptions,
@@ -94,6 +100,13 @@ func (s *Service) Initialize(
 ) (OperationResult, error) {
 	path, err := s.validateInitialize(ctx, options, worktree, progress)
 	if err != nil {
+		return OperationResult{}, err
+	}
+	ctx, err = pinConnectBase(ctx, path)
+	if err != nil {
+		return OperationResult{}, err
+	}
+	if err := s.porcelain.ValidateBranch(ctx, path, options.Snapshot.Branch); err != nil {
 		return OperationResult{}, err
 	}
 	checkpoint := newConnectCheckpoint(options, progress)
@@ -112,6 +125,9 @@ func (s *Service) Initialize(
 		return OperationResult{}, err
 	}
 
+	if err := requireConnectBase(ctx, path); err != nil {
+		return OperationResult{}, err
+	}
 	remote, err := s.porcelain.InspectRemote(ctx, path, options.Snapshot.URL)
 	if err != nil {
 		return OperationResult{}, err
@@ -153,7 +169,7 @@ func (s *Service) Initialize(
 			if err := checkpoint.save(ctx, StageProbing); err != nil {
 				return err
 			}
-			if _, err := s.runLocal(ctx, path, false, "init", "--initial-branch", options.Snapshot.Branch); err != nil {
+			if _, err := s.connectRunLocal(ctx, path, false, "init", "--initial-branch", options.Snapshot.Branch); err != nil {
 				return err
 			}
 			current, err = s.inspectSafeLocal(ctx, path)
@@ -223,7 +239,7 @@ func (s *Service) Initialize(
 			}
 			fetchRef := "refs/igonotes/fetch/" + options.Operation.ID
 			refspec := "+refs/heads/" + options.Snapshot.Branch + ":" + fetchRef
-			if _, err := s.runNetwork(ctx, path, options.Snapshot.URL, false,
+			if _, err := s.connectRunNetwork(ctx, path, options.Snapshot.URL, false,
 				"fetch", "--no-tags", "--show-forced-updates", "origin", refspec); err != nil {
 				return OperationResult{}, err
 			}
@@ -245,10 +261,17 @@ func (s *Service) Initialize(
 		if err := requireCallbackPath(path, callbackPath); err != nil {
 			return err
 		}
-		if _, err := s.inspectSafeLocal(ctx, path); err != nil {
+		local, err := s.inspectSafeLocal(ctx, path)
+		if err != nil {
 			return err
 		}
 		if !actual.remoteEmpty {
+			if actual.population == remotePopulationNone && actual.snapshotOID == "" && !local.HasCommits &&
+				!local.DetachedHead && local.CurrentBranch == options.Snapshot.Branch {
+				if err := s.requireSafeUnbornCheckout(ctx, path, actual.fetchedOID); err != nil {
+					return err
+				}
+			}
 			if err := s.establishRemoteTrust(ctx, path, options, actual.fetchedOID, checkpoint); err != nil {
 				return err
 			}
@@ -279,8 +302,11 @@ func (s *Service) Initialize(
 	if err := checkpoint.save(ctx, StagePushing); err != nil {
 		return OperationResult{}, err
 	}
+	if err := s.requireOrigin(ctx, path, options.Snapshot.URL); err != nil {
+		return OperationResult{}, err
+	}
 	refspec := actual.pushOID + ":refs/heads/" + options.Snapshot.Branch
-	if _, err := s.runNetwork(ctx, path, options.Snapshot.URL, false,
+	if _, err := s.connectRunNetwork(ctx, path, options.Snapshot.URL, false,
 		"push", "--no-verify", "--porcelain", "origin", refspec); err != nil {
 		return OperationResult{}, err
 	}
@@ -301,12 +327,12 @@ func (s *Service) Initialize(
 		}
 		expected := actual.fetchedOID
 		if actual.remoteEmpty {
-			expected = zeroObjectID
+			expected = zeroObjectIDFor(actual.pushOID)
 		}
 		if err := checkpoint.save(ctx, StagePushing); err != nil {
 			return err
 		}
-		if _, err := s.runLocal(ctx, path, false, "update-ref", managedRemoteRef(options.Snapshot.Branch), actual.pushOID, expected); err != nil {
+		if _, err := s.connectRunLocal(ctx, path, false, "update-ref", managedRemoteRef(options.Snapshot.Branch), actual.pushOID, expected); err != nil {
 			current, exists, inspectErr := s.optionalRefOID(ctx, path, managedRemoteRef(options.Snapshot.Branch))
 			if inspectErr != nil {
 				return inspectErr
@@ -364,9 +390,6 @@ func (s *Service) validateInitialize(
 	if path != snapshot.Path || path != options.Operation.RepoPath {
 		return "", &SafeError{Code: CodeRepositoryRoot, Message: "Git repository root does not match the base directory"}
 	}
-	if err := s.porcelain.ValidateBranch(ctx, path, snapshot.Branch); err != nil {
-		return "", err
-	}
 	if options.Operation.BackupRef != "" && !validBackupRef(options.Operation.BackupRef, options.Operation.CreatedAt) {
 		return "", &SafeError{Code: CodeBackupMismatch, Message: "Git backup reference does not match the operation"}
 	}
@@ -396,7 +419,74 @@ func requireCallbackPath(expected, callbackPath string) error {
 	return nil
 }
 
+func pinConnectBase(ctx context.Context, path string) (context.Context, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, &SafeError{Code: CodeNeedsReconnect, Message: "Git base directory must be reconnected", cause: err}
+	}
+	return context.WithValue(ctx, connectBaseIdentityKey{}, connectBaseIdentity{path: path, info: info}), nil
+}
+
+func requireConnectBase(ctx context.Context, path string) error {
+	pinned, ok := ctx.Value(connectBaseIdentityKey{}).(connectBaseIdentity)
+	if !ok || pinned.path != path {
+		return &SafeError{Code: CodeNeedsReconnect, Message: "Git base directory must be reconnected"}
+	}
+	current, err := os.Stat(path)
+	if err != nil || !os.SameFile(pinned.info, current) {
+		return &SafeError{Code: CodeNeedsReconnect, Message: "Git base directory was replaced", cause: err}
+	}
+	return nil
+}
+
+func (s *Service) connectRunLocal(ctx context.Context, path string, readOnly bool, args ...string) (Result, error) {
+	if err := requireConnectBase(ctx, path); err != nil {
+		return Result{}, err
+	}
+	if !readOnly {
+		if _, err := s.inspectSafeLocal(ctx, path); err != nil {
+			return Result{}, err
+		}
+		if err := requireConnectBase(ctx, path); err != nil {
+			return Result{}, err
+		}
+	}
+	return s.runLocal(ctx, path, readOnly, args...)
+}
+
+func (s *Service) connectRun(
+	ctx context.Context,
+	path string,
+	scope OperationScope,
+	readOnly bool,
+	secret string,
+	args ...string,
+) (Result, error) {
+	if err := requireConnectBase(ctx, path); err != nil {
+		return Result{}, err
+	}
+	if !readOnly && scope == LocalOperation {
+		if _, err := s.inspectSafeLocal(ctx, path); err != nil {
+			return Result{}, err
+		}
+		if err := requireConnectBase(ctx, path); err != nil {
+			return Result{}, err
+		}
+	}
+	return s.run(ctx, path, scope, readOnly, secret, args...)
+}
+
+func (s *Service) connectRunNetwork(ctx context.Context, path, secret string, readOnly bool, args ...string) (Result, error) {
+	if err := requireConnectBase(ctx, path); err != nil {
+		return Result{}, err
+	}
+	return s.runNetwork(ctx, path, secret, readOnly, args...)
+}
+
 func (s *Service) inspectSafeLocal(ctx context.Context, path string) (LocalInspection, error) {
+	if err := requireConnectBase(ctx, path); err != nil {
+		return LocalInspection{}, err
+	}
 	local, err := s.porcelain.InspectLocal(ctx, path)
 	if err != nil {
 		return LocalInspection{}, err
@@ -436,11 +526,11 @@ func (s *Service) preflightInitializeRefs(
 		}
 		return nil
 	}
-	urls, exists, err := s.originURLs(ctx, path)
+	origin, err := s.originURLs(ctx, path)
 	if err != nil {
 		return err
 	}
-	if exists && (len(urls) != 1 || urls[0] != options.Snapshot.URL) && !options.Confirmations.ReplaceOrigin {
+	if origin.exists && !origin.matches(options.Snapshot.URL) && !options.Confirmations.ReplaceOrigin {
 		return &SafeError{Code: CodeOriginMismatch, Message: "Configured origin does not match"}
 	}
 	if _, _, err := s.optionalCommitOID(ctx, path, "refs/heads/"+options.Snapshot.Branch); err != nil {
@@ -601,7 +691,7 @@ func (s *Service) emptyUnbornIndexAndWorktree(ctx context.Context, path string) 
 		{"ls-files", "--cached", "-z"},
 		{"ls-files", "--others", "--exclude-standard", "-z"},
 	} {
-		result, err := s.runLocal(ctx, path, true, args...)
+		result, err := s.connectRunLocal(ctx, path, true, args...)
 		if err != nil {
 			return false, err
 		}
@@ -621,7 +711,7 @@ func (s *Service) indexAndWorktreeEqualCommit(ctx context.Context, path, oid str
 		{"diff", "--cached", "--quiet", "--exit-code", oid, "--"},
 		{"diff", "--quiet", "--exit-code", oid, "--"},
 	} {
-		result, err := s.runLocal(ctx, path, true, args...)
+		result, err := s.connectRunLocal(ctx, path, true, args...)
 		if err != nil {
 			if expectedExit(err, 1) {
 				return false, nil
@@ -632,7 +722,7 @@ func (s *Service) indexAndWorktreeEqualCommit(ctx context.Context, path, oid str
 			return false, malformedOutputError()
 		}
 	}
-	result, err := s.runLocal(ctx, path, true, "ls-files", "--others", "--exclude-standard", "-z")
+	result, err := s.connectRunLocal(ctx, path, true, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return false, err
 	}
@@ -649,38 +739,77 @@ func (s *Service) ensureOrigin(
 	replace bool,
 	checkpoint *connectCheckpoint,
 ) error {
-	urls, exists, err := s.originURLs(ctx, path)
+	origin, err := s.originURLs(ctx, path)
 	if err != nil {
 		return err
 	}
-	if exists && len(urls) == 1 && urls[0] == expectedURL {
+	if origin.matches(expectedURL) {
 		return nil
 	}
-	if exists && !replace {
+	if origin.exists && !replace {
 		return &SafeError{Code: CodeOriginMismatch, Message: "Configured origin does not match"}
 	}
 	if err := checkpoint.save(ctx, StageProbing); err != nil {
 		return err
 	}
 	args := []string{"remote", "add", "origin", expectedURL}
-	if exists {
+	if origin.exists {
 		args = []string{"remote", "set-url", "origin", expectedURL}
 	}
-	if _, err := s.run(ctx, path, LocalOperation, false, expectedURL, args...); err != nil {
+	if _, err := s.connectRun(ctx, path, LocalOperation, false, expectedURL, args...); err != nil {
 		return err
 	}
-	urls, exists, err = s.originURLs(ctx, path)
+	if origin.exists {
+		if _, err := s.connectRun(ctx, path, LocalOperation, false, expectedURL,
+			"config", "--replace-all", "remote.origin.url", expectedURL); err != nil {
+			return err
+		}
+		if _, err := s.connectRunLocal(ctx, path, false, "config", "--unset-all", "remote.origin.pushurl"); err != nil && !expectedExit(err, 5) {
+			return err
+		}
+	}
+	origin, err = s.originURLs(ctx, path)
 	if err != nil {
 		return err
 	}
-	if !exists || len(urls) != 1 || urls[0] != expectedURL {
+	if !origin.matches(expectedURL) {
 		return &SafeError{Code: CodeOriginMismatch, Message: "Configured origin does not match"}
 	}
 	return checkpoint.save(ctx, StageProbing)
 }
 
-func (s *Service) originURLs(ctx context.Context, path string) ([]string, bool, error) {
-	result, err := s.runLocal(ctx, path, true, "remote", "get-url", "--all", "origin")
+type originURLSet struct {
+	fetch  []string
+	push   []string
+	exists bool
+}
+
+func (o originURLSet) matches(expected string) bool {
+	return o.exists && len(o.fetch) == 1 && o.fetch[0] == expected && len(o.push) == 1 && o.push[0] == expected
+}
+
+func (s *Service) originURLs(ctx context.Context, path string) (originURLSet, error) {
+	fetch, exists, err := s.readOriginURLs(ctx, path, false)
+	if err != nil {
+		return originURLSet{}, err
+	}
+	push, pushExists, err := s.readOriginURLs(ctx, path, true)
+	if err != nil {
+		return originURLSet{}, err
+	}
+	if exists != pushExists {
+		return originURLSet{}, malformedOutputError()
+	}
+	return originURLSet{fetch: fetch, push: push, exists: exists}, nil
+}
+
+func (s *Service) readOriginURLs(ctx context.Context, path string, push bool) ([]string, bool, error) {
+	args := []string{"remote", "get-url", "--all"}
+	if push {
+		args = append(args, "--push")
+	}
+	args = append(args, "origin")
+	result, err := s.connectRunLocal(ctx, path, true, args...)
 	if err != nil {
 		if expectedExit(err, 2) {
 			return nil, false, nil
@@ -699,6 +828,17 @@ func (s *Service) originURLs(ctx context.Context, path string) ([]string, bool, 
 	return lines, true, nil
 }
 
+func (s *Service) requireOrigin(ctx context.Context, path, expectedURL string) error {
+	origin, err := s.originURLs(ctx, path)
+	if err != nil {
+		return err
+	}
+	if !origin.matches(expectedURL) {
+		return &SafeError{Code: CodeOriginMismatch, Message: "Configured origin does not match"}
+	}
+	return nil
+}
+
 func (s *Service) snapshotInitialTree(
 	ctx context.Context,
 	path string,
@@ -712,7 +852,7 @@ func (s *Service) snapshotInitialTree(
 	if err := checkpoint.save(ctx, StageSnapshotting); err != nil {
 		return "", nil, err
 	}
-	if _, err := s.runLocal(ctx, path, false, "add", "--all", "--", "."); err != nil {
+	if _, err := s.connectRunLocal(ctx, path, false, "add", "--all", "--", "."); err != nil {
 		return "", nil, err
 	}
 	changed, err := s.stagedChanges(ctx, path)
@@ -735,7 +875,7 @@ func (s *Service) snapshotInitialTree(
 		if err := checkpoint.save(ctx, StageSnapshotting); err != nil {
 			return "", nil, err
 		}
-		if _, err := s.runLocal(ctx, path, false, "commit", "-m", initialCommitMessage); err != nil {
+		if _, err := s.connectRunLocal(ctx, path, false, "commit", "-m", initialCommitMessage); err != nil {
 			return "", nil, err
 		}
 	} else {
@@ -753,7 +893,7 @@ func (s *Service) snapshotInitialTree(
 			if err := checkpoint.save(ctx, StageSnapshotting); err != nil {
 				return "", nil, err
 			}
-			if _, err := s.runLocal(ctx, path, false, "commit", "--allow-empty", "-m", initialCommitMessage); err != nil {
+			if _, err := s.connectRunLocal(ctx, path, false, "commit", "--allow-empty", "-m", initialCommitMessage); err != nil {
 				return "", nil, err
 			}
 		}
@@ -769,7 +909,7 @@ func (s *Service) snapshotInitialTree(
 }
 
 func (s *Service) stagedChanges(ctx context.Context, path string) (bool, error) {
-	result, err := s.runLocal(ctx, path, true, "diff", "--cached", "--quiet", "--exit-code")
+	result, err := s.connectRunLocal(ctx, path, true, "diff", "--cached", "--quiet", "--exit-code")
 	if result.StdoutTruncated || result.StderrTruncated {
 		return false, malformedOutputError()
 	}
@@ -783,7 +923,7 @@ func (s *Service) stagedChanges(ctx context.Context, path string) (bool, error) 
 }
 
 func (s *Service) stagedPaths(ctx context.Context, path string) ([]string, error) {
-	result, err := s.runLocal(ctx, path, true, "diff", "--cached", "--name-only", "-z")
+	result, err := s.connectRunLocal(ctx, path, true, "diff", "--cached", "--name-only", "-z")
 	if err != nil {
 		return nil, err
 	}
@@ -875,8 +1015,8 @@ func (s *Service) ensureBackup(
 		if err := checkpoint.save(ctx, StageBackingUp); err != nil {
 			return "", err
 		}
-		if _, err := s.runLocal(ctx, path, false, "update-ref", "--create-reflog", "-m",
-			"IGoNotes initial-connect backup", candidate, snapshotOID, zeroObjectID); err != nil {
+		if _, err := s.connectRunLocal(ctx, path, false, "update-ref", "--create-reflog", "-m",
+			"IGoNotes initial-connect backup", candidate, snapshotOID, zeroObjectIDFor(snapshotOID)); err != nil {
 			existing, exists, inspectErr := s.optionalRefOID(ctx, path, candidate)
 			if inspectErr != nil {
 				return "", inspectErr
@@ -912,7 +1052,7 @@ func (s *Service) establishRemoteTrust(
 	if err != nil {
 		return err
 	}
-	expected := zeroObjectID
+	expected := zeroObjectIDFor(candidate)
 	if exists {
 		expected = current
 	}
@@ -947,7 +1087,7 @@ func (s *Service) establishRemoteTrust(
 	if err := checkpoint.save(ctx, StageFetching); err != nil {
 		return err
 	}
-	if _, err := s.runLocal(ctx, path, false, "update-ref", managedRef, candidate, expected); err != nil {
+	if _, err := s.connectRunLocal(ctx, path, false, "update-ref", managedRef, candidate, expected); err != nil {
 		current, exists, inspectErr := s.optionalRefOID(ctx, path, managedRef)
 		if inspectErr != nil {
 			return inspectErr
@@ -991,23 +1131,19 @@ func (s *Service) selectAndMerge(
 	}
 
 	if actual.population == remotePopulationPreCheckout {
-		collision, err := s.ignoredCheckoutCollision(ctx, path, actual.fetchedOID)
-		if err != nil {
-			return err
-		}
-		if collision {
-			return &SafeError{Code: CodeOperationInterrupted, Message: "Git checkout would overwrite ignored local files"}
-		}
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
 			return err
 		}
-		if _, err := s.runLocal(ctx, path, false, "checkout", actual.fetchedOID, "--", "."); err != nil {
+		if err := s.requireSafeUnbornCheckout(ctx, path, actual.fetchedOID); err != nil {
+			return err
+		}
+		if _, err := s.connectRunLocal(ctx, path, false, "checkout", actual.fetchedOID, "--", "."); err != nil {
 			return err
 		}
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
 			return err
 		}
-		if _, err := s.runLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectID); err != nil {
+		if _, err := s.connectRunLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectIDFor(actual.fetchedOID)); err != nil {
 			return err
 		}
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
@@ -1020,7 +1156,7 @@ func (s *Service) selectAndMerge(
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
 			return err
 		}
-		if _, err := s.runLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectID); err != nil {
+		if _, err := s.connectRunLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectIDFor(actual.fetchedOID)); err != nil {
 			return err
 		}
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
@@ -1032,23 +1168,19 @@ func (s *Service) selectAndMerge(
 	} else if actual.population == remotePopulationBranchCreated {
 		// The selected branch already points at the validated fetched candidate.
 	} else if !branchExists && !actual.remoteEmpty && actual.snapshotOID == "" && !detached && currentBranch == branch {
-		collision, err := s.ignoredCheckoutCollision(ctx, path, actual.fetchedOID)
-		if err != nil {
-			return err
-		}
-		if collision {
-			return &SafeError{Code: CodeOperationInterrupted, Message: "Git checkout would overwrite ignored local files"}
-		}
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
 			return err
 		}
-		if _, err := s.runLocal(ctx, path, false, "checkout", actual.fetchedOID, "--", "."); err != nil {
+		if err := s.requireSafeUnbornCheckout(ctx, path, actual.fetchedOID); err != nil {
+			return err
+		}
+		if _, err := s.connectRunLocal(ctx, path, false, "checkout", actual.fetchedOID, "--", "."); err != nil {
 			return err
 		}
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
 			return err
 		}
-		if _, err := s.runLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectID); err != nil {
+		if _, err := s.connectRunLocal(ctx, path, false, "update-ref", "refs/heads/"+branch, actual.fetchedOID, zeroObjectIDFor(actual.fetchedOID)); err != nil {
 			return err
 		}
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
@@ -1062,7 +1194,7 @@ func (s *Service) selectAndMerge(
 			if err := checkpoint.save(ctx, StageSwitching); err != nil {
 				return err
 			}
-			if _, err := s.runLocal(ctx, path, false, "switch", branch); err != nil {
+			if _, err := s.connectRunLocal(ctx, path, false, "switch", branch); err != nil {
 				return err
 			}
 		}
@@ -1079,7 +1211,7 @@ func (s *Service) selectAndMerge(
 		if err := checkpoint.save(ctx, StageSwitching); err != nil {
 			return err
 		}
-		if _, err := s.runLocal(ctx, path, false, "switch", "-c", branch, startOID); err != nil {
+		if _, err := s.connectRunLocal(ctx, path, false, "switch", "-c", branch, startOID); err != nil {
 			return err
 		}
 		branchExists = true
@@ -1134,10 +1266,12 @@ func (s *Service) mergeIfNeeded(
 		args = append(args, "--allow-unrelated-histories")
 	}
 	args = append(args, oid)
-	if _, err := s.runLocal(ctx, path, false, args...); err != nil {
+	if _, err := s.connectRunLocal(ctx, path, false, args...); err != nil {
 		paths, inspectErr := s.unmergedPaths(ctx, path)
 		if inspectErr != nil {
-			return inspectErr
+			checkpoint.value.ConflictPaths = paths
+			conflictErr := newConflictError(paths)
+			return errors.Join(conflictErr, inspectErr, checkpoint.save(ctx, StageMerging))
 		}
 		if len(paths) != 0 {
 			checkpoint.value.ConflictPaths = paths
@@ -1182,7 +1316,7 @@ func (s *Service) requireRemoteUnchanged(
 }
 
 func (s *Service) inspectOriginRemote(ctx context.Context, path, secret string) (RemoteInspection, error) {
-	result, err := s.runNetwork(ctx, path, secret, true, "ls-remote", "--symref", "origin")
+	result, err := s.connectRunNetwork(ctx, path, secret, true, "ls-remote", "--symref", "origin")
 	if err != nil {
 		return RemoteInspection{}, err
 	}
@@ -1194,7 +1328,7 @@ func (s *Service) inspectOriginRemote(ctx context.Context, path, secret string) 
 
 func (s *Service) selectedRemoteOID(ctx context.Context, path, secret, branch string) (string, error) {
 	ref := "refs/heads/" + branch
-	result, err := s.runNetwork(ctx, path, secret, true, "ls-remote", "--exit-code", "--heads", "origin", ref)
+	result, err := s.connectRunNetwork(ctx, path, secret, true, "ls-remote", "--exit-code", "--heads", "origin", ref)
 	if err != nil {
 		if expectedExit(err, 2) {
 			return "", &SafeError{Code: CodeBranchDeleted, Message: "Selected Git branch no longer exists"}
@@ -1235,12 +1369,8 @@ func (s *Service) finishAcceptedInitialize(
 		if !local.HasRepository {
 			return &SafeError{Code: CodeOperationInterrupted, Message: "Git repository is missing after push"}
 		}
-		urls, exists, err := s.originURLs(ctx, path)
-		if err != nil {
+		if err := s.requireOrigin(ctx, path, options.Snapshot.URL); err != nil {
 			return err
-		}
-		if !exists || len(urls) != 1 || urls[0] != options.Snapshot.URL {
-			return &SafeError{Code: CodeOriginMismatch, Message: "Configured origin does not match"}
 		}
 		head, err := s.commitOID(ctx, path, "HEAD")
 		if err != nil {
@@ -1284,11 +1414,11 @@ func (s *Service) finishAcceptedInitialize(
 					return err
 				}
 			}
-			expected := zeroObjectID
+			expected := zeroObjectIDFor(acceptedOID)
 			if exists {
 				expected = current
 			}
-			if _, err := s.runLocal(ctx, path, false, "update-ref", managed, acceptedOID, expected); err != nil {
+			if _, err := s.connectRunLocal(ctx, path, false, "update-ref", managed, acceptedOID, expected); err != nil {
 				return err
 			}
 		}
@@ -1338,7 +1468,7 @@ func managedRemoteRef(branch string) string {
 }
 
 func (s *Service) currentBranch(ctx context.Context, path string) (string, bool, error) {
-	result, err := s.runLocal(ctx, path, true, "symbolic-ref", "--quiet", "--short", "HEAD")
+	result, err := s.connectRunLocal(ctx, path, true, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil {
 		if expectedExit(err, 1) {
 			return "", true, nil
@@ -1367,7 +1497,7 @@ func (s *Service) commitOID(ctx context.Context, path, revision string) (string,
 }
 
 func (s *Service) optionalCommitOID(ctx context.Context, path, revision string) (string, bool, error) {
-	result, err := s.runLocal(ctx, path, true, "rev-parse", "--verify", revision+"^{commit}")
+	result, err := s.connectRunLocal(ctx, path, true, "rev-parse", "--verify", revision+"^{commit}")
 	if err != nil {
 		if expectedExit(err, 1) || expectedExit(err, 128) {
 			return "", false, nil
@@ -1385,7 +1515,7 @@ func (s *Service) optionalCommitOID(ctx context.Context, path, revision string) 
 }
 
 func (s *Service) optionalRefOID(ctx context.Context, path, ref string) (string, bool, error) {
-	result, err := s.runLocal(ctx, path, true, "rev-parse", "--verify", ref)
+	result, err := s.connectRunLocal(ctx, path, true, "rev-parse", "--verify", ref)
 	if err != nil {
 		if expectedExit(err, 1) || expectedExit(err, 128) {
 			return "", false, nil
@@ -1414,7 +1544,7 @@ func (s *Service) requireAncestor(ctx context.Context, path, ancestor, descendan
 }
 
 func (s *Service) isAncestor(ctx context.Context, path, ancestor, descendant string) (bool, error) {
-	result, err := s.runLocal(ctx, path, true, "merge-base", "--is-ancestor", ancestor, descendant)
+	result, err := s.connectRunLocal(ctx, path, true, "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		if result.StdoutTruncated || result.StderrTruncated || result.Stdout != "" {
 			return false, malformedOutputError()
@@ -1428,7 +1558,7 @@ func (s *Service) isAncestor(ctx context.Context, path, ancestor, descendant str
 }
 
 func (s *Service) unrelated(ctx context.Context, path, left, right string) (bool, error) {
-	result, err := s.runLocal(ctx, path, true, "merge-base", left, right)
+	result, err := s.connectRunLocal(ctx, path, true, "merge-base", left, right)
 	if err != nil {
 		if expectedExit(err, 1) {
 			return true, nil
@@ -1446,34 +1576,36 @@ func (s *Service) unrelated(ctx context.Context, path, left, right string) (bool
 }
 
 func (s *Service) unmergedPaths(ctx context.Context, path string) ([]string, error) {
-	result, err := s.runLocal(ctx, path, true, "ls-files", "-u", "-z")
-	if err != nil {
+	result, err := s.connectRunLocal(ctx, path, true, "ls-files", "-u", "-z")
+	if result.Stdout == "" {
+		if result.StdoutTruncated || result.StderrTruncated {
+			return nil, errors.Join(err, malformedOutputError())
+		}
 		return nil, err
 	}
-	if result.StdoutTruncated || result.StderrTruncated {
-		return nil, malformedOutputError()
-	}
-	if result.Stdout == "" {
-		return nil, nil
-	}
-	if !strings.HasSuffix(result.Stdout, "\x00") {
-		return nil, malformedOutputError()
-	}
-	entries := strings.Split(strings.TrimSuffix(result.Stdout, "\x00"), "\x00")
+	malformed := result.StdoutTruncated || result.StderrTruncated || !strings.HasSuffix(result.Stdout, "\x00")
+	entries := strings.Split(result.Stdout, "\x00")
+	entries = entries[:len(entries)-1]
 	paths := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		metadata, path, found := strings.Cut(entry, "\t")
-		if !found || path == "" || strings.ContainsAny(path, "\x00\r\n") {
-			return nil, malformedOutputError()
+		if !found || path == "" {
+			malformed = true
+			continue
 		}
 		fields := strings.Fields(metadata)
 		if len(fields) != 3 || !validGitMode(fields[0]) || !validObjectID(fields[1]) ||
 			(fields[2] != "1" && fields[2] != "2" && fields[2] != "3") {
-			return nil, malformedOutputError()
+			malformed = true
+			continue
 		}
 		paths = append(paths, path)
 	}
-	return sortedUnique(paths), nil
+	paths = sortedUnique(paths)
+	if malformed {
+		return paths, errors.Join(err, malformedOutputError())
+	}
+	return paths, err
 }
 
 func validGitMode(mode string) bool {
@@ -1488,33 +1620,63 @@ func validGitMode(mode string) bool {
 	return true
 }
 
-func (s *Service) ignoredCheckoutCollision(ctx context.Context, path, oid string) (bool, error) {
-	ignoredResult, err := s.runLocal(ctx, path, true, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+func (s *Service) requireSafeUnbornCheckout(ctx context.Context, path, oid string) error {
+	empty, err := s.emptyUnbornIndexAndWorktree(ctx, path)
 	if err != nil {
-		return false, err
+		return err
 	}
-	ignored, err := parseNULPaths(ignoredResult)
-	if err != nil || len(ignored) == 0 {
-		return false, err
+	if !empty {
+		return &SafeError{Code: CodeOperationInterrupted, Message: "Git worktree changed before branch population"}
 	}
-	treeResult, err := s.runLocal(ctx, path, true, "ls-tree", "-r", "--name-only", "-z", oid, "--")
+	treeResult, err := s.connectRunLocal(ctx, path, true, "ls-tree", "-r", "--name-only", "-z", oid, "--")
 	if err != nil {
-		return false, err
+		return err
 	}
 	treePaths, err := parseNULPaths(treeResult)
 	if err != nil {
-		return false, err
+		return err
 	}
-	tree := make(map[string]struct{}, len(treePaths))
 	for _, treePath := range treePaths {
-		tree[treePath] = struct{}{}
-	}
-	for _, ignoredPath := range ignored {
-		if _, exists := tree[ignoredPath]; exists {
-			return true, nil
+		parts := strings.Split(treePath, "/")
+		if !safeGitTreePath(treePath, parts) {
+			return malformedOutputError()
+		}
+		for index := 1; index < len(parts); index++ {
+			prefix := filepath.Join(append([]string{path}, parts[:index]...)...)
+			info, statErr := os.Lstat(prefix)
+			switch {
+			case statErr == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0):
+				return &SafeError{Code: CodeOperationInterrupted, Message: "Git checkout path collides with local files"}
+			case statErr == nil:
+			case errors.Is(statErr, os.ErrNotExist):
+				break
+			default:
+				return &SafeError{Code: CodeOperationInterrupted, Message: "Git checkout path cannot be inspected", cause: statErr}
+			}
+		}
+		leaf := filepath.Join(append([]string{path}, parts...)...)
+		_, statErr := os.Lstat(leaf)
+		switch {
+		case statErr == nil:
+			return &SafeError{Code: CodeOperationInterrupted, Message: "Git checkout path collides with local files"}
+		case errors.Is(statErr, os.ErrNotExist):
+		default:
+			return &SafeError{Code: CodeOperationInterrupted, Message: "Git checkout path cannot be inspected", cause: statErr}
 		}
 	}
-	return false, nil
+	return nil
+}
+
+func safeGitTreePath(path string, parts []string) bool {
+	if path == "" || strings.HasPrefix(path, "/") || filepath.IsAbs(filepath.FromSlash(path)) || filepath.VolumeName(filepath.FromSlash(path)) != "" {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func parseNULPaths(result Result) ([]string, error) {
@@ -1529,7 +1691,7 @@ func parseNULPaths(result Result) ([]string, error) {
 	}
 	paths := strings.Split(strings.TrimSuffix(result.Stdout, "\x00"), "\x00")
 	for _, path := range paths {
-		if path == "" || strings.ContainsAny(path, "\x00\r\n") || filepath.IsAbs(path) {
+		if path == "" || strings.ContainsRune(path, '\x00') || filepath.IsAbs(path) {
 			return nil, malformedOutputError()
 		}
 	}
@@ -1550,6 +1712,10 @@ func sortedUnique(values []string) []string {
 		}
 	}
 	return result[:write]
+}
+
+func zeroObjectIDFor(oid string) string {
+	return strings.Repeat("0", len(oid))
 }
 
 func confirmationRequired(message string) error {
