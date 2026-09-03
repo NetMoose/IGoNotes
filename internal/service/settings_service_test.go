@@ -2573,6 +2573,93 @@ func TestSettingsServiceReplaceConfigReservesExactNameMatchesBeforePathMatches(t
 	}
 }
 
+func TestSettingsServiceReplaceConfigGitPathMatchingRequiresBidirectionalUniqueness(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		renamedFirst bool
+	}{
+		{name: "renamed before alias", renamedFirst: true},
+		{name: "alias before renamed", renamedFirst: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir()
+			completed := true
+			current := model.Base{Name: "old", Path: path}
+			setConfiguredGit(&current)
+			config := model.Config{Bases: []model.Base{current}, CurrentBase: current.Name, SetupCompleted: &completed}
+			service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, path)
+			renamed := current
+			renamed.Name = "renamed"
+			alias := model.Base{Name: "alias", Path: path}
+			input := cloneConfig(config)
+			if test.renamedFirst {
+				input.Bases = []model.Base{renamed, alias}
+			} else {
+				input.Bases = []model.Base{alias, renamed}
+			}
+			input.CurrentBase = renamed.Name
+			beforePathCalls := runtime.pathCalls
+
+			_, err := service.ReplaceConfig(input)
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("ReplaceConfig() error = %v, want ErrInvalidConfig", err)
+			}
+			renamedIndex := 1
+			if test.renamedFirst {
+				renamedIndex = 0
+			}
+			assertFieldError(t, err, fmt.Sprintf("bases[%d].git_url", renamedIndex))
+			if !reflect.DeepEqual(service.GetConfig(), config) || store.saveCalls != 0 {
+				t.Fatalf("rejected replace changed config: config %#v saves %d", service.GetConfig(), store.saveCalls)
+			}
+			if statuses.listCalls != 0 || len(statuses.getCalls)+len(statuses.upsertCalls)+len(statuses.deleteCalls) != 0 {
+				t.Fatalf("rejected replace status calls = list %d get %v upsert %v delete %v", statuses.listCalls, statuses.getCalls, statuses.upsertCalls, statuses.deleteCalls)
+			}
+			if runtime.pathCalls != beforePathCalls || runtime.persistCalls != 0 || len(runtime.transactionCalls) != 0 {
+				t.Fatalf("rejected replace runtime calls = paths %d/%d persists %d transactions %v", runtime.pathCalls, beforePathCalls, runtime.persistCalls, runtime.transactionCalls)
+			}
+		})
+	}
+}
+
+func TestSettingsServiceReplaceConfigGitPathMatchingAllowsAmbiguousZeroFieldAliases(t *testing.T) {
+	for _, renamedFirst := range []bool{true, false} {
+		name := "renamed before alias"
+		if !renamedFirst {
+			name = "alias before renamed"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := t.TempDir()
+			completed := true
+			config := model.Config{Bases: []model.Base{{Name: "old", Path: path}}, CurrentBase: "old", SetupCompleted: &completed}
+			service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, path)
+			renamed := model.Base{Name: "renamed", Path: path}
+			alias := model.Base{Name: "alias", Path: path}
+			input := cloneConfig(config)
+			if renamedFirst {
+				input.Bases = []model.Base{renamed, alias}
+			} else {
+				input.Bases = []model.Base{alias, renamed}
+			}
+			input.CurrentBase = renamed.Name
+
+			response, err := service.ReplaceConfig(input)
+			if err != nil {
+				t.Fatalf("ReplaceConfig() error = %v", err)
+			}
+			if !reflect.DeepEqual(response.Config.Bases, input.Bases) || response.Config.CurrentBase != renamed.Name {
+				t.Fatalf("ReplaceConfig() config = %#v, want %#v", response.Config, input)
+			}
+			if store.saveCalls != 1 || runtime.persistCalls != 1 || len(runtime.transactionCalls) != 0 {
+				t.Fatalf("config/runtime calls = saves %d persists %d transactions %v", store.saveCalls, runtime.persistCalls, runtime.transactionCalls)
+			}
+			if len(statuses.upsertCalls)+len(statuses.deleteCalls) != 0 {
+				t.Fatalf("zero-field aliases mutated statuses: upsert %v delete %v", statuses.upsertCalls, statuses.deleteCalls)
+			}
+		})
+	}
+}
+
 func TestSettingsServiceAllowsNonGitDuplicateCanonicalPaths(t *testing.T) {
 	path := t.TempDir()
 	alias := filepath.Join(t.TempDir(), "base-alias")

@@ -862,6 +862,11 @@ func matchReplaceConfigBases(current, next []model.Base) ([]int, error) {
 			reserved[exact] = true
 		}
 	}
+	candidates := make([]int, len(next))
+	for index := range candidates {
+		candidates[index] = -1
+	}
+	claims := make([]int, len(current))
 	for index := range next {
 		if matches[index] >= 0 {
 			continue
@@ -888,9 +893,14 @@ func matchReplaceConfigBases(current, next []model.Base) ([]int, error) {
 			}
 			unique = currentIndex
 		}
-		matches[index] = unique
+		candidates[index] = unique
 		if unique >= 0 {
-			reserved[unique] = true
+			claims[unique]++
+		}
+	}
+	for index, candidate := range candidates {
+		if candidate >= 0 && claims[candidate] == 1 {
+			matches[index] = candidate
 		}
 	}
 	return matches, nil
