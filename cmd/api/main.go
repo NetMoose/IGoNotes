@@ -94,7 +94,8 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	gitClient := gitcmd.NewClient(gitRunner)
 	gitStatusRepo := repository.NewGitStatusRepository(db)
 	gitValidator := service.NewGitConfigValidator(gitClient)
-	settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, options.base, log.Default(), gitValidator, gitStatusRepo)
+	coordinator := service.NewBaseOperationCoordinator()
+	settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, coordinator, options.base, log.Default(), gitValidator, gitStatusRepo)
 	if err != nil {
 		return fmt.Errorf("инициализировать сервис настроек: %w", err)
 	}

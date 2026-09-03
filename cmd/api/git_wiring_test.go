@@ -85,7 +85,7 @@ func TestGitFoundationConstructionDoesNotExecuteGitOrAccessStatuses(t *testing.T
 	validator := service.NewGitConfigValidator(client)
 	statuses := &countingGitStatusStore{}
 
-	settings, err := service.NewSettingsServiceWithGit(store, notes, "", nil, validator, statuses)
+	settings, err := service.NewSettingsServiceWithGit(store, notes, service.NewBaseOperationCoordinator(), "", nil, validator, statuses)
 	if err != nil {
 		t.Fatalf("NewSettingsServiceWithGit() error = %v", err)
 	}
@@ -114,7 +114,8 @@ func TestRunServerWiresGitFoundationBeforeSystemRoutesAndServing(t *testing.T) {
 		"gitClient := gitcmd.NewClient(gitRunner)",
 		"gitStatusRepo := repository.NewGitStatusRepository(db)",
 		"gitValidator := service.NewGitConfigValidator(gitClient)",
-		"settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, options.base, log.Default(), gitValidator, gitStatusRepo)",
+		"coordinator := service.NewBaseOperationCoordinator()",
+		"settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, coordinator, options.base, log.Default(), gitValidator, gitStatusRepo)",
 		"gitProbeService := service.NewGitProbeService(settingsService, gitClient)",
 		"gitStatusService := service.NewGitStatusService(settingsService, gitStatusRepo)",
 		"gitHandler := handlers.NewGitHandler(gitProbeService, settingsService, gitStatusService)",

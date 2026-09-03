@@ -40,7 +40,7 @@ func newSettingsHandlerFixture(t *testing.T) settingsHandlerFixture {
 		t.Fatalf("NoteService.SyncFS() error = %v", err)
 	}
 	config := service.NewConfigService(filepath.Join(root, "config", "config.json"))
-	settings, err := service.NewSettingsService(config, notes, "", nil)
+	settings, err := service.NewSettingsService(config, notes, service.NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("service.NewSettingsService() error = %v", err)
 	}

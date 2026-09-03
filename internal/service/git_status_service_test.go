@@ -185,6 +185,7 @@ func TestGitStatusServiceSerializesConfigAndStatusGeneration(t *testing.T) {
 	settings, err := NewSettingsServiceWithGit(
 		&fakeConfigStore{config: &config},
 		&fakeBaseRuntime{path: path},
+		NewBaseOperationCoordinator(),
 		"",
 		nil,
 		nil,

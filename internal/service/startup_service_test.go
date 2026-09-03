@@ -101,7 +101,7 @@ func TestEmptyConfigStartupCanCompleteSetup(t *testing.T) {
 
 			notes := newProductionNoteService(t, basePath)
 			store := &countingConfigStore{ConfigService: configService}
-			settings, err := NewSettingsService(store, notes, "", nil)
+			settings, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
 			if err != nil {
 				t.Fatalf("NewSettingsService() error = %v, want nil", err)
 			}
@@ -165,7 +165,7 @@ func TestExplicitIncompleteEmptyConfigStartupDoesNotMigrate(t *testing.T) {
 		t.Fatalf("ResolveStartupBase() error = %v, want nil", err)
 	}
 	store := &countingConfigStore{ConfigService: configService}
-	settings, err := NewSettingsService(store, newProductionNoteService(t, basePath), "", nil)
+	settings, err := NewSettingsService(store, newProductionNoteService(t, basePath), NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v, want nil", err)
 	}

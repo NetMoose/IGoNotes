@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -320,6 +321,248 @@ func cloneGitStatusForTest(status model.GitStatus) model.GitStatus {
 	return status
 }
 
+func TestSettingsServiceMutationsWaitAtCoordinatorBeforeSettingsLock(t *testing.T) {
+	mutations := []struct {
+		name string
+		call func(*SettingsService, string, string) error
+	}{
+		{name: "complete setup", call: func(settings *SettingsService, _, mutationPath string) error {
+			_, err := settings.CompleteSetup(model.BaseMutationRequest{Mode: "connect", Name: "setup", Path: mutationPath})
+			return err
+		}},
+		{name: "add base", call: func(settings *SettingsService, _, mutationPath string) error {
+			_, err := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: mutationPath})
+			return err
+		}},
+		{name: "switch base", call: func(settings *SettingsService, _, _ string) error {
+			_, err := settings.SwitchBase("other")
+			return err
+		}},
+		{name: "update base", call: func(settings *SettingsService, otherPath, _ string) error {
+			_, err := settings.UpdateBase("other", model.BaseUpdateRequest{Name: "renamed", Path: otherPath})
+			return err
+		}},
+		{name: "forget base", call: func(settings *SettingsService, _, _ string) error {
+			_, err := settings.ForgetBase("other")
+			return err
+		}},
+		{name: "replace config", call: func(settings *SettingsService, _, _ string) error {
+			_, err := settings.ReplaceConfig(settings.GetConfig())
+			return err
+		}},
+		{name: "configure git", call: func(settings *SettingsService, _, _ string) error {
+			_, err := settings.ConfigureGit(context.Background(), "active", model.GitConfigRequest{GitURL: "git@example.test:notes.git", GitBranch: "main"})
+			return err
+		}},
+		{name: "disable git", call: func(settings *SettingsService, _, _ string) error {
+			_, err := settings.DisableGit(context.Background(), "active")
+			return err
+		}},
+	}
+
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			coordinator := NewBaseOperationCoordinator()
+			settings, otherPath := newConfiguredSettingsServiceWithCoordinator(t, coordinator)
+			mutationPath := t.TempDir()
+			coordinator.Lock()
+			t.Cleanup(func() {
+				if coordinator != nil {
+					coordinator.Unlock()
+				}
+			})
+
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				close(started)
+				done <- mutation.call(settings, otherPath, mutationPath)
+			}()
+			<-started
+			for range 10 {
+				runtime.Gosched()
+			}
+
+			if !settings.mu.TryLock() {
+				coordinator.Unlock()
+				coordinator = nil
+				<-done
+				t.Fatal("settings lock was taken while mutation should be waiting at coordinator")
+			}
+			settings.mu.Unlock()
+			select {
+			case err := <-done:
+				coordinator.Unlock()
+				coordinator = nil
+				t.Fatalf("mutation completed while coordinator was held: %v", err)
+			default:
+			}
+
+			coordinator.Unlock()
+			coordinator = nil
+			if err := <-done; err != nil {
+				t.Fatalf("mutation after coordinator release error = %v", err)
+			}
+		})
+	}
+}
+
+func newConfiguredSettingsServiceWithCoordinator(t *testing.T, coordinator *BaseOperationCoordinator) (*SettingsService, string) {
+	t.Helper()
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	completed := false
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: activePath},
+			{Name: "other", Path: otherPath},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	settings, err := NewSettingsServiceWithGit(
+		&fakeConfigStore{config: &config},
+		&fakeBaseRuntime{path: activePath},
+		coordinator,
+		"",
+		nil,
+		&fakeGitConfigValidator{},
+		&fakeGitStatusStore{statuses: make(map[string]model.GitStatus)},
+	)
+	if err != nil {
+		t.Fatalf("NewSettingsServiceWithGit() error = %v", err)
+	}
+	return settings, otherPath
+}
+
+func TestNewSettingsServiceRejectsNilCoordinator(t *testing.T) {
+	settings, err := NewSettingsService(&fakeConfigStore{}, &fakeBaseRuntime{}, nil, "", nil)
+	if settings != nil {
+		t.Errorf("NewSettingsService() service = %#v, want nil", settings)
+	}
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewSettingsService() error = %v, want ErrInvalidConfig", err)
+	}
+	if !strings.Contains(err.Error(), "coordinator") {
+		t.Errorf("NewSettingsService() error = %q, want coordinator context", err)
+	}
+}
+
+func TestNewSettingsServiceWithGitRejectsNilCoordinator(t *testing.T) {
+	settings, err := NewSettingsServiceWithGit(
+		&fakeConfigStore{},
+		&fakeBaseRuntime{},
+		nil,
+		"",
+		nil,
+		&fakeGitConfigValidator{},
+		&fakeGitStatusStore{},
+	)
+	if settings != nil {
+		t.Errorf("NewSettingsServiceWithGit() service = %#v, want nil", settings)
+	}
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewSettingsServiceWithGit() error = %v, want ErrInvalidConfig", err)
+	}
+	if !strings.Contains(err.Error(), "coordinator") {
+		t.Errorf("NewSettingsServiceWithGit() error = %q, want coordinator context", err)
+	}
+}
+
+func TestSettingsServiceSuccessfulPathReplacementClearsRemovedConflictOnly(t *testing.T) {
+	settings, store, coordinator, activePath, otherPath := newConflictSettingsService(t)
+	newPath := t.TempDir()
+	coordinator.SetConflict(activePath, true)
+	coordinator.SetConflict(otherPath, true)
+
+	if _, err := settings.UpdateBase("other", model.BaseUpdateRequest{Name: "other", Path: newPath}); err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	if err := coordinator.CheckMutation(otherPath); err != nil {
+		t.Errorf("removed path conflict = %v, want nil", err)
+	}
+	if err := coordinator.CheckMutation(activePath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retained active path conflict = %v, want ErrGitConflictPending", err)
+	}
+	if store.saveCalls != 1 {
+		t.Errorf("Save calls = %d, want 1", store.saveCalls)
+	}
+}
+
+func TestSettingsServiceSamePathRenameRetainsConflict(t *testing.T) {
+	settings, _, coordinator, _, otherPath := newConflictSettingsService(t)
+	coordinator.SetConflict(otherPath, true)
+
+	if _, err := settings.UpdateBase("other", model.BaseUpdateRequest{Name: "renamed", Path: otherPath}); err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	if err := coordinator.CheckMutation(otherPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("same-path conflict = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestSettingsServiceForgetBaseClearsRemovedConflict(t *testing.T) {
+	settings, _, coordinator, _, otherPath := newConflictSettingsService(t)
+	coordinator.SetConflict(otherPath, true)
+
+	if _, err := settings.ForgetBase("other"); err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+	if err := coordinator.CheckMutation(otherPath); err != nil {
+		t.Errorf("forgotten path conflict = %v, want nil", err)
+	}
+}
+
+func TestSettingsServiceFailedPersistenceRetainsConflict(t *testing.T) {
+	settings, store, coordinator, _, otherPath := newConflictSettingsService(t)
+	saveErr := errors.New("save failed")
+	store.saveErr = saveErr
+	coordinator.SetConflict(otherPath, true)
+
+	if _, err := settings.ForgetBase("other"); !errors.Is(err, saveErr) {
+		t.Fatalf("ForgetBase() error = %v, want %v", err, saveErr)
+	}
+	if err := coordinator.CheckMutation(otherPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("conflict after failed persistence = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestSettingsServiceReplaceConfigClearsRemovedConflict(t *testing.T) {
+	settings, _, coordinator, _, otherPath := newConflictSettingsService(t)
+	coordinator.SetConflict(otherPath, true)
+	next := settings.GetConfig()
+	next.Bases = next.Bases[:1]
+
+	if _, err := settings.ReplaceConfig(next); err != nil {
+		t.Fatalf("ReplaceConfig() error = %v", err)
+	}
+	if err := coordinator.CheckMutation(otherPath); err != nil {
+		t.Errorf("removed replacement path conflict = %v, want nil", err)
+	}
+}
+
+func newConflictSettingsService(t *testing.T) (*SettingsService, *fakeConfigStore, *BaseOperationCoordinator, string, string) {
+	t.Helper()
+	activePath := t.TempDir()
+	otherPath := t.TempDir()
+	completed := true
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: activePath},
+			{Name: "other", Path: otherPath},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	store := &fakeConfigStore{config: &config}
+	coordinator := NewBaseOperationCoordinator()
+	settings, err := NewSettingsService(store, &fakeBaseRuntime{path: activePath}, coordinator, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	return settings, store, coordinator, activePath, otherPath
+}
+
 func TestNewSettingsServiceMigratesLegacyConfig(t *testing.T) {
 	store := &fakeConfigStore{config: &model.Config{
 		BaseDir:     "/notes",
@@ -327,7 +570,7 @@ func TestNewSettingsServiceMigratesLegacyConfig(t *testing.T) {
 		CurrentBase: "personal",
 	}}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -346,7 +589,7 @@ func TestNewSettingsServiceMigratesStructurallyEmptyConfig(t *testing.T) {
 	store := &fakeConfigStore{config: &model.Config{}}
 	notes := newTestNoteService(t, &fakeNoteRepository{}, "")
 
-	service, err := NewSettingsService(store, notes, "", nil)
+	service, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -373,7 +616,7 @@ func TestNewSettingsServiceMigrationRejectsClosedRuntimeWithoutSave(t *testing.T
 		t.Fatalf("NoteService.Close() error = %v", err)
 	}
 
-	service, err := NewSettingsService(store, notes, "", nil)
+	service, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -393,7 +636,7 @@ func TestSettingsServiceEmptyHealthyRuntimePersistsConfigOnlyMutation(t *testing
 	config := model.Config{SetupCompleted: &completed}
 	store := &fakeConfigStore{config: &config}
 	notes := newTestNoteService(t, &fakeNoteRepository{}, "")
-	service, err := NewSettingsService(store, notes, "", nil)
+	service, err := NewSettingsService(store, notes, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -417,7 +660,7 @@ func TestSettingsServiceEmptyHealthyRuntimePersistsConfigOnlyMutation(t *testing
 func TestNewSettingsServiceRejectsCLIBaseForStructurallyEmptyConfig(t *testing.T) {
 	store := &fakeConfigStore{config: &model.Config{}}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{}, "missing", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{}, NewBaseOperationCoordinator(), "missing", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -458,7 +701,7 @@ func TestNewSettingsServicePreservesExplicitSetupState(t *testing.T) {
 			config.SetupCompleted = &completed
 			store := &fakeConfigStore{config: &config}
 
-			service, err := NewSettingsService(store, &fakeBaseRuntime{path: tt.runtimePath}, "", nil)
+			service, err := NewSettingsService(store, &fakeBaseRuntime{path: tt.runtimePath}, NewBaseOperationCoordinator(), "", nil)
 			if err != nil {
 				t.Fatalf("NewSettingsService() error = %v", err)
 			}
@@ -476,7 +719,7 @@ func TestNewSettingsServiceReturnsMigrationSaveError(t *testing.T) {
 	saveErr := errors.New("disk full")
 	store := &fakeConfigStore{config: &model.Config{}, saveErr: saveErr}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{}, NewBaseOperationCoordinator(), "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -501,7 +744,7 @@ func TestNewSettingsServiceAppliesCLIBaseToSnapshotOnly(t *testing.T) {
 	}}
 	runtime := &fakeBaseRuntime{path: filepath.Join("notes", ".", "work")}
 
-	service, err := NewSettingsService(store, runtime, "work", nil)
+	service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "work", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -530,7 +773,7 @@ func TestNewSettingsServiceRejectsUnknownCLIBase(t *testing.T) {
 		SetupCompleted: &completed,
 	}}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/work"}, "work", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/work"}, NewBaseOperationCoordinator(), "work", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -547,7 +790,7 @@ func TestNewSettingsServiceRejectsMismatchedRuntimePath(t *testing.T) {
 		SetupCompleted: &completed,
 	}}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, "work", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, NewBaseOperationCoordinator(), "work", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -564,7 +807,7 @@ func TestNewSettingsServiceRejectsMismatchedRuntimePath(t *testing.T) {
 }
 
 func TestNewSettingsServiceRejectsNilLoadedConfig(t *testing.T) {
-	service, err := NewSettingsService(&fakeConfigStore{}, &fakeBaseRuntime{}, "", nil)
+	service, err := NewSettingsService(&fakeConfigStore{}, &fakeBaseRuntime{}, NewBaseOperationCoordinator(), "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -579,6 +822,7 @@ func TestNewSettingsServiceReturnsLoadError(t *testing.T) {
 	service, err := NewSettingsService(
 		&fakeConfigStore{loadErr: loadErr},
 		&fakeBaseRuntime{},
+		NewBaseOperationCoordinator(),
 		"",
 		nil,
 	)
@@ -594,7 +838,7 @@ func TestNewSettingsServiceReturnsLoadError(t *testing.T) {
 }
 
 func TestNewSettingsServiceRejectsNilConfigStore(t *testing.T) {
-	service, err := NewSettingsService(nil, &fakeBaseRuntime{}, "", nil)
+	service, err := NewSettingsService(nil, &fakeBaseRuntime{}, NewBaseOperationCoordinator(), "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -610,7 +854,7 @@ func TestNewSettingsServiceRejectsNilBaseRuntime(t *testing.T) {
 	completed := false
 	store := &fakeConfigStore{config: &model.Config{SetupCompleted: &completed}}
 
-	service, err := NewSettingsService(store, nil, "", nil)
+	service, err := NewSettingsService(store, nil, NewBaseOperationCoordinator(), "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -630,7 +874,7 @@ func TestNewSettingsServiceRejectsUnknownPersistedCurrentBase(t *testing.T) {
 		SetupCompleted: &completed,
 	}}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/work"}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/work"}, NewBaseOperationCoordinator(), "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -650,7 +894,7 @@ func TestNewSettingsServiceRejectsMismatchedPersistedCurrentBasePath(t *testing.
 		SetupCompleted: &completed,
 	}}
 
-	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, NewBaseOperationCoordinator(), "", nil)
 	if service != nil {
 		t.Errorf("NewSettingsService() service = %#v, want nil", service)
 	}
@@ -675,7 +919,7 @@ func TestNewSettingsServiceAcceptsMatchingPersistedCurrentBase(t *testing.T) {
 	}}
 	runtime := &fakeBaseRuntime{path: filepath.Join("notes", ".", "work")}
 
-	service, err := NewSettingsService(store, runtime, "", nil)
+	service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -697,7 +941,7 @@ func TestSettingsServiceGetConfigReturnsDeepSnapshot(t *testing.T) {
 		CurrentBase:    "personal",
 		SetupCompleted: &completed,
 	}}
-	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: "/notes/personal"}, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -808,7 +1052,7 @@ func TestSettingsServiceCompleteSetupRejectsRepeatedSetupBeforeValidation(t *tes
 	}
 	store := &fakeConfigStore{config: &config}
 	runtime := &fakeBaseRuntime{path: basePath}
-	service, err := NewSettingsService(store, runtime, "", nil)
+	service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -966,7 +1210,7 @@ func TestSettingsServiceCompleteSetupFromEmptyRuntimeRollsBackAndPreservesCreate
 	original := model.Config{SetupCompleted: &completed}
 	store := &fakeConfigStore{config: &original, saveErr: errors.New("disk full")}
 	runtime := &fakeBaseRuntime{}
-	service, err := NewSettingsService(store, runtime, "", nil)
+	service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -1532,7 +1776,7 @@ func TestSettingsServiceSwitchBaseRejectsRuntimePathResolutionFailures(t *testin
 		}
 		store := &fakeConfigStore{config: &config}
 		runtime := &fakeBaseRuntime{path: activePath}
-		service, err := NewSettingsService(store, runtime, "", nil)
+		service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 		if err != nil {
 			t.Fatalf("NewSettingsService() error = %v", err)
 		}
@@ -1608,7 +1852,7 @@ func TestSettingsServiceForgetBaseValidatesAndPreservesFiles(t *testing.T) {
 		config := model.Config{Bases: []model.Base{{Name: "active", Path: activePath}}, CurrentBase: "active", SetupCompleted: &completed}
 		store := &fakeConfigStore{config: &config}
 		runtime := &fakeBaseRuntime{path: activePath}
-		svc, err := NewSettingsService(store, runtime, "", nil)
+		svc, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 		if err != nil {
 			t.Fatalf("NewSettingsService() error = %v", err)
 		}
@@ -2020,7 +2264,7 @@ func TestSettingsServiceConcurrentTask7MutationsAreSerialized(t *testing.T) {
 	}
 	store := &fakeConfigStore{config: &original}
 	runtime := &fakeBaseRuntime{path: activePath}
-	service, err := NewSettingsService(store, runtime, "", nil)
+	service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -2088,7 +2332,7 @@ func TestNewSettingsServiceWithGitDoesNotCallGitDependencies(t *testing.T) {
 	validator := &fakeGitConfigValidator{err: errors.New("must not validate at startup")}
 	statuses := &exactGitStatusStore{}
 
-	service, err := NewSettingsServiceWithGit(&fakeConfigStore{config: &config}, &fakeBaseRuntime{path: basePath}, "", nil, validator, statuses)
+	service, err := NewSettingsServiceWithGit(&fakeConfigStore{config: &config}, &fakeBaseRuntime{path: basePath}, NewBaseOperationCoordinator(), "", nil, validator, statuses)
 	if err != nil {
 		t.Fatalf("NewSettingsServiceWithGit() error = %v", err)
 	}
@@ -2175,7 +2419,7 @@ func TestSettingsServiceGitMutationsRequireDependenciesAndExactBase(t *testing.T
 	completed := true
 	config := model.Config{Bases: []model.Base{{Name: "Work", Path: basePath}}, CurrentBase: "Work", SetupCompleted: &completed}
 	store := &fakeConfigStore{config: &config}
-	service, err := NewSettingsService(store, &fakeBaseRuntime{path: basePath}, "", nil)
+	service, err := NewSettingsService(store, &fakeBaseRuntime{path: basePath}, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2284,7 +2528,7 @@ func TestSettingsServiceDisableGitAfterRepositoryPathDisappears(t *testing.T) {
 	runtime := &fakeBaseRuntime{path: activePath}
 	statuses := &fakeGitStatusStore{statuses: make(map[string]model.GitStatus)}
 	validator := &fakeGitConfigValidator{}
-	service, err := NewSettingsServiceWithGit(store, runtime, "", nil, validator, statuses)
+	service, err := NewSettingsServiceWithGit(store, runtime, NewBaseOperationCoordinator(), "", nil, validator, statuses)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3431,7 +3675,7 @@ func newGitSettingsServiceForConfig(
 	runtime := &fakeBaseRuntime{path: runtimePath}
 	validator := &fakeGitConfigValidator{}
 	statuses := &fakeGitStatusStore{statuses: make(map[string]model.GitStatus)}
-	service, err := NewSettingsServiceWithGit(store, runtime, "", nil, validator, statuses)
+	service, err := NewSettingsServiceWithGit(store, runtime, NewBaseOperationCoordinator(), "", nil, validator, statuses)
 	if err != nil {
 		t.Fatalf("NewSettingsServiceWithGit() error = %v", err)
 	}
@@ -3480,7 +3724,7 @@ func newGitSettingsService(t *testing.T) (*SettingsService, *fakeConfigStore, *f
 	runtime := &fakeBaseRuntime{path: basePath}
 	validator := &fakeGitConfigValidator{}
 	statuses := &fakeGitStatusStore{statuses: make(map[string]model.GitStatus)}
-	service, err := NewSettingsServiceWithGit(store, runtime, "", nil, validator, statuses)
+	service, err := NewSettingsServiceWithGit(store, runtime, NewBaseOperationCoordinator(), "", nil, validator, statuses)
 	if err != nil {
 		t.Fatalf("NewSettingsServiceWithGit() error = %v", err)
 	}
@@ -3516,7 +3760,7 @@ func newIncompleteSettingsService(t *testing.T) (*SettingsService, *fakeConfigSt
 	}
 	store := &fakeConfigStore{config: &config}
 	runtime := &fakeBaseRuntime{path: defaultPath}
-	service, err := NewSettingsService(store, runtime, "", nil)
+	service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -3537,7 +3781,7 @@ func newConfiguredSettingsService(t *testing.T, activePath, otherPath string) (*
 	}
 	store := &fakeConfigStore{config: &config}
 	runtime := &fakeBaseRuntime{path: activePath}
-	service, err := NewSettingsService(store, runtime, "", nil)
+	service, err := NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}

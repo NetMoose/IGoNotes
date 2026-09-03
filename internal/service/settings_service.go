@@ -42,11 +42,12 @@ type BaseRuntime interface {
 }
 
 type SettingsService struct {
-	// Lock ordering: SettingsService.mu precedes BaseRuntime locks, which precede
-	// ConfigStore.Save. Neither dependency may call back into an earlier layer.
+	// Lock ordering: coordinator -> SettingsService.mu -> future NoteService.baseMu
+	// -> repository/SQLite. Dependencies must not call back into an earlier layer.
 	mu           sync.RWMutex
 	store        ConfigStore
 	notes        BaseRuntime
+	coordinator  *BaseOperationCoordinator
 	logger       *log.Logger
 	gitValidator GitConfigValidator
 	gitStatuses  GitStatusStore
@@ -57,15 +58,19 @@ type SettingsService struct {
 func NewSettingsService(
 	store ConfigStore,
 	notes BaseRuntime,
+	coordinator *BaseOperationCoordinator,
 	activeBaseName string,
 	logger *log.Logger,
 ) (*SettingsService, error) {
-	return NewSettingsServiceWithGit(store, notes, activeBaseName, logger, nil, nil)
+	return NewSettingsServiceWithGit(store, notes, coordinator, activeBaseName, logger, nil, nil)
 }
 
+// NewSettingsServiceWithGit may call BaseRuntime without holding coordinator
+// only during this constructor, before the returned service can be published.
 func NewSettingsServiceWithGit(
 	store ConfigStore,
 	notes BaseRuntime,
+	coordinator *BaseOperationCoordinator,
 	activeBaseName string,
 	logger *log.Logger,
 	gitValidator GitConfigValidator,
@@ -76,6 +81,9 @@ func NewSettingsServiceWithGit(
 	}
 	if notes == nil {
 		return nil, fmt.Errorf("base runtime: %w", ErrInvalidConfig)
+	}
+	if coordinator == nil {
+		return nil, fmt.Errorf("base operation coordinator: %w", ErrInvalidConfig)
 	}
 
 	loadedConfig, err := store.Load()
@@ -133,11 +141,22 @@ func NewSettingsServiceWithGit(
 	return &SettingsService{
 		store:        store,
 		notes:        notes,
+		coordinator:  coordinator,
 		logger:       logger,
 		gitValidator: gitValidator,
 		gitStatuses:  gitStatuses,
 		config:       cloneConfig(config),
 	}, nil
+}
+
+func (s *SettingsService) lockMutation() {
+	s.coordinator.Lock()
+	s.mu.Lock()
+}
+
+func (s *SettingsService) unlockMutation() {
+	s.mu.Unlock()
+	s.coordinator.Unlock()
 }
 
 func (s *SettingsService) GetConfig() model.Config {
@@ -250,7 +269,7 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 		return fmt.Errorf("save settings: %w", err)
 	}
 	if matches {
-		s.config = cloneConfig(next)
+		s.publishConfigLocked(next)
 		return nil
 	}
 	if targetPath == "" {
@@ -276,8 +295,28 @@ func (s *SettingsService) applyConfigLocked(next model.Config, targetPath string
 		return operationErr
 	}
 
-	s.config = cloneConfig(next)
+	s.publishConfigLocked(next)
 	return nil
+}
+
+func (s *SettingsService) publishConfigLocked(next model.Config) {
+	previous := s.config
+	s.config = cloneConfig(next)
+	retainedPaths := make(map[string]struct{}, len(next.Bases))
+	for _, base := range next.Bases {
+		if base.Path != "" {
+			retainedPaths[filepath.Clean(base.Path)] = struct{}{}
+		}
+	}
+	for _, base := range previous.Bases {
+		if base.Path == "" {
+			continue
+		}
+		path := filepath.Clean(base.Path)
+		if _, retained := retainedPaths[path]; !retained {
+			s.coordinator.SetConflict(path, false)
+		}
+	}
 }
 
 type gitStatusChange struct {
@@ -481,8 +520,8 @@ func validLiteralGitBranch(branch string) bool {
 }
 
 func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request model.GitConfigRequest) (model.GitConfigResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.GitConfigResponse{}, s.degraded
@@ -528,8 +567,8 @@ func (s *SettingsService) ConfigureGit(ctx context.Context, name string, request
 }
 
 func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.GitConfigResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.GitConfigResponse{}, s.degraded
@@ -566,8 +605,8 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 }
 
 func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (model.SettingsResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.SettingsResponse{}, s.degraded
@@ -609,8 +648,8 @@ func ensureUniqueName(config model.Config, name, except string) error {
 }
 
 func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.SettingsResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.SettingsResponse{}, s.degraded
@@ -638,8 +677,8 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 }
 
 func (s *SettingsService) UpdateBase(oldName string, request model.BaseUpdateRequest) (model.SettingsResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.SettingsResponse{}, s.degraded
@@ -684,8 +723,8 @@ func (s *SettingsService) UpdateBase(oldName string, request model.BaseUpdateReq
 }
 
 func (s *SettingsService) ForgetBase(name string) (model.SettingsResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.SettingsResponse{}, s.degraded
@@ -714,8 +753,8 @@ func (s *SettingsService) ForgetBase(name string) (model.SettingsResponse, error
 }
 
 func (s *SettingsService) SwitchBase(name string) (model.SettingsResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.SettingsResponse{}, s.degraded
@@ -734,8 +773,8 @@ func (s *SettingsService) SwitchBase(name string) (model.SettingsResponse, error
 }
 
 func (s *SettingsService) ReplaceConfig(input model.Config) (model.SettingsResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockMutation()
+	defer s.unlockMutation()
 
 	if s.degraded != nil {
 		return model.SettingsResponse{}, s.degraded

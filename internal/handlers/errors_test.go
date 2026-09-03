@@ -233,7 +233,7 @@ func TestWriteServiceErrorDoesNotLeakServiceFieldErrorCause(t *testing.T) {
 	incomplete := false
 	store := &handlerConfigStore{config: model.Config{SetupCompleted: &incomplete}}
 	notes := service.NewNoteService(handlerNoteRepository{}, "")
-	settings, err := service.NewSettingsService(store, notes, "", nil)
+	settings, err := service.NewSettingsService(store, notes, service.NewBaseOperationCoordinator(), "", nil)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
