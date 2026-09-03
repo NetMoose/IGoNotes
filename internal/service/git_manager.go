@@ -607,11 +607,17 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 		if transitionErr != nil {
 			recoveryErrors = append(recoveryErrors, transitionErr)
 			m.coordinator.SetConflict(current.Path, true)
-			safeErr := managerSafeError(transitionErr)
 			status := model.GitStatus{
-				Base: current.Name, RepositoryPath: current.Path, State: model.GitStateNeedsReconnect,
-				ChangedPaths: []string{}, RemoteOID: result.RemoteOID,
-				Error: &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field},
+				Base: current.Name, RepositoryPath: current.Path, ChangedPaths: []string{}, RemoteOID: result.RemoteOID,
+			}
+			if isConflict {
+				status.State = model.GitStateConflict
+				status.ChangedPaths = sortedManagerPaths(append(result.ConflictPaths, conflict.Paths...))
+				status.Error = &model.APIError{Code: string(gitcmd.CodeGitConflict), Message: "Git merge has conflicts"}
+			} else {
+				safeErr := managerSafeError(transitionErr)
+				status.State = model.GitStateNeedsReconnect
+				status.Error = &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field}
 			}
 			if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
 				recoveryErrors = append(recoveryErrors, persistenceError(statusErr))

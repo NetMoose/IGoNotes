@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -434,6 +435,9 @@ func TestGitManagerQueueRejectsStaleBeforeDurableState(t *testing.T) {
 }
 
 func TestGitManagerQueueCoordinatorOrderingAndUnlockedManagerWait(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
 	for _, kind := range []gitcmd.OperationKind{gitcmd.OperationInitialize, gitcmd.OperationSync} {
 		t.Run(string(kind), func(t *testing.T) {
 			base := configuredManagerBase("work", t.TempDir())
@@ -457,6 +461,7 @@ func TestGitManagerQueueCoordinatorOrderingAndUnlockedManagerWait(t *testing.T) 
 				result <- err
 			}()
 			<-coordinatorAttempting
+			runtime.Gosched()
 			if !fixture.manager.mu.TryLock() {
 				t.Fatal("queue retained manager mutex while waiting for coordinator")
 			}
@@ -1430,6 +1435,91 @@ func TestGitManagerRecoveryFinishFailureImmediatelyFailsClosed(t *testing.T) {
 	}
 	if network.Load() != 0 {
 		t.Fatalf("recovery network calls = %d", network.Load())
+	}
+}
+
+func TestGitManagerRecoveryTransitionFailurePreservesDurableConflictAcrossRestart(t *testing.T) {
+	for _, transition := range []string{"checkpoint", "finish"} {
+		t.Run(transition, func(t *testing.T) {
+			fixture, base, head, network := newManagerRecoveryFixture(t)
+			now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
+			op := gitcmd.Operation{
+				ID: strings.Repeat("8", 32), BaseName: base.Name, RepoPath: base.Path,
+				ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+				Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageMerging,
+				Branch: base.Branch, RemoteOID: head, CreatedAt: now, UpdatedAt: now,
+			}
+			if transition == "checkpoint" {
+				op.RemoteOID = ""
+				op.CandidateOID = head
+				runManagerGit(t, base.Path, "update-ref", "refs/igonotes/fetch/"+op.ID, head)
+			}
+			if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+				t.Fatal(err)
+			}
+			wantPaths := []string{"a.md", "z.md"}
+			if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+				Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict,
+				OperationID: op.ID, Stage: string(gitcmd.StageMerging), ChangedPaths: wantPaths,
+				RemoteOID: head,
+				Error:     &model.APIError{Code: string(gitcmd.CodeGitConflict), Message: "Git merge has conflicts"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			trigger := "reject_durable_conflict_" + transition
+			condition := "NEW.state = 'running'"
+			if transition == "finish" {
+				condition = "NEW.state = 'conflict'"
+			}
+			if _, err := fixture.db.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON git_operations
+				WHEN %s BEGIN SELECT RAISE(ABORT, 'secret durable conflict transition failure'); END`, trigger, condition)); err != nil {
+				t.Fatal(err)
+			}
+
+			err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base})
+			if err == nil || !strings.Contains(err.Error(), "Git operation persistence failed") || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("first RecoverLocal() error = %v, want safe %s failure", err, transition)
+			}
+			status, found, statusErr := fixture.statuses.Get(context.Background(), base.Path)
+			if statusErr != nil || !found || status.State != model.GitStateConflict ||
+				!reflect.DeepEqual(status.ChangedPaths, wantPaths) || status.Error == nil || status.Error.Code != string(gitcmd.CodeGitConflict) {
+				t.Fatalf("status after %s failure = %#v, %v, %v; want durable conflict %v", transition, status, found, statusErr, wantPaths)
+			}
+			if !errors.Is(fixture.coordinator.CheckMutation(base.Path), ErrGitConflictPending) {
+				t.Fatalf("%s failure reopened mutation gate", transition)
+			}
+			if active, found, err := fixture.operations.ActiveByPath(context.Background(), base.Path); err != nil || !found || active.ID != op.ID {
+				t.Fatalf("active journal after %s failure = %#v, %v, %v", transition, active, found, err)
+			}
+
+			if _, err := fixture.db.Exec("DROP TRIGGER " + trigger); err != nil {
+				t.Fatal(err)
+			}
+			restartCoordinator := NewBaseOperationCoordinator()
+			restarted := NewGitManager(
+				fixture.manager.gitService, fixture.statuses, fixture.operations, fixture.manager.prober,
+				fixture.snapshots.get, fixture.notes, restartCoordinator,
+			)
+			t.Cleanup(func() { _ = restarted.Close() })
+			if err := restarted.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+				t.Fatalf("restart RecoverLocal() error = %v", err)
+			}
+			status, found, statusErr = fixture.statuses.Get(context.Background(), base.Path)
+			if statusErr != nil || !found || status.State != model.GitStateConflict ||
+				!reflect.DeepEqual(status.ChangedPaths, wantPaths) || status.Error == nil || status.Error.Code != string(gitcmd.CodeGitConflict) {
+				t.Fatalf("status after restart = %#v, %v, %v; want durable conflict %v", status, found, statusErr, wantPaths)
+			}
+			if !errors.Is(restartCoordinator.CheckMutation(base.Path), ErrGitConflictPending) {
+				t.Fatal("restart did not republish durable conflict gate")
+			}
+			stored, found, lookupErr := fixture.operations.LatestByPath(context.Background(), base.Path)
+			if lookupErr != nil || !found || stored.State != gitcmd.OperationConflict || !reflect.DeepEqual(stored.ConflictPaths, wantPaths) {
+				t.Fatalf("journal after restart = %#v, %v, %v", stored, found, lookupErr)
+			}
+			if network.Load() != 0 {
+				t.Fatalf("recovery network calls = %d", network.Load())
+			}
+		})
 	}
 }
 
