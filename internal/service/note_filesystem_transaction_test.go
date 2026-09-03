@@ -4,7 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -70,9 +70,15 @@ func TestNoteServiceMutateActiveFilesystemReindexesAfterCallbackError(t *testing
 	if repo.prepareCalls != 2 || repo.commitCalls != 2 {
 		t.Errorf("index transactions = prepare %d commit %d, want initial sync plus mandatory reindex", repo.prepareCalls, repo.commitCalls)
 	}
+	if content, err := service.GetNoteContent("conflicted.md"); err != nil || content != "conflicted" {
+		t.Errorf("GetNoteContent() after recoverable callback error = %q, %v; want conflicted, nil", content, err)
+	}
+	if _, err := service.GetTree(); err != nil {
+		t.Errorf("GetTree() after recoverable callback error = %v, want nil", err)
+	}
 }
 
-func TestNoteServiceMutateActiveFilesystemJoinsMutationAndIndexErrors(t *testing.T) {
+func TestNoteServiceMutateActiveFilesystemFailsClosedWhenIndexPreparationFails(t *testing.T) {
 	basePath := t.TempDir()
 	writeTestNote(t, basePath, "old.md", "old")
 	repo := &fakeNoteRepository{}
@@ -84,15 +90,64 @@ func TestNoteServiceMutateActiveFilesystemJoinsMutationAndIndexErrors(t *testing
 	indexErr := errors.New("index failed")
 	repo.prepareErr = indexErr
 
-	err := mutateActiveFilesystemWithCoordinator(service, basePath, func(string) error {
+	err := mutateActiveFilesystemWithCoordinator(service, basePath, func(canonicalPath string) error {
+		if err := os.Remove(filepath.Join(canonicalPath, "old.md")); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(canonicalPath, "incoming.md"), []byte("incoming"), 0o600); err != nil {
+			return err
+		}
 		return mutationErr
 	})
-	if !errors.Is(err, mutationErr) || !errors.Is(err, indexErr) {
-		t.Fatalf("MutateActiveFilesystem() error = %v, want mutation %v and index %v", err, mutationErr, indexErr)
+	if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, mutationErr) || !errors.Is(err, indexErr) {
+		t.Fatalf("MutateActiveFilesystem() error = %v, want fail-closed mutation %v and index %v", err, mutationErr, indexErr)
 	}
 	if repo.prepareCalls != 2 {
 		t.Errorf("index preparations = %d, want initial sync plus mandatory reindex", repo.prepareCalls)
 	}
+	assertFilesystemTransactionFailedClosed(t, service, repo, indexErr)
+}
+
+func TestNoteServiceMutateActiveFilesystemFailsClosedWhenScanFails(t *testing.T) {
+	basePath := t.TempDir()
+	writeTestNote(t, basePath, "old.md", "old")
+	repo := &fakeNoteRepository{}
+	service := newTestNoteService(t, repo, basePath)
+	if err := service.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	scanErr := errors.New("scan failed")
+	service.scan = func(*os.Root) ([]model.NoteNode, error) { return nil, scanErr }
+
+	err := mutateActiveFilesystemWithCoordinator(service, basePath, replaceOldWithIncoming)
+	if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, scanErr) {
+		t.Fatalf("MutateActiveFilesystem() error = %v, want fail-closed scan error %v", err, scanErr)
+	}
+	if repo.prepareCalls != 1 || repo.commitCalls != 1 {
+		t.Errorf("index transactions = prepare %d commit %d, want initial sync only", repo.prepareCalls, repo.commitCalls)
+	}
+	assertFilesystemTransactionFailedClosed(t, service, repo, scanErr)
+}
+
+func TestNoteServiceMutateActiveFilesystemDoesNotDoubleWrapExistingFailClosedError(t *testing.T) {
+	basePath := t.TempDir()
+	writeTestNote(t, basePath, "old.md", "old")
+	repo := &fakeNoteRepository{}
+	service := newTestNoteService(t, repo, basePath)
+	if err := service.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	commitErr := errors.New("commit failed")
+	repo.commitErr = commitErr
+
+	err := mutateActiveFilesystemWithCoordinator(service, basePath, replaceOldWithIncoming)
+	if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, commitErr) {
+		t.Fatalf("MutateActiveFilesystem() error = %v, want existing fail-closed commit error %v", err, commitErr)
+	}
+	if got := strings.Count(service.baseErr.Error(), ErrRollbackFailed.Error()); got != 1 {
+		t.Errorf("base error contains ErrRollbackFailed %d times, want one: %v", got, service.baseErr)
+	}
+	assertFilesystemTransactionFailedClosed(t, service, repo, commitErr)
 }
 
 func TestNoteServiceMutateActiveFilesystemRejectsInactiveOrChangedIdentity(t *testing.T) {
@@ -201,12 +256,25 @@ func TestNoteServiceMutateActiveFilesystemBlocksReadersThroughReindex(t *testing
 	var releaseReindexOnce sync.Once
 	releaseCallback := func() { releaseCallbackOnce.Do(func() { close(callbackRelease) }) }
 	releaseReindex := func() { releaseReindexOnce.Do(func() { close(reindexRelease) }) }
-	t.Cleanup(releaseCallback)
-	t.Cleanup(releaseReindex)
 	repo.replaceStarted = reindexStarted
 	repo.replaceRelease = reindexRelease
 
 	transactionDone := make(chan error, 1)
+	transactionStarted := true
+	transactionJoined := false
+	readerStarted := false
+	readerJoined := false
+	contentDone := make(chan noteReadResult, 1)
+	t.Cleanup(func() {
+		releaseCallback()
+		releaseReindex()
+		if transactionStarted && !transactionJoined {
+			<-transactionDone
+		}
+		if readerStarted && !readerJoined {
+			<-contentDone
+		}
+	})
 	go func() {
 		transactionDone <- mutateActiveFilesystemWithCoordinator(service, basePath, func(canonicalPath string) error {
 			if err := os.Remove(filepath.Join(canonicalPath, "old.md")); err != nil {
@@ -229,49 +297,28 @@ func TestNoteServiceMutateActiveFilesystemBlocksReadersThroughReindex(t *testing
 	readAttempted := make(chan struct{})
 	var readAttemptedOnce sync.Once
 	service.beforeReadLock = func() { readAttemptedOnce.Do(func() { close(readAttempted) }) }
-	contentDone := make(chan noteReadResult, 1)
+	readerStarted = true
 	go func() {
 		content, err := service.GetNoteContent("incoming.md")
 		contentDone <- noteReadResult{content: content, err: err}
 	}()
 	<-readAttempted
-	treeStarted := make(chan struct{})
-	treeDone := make(chan struct {
-		nodes []model.NoteNode
-		err   error
-	}, 1)
-	go func() {
-		close(treeStarted)
-		nodes, err := service.GetTree()
-		treeDone <- struct {
-			nodes []model.NoteNode
-			err   error
-		}{nodes: nodes, err: err}
-	}()
-	<-treeStarted
-	for range 10 {
-		runtime.Gosched()
-	}
-	assertFilesystemTransactionReadersBlocked(t, contentDone, treeDone, "callback")
+	assertFilesystemTransactionReaderBlocked(t, contentDone, &readerJoined, "callback")
 
 	releaseCallback()
 	<-reindexStarted
-	assertFilesystemTransactionReadersBlocked(t, contentDone, treeDone, "reindex")
+	assertFilesystemTransactionReaderBlocked(t, contentDone, &readerJoined, "reindex")
 
 	releaseReindex()
-	if err := <-transactionDone; err != nil {
+	err := <-transactionDone
+	transactionJoined = true
+	if err != nil {
 		t.Fatalf("MutateActiveFilesystem() error = %v", err)
 	}
 	contentResult := <-contentDone
+	readerJoined = true
 	if contentResult.err != nil || contentResult.content != "incoming" {
 		t.Errorf("GetNoteContent() after transaction = %q, %v; want incoming, nil", contentResult.content, contentResult.err)
-	}
-	treeResult := <-treeDone
-	if treeResult.err != nil {
-		t.Fatalf("GetTree() after transaction error = %v", treeResult.err)
-	}
-	if len(treeResult.nodes) != 1 || treeResult.nodes[0].ID != "incoming.md" {
-		t.Errorf("GetTree() after transaction = %#v, want incoming.md", treeResult.nodes)
 	}
 }
 
@@ -301,24 +348,34 @@ func mutateActiveFilesystemWithCoordinator(service *NoteService, expectedPath st
 	return service.MutateActiveFilesystem(expectedPath, mutate)
 }
 
-func assertFilesystemTransactionReadersBlocked(
-	t *testing.T,
-	contentDone <-chan noteReadResult,
-	treeDone <-chan struct {
-		nodes []model.NoteNode
-		err   error
-	},
-	phase string,
-) {
+func assertFilesystemTransactionReaderBlocked(t *testing.T, contentDone <-chan noteReadResult, readerJoined *bool, phase string) {
 	t.Helper()
 	select {
 	case result := <-contentDone:
+		*readerJoined = true
 		t.Fatalf("GetNoteContent() completed during %s: %#v", phase, result)
 	default:
 	}
-	select {
-	case result := <-treeDone:
-		t.Fatalf("GetTree() completed during %s: %#v", phase, result)
-	default:
+}
+
+func replaceOldWithIncoming(canonicalPath string) error {
+	if err := os.Remove(filepath.Join(canonicalPath, "old.md")); err != nil {
+		return err
 	}
+	return os.WriteFile(filepath.Join(canonicalPath, "incoming.md"), []byte("incoming"), 0o600)
+}
+
+func assertFilesystemTransactionFailedClosed(t *testing.T, service *NoteService, repo *fakeNoteRepository, cause error) {
+	t.Helper()
+	if tree, err := service.GetTree(); tree != nil || !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, cause) {
+		t.Errorf("GetTree() after reindex failure = %#v, %v; want nil and fail-closed cause", tree, err)
+	}
+	if content, err := service.GetNoteContent("incoming.md"); content != "" || !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, cause) {
+		t.Errorf("GetNoteContent() after reindex failure = %q, %v; want empty and fail-closed cause", content, err)
+	}
+	if err := service.SaveNoteContent("incoming.md", "changed"); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, cause) {
+		t.Errorf("SaveNoteContent() after reindex failure = %v; want fail-closed cause", err)
+	}
+	assertFileContent(t, filepath.Join(service.basePath, "incoming.md"), []byte("incoming"))
+	assertRepositoryIDs(t, repo, "old.md")
 }

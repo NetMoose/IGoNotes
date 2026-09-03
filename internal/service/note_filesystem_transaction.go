@@ -34,5 +34,8 @@ func (s *NoteService) MutateActiveFilesystem(expectedPath string, mutate func(ca
 	// worktree; reindex even after callback failure before readers resume.
 	mutationErr := mutate(canonicalPath)
 	indexErr := s.replaceIndexLocked()
+	if indexErr != nil && s.baseErr == nil {
+		indexErr = s.failClosedLocked(indexErr, nil)
+	}
 	return errors.Join(mutationErr, indexErr)
 }
