@@ -241,6 +241,157 @@ func TestInitializeRejectsBaseIdentityReplacementBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestInitializeNetworkSafetyRejectsParentRepositoryBeforeFetch(t *testing.T) {
+	fixture := newConnectFixture(t)
+	parent := filepath.Dir(fixture.root)
+	fixture.git(parent, "init", "--initial-branch", "parent")
+	candidate := fixture.seedRemote()
+	fixture.git(fixture.root, "init", "--initial-branch", "main")
+	fixture.git(fixture.root, "config", "user.name", "IGoNotes Test")
+	fixture.git(fixture.root, "config", "user.email", "igonotes@example.invalid")
+	parentRefs := fixture.git(parent, "for-each-ref", "--format=%(refname) %(objectname)")
+	savedGitDir := filepath.Join(t.TempDir(), "nested.git")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	added := false
+	exposed := false
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if err == nil && len(command.Args) > 0 && command.Args[0] == "add" {
+			added = true
+		}
+		if !exposed && added && reflect.DeepEqual(command.Args, []string{"rev-parse", "--verify", "HEAD^{commit}"}) {
+			if renameErr := os.Rename(filepath.Join(fixture.root, ".git"), savedGitDir); renameErr != nil {
+				t.Fatal(renameErr)
+			}
+			exposed = true
+		}
+		return result, err
+	}
+	t.Cleanup(func() {
+		if exposed {
+			_ = os.Rename(savedGitDir, filepath.Join(fixture.root, ".git"))
+		}
+	})
+
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+	assertSafeCode(t, err, CodeRepositoryRoot)
+	if !exposed {
+		t.Fatal("parent repository was not exposed before fetch")
+	}
+	assertNoNetworkCommand(t, runner.commands, "fetch")
+	if got := fixture.git(parent, "for-each-ref", "--format=%(refname) %(objectname)"); got != parentRefs {
+		t.Fatalf("parent refs changed: got %q want %q", got, parentRefs)
+	}
+	privateRef := "refs/igonotes/fetch/" + testOperationID
+	if output, refErr := runFixtureGit(parent, "rev-parse", "--verify", privateRef); refErr == nil {
+		t.Fatalf("private fetch ref created in parent: output %q error %v, candidate %q", output, refErr, candidate)
+	}
+}
+
+func TestInitializeNetworkSafetyRejectsParentRepositoryBeforePush(t *testing.T) {
+	fixture := newConnectFixture(t)
+	parent := filepath.Dir(fixture.root)
+	fixture.git(parent, "init", "--initial-branch", "parent")
+	fixture.initLocal("main")
+	parentRefs := fixture.git(parent, "for-each-ref", "--format=%(refname) %(objectname)")
+	savedGitDir := filepath.Join(t.TempDir(), "nested.git")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	pushing := false
+	exposed := false
+	runner.after = func(command Command, result Result, err error) (Result, error) {
+		if !exposed && pushing && reflect.DeepEqual(command.Args, []string{"remote", "get-url", "--all", "--push", "origin"}) {
+			if renameErr := os.Rename(filepath.Join(fixture.root, ".git"), savedGitDir); renameErr != nil {
+				t.Fatal(renameErr)
+			}
+			exposed = true
+		}
+		return result, err
+	}
+	t.Cleanup(func() {
+		if exposed {
+			_ = os.Rename(savedGitDir, filepath.Join(fixture.root, ".git"))
+		}
+	})
+
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, func(_ context.Context, checkpoint Checkpoint) error {
+		if checkpoint.Stage == StagePushing {
+			pushing = true
+		}
+		return nil
+	})
+	assertSafeCode(t, err, CodeRepositoryRoot)
+	if !exposed {
+		t.Fatal("parent repository was not exposed before push")
+	}
+	assertNoNetworkCommand(t, runner.commands, "push")
+	if got := fixture.git(parent, "for-each-ref", "--format=%(refname) %(objectname)"); got != parentRefs {
+		t.Fatalf("parent refs changed: got %q want %q", got, parentRefs)
+	}
+	if output, refErr := runFixtureGit(parent, "--git-dir", fixture.remote, "rev-parse", "--verify", "refs/heads/main"); refErr == nil {
+		t.Fatalf("remote branch created despite blocked push: output %q error %v", output, refErr)
+	}
+}
+
+func TestInitializeNetworkSafetyRejectsUnsafeRepositoryBeforePush(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		marker string
+	}{
+		{name: "pending operation", marker: "MERGE_HEAD"},
+		{name: "index lock", marker: "index.lock"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newConnectFixture(t)
+			candidate := fixture.seedRemote()
+			fixture.initLocal("local")
+			runner := &interceptRunner{delegate: NewCommandRunner()}
+			pushing := false
+			injected := false
+			marker := filepath.Join(fixture.root, ".git", test.marker)
+			runner.after = func(command Command, result Result, err error) (Result, error) {
+				if !injected && pushing && reflect.DeepEqual(command.Args, []string{"remote", "get-url", "--all", "--push", "origin"}) {
+					contents := "locked\n"
+					if test.marker == "MERGE_HEAD" {
+						contents = candidate + "\n"
+					}
+					if writeErr := os.WriteFile(marker, []byte(contents), 0o600); writeErr != nil {
+						t.Fatal(writeErr)
+					}
+					injected = true
+				}
+				return result, err
+			}
+			t.Cleanup(func() { _ = os.Remove(marker) })
+
+			_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, func(_ context.Context, checkpoint Checkpoint) error {
+				if checkpoint.Stage == StagePushing {
+					pushing = true
+				}
+				return nil
+			})
+			assertSafeCode(t, err, CodeRepositoryLocked)
+			if !injected {
+				t.Fatal("unsafe repository state was not injected before push")
+			}
+			assertNoNetworkCommand(t, runner.commands, "push")
+			if got := fixture.git(fixture.root, "rev-parse", managedRemoteRef("main")); got != candidate {
+				t.Fatalf("managed trust ref = %q, want unchanged candidate %q", got, candidate)
+			}
+			if got := fixture.remoteOID(); got != candidate {
+				t.Fatalf("remote advanced to %q, want %q", got, candidate)
+			}
+		})
+	}
+}
+
+func assertNoNetworkCommand(t *testing.T, commands []Command, action string) {
+	t.Helper()
+	for _, command := range commands {
+		if command.Scope == NetworkOperation && len(command.Args) > 0 && command.Args[0] == action {
+			t.Fatalf("unexpected %s command: %#v", action, command)
+		}
+	}
+}
+
 func TestInitializeConflictCheckpointFailurePreservesTypedConflict(t *testing.T) {
 	fixture := newConnectFixture(t)
 	fixture.seedRemote()

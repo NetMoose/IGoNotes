@@ -480,6 +480,14 @@ func (s *Service) connectRunNetwork(ctx context.Context, path, secret string, re
 	if err := requireConnectBase(ctx, path); err != nil {
 		return Result{}, err
 	}
+	if !readOnly {
+		if _, err := s.inspectSafeLocal(ctx, path); err != nil {
+			return Result{}, err
+		}
+		if err := requireConnectBase(ctx, path); err != nil {
+			return Result{}, err
+		}
+	}
 	return s.runNetwork(ctx, path, secret, readOnly, args...)
 }
 
