@@ -31,12 +31,13 @@ type GitManager struct {
 	notes       *NoteService
 	coordinator *BaseOperationCoordinator
 
-	mu       sync.Mutex
-	cond     *sync.Cond
-	queue    []gitManagerJob
-	inFlight map[string]gitcmd.Operation
-	closed   bool
-	started  bool
+	mu        sync.Mutex
+	cond      *sync.Cond
+	queue     []gitManagerJob
+	inFlight  map[string]gitcmd.Operation
+	closed    bool
+	started   bool
+	workerErr error
 
 	lifetimeCtx    context.Context
 	lifetimeCancel context.CancelFunc
@@ -218,13 +219,19 @@ func (m *GitManager) queueOperation(
 	}
 	queuedStatus := managerWorkingStatus(operation, status, statusFound)
 	if err := m.statuses.Upsert(ctx, queuedStatus); err != nil {
-		safeErr := persistenceError(err)
+		statusErr := statusPersistenceError(err)
 		operation.State = gitcmd.OperationFailed
-		operation.Error = safeErr
-		_ = m.operations.Finish(ctx, operation)
+		operation.Error = statusErr
+		finishErr := m.operations.Finish(ctx, operation)
+		if finishErr != nil {
+			active := operation
+			active.State = gitcmd.OperationQueued
+			active.Error = nil
+			m.inFlight[current.Path] = active
+		}
 		m.mu.Unlock()
 		m.coordinator.Unlock()
-		return operation, false, safeErr
+		return operation, false, errors.Join(statusErr, managerJournalError(finishErr))
 	}
 	m.inFlight[current.Path] = operation
 	m.queue = append(m.queue, gitManagerJob{operation: operation, snapshot: current, confirmations: confirmations})
@@ -262,7 +269,10 @@ func (m *GitManager) Close() error {
 	done := m.workerDone
 	m.mu.Unlock()
 	<-done
-	return nil
+	m.mu.Lock()
+	err := m.workerErr
+	m.mu.Unlock()
+	return err
 }
 
 func (m *GitManager) worker() {
@@ -294,8 +304,8 @@ func (m *GitManager) runJob(job gitManagerJob) {
 	}
 	if snapshotErr != nil || current != job.snapshot {
 		m.beforeTerminalPublication()
-		m.finishStale(job.operation)
-		m.removeInFlight(job.operation.RepoPath)
+		finished, terminalErr := m.finishStale(job.operation)
+		m.completeTerminal(job.operation.RepoPath, finished, terminalErr)
 		return
 	}
 
@@ -305,15 +315,15 @@ func (m *GitManager) runJob(job gitManagerJob) {
 		if err == nil {
 			err = errors.New("active Git operation is missing")
 		}
-		m.finishFailure(job.operation, current, gitcmd.OperationResult{}, persistenceError(err), nil)
-		m.removeInFlight(current.Path)
+		finished, terminalErr := m.finishFailure(job.operation, current, gitcmd.OperationResult{}, persistenceError(err), nil)
+		m.completeTerminal(current.Path, finished, terminalErr)
 		return
 	}
 	status, statusFound, statusErr := m.statuses.Get(m.lifetimeCtx, current.Path)
 	if statusErr != nil {
 		m.beforeTerminalPublication()
-		m.finishFailure(operation, current, gitcmd.OperationResult{}, persistenceError(statusErr), nil)
-		m.removeInFlight(current.Path)
+		finished, terminalErr := m.finishFailure(operation, current, gitcmd.OperationResult{}, persistenceError(statusErr), nil)
+		m.completeTerminal(current.Path, finished, terminalErr)
 		return
 	}
 
@@ -344,20 +354,7 @@ func (m *GitManager) runJob(job gitManagerJob) {
 		return nil
 	}
 
-	transaction := func(ctx context.Context, mutate func(string) error) error {
-		guardedMutate := func(canonicalPath string) error {
-			err := mutate(canonicalPath)
-			var conflict *gitcmd.ConflictError
-			if errors.As(err, &conflict) {
-				m.coordinator.SetConflict(current.Path, true)
-			}
-			return err
-		}
-		if active {
-			return m.notes.MutateActiveFilesystem(current.Path, guardedMutate)
-		}
-		return guardedMutate(current.Path)
-	}
+	transaction := m.worktreeTransaction(current, active)
 
 	var result gitcmd.OperationResult
 	var operationErr error
@@ -414,36 +411,56 @@ func (m *GitManager) runJob(job gitManagerJob) {
 		m.coordinator.SetConflict(current.Path, true)
 	}
 	if operationErr == nil {
-		m.finishSuccess(operation, current, result)
+		finished, terminalErr := m.finishSuccess(operation, current, result)
+		m.completeTerminal(current.Path, finished, terminalErr)
 	} else {
-		m.finishFailure(operation, current, result, managerSafeError(operationErr), conflict)
+		finished, terminalErr := m.finishFailure(operation, current, result, managerSafeError(operationErr), conflict)
+		m.completeTerminal(current.Path, finished, terminalErr)
 	}
-	m.removeInFlight(current.Path)
 }
 
-func (m *GitManager) finishStale(operation gitcmd.Operation) {
+func (m *GitManager) worktreeTransaction(current gitcmd.ConfiguredBase, active bool) gitcmd.WorktreeTransaction {
+	return func(ctx context.Context, mutate func(string) error) error {
+		guardedMutate := func(canonicalPath string) error {
+			err := mutate(canonicalPath)
+			var conflict *gitcmd.ConflictError
+			if errors.As(err, &conflict) {
+				m.coordinator.SetConflict(canonicalPath, true)
+			}
+			return err
+		}
+		if active {
+			return m.notes.MutateActiveFilesystem(current.Path, guardedMutate)
+		}
+		return guardedMutate(current.Path)
+	}
+}
+
+func (m *GitManager) finishStale(operation gitcmd.Operation) (bool, error) {
 	ctx := context.WithoutCancel(m.lifetimeCtx)
 	operation.State = gitcmd.OperationFailed
 	operation.Error = needsReconnect("Git configuration changed before the operation started")
 	operation.UpdatedAt = m.now().UTC()
-	_ = m.operations.Finish(ctx, operation)
+	err := m.operations.Finish(ctx, operation)
+	return err == nil, managerJournalError(err)
 }
 
-func (m *GitManager) finishSuccess(operation gitcmd.Operation, current gitcmd.ConfiguredBase, result gitcmd.OperationResult) {
+func (m *GitManager) finishSuccess(operation gitcmd.Operation, current gitcmd.ConfiguredBase, result gitcmd.OperationResult) (bool, error) {
 	ctx := context.WithoutCancel(m.lifetimeCtx)
-	operation = m.latestOperation(ctx, operation)
+	operation, lookupErr := m.latestOperation(ctx, operation)
 	operation.State = gitcmd.OperationSucceeded
 	operation.Stage = gitcmd.StageCompleted
 	applyManagerResult(&operation, result)
 	now := m.now().UTC()
 	operation.UpdatedAt = now
-	_ = m.operations.Finish(ctx, operation)
+	finishErr := m.operations.Finish(ctx, operation)
 	changed := sortedManagerPaths(result.ChangedPaths)
-	_ = m.statuses.Upsert(ctx, model.GitStatus{
+	statusErr := m.statuses.Upsert(ctx, model.GitStatus{
 		Base: current.Name, RepositoryPath: current.Path, State: model.GitStateReady,
 		OperationID: operation.ID, Stage: string(gitcmd.StageCompleted), Ahead: result.Ahead, Behind: result.Behind,
 		LastAttempt: &now, LastSuccess: &now, ChangedPaths: changed, RemoteOID: result.RemoteOID,
 	})
+	return finishErr == nil, errors.Join(managerJournalError(lookupErr), managerJournalError(finishErr), managerStatusError(statusErr))
 }
 
 func (m *GitManager) finishFailure(
@@ -452,9 +469,9 @@ func (m *GitManager) finishFailure(
 	result gitcmd.OperationResult,
 	safeErr *gitcmd.SafeError,
 	conflict *gitcmd.ConflictError,
-) {
+) (bool, error) {
 	ctx := context.WithoutCancel(m.lifetimeCtx)
-	operation = m.latestOperation(ctx, operation)
+	operation, lookupErr := m.latestOperation(ctx, operation)
 	applyManagerResult(&operation, result)
 	now := m.now().UTC()
 	operation.UpdatedAt = now
@@ -470,30 +487,36 @@ func (m *GitManager) finishFailure(
 	} else {
 		operation.State = gitcmd.OperationFailed
 	}
-	_ = m.operations.Finish(ctx, operation)
+	finishErr := m.operations.Finish(ctx, operation)
 	remoteOID := operation.RemoteOID
 	if result.RemoteOID != "" {
 		remoteOID = result.RemoteOID
 	}
-	_ = m.statuses.Upsert(ctx, model.GitStatus{
+	statusErr := m.statuses.Upsert(ctx, model.GitStatus{
 		Base: current.Name, RepositoryPath: current.Path, State: state,
 		OperationID: operation.ID, Stage: string(operation.Stage), Ahead: result.Ahead, Behind: result.Behind,
 		LastAttempt: &now, ChangedPaths: changed, RemoteOID: remoteOID,
 		Error: &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field},
 	})
+	return finishErr == nil, errors.Join(managerJournalError(lookupErr), managerJournalError(finishErr), managerStatusError(statusErr))
 }
 
-func (m *GitManager) latestOperation(ctx context.Context, fallback gitcmd.Operation) gitcmd.Operation {
+func (m *GitManager) latestOperation(ctx context.Context, fallback gitcmd.Operation) (gitcmd.Operation, error) {
 	operation, found, err := m.operations.ActiveByPath(ctx, fallback.RepoPath)
 	if err == nil && found && operation.ID == fallback.ID {
-		return operation
+		return operation, nil
 	}
-	return fallback
+	return fallback, err
 }
 
-func (m *GitManager) removeInFlight(path string) {
+func (m *GitManager) completeTerminal(path string, journalFinished bool, terminalErr error) {
 	m.mu.Lock()
-	delete(m.inFlight, path)
+	if journalFinished {
+		delete(m.inFlight, path)
+	}
+	if terminalErr != nil {
+		m.workerErr = errors.Join(m.workerErr, terminalErr)
+	}
 	m.mu.Unlock()
 }
 
@@ -522,6 +545,21 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 			m.coordinator.Unlock()
 			continue
 		}
+		existingStatus, statusFound, statusErr := m.statuses.Get(ctx, current.Path)
+		if statusErr != nil {
+			recoveryErrors = append(recoveryErrors, persistenceError(statusErr))
+			m.coordinator.Unlock()
+			continue
+		}
+		durableConflict := latestFound && latest.State == gitcmd.OperationConflict ||
+			statusFound && existingStatus.State == model.GitStateConflict
+		durableConflictPaths := []string(nil)
+		if latestFound && latest.State == gitcmd.OperationConflict {
+			durableConflictPaths = append(durableConflictPaths, latest.ConflictPaths...)
+		}
+		if statusFound && existingStatus.State == model.GitStateConflict {
+			durableConflictPaths = append(durableConflictPaths, existingStatus.ChangedPaths...)
+		}
 		var latestPointer *gitcmd.Operation
 		if latestFound && sameManagerIdentity(latest, current) {
 			latestCopy := latest
@@ -530,7 +568,28 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 		result, serviceErr := m.gitService.RecoverLocal(ctx, gitcmd.RecoveryOptions{Snapshot: current, Operation: latestPointer})
 		var conflict *gitcmd.ConflictError
 		isConflict := errors.As(serviceErr, &conflict)
+		if durableConflict {
+			if !isConflict {
+				conflict = &gitcmd.ConflictError{}
+			}
+			conflict.Paths = sortedManagerPaths(append(conflict.Paths, durableConflictPaths...))
+			isConflict = true
+		}
 		if active, found := unfinishedByPath[current.Path]; found {
+			trustCheckpointFailed := false
+			if result.RemoteOID != "" && active.RemoteOID != result.RemoteOID {
+				checkpoint := gitcmd.Checkpoint{
+					Stage: active.Stage, BackupRef: active.BackupRef, LocalOID: active.LocalOID,
+					CandidateOID: active.CandidateOID, RemoteOID: result.RemoteOID, PushOID: active.PushOID,
+					ChangedPaths: active.ChangedPaths, ConflictPaths: active.ConflictPaths,
+				}
+				if checkpointErr := m.operations.Checkpoint(ctx, active.ID, checkpoint); checkpointErr != nil {
+					recoveryErrors = append(recoveryErrors, persistenceError(checkpointErr))
+					trustCheckpointFailed = true
+				} else {
+					active.RemoteOID = result.RemoteOID
+				}
+			}
 			active.UpdatedAt = m.now().UTC()
 			if isConflict {
 				active.State = gitcmd.OperationConflict
@@ -540,8 +599,10 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 				active.State = gitcmd.OperationFailed
 				active.Error = &gitcmd.SafeError{Code: gitcmd.CodeOperationInterrupted, Message: "Git operation was interrupted"}
 			}
-			if finishErr := m.operations.Finish(ctx, active); finishErr != nil {
-				recoveryErrors = append(recoveryErrors, persistenceError(finishErr))
+			if !trustCheckpointFailed {
+				if finishErr := m.operations.Finish(ctx, active); finishErr != nil {
+					recoveryErrors = append(recoveryErrors, persistenceError(finishErr))
+				}
 			}
 		}
 
@@ -732,6 +793,24 @@ func needsReconnect(message string) *gitcmd.SafeError {
 
 func persistenceError(error) *gitcmd.SafeError {
 	return &gitcmd.SafeError{Code: gitcmd.CodeCommandFailed, Message: "Git operation persistence failed"}
+}
+
+func statusPersistenceError(error) *gitcmd.SafeError {
+	return &gitcmd.SafeError{Code: gitcmd.CodeCommandFailed, Message: "Git status persistence failed"}
+}
+
+func managerJournalError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &gitcmd.SafeError{Code: gitcmd.CodeCommandFailed, Message: "Git operation journal persistence failed"}
+}
+
+func managerStatusError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return statusPersistenceError(err)
 }
 
 func managerSafeError(err error) *gitcmd.SafeError {
