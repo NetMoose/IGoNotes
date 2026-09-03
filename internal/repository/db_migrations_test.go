@@ -16,14 +16,15 @@ func TestInitDBMigrationsFreshDatabaseInOrder(t *testing.T) {
 	}
 	defer db.Close()
 
-	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2}) {
-		t.Fatalf("migration versions = %v, want [1 2]", got)
+	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
+		t.Fatalf("migration versions = %v, want [1 2 3]", got)
 	}
 
 	var indexName string
 	if err := db.QueryRow("SELECT name FROM sqlite_master WHERE type = ? AND name = ?", "index", "git_status_base_name_idx").Scan(&indexName); err != nil {
 		t.Fatalf("git status base-name index error = %v", err)
 	}
+	assertGitOperationSchema(t, db)
 }
 
 func TestInitDBUpgradesLegacySchemaWithoutDataLoss(t *testing.T) {
@@ -61,9 +62,10 @@ func TestInitDBUpgradesLegacySchemaWithoutDataLoss(t *testing.T) {
 	}
 	defer db.Close()
 
-	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2}) {
-		t.Errorf("migration versions = %v, want [1 2]", got)
+	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
+		t.Errorf("migration versions = %v, want [1 2 3]", got)
 	}
+	assertGitOperationSchema(t, db)
 	wantNotes := [][]string{{"legacy.md", "Legacy", "legacy.md", "", "file", "'2001-02-03 04:05:06'", "'2007-08-09 10:11:12'"}}
 	if got := repositoryRows(t, db, "SELECT id, title, path, COALESCE(parent_id, ''), type, quote(created_at), quote(updated_at) FROM notes", 7); !reflect.DeepEqual(got, wantNotes) {
 		t.Errorf("legacy notes = %#v, want %#v", got, wantNotes)
@@ -80,8 +82,8 @@ func TestInitDBRerunDoesNotDuplicateVersions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("InitDB() run %d error = %v", run, err)
 		}
-		if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2}) {
-			t.Errorf("run %d migration versions = %v, want [1 2]", run, got)
+		if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
+			t.Errorf("run %d migration versions = %v, want [1 2 3]", run, got)
 		}
 		if err := db.Close(); err != nil {
 			t.Fatalf("close run %d: %v", run, err)
@@ -92,9 +94,9 @@ func TestInitDBRerunDoesNotDuplicateVersions(t *testing.T) {
 func TestInitDBMigrationFailureRollsBackSchemaAndVersion(t *testing.T) {
 	original := migrations
 	migrations = append(append([]migration(nil), migrations...), migration{
-		version: 3,
+		version: 4,
 		sql: `
-			CREATE TABLE migration_three_marker (id INTEGER PRIMARY KEY);
+			CREATE TABLE migration_four_marker (id INTEGER PRIMARY KEY);
 			INSERT INTO table_that_does_not_exist (id) VALUES (1);
 		`,
 	})
@@ -115,11 +117,12 @@ func TestInitDBMigrationFailureRollsBackSchemaAndVersion(t *testing.T) {
 
 	reopened := openRawDB(t, dbPath)
 	defer reopened.Close()
-	if got := migrationVersions(t, reopened); !reflect.DeepEqual(got, []int{1, 2}) {
-		t.Errorf("migration versions after failure = %v, want [1 2]", got)
+	if got := migrationVersions(t, reopened); !reflect.DeepEqual(got, []int{1, 2, 3}) {
+		t.Errorf("migration versions after failure = %v, want [1 2 3]", got)
 	}
+	assertGitOperationSchema(t, reopened)
 	var markerCount int
-	if err := reopened.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = ? AND name = ?", "table", "migration_three_marker").Scan(&markerCount); err != nil {
+	if err := reopened.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = ? AND name = ?", "table", "migration_four_marker").Scan(&markerCount); err != nil {
 		t.Fatalf("query migration marker: %v", err)
 	}
 	if markerCount != 0 {
@@ -251,4 +254,23 @@ func migrationVersions(t *testing.T, db *sql.DB) []int {
 		t.Fatalf("migration version rows: %v", err)
 	}
 	return versions
+}
+
+func assertGitOperationSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	want := map[string]string{
+		"git_operations":                 "table",
+		"git_operations_one_active_path": "index",
+		"git_operations_unfinished":      "index",
+	}
+	for name, objectType := range want {
+		var got string
+		if err := db.QueryRow(
+			"SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
+			objectType,
+			name,
+		).Scan(&got); err != nil {
+			t.Errorf("Git operation schema object %q error = %v", name, err)
+		}
+	}
 }
