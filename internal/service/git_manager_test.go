@@ -375,6 +375,45 @@ func TestGitManagerQueueDurabilityCanonicalDedupeAndIdentity(t *testing.T) {
 	}
 }
 
+func TestGitManagerQueueDurableMapGapDedupeAndIdentityRejection(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", nil, nil, nil)
+	op, deduplicated, err := fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base})
+	if err != nil || deduplicated {
+		t.Fatalf("initial QueueInitialize() = %#v, %v, %v", op, deduplicated, err)
+	}
+	newProcessManager := func() *GitManager {
+		manager := NewGitManager(
+			fixture.manager.gitService, fixture.statuses, fixture.operations, fixture.manager.prober,
+			fixture.snapshots.get, fixture.notes, fixture.coordinator,
+		)
+		t.Cleanup(func() { _ = manager.Close() })
+		return manager
+	}
+
+	deduped, deduplicated, err := newProcessManager().QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
+	if err != nil || !deduplicated || deduped.ID != op.ID {
+		t.Fatalf("durable map-gap dedupe = %#v, %v, %v; want %q", deduped, deduplicated, err, op.ID)
+	}
+
+	otherName := configuredManagerBase("other", base.Path)
+	fixture.snapshots.put(otherName)
+	if _, _, err := newProcessManager().QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: otherName}); !errors.Is(err, ErrGitRepositoryInUse) {
+		t.Fatalf("durable distinct base-name error = %v, want ErrGitRepositoryInUse", err)
+	}
+
+	otherRemote := base
+	otherRemote.RemoteFingerprint = "remote-reconfigured"
+	fixture.snapshots.put(otherRemote)
+	if _, _, err := newProcessManager().QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: otherRemote}); !errors.Is(err, ErrGitRepositoryInUse) {
+		t.Fatalf("durable distinct remote-fingerprint error = %v, want ErrGitRepositoryInUse", err)
+	}
+	stored, found, err := fixture.operations.ActiveByPath(context.Background(), base.Path)
+	if err != nil || !found || !reflect.DeepEqual(stored, op) {
+		t.Fatalf("durable operation changed = %#v, %v, %v; want %#v", stored, found, err, op)
+	}
+}
+
 func TestGitManagerQueueRejectsStaleBeforeDurableState(t *testing.T) {
 	base := configuredManagerBase("work", t.TempDir())
 	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", nil, nil, nil)
@@ -405,8 +444,10 @@ func TestGitManagerQueueCoordinatorOrderingAndUnlockedManagerWait(t *testing.T) 
 			snapshotCalled := make(chan struct{})
 			fixture.snapshots.before = func(string) { close(snapshotCalled) }
 			fixture.coordinator.Lock()
+			coordinatorAttempting := make(chan struct{})
 			result := make(chan error, 1)
 			go func() {
+				close(coordinatorAttempting)
 				if kind == gitcmd.OperationInitialize {
 					_, _, err := fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base})
 					result <- err
@@ -415,15 +456,11 @@ func TestGitManagerQueueCoordinatorOrderingAndUnlockedManagerWait(t *testing.T) 
 				_, _, err := fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
 				result <- err
 			}()
-			fixture.manager.mu.Lock()
-			managerLockAvailable := make(chan struct{})
-			go func() {
-				fixture.manager.mu.Lock()
-				close(managerLockAvailable)
-				fixture.manager.mu.Unlock()
-			}()
+			<-coordinatorAttempting
+			if !fixture.manager.mu.TryLock() {
+				t.Fatal("queue retained manager mutex while waiting for coordinator")
+			}
 			fixture.manager.mu.Unlock()
-			<-managerLockAvailable
 			select {
 			case <-snapshotCalled:
 				t.Fatal("final snapshot ran before coordinator ownership")
@@ -486,121 +523,144 @@ func TestGitManagerQueueHoldsCoordinatorThroughJournalStatusAndFIFO(t *testing.T
 func TestGitManagerQueueRaceRepeatedUsesCoherentImmutableSnapshot(t *testing.T) {
 	for _, kind := range []gitcmd.OperationKind{gitcmd.OperationInitialize, gitcmd.OperationSync} {
 		t.Run(string(kind), func(t *testing.T) {
-			for iteration := 0; iteration < 20; iteration++ {
-				base := configuredManagerBase("work", t.TempDir())
-				fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "work", nil, nil, nil)
-				if kind == gitcmd.OperationSync {
-					seedManagerTrust(t, fixture, base, managerOID)
+			for _, queueFirst := range []bool{true, false} {
+				outcome := "reconfigure first"
+				if queueFirst {
+					outcome = "queue first"
 				}
-				beforeStatus, beforeStatusFound, err := fixture.statuses.Get(context.Background(), base.Path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				beforeOperations, err := fixture.operations.ListUnfinished(context.Background())
-				if err != nil {
-					t.Fatal(err)
-				}
-				type queueResult struct {
-					operation gitcmd.Operation
-					deduped   bool
-					err       error
-				}
-				start := make(chan struct{})
-				queueReady := make(chan struct{})
-				queued := make(chan queueResult, 1)
-				go func() {
-					close(queueReady)
-					<-start
-					if kind == gitcmd.OperationInitialize {
-						op, deduped, err := fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base})
-						queued <- queueResult{operation: op, deduped: deduped, err: err}
-						return
-					}
-					op, deduped, err := fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
-					queued <- queueResult{operation: op, deduped: deduped, err: err}
-				}()
-				changed := base
-				changed.URL = "https://example.invalid/changed.git"
-				changed.Fingerprint = fmt.Sprintf("changed-%d", iteration)
-				reconfigureReady := make(chan struct{})
-				reconfigured := make(chan struct{})
-				go func() {
-					close(reconfigureReady)
-					<-start
-					fixture.coordinator.Lock()
-					fixture.snapshots.mu.Lock()
-					fixture.snapshots.bases[changed.Name] = changed
-					fixture.snapshots.active = ""
-					fixture.snapshots.mu.Unlock()
-					fixture.coordinator.Unlock()
-					close(reconfigured)
-				}()
-				<-queueReady
-				<-reconfigureReady
-				close(start)
-				result := <-queued
-				<-reconfigured
-				if result.err == nil {
-					if result.deduped || result.operation.ConfigFingerprint != base.Fingerprint ||
-						result.operation.RemoteFingerprint != base.RemoteFingerprint || result.operation.RepoPath != base.Path {
-						t.Fatalf("iteration %d accepted operation mixed snapshots: %#v, deduped %v", iteration, result.operation, result.deduped)
-					}
-				} else {
-					requireManagerCode(t, result.err, gitcmd.CodeNeedsReconnect)
-					afterStatus, afterStatusFound, err := fixture.statuses.Get(context.Background(), base.Path)
-					if err != nil {
-						t.Fatal(err)
-					}
-					afterOperations, err := fixture.operations.ListUnfinished(context.Background())
-					if err != nil {
-						t.Fatal(err)
-					}
-					fixture.manager.mu.Lock()
-					queueLength := len(fixture.manager.queue)
-					inFlightLength := len(fixture.manager.inFlight)
-					fixture.manager.mu.Unlock()
-					if afterStatusFound != beforeStatusFound || !reflect.DeepEqual(afterStatus, beforeStatus) ||
-						!reflect.DeepEqual(afterOperations, beforeOperations) || queueLength != 0 || inFlightLength != 0 {
-						t.Fatalf("iteration %d stale raced request mutated status/journal/FIFO/inFlight", iteration)
-					}
-				}
+				t.Run(outcome, func(t *testing.T) {
+					for iteration := 0; iteration < 10; iteration++ {
+						base := configuredManagerBase("work", t.TempDir())
+						fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "work", nil, nil, nil)
+						if kind == gitcmd.OperationSync {
+							seedManagerTrust(t, fixture, base, managerOID)
+						}
+						beforeStatus, beforeStatusFound, err := fixture.statuses.Get(context.Background(), base.Path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						beforeOperations, err := fixture.operations.ListUnfinished(context.Background())
+						if err != nil {
+							t.Fatal(err)
+						}
+						changed := base
+						changed.URL = "https://example.invalid/changed.git"
+						changed.Fingerprint = fmt.Sprintf("changed-%d", iteration)
+						type queueResult struct {
+							operation gitcmd.Operation
+							deduped   bool
+							err       error
+						}
+						queue := func() (gitcmd.Operation, bool, error) {
+							if kind == gitcmd.OperationInitialize {
+								return fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base})
+							}
+							return fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
+						}
+						queued := make(chan queueResult, 1)
 
-				stableStatus, stableStatusFound, err := fixture.statuses.Get(context.Background(), base.Path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				stableOperations, err := fixture.operations.ListUnfinished(context.Background())
-				if err != nil {
-					t.Fatal(err)
-				}
-				fixture.manager.mu.Lock()
-				stableQueueLength := len(fixture.manager.queue)
-				stableInFlight := fixture.manager.inFlight[base.Path]
-				fixture.manager.mu.Unlock()
-				var staleErr error
-				if kind == gitcmd.OperationInitialize {
-					_, _, staleErr = fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base})
-				} else {
-					_, _, staleErr = fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
-				}
-				requireManagerCode(t, staleErr, gitcmd.CodeNeedsReconnect)
-				afterStatus, afterStatusFound, err := fixture.statuses.Get(context.Background(), base.Path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				afterOperations, err := fixture.operations.ListUnfinished(context.Background())
-				if err != nil {
-					t.Fatal(err)
-				}
-				fixture.manager.mu.Lock()
-				afterQueueLength := len(fixture.manager.queue)
-				afterInFlight := fixture.manager.inFlight[base.Path]
-				fixture.manager.mu.Unlock()
-				if afterStatusFound != stableStatusFound || !reflect.DeepEqual(afterStatus, stableStatus) ||
-					!reflect.DeepEqual(afterOperations, stableOperations) || afterQueueLength != stableQueueLength ||
-					!reflect.DeepEqual(afterInFlight, stableInFlight) {
-					t.Fatalf("iteration %d final stale request mutated status/journal/FIFO/inFlight", iteration)
-				}
+						if queueFirst {
+							snapshotEntered := make(chan struct{})
+							releaseSnapshot := make(chan struct{})
+							fixture.snapshots.before = func(string) {
+								close(snapshotEntered)
+								<-releaseSnapshot
+							}
+							go func() {
+								op, deduped, err := queue()
+								queued <- queueResult{operation: op, deduped: deduped, err: err}
+							}()
+							<-snapshotEntered
+							reconfigureAttempting := make(chan struct{})
+							reconfigured := make(chan struct{})
+							go func() {
+								close(reconfigureAttempting)
+								fixture.coordinator.Lock()
+								fixture.snapshots.mu.Lock()
+								fixture.snapshots.bases[changed.Name] = changed
+								fixture.snapshots.active = ""
+								fixture.snapshots.mu.Unlock()
+								fixture.coordinator.Unlock()
+								close(reconfigured)
+							}()
+							<-reconfigureAttempting
+							select {
+							case <-reconfigured:
+								t.Fatal("reconfiguration crossed queue admission")
+							default:
+							}
+							close(releaseSnapshot)
+							result := <-queued
+							<-reconfigured
+							if result.err != nil || result.deduped || result.operation.ConfigFingerprint != base.Fingerprint ||
+								result.operation.RemoteFingerprint != base.RemoteFingerprint || result.operation.RepoPath != base.Path {
+								t.Fatalf("iteration %d accepted operation = %#v, %v, %v", iteration, result.operation, result.deduped, result.err)
+							}
+							stored, found, err := fixture.operations.ActiveByPath(context.Background(), base.Path)
+							status, statusFound, statusErr := fixture.statuses.Get(context.Background(), base.Path)
+							fixture.manager.mu.Lock()
+							fifo := append([]gitManagerJob(nil), fixture.manager.queue...)
+							inFlight := fixture.manager.inFlight[base.Path]
+							fixture.manager.mu.Unlock()
+							if err != nil || !found || statusErr != nil || !statusFound || stored.ID != result.operation.ID ||
+								status.OperationID != result.operation.ID || len(fifo) != 1 || fifo[0].operation.ID != result.operation.ID ||
+								fifo[0].snapshot != base || inFlight.ID != result.operation.ID {
+								t.Fatalf("iteration %d journal/status/FIFO/inFlight = %#v / %#v / %#v / %#v, errors %v/%v", iteration, stored, status, fifo, inFlight, err, statusErr)
+							}
+							continue
+						}
+
+						reconfigureOwned := make(chan struct{})
+						releaseReconfigure := make(chan struct{})
+						go func() {
+							fixture.coordinator.Lock()
+							fixture.snapshots.mu.Lock()
+							fixture.snapshots.bases[changed.Name] = changed
+							fixture.snapshots.active = ""
+							fixture.snapshots.mu.Unlock()
+							close(reconfigureOwned)
+							<-releaseReconfigure
+							fixture.coordinator.Unlock()
+						}()
+						<-reconfigureOwned
+						queueAttempting := make(chan struct{})
+						snapshotCalled := make(chan struct{})
+						fixture.snapshots.before = func(string) { close(snapshotCalled) }
+						go func() {
+							close(queueAttempting)
+							op, deduped, err := queue()
+							queued <- queueResult{operation: op, deduped: deduped, err: err}
+						}()
+						<-queueAttempting
+						select {
+						case <-snapshotCalled:
+							t.Fatal("queue snapshot crossed reconfiguration")
+						default:
+						}
+						close(releaseReconfigure)
+						result := <-queued
+						requireManagerCode(t, result.err, gitcmd.CodeNeedsReconnect)
+						if result.deduped || result.operation.ID != "" {
+							t.Fatalf("iteration %d stale request = %#v, deduped %v", iteration, result.operation, result.deduped)
+						}
+						afterStatus, afterStatusFound, err := fixture.statuses.Get(context.Background(), base.Path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						afterOperations, err := fixture.operations.ListUnfinished(context.Background())
+						if err != nil {
+							t.Fatal(err)
+						}
+						fixture.manager.mu.Lock()
+						queueLength := len(fixture.manager.queue)
+						inFlightLength := len(fixture.manager.inFlight)
+						fixture.manager.mu.Unlock()
+						if afterStatusFound != beforeStatusFound || !reflect.DeepEqual(afterStatus, beforeStatus) ||
+							!reflect.DeepEqual(afterOperations, beforeOperations) || queueLength != 0 || inFlightLength != 0 {
+							t.Fatalf("iteration %d stale request mutated status/journal/FIFO/inFlight", iteration)
+						}
+					}
+				})
 			}
 		})
 	}
@@ -626,6 +686,46 @@ func TestGitManagerQueueRejectsConflictAndSyncNeedsReconnect(t *testing.T) {
 	}
 	if _, _, err := fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base}); err != nil {
 		t.Fatalf("initialize may replace needs_reconnect: %v", err)
+	}
+}
+
+func TestGitManagerAdmissionTrustUsesPushOIDOnlyForProvenTerminalSuccess(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	status := model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateReady,
+		RemoteOID: managerOID, ChangedPaths: []string{},
+	}
+	operation := gitcmd.Operation{
+		BaseName: base.Name, RepoPath: base.Path, ConfigFingerprint: base.Fingerprint,
+		RemoteFingerprint: base.RemoteFingerprint, State: gitcmd.OperationSucceeded,
+		Stage: gitcmd.StageCompleted, PushOID: managerOID,
+	}
+	trusted, err := managerAdmissionTrust(gitcmd.OperationSync, base, status, true, operation, true)
+	if err != nil || trusted != managerOID {
+		t.Fatalf("proven terminal success trust = %q, %v", trusted, err)
+	}
+
+	for _, test := range []struct {
+		name        string
+		state       gitcmd.OperationState
+		stage       gitcmd.Stage
+		statusState model.GitState
+	}{
+		{name: "failed", state: gitcmd.OperationFailed, stage: gitcmd.StagePushing, statusState: model.GitStateReady},
+		{name: "conflict", state: gitcmd.OperationConflict, stage: gitcmd.StageMerging, statusState: model.GitStateReady},
+		{name: "incomplete success", state: gitcmd.OperationSucceeded, stage: gitcmd.StagePushing, statusState: model.GitStateReady},
+		{name: "non-ready status", state: gitcmd.OperationSucceeded, stage: gitcmd.StageCompleted, statusState: model.GitStateError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			operation.State = test.state
+			operation.Stage = test.stage
+			status.State = test.statusState
+			if trusted, err := managerAdmissionTrust(gitcmd.OperationSync, base, status, true, operation, true); err == nil {
+				t.Fatalf("unproven PushOID trust = %q, nil error", trusted)
+			} else {
+				requireManagerCode(t, err, gitcmd.CodeNeedsReconnect)
+			}
+		})
 	}
 }
 
@@ -1231,6 +1331,108 @@ func runManagerGit(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
+func newManagerRecoveryFixture(t *testing.T) (*gitManagerFixture, gitcmd.ConfiguredBase, string, *atomic.Int32) {
+	t.Helper()
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("clean\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	head := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", head)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	network := &atomic.Int32{}
+	runner := managerRunnerFunc(func(ctx context.Context, command gitcmd.Command) (gitcmd.Result, error) {
+		if command.Scope == gitcmd.NetworkOperation {
+			network.Add(1)
+			return gitcmd.Result{}, errors.New("network forbidden")
+		}
+		return delegate.Run(ctx, command)
+	})
+	client := gitcmd.NewClient(runner)
+	return newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", runner, client, client), base, head, network
+}
+
+func TestGitManagerRecoveryCheckpointFailureImmediatelyFailsClosed(t *testing.T) {
+	fixture, base, head, network := newManagerRecoveryFixture(t)
+	now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("6", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageFetching,
+		Branch: base.Branch, CandidateOID: head, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, base.Path, "update-ref", "refs/igonotes/fetch/"+op.ID, head)
+	if _, err := fixture.db.Exec(`CREATE TRIGGER reject_recovery_checkpoint BEFORE UPDATE ON git_operations
+		WHEN NEW.state = 'running' BEGIN SELECT RAISE(ABORT, 'secret recovery checkpoint failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base})
+	if err == nil || !strings.Contains(err.Error(), "Git operation persistence failed") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("RecoverLocal() error = %v, want safe checkpoint persistence failure", err)
+	}
+	active, found, lookupErr := fixture.operations.ActiveByPath(context.Background(), base.Path)
+	if lookupErr != nil || !found || active.ID != op.ID || active.State == gitcmd.OperationSucceeded {
+		t.Fatalf("active journal immediately after checkpoint failure = %#v, %v, %v", active, found, lookupErr)
+	}
+	status, statusFound, statusErr := fixture.statuses.Get(context.Background(), base.Path)
+	if statusErr != nil || !statusFound || status.State != model.GitStateNeedsReconnect || status.Error == nil {
+		t.Fatalf("status immediately after checkpoint failure = %#v, %v, %v", status, statusFound, statusErr)
+	}
+	if !errors.Is(fixture.coordinator.CheckMutation(base.Path), ErrGitConflictPending) {
+		t.Fatal("checkpoint failure reopened mutation gate")
+	}
+	if network.Load() != 0 {
+		t.Fatalf("recovery network calls = %d", network.Load())
+	}
+}
+
+func TestGitManagerRecoveryFinishFailureImmediatelyFailsClosed(t *testing.T) {
+	fixture, base, head, network := newManagerRecoveryFixture(t)
+	now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("7", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageFetching,
+		Branch: base.Branch, RemoteOID: head, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`CREATE TRIGGER reject_recovery_finish BEFORE UPDATE ON git_operations
+		WHEN NEW.state IN ('failed', 'conflict') BEGIN SELECT RAISE(ABORT, 'secret recovery finish failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base})
+	if err == nil || !strings.Contains(err.Error(), "Git operation persistence failed") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("RecoverLocal() error = %v, want safe finish persistence failure", err)
+	}
+	active, found, lookupErr := fixture.operations.ActiveByPath(context.Background(), base.Path)
+	if lookupErr != nil || !found || active.ID != op.ID || active.State == gitcmd.OperationSucceeded {
+		t.Fatalf("active journal immediately after finish failure = %#v, %v, %v", active, found, lookupErr)
+	}
+	status, statusFound, statusErr := fixture.statuses.Get(context.Background(), base.Path)
+	if statusErr != nil || !statusFound || status.State != model.GitStateNeedsReconnect || status.Error == nil {
+		t.Fatalf("status immediately after finish failure = %#v, %v, %v", status, statusFound, statusErr)
+	}
+	if !errors.Is(fixture.coordinator.CheckMutation(base.Path), ErrGitConflictPending) {
+		t.Fatal("finish failure reopened mutation gate")
+	}
+	if network.Load() != 0 {
+		t.Fatalf("recovery network calls = %d", network.Load())
+	}
+}
+
 func TestGitManagerRecoverLocalInterruptedConflictFailureGateAndReadyStates(t *testing.T) {
 	t.Run("clean interrupted is failed and ready without network", func(t *testing.T) {
 		root, remote := newManagerGitPair(t)
@@ -1291,20 +1493,26 @@ func TestGitManagerRecoverLocalInterruptedConflictFailureGateAndReadyStates(t *t
 	})
 }
 
-func TestGitManagerRecoveryCheckpointTrustTerminalGapAndIdempotentConflict(t *testing.T) {
-	// Candidate and post-push proof are exercised by git.Service recovery tests;
-	// this manager test verifies that even a terminal journal row is supplied to
-	// local recovery and can rebuild a missing public status without networking.
+func TestGitManagerRecoveryUsesProvenTerminalPostPushCheckpointForSubsequentSync(t *testing.T) {
 	root, remote := newManagerGitPair(t)
 	runManagerGit(t, root, "init", "--initial-branch", "main")
 	runManagerGit(t, root, "remote", "add", "origin", remote)
-	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("clean\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("old\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runManagerGit(t, root, "add", "--all")
-	runManagerGit(t, root, "commit", "-m", "initial")
-	oid := runManagerGit(t, root, "rev-parse", "HEAD")
-	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	runManagerGit(t, root, "commit", "-m", "old remote")
+	oldOID := runManagerGit(t, root, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("pushed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "commit", "-am", "pushed")
+	pushOID := runManagerGit(t, root, "rev-parse", "HEAD")
+	if oldOID == pushOID {
+		t.Fatal("terminal recovery test requires distinct RemoteOID and PushOID")
+	}
+	runManagerGit(t, root, "push", "--no-verify", "origin", pushOID+":refs/heads/main")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", pushOID)
 	base := configuredManagerBase("work", root)
 	base.URL = remote
 	delegate := gitcmd.NewCommandRunner()
@@ -1312,7 +1520,6 @@ func TestGitManagerRecoveryCheckpointTrustTerminalGapAndIdempotentConflict(t *te
 	runner := managerRunnerFunc(func(ctx context.Context, command gitcmd.Command) (gitcmd.Result, error) {
 		if command.Scope == gitcmd.NetworkOperation {
 			network.Add(1)
-			return gitcmd.Result{}, errors.New("network forbidden")
 		}
 		return delegate.Run(ctx, command)
 	})
@@ -1328,8 +1535,8 @@ func TestGitManagerRecoveryCheckpointTrustTerminalGapAndIdempotentConflict(t *te
 	}
 	op.State = gitcmd.OperationSucceeded
 	op.Stage = gitcmd.StageCompleted
-	op.RemoteOID = oid
-	op.PushOID = oid
+	op.RemoteOID = oldOID
+	op.PushOID = pushOID
 	if err := fixture.operations.Finish(context.Background(), op); err != nil {
 		t.Fatal(err)
 	}
@@ -1338,11 +1545,33 @@ func TestGitManagerRecoveryCheckpointTrustTerminalGapAndIdempotentConflict(t *te
 		t.Fatal(err)
 	}
 	status, _, _ := fixture.statuses.Get(context.Background(), root)
-	if status.State != model.GitStateReady || status.RemoteOID != oid || network.Load() != 0 {
+	if status.State != model.GitStateReady || status.RemoteOID != pushOID || network.Load() != 0 {
 		t.Fatalf("terminal gap status/network = %#v / %d", status, network.Load())
 	}
+	queued, deduplicated, err := fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
+	if err != nil || deduplicated || queued.RemoteOID != pushOID {
+		t.Fatalf("QueueSync() after terminal post-push recovery = %#v, %v, %v", queued, deduplicated, err)
+	}
+	waitManagerTerminal(t, fixture.manager)
+	completed, found, err := fixture.operations.LatestByPath(context.Background(), root)
+	if err != nil || !found || completed.ID != queued.ID || completed.State != gitcmd.OperationSucceeded ||
+		completed.RemoteOID != pushOID || completed.Error != nil {
+		t.Fatalf("subsequent sync operation = %#v, %v, %v", completed, found, err)
+	}
+	status, found, err = fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStateReady || status.RemoteOID != pushOID ||
+		(status.Error != nil && status.Error.Code == string(gitcmd.CodeNeedsReconnect)) {
+		t.Fatalf("subsequent sync status = %#v, %v, %v", status, found, err)
+	}
+	if network.Load() == 0 {
+		t.Fatal("subsequent sync did not execute")
+	}
+	beforeRecovery := network.Load()
 	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
 		t.Fatal(err)
+	}
+	if network.Load() != beforeRecovery {
+		t.Fatalf("idempotent recovery network calls changed from %d to %d", beforeRecovery, network.Load())
 	}
 }
 

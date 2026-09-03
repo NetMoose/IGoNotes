@@ -575,8 +575,8 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 			conflict.Paths = sortedManagerPaths(append(conflict.Paths, durableConflictPaths...))
 			isConflict = true
 		}
+		var transitionErr error
 		if active, found := unfinishedByPath[current.Path]; found {
-			trustCheckpointFailed := false
 			if result.RemoteOID != "" && active.RemoteOID != result.RemoteOID {
 				checkpoint := gitcmd.Checkpoint{
 					Stage: active.Stage, BackupRef: active.BackupRef, LocalOID: active.LocalOID,
@@ -584,8 +584,7 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 					ChangedPaths: active.ChangedPaths, ConflictPaths: active.ConflictPaths,
 				}
 				if checkpointErr := m.operations.Checkpoint(ctx, active.ID, checkpoint); checkpointErr != nil {
-					recoveryErrors = append(recoveryErrors, persistenceError(checkpointErr))
-					trustCheckpointFailed = true
+					transitionErr = persistenceError(checkpointErr)
 				} else {
 					active.RemoteOID = result.RemoteOID
 				}
@@ -599,11 +598,26 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 				active.State = gitcmd.OperationFailed
 				active.Error = &gitcmd.SafeError{Code: gitcmd.CodeOperationInterrupted, Message: "Git operation was interrupted"}
 			}
-			if !trustCheckpointFailed {
+			if transitionErr == nil {
 				if finishErr := m.operations.Finish(ctx, active); finishErr != nil {
-					recoveryErrors = append(recoveryErrors, persistenceError(finishErr))
+					transitionErr = persistenceError(finishErr)
 				}
 			}
+		}
+		if transitionErr != nil {
+			recoveryErrors = append(recoveryErrors, transitionErr)
+			m.coordinator.SetConflict(current.Path, true)
+			safeErr := managerSafeError(transitionErr)
+			status := model.GitStatus{
+				Base: current.Name, RepositoryPath: current.Path, State: model.GitStateNeedsReconnect,
+				ChangedPaths: []string{}, RemoteOID: result.RemoteOID,
+				Error: &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field},
+			}
+			if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
+				recoveryErrors = append(recoveryErrors, persistenceError(statusErr))
+			}
+			m.coordinator.Unlock()
+			continue
 		}
 
 		status := model.GitStatus{Base: current.Name, RepositoryPath: current.Path, ChangedPaths: []string{}, RemoteOID: result.RemoteOID}
@@ -687,7 +701,7 @@ func managerAdmissionTrust(
 		}
 		return "", nil
 	}
-	journalOID := managerOperationRemoteOID(latest)
+	journalOID := managerOperationTrustedOID(latest, status, statusFound)
 	statusOID := ""
 	if statusFound {
 		statusOID = status.RemoteOID
@@ -722,11 +736,12 @@ func managerRuntimeSyncTrust(
 	return managerAdmissionTrust(gitcmd.OperationSync, snapshot, status, statusFound, operation, true)
 }
 
-func managerOperationRemoteOID(operation gitcmd.Operation) string {
-	if operation.RemoteOID != "" {
-		return operation.RemoteOID
+func managerOperationTrustedOID(operation gitcmd.Operation, status model.GitStatus, statusFound bool) string {
+	if operation.State == gitcmd.OperationSucceeded && operation.Stage == gitcmd.StageCompleted &&
+		operation.PushOID != "" && statusFound && status.State == model.GitStateReady && status.RemoteOID == operation.PushOID {
+		return operation.PushOID
 	}
-	return operation.PushOID
+	return operation.RemoteOID
 }
 
 func requireManagerConfirmations(required model.GitRequiredMutations, confirmations model.GitConfirmations) error {
