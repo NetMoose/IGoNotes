@@ -51,15 +51,19 @@ func TestBaseOperationLockOrderCoordinatesFilesystemMutationAndSwitch(t *testing
 	var releaseMutationOnce sync.Once
 	releaseMutation := func() { releaseMutationOnce.Do(func() { close(mutationRelease) }) }
 	settingsLockHeld := false
+	releaseSettingsLock := func() {
+		if settingsLockHeld {
+			settingsLockHeld = false
+			settings.mu.Unlock()
+		}
+	}
 	mutationLaunched := false
 	switchLaunched := false
 	mutationJoined := false
 	switchJoined := false
 	t.Cleanup(func() {
 		releaseMutation()
-		if settingsLockHeld {
-			settings.mu.Unlock()
-		}
+		releaseSettingsLock()
 		if mutationLaunched && !mutationJoined {
 			select {
 			case <-mutationDone:
@@ -79,12 +83,13 @@ func TestBaseOperationLockOrderCoordinatesFilesystemMutationAndSwitch(t *testing
 	mutationLaunched = true
 	go func() {
 		coordinator.Lock()
-		defer coordinator.Unlock()
-		mutationDone <- notes.MutateActiveFilesystem(activePath, func(canonicalPath string) error {
+		mutationErr := notes.MutateActiveFilesystem(activePath, func(canonicalPath string) error {
 			close(mutationStarted)
 			<-mutationRelease
 			return os.WriteFile(filepath.Join(canonicalPath, "incoming.md"), []byte("incoming"), 0o600)
 		})
+		coordinator.Unlock()
+		mutationDone <- mutationErr
 	}()
 	select {
 	case <-mutationStarted:
@@ -141,8 +146,7 @@ func TestBaseOperationLockOrderCoordinatesFilesystemMutationAndSwitch(t *testing
 		runtime.Gosched()
 	}
 
-	settings.mu.Unlock()
-	settingsLockHeld = false
+	releaseSettingsLock()
 	select {
 	case err := <-switchDone:
 		switchJoined = true
