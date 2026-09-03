@@ -13,10 +13,10 @@ type conflictPathSet map[string]struct{}
 
 // BaseOperationCoordinator serializes base lifecycle and Git operations.
 // Lock ordering is coordinator -> SettingsService.mu -> NoteService.baseMu ->
-// repository/SQLite. Repository and filesystem callbacks must never call back
-// into SettingsService, NoteService, or BaseOperationCoordinator. Conflict
-// snapshots are immutable after publication so mutation checks remain lock-free
-// and never acquire operations.
+// repository/SQLite. Repository and filesystem callbacks must not call Lock or
+// call upward into SettingsService, NoteService, or repository layers; lock-free
+// SetConflict and CheckMutation handoffs remain allowed. Conflict snapshots are
+// immutable after publication and never acquire operations.
 type BaseOperationCoordinator struct {
 	operations sync.Mutex
 	conflicts  atomic.Pointer[conflictPathSet]
@@ -45,9 +45,12 @@ func (c *BaseOperationCoordinator) SetConflict(canonicalBasePath string, pending
 	basePath := filepath.Clean(canonicalBasePath)
 	for {
 		current := c.conflicts.Load()
-		next := make(conflictPathSet, len(*current)+1)
-		for path := range *current {
-			next[path] = struct{}{}
+		next := make(conflictPathSet)
+		if current != nil {
+			next = make(conflictPathSet, len(*current)+1)
+			for path := range *current {
+				next[path] = struct{}{}
+			}
 		}
 		if pending {
 			next[basePath] = struct{}{}
@@ -66,6 +69,9 @@ func (c *BaseOperationCoordinator) CheckMutation(canonicalBasePath string) error
 		return nil
 	}
 	conflicts := c.conflicts.Load()
+	if conflicts == nil {
+		return nil
+	}
 	if _, pending := (*conflicts)[filepath.Clean(canonicalBasePath)]; pending {
 		return ErrGitConflictPending
 	}

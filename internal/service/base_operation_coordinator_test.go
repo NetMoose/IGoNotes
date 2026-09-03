@@ -9,24 +9,41 @@ import (
 	"time"
 )
 
+func TestBaseOperationCoordinatorZeroValueSupportsConflictPolicy(t *testing.T) {
+	var coordinator BaseOperationCoordinator
+	basePath := filepath.Join(t.TempDir(), "notes")
+
+	if err := coordinator.CheckMutation(""); err != nil {
+		t.Fatalf("CheckMutation(empty) error = %v, want nil", err)
+	}
+	if err := coordinator.CheckMutation(basePath); err != nil {
+		t.Fatalf("CheckMutation() before conflict error = %v, want nil", err)
+	}
+	coordinator.SetConflict("", true)
+	coordinator.SetConflict(basePath, true)
+	if err := coordinator.CheckMutation(basePath); !errors.Is(err, ErrGitConflictPending) {
+		t.Fatalf("CheckMutation() error = %v, want ErrGitConflictPending", err)
+	}
+	coordinator.SetConflict(basePath, false)
+	if err := coordinator.CheckMutation(basePath); err != nil {
+		t.Fatalf("CheckMutation() after clearing error = %v, want nil", err)
+	}
+}
+
 func TestBaseOperationCoordinatorSerializesOperations(t *testing.T) {
 	coordinator := NewBaseOperationCoordinator()
 	coordinator.Lock()
 
-	attempting := make(chan struct{})
 	acquired := make(chan struct{})
 	go func() {
-		close(attempting)
 		coordinator.Lock()
 		close(acquired)
 		coordinator.Unlock()
 	}()
-	<-attempting
 
 	select {
 	case <-acquired:
-		coordinator.Unlock()
-		t.Fatal("second Lock() acquired while the first operation held the coordinator")
+		t.Fatal("second operation was observed while the first held the coordinator")
 	case <-time.After(50 * time.Millisecond):
 	}
 
