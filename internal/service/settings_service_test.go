@@ -2526,6 +2526,53 @@ func TestSettingsServiceRejectsConfiguredPathConvergenceBeforeMutation(t *testin
 	}
 }
 
+func TestSettingsServiceReplaceConfigReservesExactNameMatchesBeforePathMatches(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		aliasFirst bool
+	}{
+		{name: "path match before exact name", aliasFirst: true},
+		{name: "exact name before path match", aliasFirst: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir()
+			completed := true
+			configured := model.Base{Name: "configured", Path: path}
+			setConfiguredGit(&configured)
+			config := model.Config{Bases: []model.Base{configured}, CurrentBase: configured.Name, SetupCompleted: &completed}
+			service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, path)
+			alias := configured
+			alias.Name = "alias"
+			input := cloneConfig(config)
+			if test.aliasFirst {
+				input.Bases = []model.Base{alias, configured}
+			} else {
+				input.Bases = []model.Base{configured, alias}
+			}
+			beforePathCalls := runtime.pathCalls
+
+			_, err := service.ReplaceConfig(input)
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("ReplaceConfig() error = %v, want ErrInvalidConfig", err)
+			}
+			aliasIndex := 1
+			if test.aliasFirst {
+				aliasIndex = 0
+			}
+			assertFieldError(t, err, fmt.Sprintf("bases[%d].git_url", aliasIndex))
+			if !reflect.DeepEqual(service.GetConfig(), config) || store.saveCalls != 0 {
+				t.Fatalf("rejected replace changed config: config %#v saves %d", service.GetConfig(), store.saveCalls)
+			}
+			if statuses.listCalls != 0 || len(statuses.getCalls)+len(statuses.upsertCalls)+len(statuses.deleteCalls) != 0 {
+				t.Fatalf("rejected replace status calls = list %d get %v upsert %v delete %v", statuses.listCalls, statuses.getCalls, statuses.upsertCalls, statuses.deleteCalls)
+			}
+			if runtime.pathCalls != beforePathCalls || runtime.persistCalls != 0 || len(runtime.transactionCalls) != 0 {
+				t.Fatalf("rejected replace runtime calls = paths %d/%d persists %d transactions %v", runtime.pathCalls, beforePathCalls, runtime.persistCalls, runtime.transactionCalls)
+			}
+		})
+	}
+}
+
 func TestSettingsServiceAllowsNonGitDuplicateCanonicalPaths(t *testing.T) {
 	path := t.TempDir()
 	alias := filepath.Join(t.TempDir(), "base-alias")
@@ -2544,6 +2591,170 @@ func TestSettingsServiceAllowsNonGitDuplicateCanonicalPaths(t *testing.T) {
 	}
 	if response.Config.Bases[1].Path != path {
 		t.Fatalf("other path = %q, want %q", response.Config.Bases[1].Path, path)
+	}
+}
+
+func TestSettingsServiceForeignLexicalGitStatusIsNotOwned(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		samePath bool
+		mutate   func(*SettingsService, string) error
+		check    func(*testing.T, model.Config, string)
+	}{
+		{
+			name:     "disable alias",
+			samePath: true,
+			mutate: func(service *SettingsService, _ string) error {
+				_, err := service.DisableGit(context.Background(), "alias")
+				return err
+			},
+			check: func(t *testing.T, config model.Config, sharedPath string) {
+				t.Helper()
+				if len(config.Bases) != 2 || config.Bases[1] != (model.Base{Name: "alias", Path: sharedPath}) {
+					t.Fatalf("disabled alias config = %#v", config)
+				}
+			},
+		},
+		{
+			name:     "rename alias",
+			samePath: true,
+			mutate: func(service *SettingsService, sharedPath string) error {
+				_, err := service.UpdateBase("alias", model.BaseUpdateRequest{Name: "renamed", Path: sharedPath})
+				return err
+			},
+			check: func(t *testing.T, config model.Config, sharedPath string) {
+				t.Helper()
+				if len(config.Bases) != 2 || config.Bases[1] != (model.Base{Name: "renamed", Path: sharedPath}) {
+					t.Fatalf("renamed alias config = %#v", config)
+				}
+			},
+		},
+		{
+			name: "move alias",
+			mutate: func(service *SettingsService, destination string) error {
+				_, err := service.UpdateBase("alias", model.BaseUpdateRequest{Name: "alias", Path: destination})
+				return err
+			},
+			check: func(t *testing.T, config model.Config, destination string) {
+				t.Helper()
+				if len(config.Bases) != 2 || config.Bases[1] != (model.Base{Name: "alias", Path: destination}) {
+					t.Fatalf("moved alias config = %#v", config)
+				}
+			},
+		},
+		{
+			name: "forget alias",
+			mutate: func(service *SettingsService, _ string) error {
+				_, err := service.ForgetBase("alias")
+				return err
+			},
+			check: func(t *testing.T, config model.Config, _ string) {
+				t.Helper()
+				if len(config.Bases) != 1 || config.Bases[0].Name != "owner" {
+					t.Fatalf("forgotten alias config = %#v", config)
+				}
+			},
+		},
+		{
+			name: "replace removes alias",
+			mutate: func(service *SettingsService, _ string) error {
+				input := service.GetConfig()
+				input.Bases = input.Bases[:1]
+				_, err := service.ReplaceConfig(input)
+				return err
+			},
+			check: func(t *testing.T, config model.Config, _ string) {
+				t.Helper()
+				if len(config.Bases) != 1 || config.Bases[0].Name != "owner" {
+					t.Fatalf("replace removal config = %#v", config)
+				}
+			},
+		},
+		{
+			name: "replace moves alias",
+			mutate: func(service *SettingsService, destination string) error {
+				input := service.GetConfig()
+				input.Bases[1].Path = destination
+				_, err := service.ReplaceConfig(input)
+				return err
+			},
+			check: func(t *testing.T, config model.Config, destination string) {
+				t.Helper()
+				if len(config.Bases) != 2 || config.Bases[1] != (model.Base{Name: "alias", Path: destination}) {
+					t.Fatalf("replace move config = %#v", config)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sharedPath, destination := t.TempDir(), t.TempDir()
+			completed := true
+			owner := model.Base{Name: "owner", Path: sharedPath}
+			setConfiguredGit(&owner)
+			config := model.Config{
+				Bases:          []model.Base{owner, {Name: "alias", Path: sharedPath}},
+				CurrentBase:    owner.Name,
+				SetupCompleted: &completed,
+			}
+			service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, sharedPath)
+			foreign := model.GitStatus{
+				Base: "owner", RepositoryPath: sharedPath, State: model.GitStateConflict,
+				OperationID: "operation", Stage: "merge", Ahead: 3, Behind: 2,
+				ConsecutiveFailures: 4, ChangedPaths: []string{"note.md"}, RemoteOID: "remote",
+				Error: &model.APIError{Code: "conflict", Message: "safe"},
+			}
+			statuses.statuses[sharedPath] = cloneGitStatusForTest(foreign)
+
+			targetPath := destination
+			if test.samePath {
+				targetPath = sharedPath
+			}
+			if err := test.mutate(service, targetPath); err != nil {
+				t.Fatalf("mutation error = %v", err)
+			}
+			test.check(t, service.GetConfig(), targetPath)
+			if len(statuses.statuses) != 1 || !reflect.DeepEqual(statuses.statuses[sharedPath], foreign) {
+				t.Fatalf("foreign status changed = %#v, want %#v", statuses.statuses, foreign)
+			}
+			if !reflect.DeepEqual(statuses.getCalls, []string{sharedPath}) || len(statuses.upsertCalls) != 0 || len(statuses.deleteCalls) != 0 {
+				t.Fatalf("foreign status calls = get %v upsert %v delete %v", statuses.getCalls, statuses.upsertCalls, statuses.deleteCalls)
+			}
+			if store.saveCalls != 1 || runtime.persistCalls != 1 || len(runtime.transactionCalls) != 0 {
+				t.Fatalf("config/runtime calls = saves %d persists %d transactions %v", store.saveCalls, runtime.persistCalls, runtime.transactionCalls)
+			}
+		})
+	}
+}
+
+func TestSettingsServiceGitConfiguredMoveWithMissingOwnStatusPreservesForeignLexicalRow(t *testing.T) {
+	sharedPath, destination := t.TempDir(), t.TempDir()
+	completed := true
+	configured := model.Base{Name: "configured", Path: sharedPath}
+	setConfiguredGit(&configured)
+	config := model.Config{
+		Bases:          []model.Base{{Name: "foreign", Path: sharedPath}, configured},
+		CurrentBase:    "foreign",
+		SetupCompleted: &completed,
+	}
+	service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, sharedPath)
+	foreign := model.GitStatus{Base: "foreign", RepositoryPath: sharedPath, State: model.GitStatePaused, ChangedPaths: []string{"keep.md"}}
+	statuses.statuses[sharedPath] = cloneGitStatusForTest(foreign)
+
+	if _, err := service.UpdateBase("configured", model.BaseUpdateRequest{Name: "configured", Path: destination}); err != nil {
+		t.Fatalf("UpdateBase() error = %v", err)
+	}
+	want := map[string]model.GitStatus{
+		sharedPath:  foreign,
+		destination: needsReconnectGitStatus("configured", destination),
+	}
+	if !reflect.DeepEqual(statuses.statuses, want) {
+		t.Fatalf("moved statuses = %#v, want %#v", statuses.statuses, want)
+	}
+	if !reflect.DeepEqual(statuses.getCalls, []string{sharedPath, destination}) || len(statuses.deleteCalls) != 0 || len(statuses.upsertCalls) != 1 {
+		t.Fatalf("status calls = get %v delete %v upsert %#v", statuses.getCalls, statuses.deleteCalls, statuses.upsertCalls)
+	}
+	if service.GetConfig().Bases[1].Path != destination || store.saveCalls != 1 || runtime.persistCalls != 1 || len(runtime.transactionCalls) != 0 {
+		t.Fatalf("config/runtime state = config %#v saves %d persists %d transactions %v", service.GetConfig(), store.saveCalls, runtime.persistCalls, runtime.transactionCalls)
 	}
 }
 
@@ -2574,10 +2785,10 @@ func TestSettingsServiceGitStatusReconciliation(t *testing.T) {
 			t.Fatalf("moved statuses = %#v, want %#v", statuses.statuses, want)
 		}
 	})
-	t.Run("unconfigured move only removes stale old row", func(t *testing.T) {
+	t.Run("unconfigured move only removes owned stale old row", func(t *testing.T) {
 		service, _, _, _, statuses, config := newGitSettingsService(t)
 		oldPath, newPath := config.Bases[0].Path, t.TempDir()
-		statuses.statuses[oldPath] = model.GitStatus{Base: "stale", RepositoryPath: oldPath, State: model.GitStateReady}
+		statuses.statuses[oldPath] = model.GitStatus{Base: "work", RepositoryPath: oldPath, State: model.GitStateReady}
 		if _, err := service.UpdateBase("work", model.BaseUpdateRequest{Name: "work", Path: newPath}); err != nil {
 			t.Fatal(err)
 		}

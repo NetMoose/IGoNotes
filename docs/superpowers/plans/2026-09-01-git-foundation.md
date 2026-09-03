@@ -1303,7 +1303,7 @@ Delete persisted status with compensation, persist config through the standard `
 
 - [ ] **Step 7: Protect dedicated fields from generic `ReplaceConfig`**
 
-Match each incoming base to the current config by exact name first, then by unique canonical path. This permits a same-name path change and a same-path rename while rejecting an ambiguous simultaneous rename-and-move of a configured base. An unchanged Git field set is accepted for compatibility with GET-then-PUT clients. Any first difference returns `ErrInvalidConfig`, field path in this order: `git_url`, `git_branch`, `auto_sync`, `auto_sync_interval_minutes`, `git_commit_message_template`, with message `Git settings must be changed through /api/git/config`. A genuinely new base through generic config must have zero Git fields.
+Match incoming bases one-to-one in two deterministic passes. Initialize every match as new, reserve all exact-name current matches first, then match each still-unmatched incoming base only to a unique canonical-path current base that has not already been reserved. A current base can never match two incoming bases regardless of input order. This permits a same-name path change and a same-path rename while rejecting an ambiguous simultaneous rename-and-move of a configured base. An unchanged Git field set is accepted for compatibility with GET-then-PUT clients. Any first difference returns `ErrInvalidConfig`, field path in this order: `git_url`, `git_branch`, `auto_sync`, `auto_sync_interval_minutes`, `git_commit_message_template`, with message `Git settings must be changed through /api/git/config`. A genuinely new base through generic config must have zero Git fields.
 
 Update existing expectations around `settings_service_test.go:1580-1625` and `1731-1779`, which currently permit generic GitURL/AutoSync changes.
 
@@ -1311,9 +1311,10 @@ Update existing expectations around `settings_service_test.go:1580-1625` and `17
 
 - Same path rename: preserve status and update its `Base`.
 - Configured path change: delete old status, create new `needs_reconnect`, preserve saved Git settings and autosync preference.
-- Unconfigured path change: remove stale old status and create no row.
-- Forget: delete status for the forgotten canonical path.
+- Unconfigured path change: remove an owned stale old status and create no row.
+- Forget: delete an owned status for the forgotten canonical path.
 - `ReplaceConfig`: apply the same reconciliation to moved/renamed bases and delete status rows for removed bases.
+- An exact-name status row owns its persisted `RepositoryPath`. With no exact-name row, a lexical-path row is owned only when its `Base` still equals the current base name; a missing row or a row owned by another base must never be snapshotted, deleted, renamed, or restored by this base. A configured move still creates destination `needs_reconnect` when its own old row is missing.
 - Every status mutation participates in compensation when config persistence fails.
 
 - [ ] **Step 9: Implement status aggregation**

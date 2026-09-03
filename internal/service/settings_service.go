@@ -433,10 +433,10 @@ func validateUniqueGitRepositoryPaths(bases []model.Base) error {
 	return nil
 }
 
-func (s *SettingsService) existingGitStatusPath(ctx context.Context, base model.Base) (string, error) {
+func (s *SettingsService) existingGitStatusPath(ctx context.Context, base model.Base) (string, bool, error) {
 	statuses, err := s.gitStatuses.List(ctx)
 	if err != nil {
-		return "", fmt.Errorf("list Git statuses: %w", err)
+		return "", false, fmt.Errorf("list Git statuses: %w", err)
 	}
 	matchedPath := ""
 	matchedCount := 0
@@ -446,18 +446,19 @@ func (s *SettingsService) existingGitStatusPath(ctx context.Context, base model.
 		}
 		matchedCount++
 		if matchedCount > 1 {
-			return "", errAmbiguousGitStatusIdentity
+			return "", false, errAmbiguousGitStatusIdentity
 		}
 		matchedPath = status.RepositoryPath
 	}
 	if matchedCount == 1 {
-		return matchedPath, nil
+		return matchedPath, true, nil
 	}
 	storedPath := storedGitStatusPath(base.Path)
-	if _, _, err := s.gitStatuses.Get(ctx, storedPath); err != nil {
-		return "", fmt.Errorf("read Git status: %w", err)
+	status, found, err := s.gitStatuses.Get(ctx, storedPath)
+	if err != nil {
+		return "", false, fmt.Errorf("read Git status: %w", err)
 	}
-	return storedPath, nil
+	return storedPath, found && status.Base == base.Name, nil
 }
 
 func validLiteralGitBranch(branch string) bool {
@@ -540,7 +541,7 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 	if s.gitStatuses == nil {
 		return model.GitConfigResponse{}, fmt.Errorf("Git status dependency: %w", ErrInvalidConfig)
 	}
-	path, err := s.existingGitStatusPath(ctx, s.config.Bases[index])
+	path, owned, err := s.existingGitStatusPath(ctx, s.config.Bases[index])
 	if err != nil {
 		return model.GitConfigResponse{}, err
 	}
@@ -551,9 +552,12 @@ func (s *SettingsService) DisableGit(ctx context.Context, name string) (model.Gi
 	base.AutoSync = false
 	base.AutoSyncIntervalMinutes = 0
 	base.GitCommitMessageTemplate = ""
-	changes, err := s.prepareGitStatusChanges(ctx, path)
-	if err != nil {
-		return model.GitConfigResponse{}, err
+	var changes []gitStatusChange
+	if owned {
+		changes, err = s.prepareGitStatusChanges(ctx, path)
+		if err != nil {
+			return model.GitConfigResponse{}, err
+		}
 	}
 	if err := s.applyConfigWithGitStatusesLocked(ctx, next, "", changes); err != nil {
 		return model.GitConfigResponse{}, err
@@ -763,7 +767,7 @@ func (s *SettingsService) prepareUpdateBaseGitStatuses(ctx context.Context, curr
 	if s.gitStatuses == nil || current.Name == next.Name && current.Path == next.Path {
 		return nil, nil
 	}
-	oldPath, err := s.existingGitStatusPath(ctx, current)
+	oldPath, oldOwned, err := s.existingGitStatusPath(ctx, current)
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +776,7 @@ func (s *SettingsService) prepareUpdateBaseGitStatuses(ctx context.Context, curr
 		return nil, err
 	}
 	if oldPath == newPath {
-		if current.Name == next.Name {
+		if current.Name == next.Name || !oldOwned {
 			return nil, nil
 		}
 		changes, err := s.prepareGitStatusChanges(ctx, oldPath)
@@ -788,9 +792,15 @@ func (s *SettingsService) prepareUpdateBaseGitStatuses(ctx context.Context, curr
 		return changes, nil
 	}
 
-	paths := []string{oldPath}
+	paths := make([]string, 0, 2)
+	if oldOwned {
+		paths = append(paths, oldPath)
+	}
 	if next.GitConfigured() {
 		paths = append(paths, newPath)
+	}
+	if len(paths) == 0 {
+		return nil, nil
 	}
 	changes, err := s.prepareGitStatusChanges(ctx, paths...)
 	if err != nil {
@@ -807,9 +817,12 @@ func (s *SettingsService) prepareForgottenBaseGitStatus(ctx context.Context, bas
 	if s.gitStatuses == nil {
 		return nil, nil
 	}
-	path, err := s.existingGitStatusPath(ctx, base)
+	path, owned, err := s.existingGitStatusPath(ctx, base)
 	if err != nil {
 		return nil, err
+	}
+	if !owned {
+		return nil, nil
 	}
 	return s.prepareGitStatusChanges(ctx, path)
 }
@@ -840,9 +853,17 @@ func matchReplaceConfigBases(current, next []model.Base) ([]int, error) {
 	matches := make([]int, len(next))
 	for index := range matches {
 		matches[index] = -1
+	}
+	reserved := make([]bool, len(current))
+	for index := range next {
 		exact := baseIndex(current, next[index].Name)
 		if exact >= 0 {
 			matches[index] = exact
+			reserved[exact] = true
+		}
+	}
+	for index := range next {
+		if matches[index] >= 0 {
 			continue
 		}
 		nextPath, err := canonicalGitStatusPath(next[index].Path)
@@ -851,6 +872,9 @@ func matchReplaceConfigBases(current, next []model.Base) ([]int, error) {
 		}
 		unique := -1
 		for currentIndex := range current {
+			if reserved[currentIndex] {
+				continue
+			}
 			currentPath, pathErr := canonicalGitStatusPath(current[currentIndex].Path)
 			if pathErr != nil {
 				return nil, pathErr
@@ -865,6 +889,9 @@ func matchReplaceConfigBases(current, next []model.Base) ([]int, error) {
 			unique = currentIndex
 		}
 		matches[index] = unique
+		if unique >= 0 {
+			reserved[unique] = true
+		}
 	}
 	return matches, nil
 }
@@ -898,6 +925,7 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 	matchedCurrent := make(map[int]struct{}, len(matches))
 	paths := make([]string, 0)
 	oldPaths := make([]string, len(matches))
+	oldOwned := make([]bool, len(matches))
 	newPaths := make([]string, len(matches))
 	for index, match := range matches {
 		if match < 0 {
@@ -907,7 +935,7 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 		if current.Bases[match].Name == next.Bases[index].Name && storedGitStatusPath(current.Bases[match].Path) == storedGitStatusPath(next.Bases[index].Path) {
 			continue
 		}
-		oldPath, err := s.existingGitStatusPath(ctx, current.Bases[match])
+		oldPath, owned, err := s.existingGitStatusPath(ctx, current.Bases[match])
 		if err != nil {
 			return nil, err
 		}
@@ -915,14 +943,16 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 		if err != nil {
 			return nil, err
 		}
-		oldPaths[index], newPaths[index] = oldPath, newPath
+		oldPaths[index], oldOwned[index], newPaths[index] = oldPath, owned, newPath
 		if oldPath == newPath {
-			if current.Bases[match].Name != next.Bases[index].Name {
+			if owned && current.Bases[match].Name != next.Bases[index].Name {
 				paths = append(paths, oldPath)
 			}
 			continue
 		}
-		paths = append(paths, oldPath)
+		if owned {
+			paths = append(paths, oldPath)
+		}
 		if next.Bases[index].GitConfigured() {
 			paths = append(paths, newPath)
 		}
@@ -932,9 +962,12 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 		if _, ok := matchedCurrent[index]; ok {
 			continue
 		}
-		path, err := s.existingGitStatusPath(ctx, current.Bases[index])
+		path, owned, err := s.existingGitStatusPath(ctx, current.Bases[index])
 		if err != nil {
 			return nil, err
+		}
+		if !owned {
+			continue
 		}
 		removedPaths = append(removedPaths, path)
 		paths = append(paths, path)
@@ -953,8 +986,11 @@ func (s *SettingsService) prepareReplaceConfigGitStatuses(
 		if match < 0 || oldPaths[index] == "" {
 			continue
 		}
-		change := gitStatusChangeAt(changes, oldPaths[index])
 		if oldPaths[index] == newPaths[index] {
+			if !oldOwned[index] {
+				continue
+			}
+			change := gitStatusChangeAt(changes, oldPaths[index])
 			if current.Bases[match].Name != next.Bases[index].Name && change.exists {
 				status := cloneGitStatus(change.before)
 				status.Base = next.Bases[index].Name
