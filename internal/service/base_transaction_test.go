@@ -38,7 +38,7 @@ func TestNoteServiceBasePersistenceBlocksReadsUntilFailureRollsBack(t *testing.T
 	store := &fakeConfigStore{saveErr: persistErr, saveStarted: persistStarted, saveRelease: persistRelease}
 	transactionDone := make(chan baseTransactionResult, 1)
 	go func() {
-		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{}, &model.Config{})
 		transactionDone <- baseTransactionResult{operationErr: operationErr, rollbackErr: rollbackErr}
 	}()
 	<-persistStarted
@@ -112,7 +112,7 @@ func TestNoteServiceBasePersistencePublishesOnlyAfterSuccess(t *testing.T) {
 	store := &fakeConfigStore{saveStarted: persistStarted, saveRelease: persistRelease, events: events}
 	done := make(chan baseTransactionResult, 1)
 	go func() {
-		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{}, &model.Config{})
 		done <- baseTransactionResult{operationErr: operationErr, rollbackErr: rollbackErr}
 	}()
 	<-persistStarted
@@ -599,7 +599,7 @@ func TestNoteServiceBasePersistenceRollbackRetainsPinnedOldRoot(t *testing.T) {
 	store := &fakeConfigStore{saveErr: persistErr, saveStarted: persistStarted, saveRelease: persistRelease}
 	done := make(chan baseTransactionResult, 1)
 	go func() {
-		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{}, &model.Config{})
 		done <- baseTransactionResult{operationErr: operationErr, rollbackErr: rollbackErr}
 	}()
 	<-persistStarted
@@ -644,7 +644,7 @@ func TestNoteServiceBasePersistenceFailurePhases(t *testing.T) {
 		repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md"}}, prepareErr: replaceErr}
 		service := newTestNoteService(t, repo, oldBase)
 		store := &fakeConfigStore{}
-		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{}, &model.Config{})
 		if !errors.Is(operationErr, replaceErr) || rollbackErr != nil {
 			t.Fatalf("switchBaseTransaction() errors = %v, %v; want %v, nil", operationErr, rollbackErr, replaceErr)
 		}
@@ -668,7 +668,7 @@ func TestNoteServiceBasePersistenceFailurePhases(t *testing.T) {
 		}
 		service := newTestNoteService(t, repo, oldBase)
 		store := &fakeConfigStore{saveErr: persistErr, events: events}
-		operationErr, gotRollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+		operationErr, gotRollbackErr := service.switchBaseTransaction(target, store, &model.Config{}, &model.Config{})
 		if !errors.Is(operationErr, persistErr) || !errors.Is(gotRollbackErr, rollbackErr) {
 			t.Fatalf("switchBaseTransaction() errors = %v, %v; want persist and rollback causes", operationErr, gotRollbackErr)
 		}
@@ -691,7 +691,7 @@ func TestNoteServiceBasePersistenceEmptyRuntimeRollback(t *testing.T) {
 	persistErr := errors.New("save failed")
 
 	store := &fakeConfigStore{saveErr: persistErr}
-	operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{})
+	operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{}, &model.Config{})
 	if !errors.Is(operationErr, persistErr) || rollbackErr != nil {
 		t.Fatalf("switchBaseTransaction() errors = %v, %v; want %v, nil", operationErr, rollbackErr, persistErr)
 	}

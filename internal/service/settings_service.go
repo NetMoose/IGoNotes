@@ -38,7 +38,7 @@ type BaseRuntime interface {
 	SwitchBase(string) error
 	baseMatches(string) (bool, error)
 	persistConfig(string, ConfigStore, *model.Config) (matches bool, err error)
-	switchBaseTransaction(string, ConfigStore, *model.Config) (operationErr, rollbackErr error)
+	switchBaseTransaction(string, ConfigStore, *model.Config, *model.Config) (operationErr, rollbackErr error)
 }
 
 type SettingsService struct {
@@ -290,7 +290,8 @@ func (s *SettingsService) applyConfigWithConflictSnapshotLocked(
 		return fmt.Errorf("resolve target runtime base %q: %w", targetPath, err)
 	}
 
-	operationErr, rollbackErr := s.notes.switchBaseTransaction(canonicalTarget, s.store, &next)
+	previous := cloneConfig(s.config)
+	operationErr, rollbackErr := s.notes.switchBaseTransaction(canonicalTarget, s.store, &next, &previous)
 	if rollbackErr != nil {
 		s.degraded = errors.Join(
 			ErrRollbackFailed,
@@ -313,8 +314,10 @@ type conflictReconciliationSnapshot struct {
 }
 
 type conflictPathResolution struct {
-	path   string
-	stable bool
+	path      string
+	info      os.FileInfo
+	stable    bool
+	preferred bool
 }
 
 func captureConflictReconciliationSnapshot(current, next model.Config, stableGitIdentities map[string]string) conflictReconciliationSnapshot {
@@ -324,25 +327,29 @@ func captureConflictReconciliationSnapshot(current, next model.Config, stableGit
 		if !ok || identity == "" || base.Path == "" || !base.GitConfigured() {
 			continue
 		}
-		identities[filepath.Clean(base.Path)] = conflictPathResolution{path: filepath.Clean(identity), stable: true}
+		stablePath := filepath.Clean(identity)
+		resolution := resolveConflictPathIdentity(stablePath)
+		resolution.path = stablePath
+		resolution.stable = true
+		resolution.preferred = true
+		identities[filepath.Clean(base.Path)] = resolution
 	}
 	resolveIdentity := func(path string) conflictPathResolution {
 		cleanedPath := filepath.Clean(path)
 		if identity, ok := identities[cleanedPath]; ok {
 			return identity
 		}
-		identity, stable := conflictPathIdentity(cleanedPath)
-		resolution := conflictPathResolution{path: identity, stable: stable}
+		resolution := resolveConflictPathIdentity(cleanedPath)
 		identities[cleanedPath] = resolution
 		return resolution
 	}
-	retainedPaths := make(map[string]struct{}, len(next.Bases))
+	retainedPaths := make([]conflictPathResolution, 0, len(next.Bases))
 	unknownRetainedPath := false
 	for _, base := range next.Bases {
 		if base.Path != "" {
 			identity := resolveIdentity(base.Path)
-			retainedPaths[identity.path] = struct{}{}
-			unknownRetainedPath = unknownRetainedPath || !identity.stable
+			retainedPaths = append(retainedPaths, identity)
+			unknownRetainedPath = unknownRetainedPath || !identity.stable || filepath.Clean(base.Path) != identity.path
 		}
 	}
 	// A broken retained alias may resolve to a removed identity when restored.
@@ -351,20 +358,47 @@ func captureConflictReconciliationSnapshot(current, next model.Config, stableGit
 		return conflictReconciliationSnapshot{}
 	}
 	pathsToClear := make([]string, 0, len(current.Bases))
-	seen := make(map[string]struct{}, len(current.Bases))
+	clearIdentities := make([]conflictPathResolution, 0, len(current.Bases))
 	for _, base := range current.Bases {
 		if base.Path == "" {
 			continue
 		}
-		path := resolveIdentity(base.Path).path
-		if _, retained := retainedPaths[path]; !retained {
-			if _, duplicate := seen[path]; !duplicate {
-				pathsToClear = append(pathsToClear, path)
-				seen[path] = struct{}{}
-			}
+		identity := resolveIdentity(base.Path)
+		if !identity.stable || containsConflictIdentity(retainedPaths, identity) {
+			continue
+		}
+		duplicate := conflictIdentityIndex(clearIdentities, identity)
+		if duplicate < 0 {
+			pathsToClear = append(pathsToClear, identity.path)
+			clearIdentities = append(clearIdentities, identity)
+			continue
+		}
+		if identity.preferred && !clearIdentities[duplicate].preferred {
+			pathsToClear[duplicate] = identity.path
+			clearIdentities[duplicate] = identity
 		}
 	}
 	return conflictReconciliationSnapshot{pathsToClear: pathsToClear}
+}
+
+func containsConflictIdentity(identities []conflictPathResolution, target conflictPathResolution) bool {
+	return conflictIdentityIndex(identities, target) >= 0
+}
+
+func conflictIdentityIndex(identities []conflictPathResolution, target conflictPathResolution) int {
+	for index, identity := range identities {
+		if sameConflictIdentity(identity, target) {
+			return index
+		}
+	}
+	return -1
+}
+
+func sameConflictIdentity(left, right conflictPathResolution) bool {
+	if left.info != nil && right.info != nil {
+		return samePhysicalFile(left.info, right.info)
+	}
+	return left.stable && right.stable && filepath.Clean(left.path) == filepath.Clean(right.path)
 }
 
 func (s *SettingsService) publishConfigLocked(next model.Config, conflicts conflictReconciliationSnapshot) {
@@ -374,17 +408,26 @@ func (s *SettingsService) publishConfigLocked(next model.Config, conflicts confl
 	}
 }
 
-func conflictPathIdentity(path string) (string, bool) {
+func resolveConflictPathIdentity(path string) conflictPathResolution {
 	cleanedPath := filepath.Clean(path)
 	absPath, err := filepath.Abs(cleanedPath)
 	if err != nil {
-		return cleanedPath, false
+		return conflictPathResolution{path: cleanedPath}
 	}
 	canonicalPath, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
-		return cleanedPath, false
+		return conflictPathResolution{path: cleanedPath}
 	}
-	return filepath.Clean(canonicalPath), true
+	canonicalPath = filepath.Clean(canonicalPath)
+	info, err := os.Stat(canonicalPath)
+	if err != nil {
+		return conflictPathResolution{path: cleanedPath}
+	}
+	return conflictPathResolution{path: canonicalPath, info: info, stable: true}
+}
+
+func samePhysicalFile(left, right os.FileInfo) bool {
+	return left != nil && right != nil && os.SameFile(left, right)
 }
 
 type gitStatusChange struct {
@@ -542,19 +585,30 @@ func storedGitStatusPath(path string) string {
 }
 
 func validateUniqueGitRepositoryPaths(bases []model.Base) error {
-	paths := make(map[string]struct{})
+	type repositoryIdentity struct {
+		base string
+		path string
+		info os.FileInfo
+	}
+	identities := make([]repositoryIdentity, 0, len(bases))
 	for _, base := range bases {
 		if !base.GitConfigured() {
 			continue
 		}
 		path, err := canonicalGitStatusPath(base.Path)
 		if err != nil {
-			return err
+			return fmt.Errorf("resolve Git repository path for base %q: %w", base.Name, err)
 		}
-		if _, exists := paths[path]; exists {
-			return ErrGitRepositoryInUse
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("inspect Git repository path for base %q: %w", base.Name, err)
 		}
-		paths[path] = struct{}{}
+		for _, existing := range identities {
+			if existing.path == path || samePhysicalFile(existing.info, info) {
+				return fmt.Errorf("Git repository for bases %q and %q: %w", existing.base, base.Name, ErrGitRepositoryInUse)
+			}
+		}
+		identities = append(identities, repositoryIdentity{base: base.Name, path: path, info: info})
 	}
 	return nil
 }

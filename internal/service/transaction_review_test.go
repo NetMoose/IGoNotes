@@ -189,7 +189,11 @@ func TestNoteServiceIndexCommitFailureFailsClosedWithExactOrder(t *testing.T) {
 		SetupCompleted: &completed,
 	}
 	store := &fakeConfigStore{config: &config, events: events}
-	settings, err := NewSettingsService(store, notes, coordinator, "", nil)
+	statuses := &fakeGitStatusStore{statuses: map[string]model.GitStatus{
+		oldBase: {Base: "active", RepositoryPath: oldBase, State: model.GitStateConflict},
+	}}
+	wantStatuses := cloneGitStatusMap(statuses.statuses)
+	settings, err := NewSettingsServiceWithGit(store, notes, coordinator, "", nil, &fakeGitConfigValidator{}, statuses)
 	if err != nil {
 		t.Fatalf("NewSettingsService() error = %v", err)
 	}
@@ -197,7 +201,7 @@ func TestNoteServiceIndexCommitFailureFailsClosedWithExactOrder(t *testing.T) {
 	if _, err := settings.SwitchBase("target"); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, commitErr) {
 		t.Fatalf("SwitchBase() error = %v, want degraded commit failure", err)
 	}
-	wantEvents := []string{"prepare:1", "save", "commit:1", "rollback:1"}
+	wantEvents := []string{"prepare:1", "save", "commit:1", "rollback:1", "save"}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 		t.Errorf("events = %v, want %v", got, wantEvents)
 	}
@@ -207,6 +211,15 @@ func TestNoteServiceIndexCommitFailureFailsClosedWithExactOrder(t *testing.T) {
 	if _, err := notes.GetNoteContent("old.md"); !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, commitErr) {
 		t.Errorf("GetNoteContent() error = %v, want fail-closed commit error", err)
 	}
+	if got := settings.GetConfig(); !reflect.DeepEqual(got, config) {
+		t.Errorf("in-memory config = %#v, want pre-operation config %#v", got, config)
+	}
+	if store.config == nil || !reflect.DeepEqual(*store.config, config) {
+		t.Errorf("persisted config = %#v, want restored pre-operation config %#v", store.config, config)
+	}
+	if !reflect.DeepEqual(statuses.statuses, wantStatuses) {
+		t.Errorf("Git statuses = %#v, want unchanged %#v", statuses.statuses, wantStatuses)
+	}
 	if candidateRoot == nil {
 		t.Fatal("candidate root was not opened")
 	}
@@ -214,6 +227,71 @@ func TestNoteServiceIndexCommitFailureFailsClosedWithExactOrder(t *testing.T) {
 		t.Errorf("candidate root Stat() error = %v, want os.ErrClosed", err)
 	}
 	assertRepositoryIDs(t, repo, "old.md")
+
+	restartCoordinator := NewBaseOperationCoordinator()
+	restartNotes := NewNoteService(&fakeNoteRepository{}, oldBase, restartCoordinator)
+	defer restartNotes.Close()
+	restarted, err := NewSettingsService(store, restartNotes, restartCoordinator, "", nil)
+	if err != nil {
+		t.Fatalf("restart NewSettingsService() error = %v", err)
+	}
+	if got := restarted.GetConfig().CurrentBase; got != "active" {
+		t.Errorf("restart current base = %q, want active", got)
+	}
+}
+
+func TestSettingsServiceIndexCommitConfigCompensationFailureDegrades(t *testing.T) {
+	oldBase := t.TempDir()
+	target := t.TempDir()
+	writeTestNote(t, oldBase, "old.md", "old")
+	writeTestNote(t, target, "new.md", "new")
+	commitErr := errors.New("index commit failed")
+	compensationErr := errors.New("restore config failed")
+	repo := &fakeNoteRepository{nodes: []model.NoteNode{{ID: "old.md"}}, commitErr: commitErr}
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(repo, oldBase, coordinator)
+	defer notes.Close()
+	completed := true
+	original := model.Config{
+		Bases:          []model.Base{{Name: "active", Path: oldBase}, {Name: "target", Path: target}},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	storeConfig := cloneConfig(original)
+	store := &fakeConfigStore{config: &storeConfig, saveErrs: []error{nil, compensationErr}}
+	settings, err := NewSettingsService(store, notes, coordinator, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+
+	_, err = settings.SwitchBase("target")
+	if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, commitErr) || !errors.Is(err, compensationErr) {
+		t.Fatalf("SwitchBase() error = %v, want rollback, commit, and config compensation causes", err)
+	}
+	if got := settings.GetConfig(); !reflect.DeepEqual(got, original) {
+		t.Errorf("in-memory config = %#v, want unpublished original %#v", got, original)
+	}
+	if store.config == nil || store.config.CurrentBase != "target" {
+		t.Errorf("persisted config after failed compensation = %#v, want un-restored target generation", store.config)
+	}
+	if store.saveCalls != 2 {
+		t.Errorf("Save calls = %d, want candidate and compensation", store.saveCalls)
+	}
+	saves := store.saveCalls
+	if _, laterErr := settings.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "later", Path: t.TempDir()}); !errors.Is(laterErr, compensationErr) {
+		t.Fatalf("later mutation error = %v, want latched compensation failure", laterErr)
+	}
+	if store.saveCalls != saves {
+		t.Errorf("Save calls after degraded mutation = %d, want %d", store.saveCalls, saves)
+	}
+}
+
+func cloneGitStatusMap(statuses map[string]model.GitStatus) map[string]model.GitStatus {
+	cloned := make(map[string]model.GitStatus, len(statuses))
+	for path, status := range statuses {
+		cloned[path] = cloneGitStatus(status)
+	}
+	return cloned
 }
 
 func TestSettingsServicePreparationRollbackFailureDegradesWithoutSave(t *testing.T) {

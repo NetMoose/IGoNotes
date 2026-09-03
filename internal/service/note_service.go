@@ -132,6 +132,8 @@ func (s *NoteService) Close() error {
 }
 
 func (s *NoteService) SwitchBase(target string) error {
+	s.coordinator.Lock()
+	defer s.coordinator.Unlock()
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
 	if errors.Is(s.baseErr, os.ErrClosed) || errors.Is(s.baseErr, ErrRollbackFailed) {
@@ -184,6 +186,13 @@ func (s *NoteService) persistConfig(expectedPath string, store ConfigStore, next
 	if !matches {
 		return false, nil
 	}
+	if next.CurrentBase != "" {
+		index := baseIndex(next.Bases, next.CurrentBase)
+		if index < 0 {
+			return false, ErrBaseNotFound
+		}
+		next.Bases[index].Path = canonicalExpected
+	}
 	config := cloneConfig(*next)
 	if err := store.Save(&config); err != nil {
 		return true, err
@@ -218,13 +227,13 @@ func (s *NoteService) baseIdentityLocked(expectedPath string) (bool, string, err
 	return s.baseRoot != nil && os.SameFile(expectedInfo, pinnedInfo), canonicalExpected, nil
 }
 
-func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, next *model.Config) (error, error) {
+func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, next, previous *model.Config) (error, error) {
 	s.baseMu.Lock()
 	defer s.baseMu.Unlock()
 	if errors.Is(s.baseErr, os.ErrClosed) || errors.Is(s.baseErr, ErrRollbackFailed) {
 		return s.baseErr, nil
 	}
-	if store == nil || next == nil {
+	if store == nil || next == nil || previous == nil {
 		return os.ErrInvalid, nil
 	}
 
@@ -247,10 +256,15 @@ func (s *NoteService) switchBaseTransaction(target string, store ConfigStore, ne
 		return operationErr, nil
 	}
 	if err := candidate.commit(); err != nil {
+		operationErr := fmt.Errorf("commit note index: %w", err)
 		rollbackErr := commitOutcomeError(candidate.rollback())
 		s.closeErr = errors.Join(s.closeErr, closeRoot(candidate.root))
-		s.failClosedLocked(fmt.Errorf("commit note index: %w", err), rollbackErr)
-		return fmt.Errorf("commit note index: %w", err), rollbackErr
+		previousConfig := cloneConfig(*previous)
+		if err := store.Save(&previousConfig); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore settings: %w", err))
+		}
+		s.failClosedLocked(operationErr, rollbackErr)
+		return operationErr, rollbackErr
 	}
 	s.publishBaseSwitchLocked(candidate)
 	return nil, nil

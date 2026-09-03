@@ -127,13 +127,13 @@ func TestNoteServiceSuccessfulSettingsSwitchRecoversInitialReadiness(t *testing.
 	writeTestNote(t, target, "settings.md", "settings")
 	notes.scan = scanNotes
 	saveErr := errors.New("save failed")
-	if operationErr, rollbackErr := notes.switchBaseTransaction(target, &fakeConfigStore{saveErr: saveErr}, &model.Config{}); !errors.Is(operationErr, saveErr) || rollbackErr != nil {
+	if operationErr, rollbackErr := notes.switchBaseTransaction(target, &fakeConfigStore{saveErr: saveErr}, &model.Config{}, &model.Config{}); !errors.Is(operationErr, saveErr) || rollbackErr != nil {
 		t.Fatalf("failed switchBaseTransaction() errors = %v, %v; want %v, nil", operationErr, rollbackErr, saveErr)
 	}
 	if _, err := notes.GetTree(); !errors.Is(err, initialErr) {
 		t.Fatalf("GetTree() after failed settings switch error = %v, want %v", err, initialErr)
 	}
-	if operationErr, rollbackErr := notes.switchBaseTransaction(target, &fakeConfigStore{}, &model.Config{}); operationErr != nil || rollbackErr != nil {
+	if operationErr, rollbackErr := notes.switchBaseTransaction(target, &fakeConfigStore{}, &model.Config{}, &model.Config{}); operationErr != nil || rollbackErr != nil {
 		t.Fatalf("switchBaseTransaction() errors = %v, %v", operationErr, rollbackErr)
 	}
 	tree, err := notes.GetTree()

@@ -166,3 +166,56 @@ func TestBaseOperationLockOrderCoordinatesFilesystemMutationAndSwitch(t *testing
 	assertRepositoryIDs(t, repo, "target.md")
 	assertFileContent(t, filepath.Join(activePath, "incoming.md"), []byte("incoming"))
 }
+
+func TestNoteServiceDirectSwitchWaitsForCoordinator(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+	activePath := t.TempDir()
+	targetPath := t.TempDir()
+	writeTestNote(t, activePath, "active.md", "active")
+	writeTestNote(t, targetPath, "target.md", "target")
+
+	coordinator := NewBaseOperationCoordinator()
+	repo := &fakeNoteRepository{}
+	notes := newTestNoteServiceWithCoordinator(t, repo, activePath, coordinator)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("initial SyncFS() error = %v", err)
+	}
+
+	coordinator.Lock()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- notes.SwitchBase(targetPath)
+	}()
+	<-started
+	runtime.Gosched()
+
+	if !notes.baseMu.TryLock() {
+		coordinator.Unlock()
+		<-done
+		t.Fatal("direct SwitchBase acquired base lock while coordinator was held")
+	}
+	notes.baseMu.Unlock()
+	select {
+	case err := <-done:
+		coordinator.Unlock()
+		t.Fatalf("direct SwitchBase completed while coordinator was held: %v", err)
+	default:
+	}
+
+	coordinator.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("direct SwitchBase error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("direct SwitchBase did not finish after coordinator release")
+	}
+	if got := notes.GetBasePath(); got != targetPath {
+		t.Errorf("GetBasePath() = %q, want %q", got, targetPath)
+	}
+	assertRepositoryIDs(t, repo, "target.md")
+}

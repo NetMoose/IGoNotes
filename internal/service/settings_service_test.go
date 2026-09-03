@@ -21,6 +21,7 @@ type fakeConfigStore struct {
 	config      *model.Config
 	loadErr     error
 	saveErr     error
+	saveErrs    []error
 	saveCalls   int
 	saveStarted chan struct{}
 	saveRelease <-chan struct{}
@@ -49,7 +50,13 @@ func (f *fakeConfigStore) Save(config *model.Config) error {
 	if f.saveRelease != nil {
 		<-f.saveRelease
 	}
-	if f.saveErr != nil {
+	if len(f.saveErrs) != 0 {
+		err := f.saveErrs[0]
+		f.saveErrs = f.saveErrs[1:]
+		if err != nil {
+			return err
+		}
+	} else if f.saveErr != nil {
 		return f.saveErr
 	}
 	cloned := cloneConfig(*config)
@@ -134,7 +141,7 @@ func (f *fakeBaseRuntime) persistConfig(expectedPath string, store ConfigStore, 
 	return true, nil
 }
 
-func (f *fakeBaseRuntime) switchBaseTransaction(path string, store ConfigStore, next *model.Config) (error, error) {
+func (f *fakeBaseRuntime) switchBaseTransaction(path string, store ConfigStore, next, previous *model.Config) (error, error) {
 	f.transactionCalls = append(f.transactionCalls, path)
 	if f.events != nil {
 		f.events.record("prepare:" + path)
@@ -153,7 +160,11 @@ func (f *fakeBaseRuntime) switchBaseTransaction(path string, store ConfigStore, 
 			f.events.record("commit:" + path)
 			f.events.record("rollback:" + path)
 		}
-		return fmt.Errorf("commit note index: %w", f.commitErr), commitOutcomeError(f.nextSwitchError())
+		rollbackErr := commitOutcomeError(f.nextSwitchError())
+		if err := store.Save(previous); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore settings: %w", err))
+		}
+		return fmt.Errorf("commit note index: %w", f.commitErr), rollbackErr
 	}
 	f.path = path
 	if f.events != nil {
@@ -691,6 +702,77 @@ func TestSettingsServiceConflictSnapshotPrecedesPersistenceForRetainedAlias(t *t
 	}
 	if err := settings.coordinator.CheckMutation(originalPath); !errors.Is(err, ErrGitConflictPending) {
 		t.Errorf("original conflict retained through pre-save alias = %v, want ErrGitConflictPending", err)
+	}
+}
+
+func TestSettingsServiceBlockedSavePinsActiveAliasGeneration(t *testing.T) {
+	pinnedPath := t.TempDir()
+	conflictedPath := t.TempDir()
+	writeTestNote(t, pinnedPath, "pinned.md", "pinned")
+	aliasPath := filepath.Join(t.TempDir(), "active-link")
+	createSymlinkOrSkip(t, pinnedPath, aliasPath)
+	completed := true
+	config := model.Config{
+		Bases: []model.Base{
+			{Name: "active", Path: aliasPath},
+			{Name: "conflicted", Path: conflictedPath},
+		},
+		CurrentBase:    "active",
+		SetupCompleted: &completed,
+	}
+	repo := &fakeNoteRepository{}
+	notes := newTestNoteService(t, repo, aliasPath)
+	if err := notes.SyncFS(); err != nil {
+		t.Fatalf("SyncFS() error = %v", err)
+	}
+	storeConfig := cloneConfig(config)
+	store := &fakeConfigStore{config: &storeConfig, saveStarted: make(chan struct{})}
+	release := make(chan struct{})
+	store.saveRelease = release
+	settings, err := NewSettingsService(store, notes, notes.coordinator, "", nil)
+	if err != nil {
+		t.Fatalf("NewSettingsService() error = %v", err)
+	}
+	settings.coordinator.SetConflict(conflictedPath, true)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := settings.ForgetBase("conflicted")
+		done <- err
+	}()
+	<-store.saveStarted
+	retargetSymlink(t, aliasPath, conflictedPath)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("ForgetBase() error = %v", err)
+	}
+
+	published := settings.GetConfig()
+	if len(published.Bases) != 1 || published.Bases[0].Path != pinnedPath {
+		t.Errorf("published bases = %#v, want active pinned to %q", published.Bases, pinnedPath)
+	}
+	if store.config == nil || !reflect.DeepEqual(*store.config, published) {
+		t.Errorf("persisted config = %#v, want published generation %#v", store.config, published)
+	}
+	if got := notes.GetBasePath(); got != pinnedPath {
+		t.Errorf("runtime path = %q, want pinned %q", got, pinnedPath)
+	}
+	if content, err := notes.GetNoteContent("pinned.md"); err != nil || content != "pinned" {
+		t.Errorf("pinned runtime note = %q, %v; want pinned, nil", content, err)
+	}
+	if err := settings.coordinator.CheckMutation(conflictedPath); !errors.Is(err, ErrGitConflictPending) {
+		t.Errorf("retargeted conflict = %v, want ErrGitConflictPending", err)
+	}
+
+	restartCoordinator := NewBaseOperationCoordinator()
+	restartNotes := NewNoteService(&fakeNoteRepository{}, pinnedPath, restartCoordinator)
+	defer restartNotes.Close()
+	restarted, err := NewSettingsService(store, restartNotes, restartCoordinator, "", nil)
+	if err != nil {
+		t.Fatalf("restart NewSettingsService() error = %v", err)
+	}
+	if got := restarted.GetConfig().Bases[0].Path; got != pinnedPath {
+		t.Errorf("restart active path = %q, want %q", got, pinnedPath)
 	}
 }
 
@@ -2709,6 +2791,70 @@ func TestSettingsServiceConfigureGitRejectsConfiguredCanonicalPathCollision(t *t
 	}
 	if store.saveCalls != 0 || len(statuses.getCalls)+len(statuses.upsertCalls) != 0 {
 		t.Fatalf("collision made persistence calls: saves %d get %v upsert %v", store.saveCalls, statuses.getCalls, statuses.upsertCalls)
+	}
+}
+
+func TestSamePhysicalFileMatchesDirectoryAliases(t *testing.T) {
+	physicalPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "alias")
+	createSymlinkOrSkip(t, physicalPath, aliasPath)
+	physicalInfo, err := os.Stat(physicalPath)
+	if err != nil {
+		t.Fatalf("Stat(physical) error = %v", err)
+	}
+	aliasInfo, err := os.Stat(aliasPath)
+	if err != nil {
+		t.Fatalf("Stat(alias) error = %v", err)
+	}
+	if !samePhysicalFile(physicalInfo, aliasInfo) {
+		t.Fatal("samePhysicalFile() = false for two names of one directory")
+	}
+}
+
+func TestSameConflictIdentityPrefersPhysicalIdentity(t *testing.T) {
+	firstInfo, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatalf("Stat(first) error = %v", err)
+	}
+	secondInfo, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatalf("Stat(second) error = %v", err)
+	}
+	if sameConflictIdentity(
+		conflictPathResolution{path: "same", info: firstInfo, stable: true},
+		conflictPathResolution{path: "same", info: secondInfo, stable: true},
+	) {
+		t.Fatal("sameConflictIdentity() used matching strings despite distinct physical identities")
+	}
+	if !sameConflictIdentity(
+		conflictPathResolution{path: "first", info: firstInfo, stable: true},
+		conflictPathResolution{path: "second", info: firstInfo, stable: true},
+	) {
+		t.Fatal("sameConflictIdentity() ignored matching physical identities with distinct strings")
+	}
+}
+
+func TestValidateUniqueGitRepositoryPathsRejectsPhysicalCaseAlias(t *testing.T) {
+	parent := t.TempDir()
+	physicalPath := filepath.Join(parent, "CaseAlias")
+	if err := os.Mkdir(physicalPath, 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	aliasPath := filepath.Join(parent, "casealias")
+	physicalInfo, err := os.Stat(physicalPath)
+	if err != nil {
+		t.Fatalf("Stat(physical) error = %v", err)
+	}
+	aliasInfo, err := os.Stat(aliasPath)
+	if err != nil || !os.SameFile(physicalInfo, aliasInfo) {
+		t.Skip("filesystem does not expose case-distinct names for one directory")
+	}
+	first := model.Base{Name: "first", Path: physicalPath}
+	second := model.Base{Name: "second", Path: aliasPath}
+	setConfiguredGit(&first)
+	setConfiguredGit(&second)
+	if err := validateUniqueGitRepositoryPaths([]model.Base{first, second}); !errors.Is(err, ErrGitRepositoryInUse) {
+		t.Fatalf("validateUniqueGitRepositoryPaths() error = %v, want ErrGitRepositoryInUse", err)
 	}
 }
 
