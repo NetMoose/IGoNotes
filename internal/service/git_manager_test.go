@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
@@ -21,9 +22,12 @@ import (
 	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 	"IGoNotes/internal/repository"
+	"modernc.org/sqlite"
 )
 
 const managerOID = "1111111111111111111111111111111111111111"
+
+var managerSQLiteFunctionID atomic.Uint64
 
 type managerSettings struct{ config model.Config }
 
@@ -793,6 +797,58 @@ func TestGitManagerQueueCompensationFailureRetainsActiveOperationAndReportsBothW
 	}
 }
 
+func TestGitManagerQueueCancellationCompensatesWithDetachedBoundedContext(t *testing.T) {
+	enteredStatusWrite := make(chan struct{})
+	releaseStatusWrite := make(chan struct{})
+	functionName := fmt.Sprintf("manager_block_status_%d", managerSQLiteFunctionID.Add(1))
+	if err := sqlite.RegisterScalarFunction(functionName, 0, func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error) {
+		close(enteredStatusWrite)
+		<-releaseStatusWrite
+		return int64(0), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base := configuredManagerBase("work", t.TempDir())
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", nil, nil, nil)
+	if _, err := fixture.db.Exec(fmt.Sprintf(`CREATE TRIGGER block_canceled_admission BEFORE INSERT ON git_status
+		WHEN NEW.state = 'initializing' BEGIN SELECT %s(); END`, functionName)); err != nil {
+		t.Fatal(err)
+	}
+	type queueResult struct {
+		operation gitcmd.Operation
+		err       error
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan queueResult, 1)
+	go func() {
+		op, _, err := fixture.manager.QueueInitialize(ctx, gitcmd.InitializeRequest{Snapshot: base})
+		result <- queueResult{operation: op, err: err}
+	}()
+	<-enteredStatusWrite
+	cancel()
+	close(releaseStatusWrite)
+	queued := <-result
+	if queued.err == nil || !strings.Contains(queued.err.Error(), "Git status persistence failed") ||
+		strings.Contains(queued.err.Error(), "Git operation journal persistence failed") {
+		t.Fatalf("QueueInitialize() error = %v, want compensated cancellation status failure", queued.err)
+	}
+	stored, found, err := fixture.operations.LatestByPath(context.Background(), base.Path)
+	if err != nil || !found || stored.ID != queued.operation.ID || stored.State != gitcmd.OperationFailed {
+		t.Fatalf("compensated canceled admission = %#v, %v, %v", stored, found, err)
+	}
+	if active, found, err := fixture.operations.ActiveByPath(context.Background(), base.Path); err != nil || found {
+		t.Fatalf("active admission after cancellation = %#v, %v, %v", active, found, err)
+	}
+	fixture.manager.mu.Lock()
+	queueLength := len(fixture.manager.queue)
+	inFlightLength := len(fixture.manager.inFlight)
+	fixture.manager.mu.Unlock()
+	if queueLength != 0 || inFlightLength != 0 {
+		t.Fatalf("canceled admission FIFO/inFlight = %d/%d", queueLength, inFlightLength)
+	}
+}
+
 func TestGitManagerInitializeReprobesAndRequiresCurrentConfirmations(t *testing.T) {
 	base := configuredManagerBase("work", t.TempDir())
 	probe := permissiveManagerPorcelain(base.Path)
@@ -876,6 +932,47 @@ func TestGitManagerWorkerSafeFailurePublication(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprintf("%#v %#v", op.Error, status.Error), secretURL) || strings.Contains(status.Error.Message, "token") {
 		t.Fatalf("unsafe failure publication = %#v / %#v", op.Error, status.Error)
+	}
+}
+
+func TestGitManagerFailurePreservesHistoricalStatusFields(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	runner := managerRunnerFunc(func(context.Context, gitcmd.Command) (gitcmd.Result, error) {
+		return gitcmd.Result{}, &gitcmd.SafeError{Code: gitcmd.CodeAuthentication, Message: "Git authentication failed"}
+	})
+	porcelain := permissiveManagerPorcelain(base.Path)
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", runner, porcelain, porcelain)
+	seedManagerTrust(t, fixture, base, managerOID)
+	lastAttempt := time.Date(2026, 9, 2, 7, 0, 0, 0, time.UTC)
+	lastSuccess := time.Date(2026, 9, 1, 6, 0, 0, 0, time.UTC)
+	previous := model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateReady,
+		OperationID: "previous-operation", Stage: string(gitcmd.StageCompleted), Ahead: 7, Behind: 3,
+		ConsecutiveFailures: 4, LastAttempt: &lastAttempt, LastSuccess: &lastSuccess,
+		ChangedPaths: []string{"historical.md"}, RemoteOID: managerOID,
+	}
+	if err := fixture.statuses.Upsert(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Date(2026, 9, 3, 8, 0, 0, 0, time.UTC)
+	fixture.manager.now = func() time.Time { return failedAt }
+	queued, _, err := fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitManagerTerminal(t, fixture.manager)
+	status, found, err := fixture.statuses.Get(context.Background(), base.Path)
+	if err != nil || !found {
+		t.Fatalf("failure status = %#v, %v, %v", status, found, err)
+	}
+	if status.State != model.GitStateError || status.OperationID != queued.ID || status.Stage != string(gitcmd.StageQueued) ||
+		status.Error == nil || status.Error.Code != string(gitcmd.CodeAuthentication) || status.LastAttempt == nil || !status.LastAttempt.Equal(failedAt) {
+		t.Fatalf("failure transition fields = %#v", status)
+	}
+	if status.LastSuccess == nil || !status.LastSuccess.Equal(lastSuccess) || status.Ahead != previous.Ahead ||
+		status.Behind != previous.Behind || status.ConsecutiveFailures != previous.ConsecutiveFailures ||
+		!reflect.DeepEqual(status.ChangedPaths, previous.ChangedPaths) || status.RemoteOID != previous.RemoteOID {
+		t.Fatalf("failure erased historical status: before %#v, after %#v", previous, status)
 	}
 }
 
@@ -1361,6 +1458,116 @@ func newManagerRecoveryFixture(t *testing.T) (*gitManagerFixture, gitcmd.Configu
 	})
 	client := gitcmd.NewClient(runner)
 	return newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", runner, client, client), base, head, network
+}
+
+func TestGitManagerCleanRecoveryPreservesHistoricalStatusFields(t *testing.T) {
+	fixture, base, head, network := newManagerRecoveryFixture(t)
+	lastAttempt := time.Date(2026, 9, 2, 7, 0, 0, 0, time.UTC)
+	lastSuccess := time.Date(2026, 9, 1, 6, 0, 0, 0, time.UTC)
+	previous := model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateError,
+		OperationID: "historical-operation", Stage: string(gitcmd.StagePushing), Ahead: 5, Behind: 2,
+		ConsecutiveFailures: 3, LastAttempt: &lastAttempt, LastSuccess: &lastSuccess,
+		ChangedPaths: []string{"historical.md"}, RemoteOID: strings.Repeat("0", 40),
+		Error: &model.APIError{Code: string(gitcmd.CodeAuthentication), Message: "Git authentication failed"},
+	}
+	if err := fixture.statuses.Upsert(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), base.Path)
+	if err != nil || !found {
+		t.Fatalf("clean recovery status = %#v, %v, %v", status, found, err)
+	}
+	if status.State != model.GitStateReady || status.Error != nil || status.RemoteOID != head {
+		t.Fatalf("clean recovery transition fields = %#v", status)
+	}
+	if status.OperationID != previous.OperationID || status.Stage != previous.Stage || status.Ahead != previous.Ahead ||
+		status.Behind != previous.Behind || status.ConsecutiveFailures != previous.ConsecutiveFailures ||
+		status.LastAttempt == nil || !status.LastAttempt.Equal(lastAttempt) || status.LastSuccess == nil ||
+		!status.LastSuccess.Equal(lastSuccess) || !reflect.DeepEqual(status.ChangedPaths, previous.ChangedPaths) {
+		t.Fatalf("clean recovery erased historical status: before %#v, after %#v", previous, status)
+	}
+	if err := fixture.coordinator.CheckMutation(base.Path); err != nil {
+		t.Fatalf("clean recovery mutation gate = %v", err)
+	}
+	if network.Load() != 0 {
+		t.Fatalf("recovery network calls = %d", network.Load())
+	}
+}
+
+func TestGitManagerRecoveryIgnoresTerminalConflictFromStaleIdentity(t *testing.T) {
+	fixture, base, head, network := newManagerRecoveryFixture(t)
+	now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
+	stale := gitcmd.Operation{
+		ID: strings.Repeat("5", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: "stale-config", RemoteFingerprint: "stale-remote",
+		Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageMerging,
+		Branch: base.Branch, RemoteOID: head, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	stale.State = gitcmd.OperationConflict
+	stale.Error = &gitcmd.SafeError{Code: gitcmd.CodeGitConflict, Message: "Git merge has conflicts"}
+	stale.ConflictPaths = []string{"obsolete.md"}
+	if err := fixture.operations.Finish(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), base.Path)
+	if err != nil || !found || status.State != model.GitStateReady || len(status.ChangedPaths) != 0 || status.Error != nil {
+		t.Fatalf("stale conflict recovery status = %#v, %v, %v", status, found, err)
+	}
+	if err := fixture.coordinator.CheckMutation(base.Path); err != nil {
+		t.Fatalf("stale conflict closed current mutation gate: %v", err)
+	}
+	if network.Load() != 0 {
+		t.Fatalf("recovery network calls = %d", network.Load())
+	}
+}
+
+func TestGitManagerRecoveryStatusWriteFailureUsesStatusPersistenceError(t *testing.T) {
+	for _, transitionFailure := range []bool{false, true} {
+		name := "clean"
+		if transitionFailure {
+			name = "with journal transition failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture, base, head, _ := newManagerRecoveryFixture(t)
+			if transitionFailure {
+				now := time.Date(2026, 9, 3, 9, 0, 0, 0, time.UTC)
+				op := gitcmd.Operation{
+					ID: strings.Repeat("4", 32), BaseName: base.Name, RepoPath: base.Path,
+					ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+					Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageFetching,
+					Branch: base.Branch, RemoteOID: head, CreatedAt: now, UpdatedAt: now,
+				}
+				if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.db.Exec(`CREATE TRIGGER reject_recovery_finish_for_status_error BEFORE UPDATE ON git_operations
+					WHEN NEW.state = 'failed' BEGIN SELECT RAISE(ABORT, 'secret finish failure'); END`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := fixture.db.Exec(`CREATE TRIGGER reject_recovery_status_write BEFORE INSERT ON git_status
+				BEGIN SELECT RAISE(ABORT, 'secret status failure'); END`); err != nil {
+				t.Fatal(err)
+			}
+			err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base})
+			if err == nil || !strings.Contains(err.Error(), "Git status persistence failed") || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("RecoverLocal() error = %v, want safe status persistence failure", err)
+			}
+			if transitionFailure && !strings.Contains(err.Error(), "Git operation persistence failed") {
+				t.Fatalf("RecoverLocal() error = %v, missing journal transition failure", err)
+			}
+		})
+	}
 }
 
 func TestGitManagerRecoveryCheckpointFailureImmediatelyFailsClosed(t *testing.T) {

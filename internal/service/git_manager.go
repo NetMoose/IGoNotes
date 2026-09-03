@@ -16,6 +16,8 @@ import (
 
 var ErrGitManagerClosed = errors.New("git manager closed")
 
+const managerAdmissionCompensationTimeout = time.Second
+
 type gitManagerJob struct {
 	operation     gitcmd.Operation
 	snapshot      gitcmd.ConfiguredBase
@@ -222,7 +224,11 @@ func (m *GitManager) queueOperation(
 		statusErr := statusPersistenceError(err)
 		operation.State = gitcmd.OperationFailed
 		operation.Error = statusErr
-		finishErr := m.operations.Finish(ctx, operation)
+		compensationCtx, cancelCompensation := context.WithTimeout(
+			context.WithoutCancel(ctx), managerAdmissionCompensationTimeout,
+		)
+		finishErr := m.operations.Finish(compensationCtx, operation)
+		cancelCompensation()
 		if finishErr != nil {
 			active := operation
 			active.State = gitcmd.OperationQueued
@@ -477,28 +483,41 @@ func (m *GitManager) finishFailure(
 	operation.UpdatedAt = now
 	operation.Error = safeErr
 	state := model.GitStateError
-	changed := sortedManagerPaths(operation.ChangedPaths)
 	if conflict != nil {
 		m.coordinator.SetConflict(current.Path, true)
 		operation.State = gitcmd.OperationConflict
 		operation.ConflictPaths = sortedManagerPaths(append(operation.ConflictPaths, conflict.Paths...))
-		changed = append([]string(nil), operation.ConflictPaths...)
 		state = model.GitStateConflict
 	} else {
 		operation.State = gitcmd.OperationFailed
 	}
 	finishErr := m.operations.Finish(ctx, operation)
-	remoteOID := operation.RemoteOID
-	if result.RemoteOID != "" {
-		remoteOID = result.RemoteOID
+	status, statusFound, statusLookupErr := m.statuses.Get(ctx, current.Path)
+	var statusErr error
+	if statusLookupErr == nil {
+		status = managerStatusFromPrevious(current, status, statusFound)
+		status.State = state
+		status.OperationID = operation.ID
+		status.Stage = string(operation.Stage)
+		status.LastAttempt = &now
+		status.Error = &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field}
+		if !statusFound {
+			status.RemoteOID = operation.RemoteOID
+		}
+		if result.RemoteOID != "" {
+			status.RemoteOID = result.RemoteOID
+		}
+		if conflict != nil {
+			status.ChangedPaths = append([]string(nil), operation.ConflictPaths...)
+		} else if result.ChangedPaths != nil {
+			status.ChangedPaths = sortedManagerPaths(result.ChangedPaths)
+		}
+		statusErr = m.statuses.Upsert(ctx, status)
 	}
-	statusErr := m.statuses.Upsert(ctx, model.GitStatus{
-		Base: current.Name, RepositoryPath: current.Path, State: state,
-		OperationID: operation.ID, Stage: string(operation.Stage), Ahead: result.Ahead, Behind: result.Behind,
-		LastAttempt: &now, ChangedPaths: changed, RemoteOID: remoteOID,
-		Error: &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field},
-	})
-	return finishErr == nil, errors.Join(managerJournalError(lookupErr), managerJournalError(finishErr), managerStatusError(statusErr))
+	return finishErr == nil, errors.Join(
+		managerJournalError(lookupErr), managerJournalError(finishErr),
+		managerStatusError(statusLookupErr), managerStatusError(statusErr),
+	)
 }
 
 func (m *GitManager) latestOperation(ctx context.Context, fallback gitcmd.Operation) (gitcmd.Operation, error) {
@@ -551,21 +570,26 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 			m.coordinator.Unlock()
 			continue
 		}
-		durableConflict := latestFound && latest.State == gitcmd.OperationConflict ||
+		latestMatches := latestFound && sameManagerIdentity(latest, current)
+		durableConflict := latestMatches && latest.State == gitcmd.OperationConflict ||
 			statusFound && existingStatus.State == model.GitStateConflict
 		durableConflictPaths := []string(nil)
-		if latestFound && latest.State == gitcmd.OperationConflict {
+		if latestMatches && latest.State == gitcmd.OperationConflict {
 			durableConflictPaths = append(durableConflictPaths, latest.ConflictPaths...)
 		}
 		if statusFound && existingStatus.State == model.GitStateConflict {
 			durableConflictPaths = append(durableConflictPaths, existingStatus.ChangedPaths...)
 		}
 		var latestPointer *gitcmd.Operation
-		if latestFound && sameManagerIdentity(latest, current) {
+		if latestMatches {
 			latestCopy := latest
 			latestPointer = &latestCopy
 		}
 		result, serviceErr := m.gitService.RecoverLocal(ctx, gitcmd.RecoveryOptions{Snapshot: current, Operation: latestPointer})
+		status := managerStatusFromPrevious(current, existingStatus, statusFound)
+		if result.RemoteOID != "" {
+			status.RemoteOID = result.RemoteOID
+		}
 		var conflict *gitcmd.ConflictError
 		isConflict := errors.As(serviceErr, &conflict)
 		if durableConflict {
@@ -607,9 +631,6 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 		if transitionErr != nil {
 			recoveryErrors = append(recoveryErrors, transitionErr)
 			m.coordinator.SetConflict(current.Path, true)
-			status := model.GitStatus{
-				Base: current.Name, RepositoryPath: current.Path, ChangedPaths: []string{}, RemoteOID: result.RemoteOID,
-			}
 			if isConflict {
 				status.State = model.GitStateConflict
 				status.ChangedPaths = sortedManagerPaths(append(result.ConflictPaths, conflict.Paths...))
@@ -620,13 +641,12 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 				status.Error = &model.APIError{Code: string(safeErr.Code), Message: safeErr.Message, Field: safeErr.Field}
 			}
 			if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
-				recoveryErrors = append(recoveryErrors, persistenceError(statusErr))
+				recoveryErrors = append(recoveryErrors, statusPersistenceError(statusErr))
 			}
 			m.coordinator.Unlock()
 			continue
 		}
 
-		status := model.GitStatus{Base: current.Name, RepositoryPath: current.Path, ChangedPaths: []string{}, RemoteOID: result.RemoteOID}
 		switch {
 		case isConflict:
 			m.coordinator.SetConflict(current.Path, true)
@@ -642,9 +662,10 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 		default:
 			m.coordinator.SetConflict(current.Path, false)
 			status.State = model.GitStateReady
+			status.Error = nil
 		}
 		if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
-			recoveryErrors = append(recoveryErrors, persistenceError(statusErr))
+			recoveryErrors = append(recoveryErrors, statusPersistenceError(statusErr))
 		}
 		m.coordinator.Unlock()
 	}
@@ -684,13 +705,27 @@ func managerWorkingStatus(operation gitcmd.Operation, previous model.GitStatus, 
 	status.OperationID = operation.ID
 	status.Stage = string(operation.Stage)
 	status.RemoteOID = operation.RemoteOID
-	status.ChangedPaths = sortedManagerPaths(operation.ChangedPaths)
+	if len(operation.ChangedPaths) != 0 {
+		status.ChangedPaths = sortedManagerPaths(operation.ChangedPaths)
+	}
 	if operation.Kind == gitcmd.OperationInitialize {
 		status.State = model.GitStateInitializing
 	} else {
 		status.State = model.GitStateSyncing
 	}
 	return status
+}
+
+func managerStatusFromPrevious(current gitcmd.ConfiguredBase, previous model.GitStatus, found bool) model.GitStatus {
+	if !found {
+		previous = model.GitStatus{ChangedPaths: []string{}}
+	}
+	previous.Base = current.Name
+	previous.RepositoryPath = current.Path
+	if previous.ChangedPaths == nil {
+		previous.ChangedPaths = []string{}
+	}
+	return previous
 }
 
 func managerAdmissionTrust(
