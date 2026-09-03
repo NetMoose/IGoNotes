@@ -211,6 +211,8 @@ func TestInitializeNoRepositoryExistingRemoteBranch(t *testing.T) {
 				if result.BackupRef == "" || fixture.git(fixture.root, "rev-list", "--parents", "-n", "1", "HEAD") == head+" "+remoteOID {
 					t.Fatalf("nonempty local did not preserve an unrelated merge and backup: %#v", result)
 				}
+				localSnapshotOID := fixture.git(fixture.root, "rev-parse", "--verify", result.BackupRef+"^{commit}")
+				assertAncestor(t, fixture, localSnapshotOID, head)
 				if fixture.git(fixture.root, "show", "HEAD:local.md") != strings.TrimSpace(localContents) {
 					t.Fatal("merged tree does not contain local file")
 				}
@@ -265,6 +267,31 @@ func TestInitializeExistingRepositoryExistingRemoteBranch(t *testing.T) {
 	}
 	if fixture.remoteOID() != head || result.PushOID != head {
 		t.Fatal("push did not preserve exact merged HEAD")
+	}
+}
+
+func TestInitializeExistingRepositoryEmptyRemoteDetachedHEAD(t *testing.T) {
+	fixture := newConnectFixture(t)
+	localOID := fixture.initLocal("main")
+	fixture.git(fixture.root, "switch", "--detach", localOID)
+	fixture.write("detached.md", "detached snapshot\n")
+
+	result, err := fixture.initialize(fixture.options(), nil, nil)
+	if err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	head := fixture.git(fixture.root, "rev-parse", "--verify", "HEAD^{commit}")
+	if result.BackupRef == "" {
+		t.Fatal("detached snapshot backup is empty")
+	}
+	backupOID := fixture.git(fixture.root, "rev-parse", "--verify", result.BackupRef+"^{commit}")
+	if backupOID == localOID {
+		t.Fatalf("detached snapshot backup = %q/%q, want committed detached changes", result.BackupRef, backupOID)
+	}
+	assertAncestor(t, fixture, localOID, head)
+	assertAncestor(t, fixture, backupOID, head)
+	if fixture.git(fixture.root, "show", "HEAD:detached.md") != "detached snapshot" || fixture.remoteOID() != head {
+		t.Fatal("detached snapshot tree or exact push was not preserved")
 	}
 }
 
@@ -354,6 +381,35 @@ func TestInitializeRejectsMissingSelectedBranchOnNonemptyRemote(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(fixture.root, ".git")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatal("repository was mutated before missing branch rejection")
 	}
+}
+
+func TestInitializeRejectsSelectedBranchMissingOnTagOnlyRemote(t *testing.T) {
+	fixture := newConnectFixture(t)
+	seed := filepath.Join(filepath.Dir(fixture.root), "tag-seed")
+	if err := os.Mkdir(seed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git(seed, "init", "--initial-branch", "temporary")
+	fixture.git(seed, "config", "user.name", "IGoNotes Test")
+	fixture.git(seed, "config", "user.email", "igonotes@example.invalid")
+	if err := os.WriteFile(filepath.Join(seed, "tagged.md"), []byte("tag only\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git(seed, "add", "--all", "--", ".")
+	fixture.git(seed, "commit", "-m", "tag only")
+	fixture.git(seed, "tag", "v1")
+	fixture.git(seed, "remote", "add", "origin", fixture.remote)
+	fixture.git(seed, "push", "origin", "refs/tags/v1:refs/tags/v1")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+	assertSafeCode(t, err, CodeBranchDeleted)
+	for _, command := range runner.commands {
+		if command.Scope == LocalOperation && !command.ReadOnly {
+			t.Fatalf("local mutation ran for tag-only missing branch: %q", command.Args)
+		}
+	}
+	assertNoServicePush(t, runner.commands)
 }
 
 func TestInitializeRejectsParentRepositoryRoot(t *testing.T) {

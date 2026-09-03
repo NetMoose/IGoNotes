@@ -2,6 +2,8 @@ package git
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -261,6 +263,13 @@ func (s *Service) Initialize(
 		if err := requireCallbackPath(path, callbackPath); err != nil {
 			return err
 		}
+		local, err := s.inspectSafeLocal(ctx, path)
+		if err != nil {
+			return err
+		}
+		if !local.HasRepository {
+			return &SafeError{Code: CodeOperationInterrupted, Message: "Git repository is missing after push"}
+		}
 		expected := actual.fetchedOID
 		if actual.remoteEmpty {
 			expected = zeroObjectID
@@ -368,6 +377,16 @@ func (s *Service) inspectSafeLocal(ctx context.Context, path string) (LocalInspe
 	}
 	if local.PendingOperation != "" {
 		return LocalInspection{}, &SafeError{Code: CodeRepositoryLocked, Message: "Git repository has a pending operation"}
+	}
+	if local.HasRepository {
+		_, lockErr := os.Stat(filepath.Join(local.GitDir, "index.lock"))
+		switch {
+		case lockErr == nil:
+			return LocalInspection{}, &SafeError{Code: CodeRepositoryLocked, Message: "Git repository is locked"}
+		case errors.Is(lockErr, os.ErrNotExist):
+		default:
+			return LocalInspection{}, &SafeError{Code: CodeCommandFailed, Message: "Git repository inspection failed", cause: lockErr}
+		}
 	}
 	if !local.IdentityConfigured {
 		return LocalInspection{}, &SafeError{Code: CodeIdentityMissing, Message: "Git identity is not configured"}
@@ -877,10 +896,11 @@ func (s *Service) mergeIfNeeded(
 		}
 		if len(paths) != 0 {
 			checkpoint.value.ConflictPaths = paths
+			conflictErr := newConflictError(paths)
 			if progressErr := checkpoint.save(ctx, StageMerging); progressErr != nil {
-				return progressErr
+				return errors.Join(conflictErr, progressErr)
 			}
-			return newConflictError(paths)
+			return conflictErr
 		}
 		return err
 	}

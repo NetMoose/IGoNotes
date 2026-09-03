@@ -61,6 +61,15 @@ func applyCheckpoint(operation *Operation, checkpoint Checkpoint) {
 	operation.ConflictPaths = append([]string(nil), checkpoint.ConflictPaths...)
 }
 
+func assertNoServicePush(t *testing.T, commands []Command) {
+	t.Helper()
+	for _, command := range commands {
+		if len(command.Args) != 0 && command.Args[0] == "push" {
+			t.Fatalf("unexpected service push: %q", command.Args)
+		}
+	}
+}
+
 func TestConflictErrorIsSafeSortedAndCloned(t *testing.T) {
 	paths := []string{"z.md", "a.md", "z.md"}
 	err := newConflictError(paths)
@@ -72,6 +81,30 @@ func TestConflictErrorIsSafeSortedAndCloned(t *testing.T) {
 	if !errors.As(err, &safeErr) || safeErr.Code != CodeGitConflict || safeErr.Diagnostic() != "" {
 		t.Fatalf("unwrapped error = %#v", safeErr)
 	}
+}
+
+func TestInitializeConflictCheckpointFailurePreservesTypedConflict(t *testing.T) {
+	fixture := newConnectFixture(t)
+	fixture.seedRemote()
+	fixture.initLocal("local")
+	fixture.write("remote.md", "local collision\n")
+	checkpointErr := errors.New("checkpoint unavailable")
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, func(_ context.Context, checkpoint Checkpoint) error {
+		if len(checkpoint.ConflictPaths) != 0 {
+			return checkpointErr
+		}
+		return nil
+	})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || !reflect.DeepEqual(conflict.Paths, []string{"remote.md"}) {
+		t.Fatalf("Initialize() error = %#v, want typed conflict", err)
+	}
+	if !errors.Is(err, checkpointErr) {
+		t.Fatalf("Initialize() error = %#v, want joined checkpoint error", err)
+	}
+	assertNoServicePush(t, runner.commands)
 }
 
 func TestInitializeRetryReusesJournaledBackupRef(t *testing.T) {
@@ -180,17 +213,70 @@ func TestInitializePreservesRemoteTrustAcrossTemplateChange(t *testing.T) {
 	}
 }
 
+func TestInitializeTemplateChangeRejectsRewrittenRemoteHistory(t *testing.T) {
+	fixture := newConnectFixture(t)
+	fixture.seedRemote()
+	first, err := fixture.initialize(fixture.options(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedRef := managedRemoteRef("main")
+	trustedOID := fixture.git(fixture.root, "rev-parse", "--verify", trustedRef)
+	if trustedOID != first.RemoteOID {
+		t.Fatalf("initial trusted ref = %q, want %q", trustedOID, first.RemoteOID)
+	}
+	rewriteRemoteUnrelated(fixture)
+	options := fixture.options()
+	options.Operation.ID = "2123456789abcdef0123456789abcdef"
+	options.Operation.ConfigFingerprint = "template-and-autosync-changed"
+	options.Snapshot.Fingerprint = "template-and-autosync-changed"
+	options.Snapshot.CommitTemplate = "changed template"
+	options.Snapshot.AutoSync = true
+	options.LastRemoteOID = trustedOID
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+
+	_, err = initializeWithRunner(t, fixture, runner, options, nil, nil)
+	assertSafeCode(t, err, CodeRemoteHistoryRewritten)
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", trustedRef); got != trustedOID {
+		t.Fatalf("trusted ref changed from %q to %q after rewrite", trustedOID, got)
+	}
+	assertNoServicePush(t, runner.commands)
+}
+
+func rewriteRemoteUnrelated(fixture *connectFixture) string {
+	fixture.t.Helper()
+	rewrite := filepath.Join(filepath.Dir(fixture.root), "rewrite")
+	if err := os.Mkdir(rewrite, 0o700); err != nil {
+		fixture.t.Fatal(err)
+	}
+	fixture.git(rewrite, "init", "--initial-branch", "main")
+	fixture.git(rewrite, "config", "user.name", "IGoNotes Test")
+	fixture.git(rewrite, "config", "user.email", "igonotes@example.invalid")
+	if err := os.WriteFile(filepath.Join(rewrite, "rewritten.md"), []byte("rewritten\n"), 0o600); err != nil {
+		fixture.t.Fatal(err)
+	}
+	fixture.git(rewrite, "add", "--all", "--", ".")
+	fixture.git(rewrite, "commit", "-m", "unrelated rewrite")
+	fixture.git(rewrite, "remote", "add", "origin", fixture.remote)
+	fixture.git(rewrite, "push", "--force", "origin", "HEAD:refs/heads/main")
+	return fixture.git(rewrite, "rev-parse", "--verify", "HEAD^{commit}")
+}
+
 func TestInitializeRebaselinesManagedRefAfterConfirmedRemoteChange(t *testing.T) {
 	fixture := newConnectFixture(t)
 	remoteOID := fixture.seedRemote()
 	localOID := fixture.initLocal("local")
 	managed := "refs/igonotes/remotes/main"
 	fixture.git(fixture.root, "update-ref", managed, localOID, strings.Repeat("0", 40))
+	oldRemote := filepath.Join(filepath.Dir(fixture.root), "old-remote.git")
+	fixture.git(filepath.Dir(fixture.root), "init", "--bare", oldRemote)
+	fixture.git(fixture.root, "remote", "add", "origin", oldRemote)
 	options := fixture.options()
 	options.Operation.RemoteFingerprint = "new-remote"
 	options.Snapshot.RemoteFingerprint = "new-remote"
 	options.LastRemoteOID = ""
-	result, err := fixture.initialize(options, nil, nil)
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	result, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,6 +284,27 @@ func TestInitializeRebaselinesManagedRefAfterConfirmedRemoteChange(t *testing.T)
 	if got := fixture.git(fixture.root, "rev-parse", managed); got != result.PushOID {
 		t.Fatalf("managed ref = %q, want pushed OID %q", got, result.PushOID)
 	}
+	if !hasExactCommand(runner.commands, Command{
+		Dir: fixture.root, Args: []string{"remote", "set-url", "origin", fixture.remote}, Scope: LocalOperation,
+		ReadOnly: false, Secrets: []string{fixture.remote},
+	}) {
+		t.Fatal("confirmed URL change did not use exact set-url command")
+	}
+	if !hasExactCommand(runner.commands, Command{
+		Dir: fixture.root, Args: []string{"update-ref", managed, remoteOID, localOID}, Scope: LocalOperation,
+		ReadOnly: false,
+	}) {
+		t.Fatalf("rebaseline did not CAS managed ref from old OID %q to candidate %q", localOID, remoteOID)
+	}
+}
+
+func hasExactCommand(commands []Command, want Command) bool {
+	for _, command := range commands {
+		if reflect.DeepEqual(command, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestInitializePushTimeoutIsRecognizedOnRetry(t *testing.T) {
@@ -246,9 +353,14 @@ func TestInitializeRechecksRemoteBeforePush(t *testing.T) {
 	fixture := newConnectFixture(t)
 	original := fixture.seedRemote()
 	changed := ""
+	transactions := 0
 	transaction := func(ctx context.Context, mutate func(string) error) error {
+		transactions++
 		if err := mutate(fixture.root); err != nil {
 			return err
+		}
+		if transactions != 2 {
+			return nil
 		}
 		seed := filepath.Join(filepath.Dir(fixture.root), "seed")
 		if err := os.WriteFile(filepath.Join(seed, "race.md"), []byte("race\n"), 0o600); err != nil {
@@ -260,9 +372,24 @@ func TestInitializeRechecksRemoteBeforePush(t *testing.T) {
 		changed = fixture.remoteOID()
 		return nil
 	}
-	_, err := fixture.initialize(fixture.options(), transaction, nil)
-	if err == nil || changed == "" || changed == original || fixture.remoteOID() != changed {
-		t.Fatalf("Initialize() error = %v, remote %q; expected changed remote and no push", err, fixture.remoteOID())
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	_, err := initializeWithRunner(t, fixture, runner, fixture.options(), transaction, nil)
+	assertSafeCode(t, err, CodeOperationInterrupted)
+	if changed == "" || changed == original || fixture.remoteOID() != changed {
+		t.Fatalf("remote race = %q from %q, want changed selected OID", changed, original)
+	}
+	assertNoServicePush(t, runner.commands)
+	fetches := 0
+	for _, command := range runner.commands {
+		if len(command.Args) != 0 && command.Args[0] == "fetch" {
+			fetches++
+		}
+	}
+	if fetches != 1 {
+		t.Fatalf("fetch count = %d, want one attempt without retry", fetches)
+	}
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", managedRemoteRef("main")); got != original {
+		t.Fatalf("trusted ref = %q, want unchanged fetched OID %q", got, original)
 	}
 }
 
@@ -316,9 +443,7 @@ func TestInitializeRetryRecoversBackupWhenCheckpointLags(t *testing.T) {
 }
 
 func TestInitializeRetryRecoversTrustedRefWhenCheckpointLags(t *testing.T) {
-	fixture := newConnectFixture(t)
-	fixture.seedRemote()
-	options := fixture.options()
+	fixture, options := prepareTrustedRemoteAdvance(t)
 	failure := errors.New("checkpoint unavailable")
 	seenCandidate := false
 	_, err := fixture.initialize(options, nil, func(_ context.Context, checkpoint Checkpoint) error {
@@ -335,9 +460,81 @@ func TestInitializeRetryRecoversTrustedRefWhenCheckpointLags(t *testing.T) {
 	if !errors.Is(err, failure) {
 		t.Fatalf("first error = %v, want checkpoint failure", err)
 	}
-	if _, err := fixture.initialize(options, nil, nil); err != nil {
+	candidate := options.Operation.CandidateOID
+	privateRef := "refs/igonotes/fetch/" + options.Operation.ID
+	managedRef := managedRemoteRef("main")
+	privateOID := fixture.git(fixture.root, "rev-parse", "--verify", privateRef)
+	managedOID := fixture.git(fixture.root, "rev-parse", "--verify", managedRef)
+	if candidate == "" || candidate != privateOID || candidate != managedOID {
+		t.Fatalf("crash-gap refs differ: checkpoint=%q private=%q managed=%q", candidate, privateOID, managedOID)
+	}
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	result, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+	if err != nil {
 		t.Fatalf("retry error = %v", err)
 	}
+	if !hasExactCommand(runner.commands, Command{
+		Dir: fixture.root, Args: []string{"update-ref", managedRef, result.PushOID, candidate}, Scope: LocalOperation,
+		ReadOnly: false,
+	}) {
+		t.Fatalf("retry did not use candidate as expected-old CAS: candidate=%q push=%q", candidate, result.PushOID)
+	}
+}
+
+func TestInitializeRetryRejectsTrustedRefCrashGapMismatch(t *testing.T) {
+	fixture, options := prepareTrustedRemoteAdvance(t)
+	failure := errors.New("checkpoint unavailable")
+	seenCandidate := false
+	_, err := fixture.initialize(options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+		if checkpoint.CandidateOID != "" && checkpoint.RemoteOID == "" {
+			seenCandidate = true
+			applyCheckpoint(&options.Operation, checkpoint)
+			return nil
+		}
+		if seenCandidate && checkpoint.RemoteOID != "" && checkpoint.PushOID == "" {
+			return failure
+		}
+		return nil
+	})
+	if !errors.Is(err, failure) {
+		t.Fatalf("first error = %v, want checkpoint failure", err)
+	}
+	candidate := options.Operation.CandidateOID
+	privateRef := "refs/igonotes/fetch/" + options.Operation.ID
+	managedRef := managedRemoteRef("main")
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", privateRef); got != candidate {
+		t.Fatalf("private ref = %q, want candidate %q", got, candidate)
+	}
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", managedRef); got != candidate {
+		t.Fatalf("managed ref = %q, want candidate %q", got, candidate)
+	}
+	fixture.git(fixture.root, "update-ref", privateRef, candidate+"^{tree}", candidate)
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	_, err = initializeWithRunner(t, fixture, runner, options, nil, nil)
+	assertSafeCode(t, err, CodeRemoteHistoryRewritten)
+	if got := fixture.git(fixture.root, "rev-parse", "--verify", managedRef); got != candidate {
+		t.Fatalf("managed ref advanced after mismatch: got %q want %q", got, candidate)
+	}
+	assertNoServicePush(t, runner.commands)
+}
+
+func prepareTrustedRemoteAdvance(t *testing.T) (*connectFixture, InitializeOptions) {
+	t.Helper()
+	fixture := newConnectFixture(t)
+	trustedOID := fixture.seedRemote()
+	fixture.initLocal("local")
+	fixture.git(fixture.root, "fetch", fixture.remote, "refs/heads/main")
+	fixture.git(fixture.root, "update-ref", managedRemoteRef("main"), trustedOID, zeroObjectID)
+	seed := filepath.Join(filepath.Dir(fixture.root), "seed")
+	if err := os.WriteFile(filepath.Join(seed, "advanced-for-crash.md"), []byte("advanced\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.git(seed, "add", "--all", "--", ".")
+	fixture.git(seed, "commit", "-m", "advance for crash gap")
+	fixture.git(seed, "push", "origin", "HEAD:main")
+	options := fixture.options()
+	options.LastRemoteOID = trustedOID
+	return fixture, options
 }
 
 func TestInitializeReindexesBeforeWorktreeUnlockAndPush(t *testing.T) {
@@ -368,6 +565,340 @@ func TestInitializeReindexesBeforeWorktreeUnlockAndPush(t *testing.T) {
 	}
 	if pushAt < 2 || !reflect.DeepEqual(events[pushAt-2:pushAt], []string{"reindex", "unlock"}) {
 		t.Fatalf("events = %q", events)
+	}
+}
+
+func TestInitializePostPushTrustUpdateRechecksLocalSafety(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		mutate   func(*connectFixture) error
+		wantCode ErrorCode
+	}{
+		{
+			name: "repository replaced by parent discovery",
+			mutate: func(fixture *connectFixture) error {
+				if err := os.Rename(filepath.Join(fixture.root, ".git"), filepath.Join(fixture.root, ".git.pushed")); err != nil {
+					return err
+				}
+				fixture.git(filepath.Dir(fixture.root), "init", "--initial-branch", "parent")
+				return nil
+			},
+			wantCode: CodeRepositoryRoot,
+		},
+		{
+			name: "pending operation appeared",
+			mutate: func(fixture *connectFixture) error {
+				head := fixture.git(fixture.root, "rev-parse", "--verify", "HEAD^{commit}")
+				return os.WriteFile(filepath.Join(fixture.root, ".git", "MERGE_HEAD"), []byte(head+"\n"), 0o600)
+			},
+			wantCode: CodeRepositoryLocked,
+		},
+		{
+			name: "repository lock appeared",
+			mutate: func(fixture *connectFixture) error {
+				return os.WriteFile(filepath.Join(fixture.root, ".git", "index.lock"), []byte("locked\n"), 0o600)
+			},
+			wantCode: CodeRepositoryLocked,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newConnectFixture(t)
+			runner := &interceptRunner{delegate: NewCommandRunner()}
+			pushed := false
+			runner.after = func(command Command, result Result, err error) (Result, error) {
+				if err == nil && len(command.Args) != 0 && command.Args[0] == "push" {
+					pushed = true
+				}
+				return result, err
+			}
+			transactions := 0
+			transaction := func(_ context.Context, mutate func(string) error) error {
+				transactions++
+				if transactions == 3 {
+					if !pushed {
+						t.Fatal("post-push transaction started before push")
+					}
+					if err := test.mutate(fixture); err != nil {
+						return err
+					}
+				}
+				return mutate(fixture.root)
+			}
+			var pushedCheckpoint string
+			_, err := initializeWithRunner(t, fixture, runner, fixture.options(), transaction, func(_ context.Context, checkpoint Checkpoint) error {
+				if checkpoint.Stage == StagePushing && checkpoint.PushOID != "" {
+					pushedCheckpoint = checkpoint.PushOID
+				}
+				return nil
+			})
+			var safeErr *SafeError
+			if !errors.As(err, &safeErr) || safeErr.Code != test.wantCode {
+				t.Fatalf("Initialize() error = %#v, want code %q", err, test.wantCode)
+			}
+			if !pushed || pushedCheckpoint == "" || pushedCheckpoint != fixture.remoteOID() {
+				t.Fatalf("confirmed push was not checkpointed: pushed=%v checkpoint=%q remote=%q", pushed, pushedCheckpoint, fixture.remoteOID())
+			}
+			for _, command := range runner.commands {
+				if isManagedRefUpdate(command, "main") {
+					t.Fatalf("managed ref update ran after unsafe local change: %q", command.Args)
+				}
+			}
+		})
+	}
+}
+
+func isManagedRefUpdate(command Command, branch string) bool {
+	return len(command.Args) >= 2 && command.Args[0] == "update-ref" && command.Args[1] == managedRemoteRef(branch)
+}
+
+func TestInitializeRequiresActualConsequenceConfirmations(t *testing.T) {
+	t.Run("create repository", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		options := fixture.options()
+		options.Confirmations.CreateRepository = false
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeConfirmationRequired)
+		for _, command := range runner.commands {
+			if command.Scope == LocalOperation && !command.ReadOnly {
+				t.Fatalf("local mutation ran without repository confirmation: %q", command.Args)
+			}
+		}
+	})
+
+	t.Run("create branch on empty remote", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		options := fixture.options()
+		options.Confirmations.CreateBranch = false
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeConfirmationRequired)
+		for _, command := range runner.commands {
+			if len(command.Args) == 0 {
+				continue
+			}
+			if command.Args[0] == "commit" || command.Args[0] == "push" ||
+				(command.Args[0] == "switch" && containsArg(command.Args, "-c")) ||
+				isSelectedBranchRefUpdate(command, "main") {
+				t.Fatalf("branch-creation consequence ran without confirmation: %q", command.Args)
+			}
+		}
+	})
+
+	t.Run("merge unrelated histories", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		fixture.seedRemote()
+		fixture.write("local.md", "local\n")
+		options := fixture.options()
+		options.Confirmations.MergeHistories = false
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		_, err := initializeWithRunner(t, fixture, runner, options, nil, nil)
+		assertSafeCode(t, err, CodeConfirmationRequired)
+		for _, command := range runner.commands {
+			if len(command.Args) != 0 && command.Args[0] == "merge" && containsArg(command.Args, "--allow-unrelated-histories") {
+				t.Fatalf("unrelated merge ran without confirmation: %q", command.Args)
+			}
+		}
+		assertNoServicePush(t, runner.commands)
+	})
+}
+
+func assertSafeCode(t *testing.T, err error, code ErrorCode) {
+	t.Helper()
+	var safeErr *SafeError
+	if !errors.As(err, &safeErr) || safeErr.Code != code {
+		t.Fatalf("error = %#v, want SafeError code %q", err, code)
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func isSelectedBranchRefUpdate(command Command, branch string) bool {
+	return len(command.Args) >= 2 && command.Args[0] == "update-ref" && command.Args[1] == "refs/heads/"+branch
+}
+
+func TestInitializeExactCommandContract(t *testing.T) {
+	t.Run("init commit origin inspections push and CAS", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		fixture.write("note.md", "note\n")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		commands := runner.commands
+		assertExactCommand(t, commands, localCommand(fixture.root, false, "init", "--initial-branch", "main"))
+		assertExactCommand(t, commands, localSecretCommand(fixture.root, false, fixture.remote, "remote", "add", "origin", fixture.remote))
+		assertExactCommand(t, commands, localCommand(fixture.root, true, "rev-parse", "--show-toplevel"))
+		assertExactCommand(t, commands, localCommand(fixture.root, true, "rev-parse", "--verify", "HEAD^{commit}"))
+		assertExactCommand(t, commands, localCommand(fixture.root, true, "symbolic-ref", "--quiet", "--short", "HEAD"))
+		assertExactCommand(t, commands, localCommand(fixture.root, true, "remote", "get-url", "--all", "origin"))
+		assertExactCommand(t, commands, networkCommand(fixture.root, true, fixture.remote, "ls-remote", "--symref", fixture.remote))
+		assertExactCommand(t, commands, networkCommand(fixture.root, true, fixture.remote, "ls-remote", "--symref", "origin"))
+		assertExactCommand(t, commands, localCommand(fixture.root, false, "add", "--all", "--", "."))
+		assertExactCommand(t, commands, localCommand(fixture.root, true, "diff", "--cached", "--quiet", "--exit-code"))
+		assertExactCommand(t, commands, localCommand(fixture.root, true, "diff", "--cached", "--name-only", "-z"))
+		assertExactCommand(t, commands, localCommand(fixture.root, false, "commit", "-m", initialCommitMessage))
+		assertExactCommand(t, commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), result.PushOID, zeroObjectID))
+		assertExactPush(t, commands, fixture, result.PushOID)
+		assertNoForbiddenServiceCommands(t, commands)
+	})
+
+	t.Run("empty bootstrap commit", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		if _, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "commit", "--allow-empty", "-m", initialCommitMessage))
+		assertNoForbiddenServiceCommands(t, runner.commands)
+	})
+
+	t.Run("fetch and unborn checkout", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		remoteOID := fixture.seedRemote()
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		privateRef := "refs/igonotes/fetch/" + testOperationID
+		assertExactCommand(t, runner.commands, networkCommand(fixture.root, false, fixture.remote,
+			"fetch", "--no-tags", "--show-forced-updates", "origin", "+refs/heads/main:"+privateRef))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, true, "rev-parse", "--verify", privateRef+"^{commit}"))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, true, "rev-parse", "--verify", managedRemoteRef("main")))
+		assertExactCommand(t, runner.commands, networkCommand(fixture.root, true, fixture.remote,
+			"ls-remote", "--exit-code", "--heads", "origin", "refs/heads/main"))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "checkout", remoteOID, "--", "."))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", "refs/heads/main", remoteOID, zeroObjectID))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), remoteOID, zeroObjectID))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "update-ref", managedRemoteRef("main"), result.PushOID, remoteOID))
+		assertExactPush(t, runner.commands, fixture, result.PushOID)
+		assertNoForbiddenServiceCommands(t, runner.commands)
+	})
+
+	t.Run("backup create branch and unrelated merge", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		remoteOID := fixture.seedRemote()
+		fixture.initLocal("local")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshotOID := fixture.git(fixture.root, "rev-parse", "--verify", result.BackupRef+"^{commit}")
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+			"update-ref", "--create-reflog", "-m", "IGoNotes initial-connect backup", result.BackupRef, snapshotOID, zeroObjectID))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "switch", "-c", "main", remoteOID))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+			"merge", "--no-edit", "-m", localMergeMessage, "--allow-unrelated-histories", snapshotOID))
+		assertNoForbiddenServiceCommands(t, runner.commands)
+	})
+
+	t.Run("switch existing branch and merge remote", func(t *testing.T) {
+		fixture := newConnectFixture(t)
+		remoteOID := fixture.seedRemote()
+		fixture.initLocal("main")
+		fixture.git(fixture.root, "switch", "-c", "local")
+		fixture.write("local-branch.md", "local branch\n")
+		fixture.git(fixture.root, "add", "--all", "--", ".")
+		fixture.git(fixture.root, "commit", "-m", "local branch")
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, err := initializeWithRunner(t, fixture, runner, fixture.options(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshotOID := fixture.git(fixture.root, "rev-parse", "--verify", result.BackupRef+"^{commit}")
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false, "switch", "main"))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+			"merge", "--no-edit", "-m", localMergeMessage, snapshotOID))
+		assertExactCommand(t, runner.commands, localCommand(fixture.root, false,
+			"merge", "--no-edit", "-m", "IGoNotes: merge origin/main", "--allow-unrelated-histories", remoteOID))
+		assertExactPush(t, runner.commands, fixture, result.PushOID)
+		assertNoForbiddenServiceCommands(t, runner.commands)
+	})
+}
+
+func localCommand(dir string, readOnly bool, args ...string) Command {
+	return Command{Dir: dir, Args: args, Scope: LocalOperation, ReadOnly: readOnly}
+}
+
+func localSecretCommand(dir string, readOnly bool, secret string, args ...string) Command {
+	return Command{Dir: dir, Args: args, Scope: LocalOperation, ReadOnly: readOnly, Secrets: []string{secret}}
+}
+
+func networkCommand(dir string, readOnly bool, secret string, args ...string) Command {
+	return Command{Dir: dir, Args: args, Scope: NetworkOperation, ReadOnly: readOnly, Secrets: []string{secret}}
+}
+
+func assertExactCommand(t *testing.T, commands []Command, want Command) {
+	t.Helper()
+	if !hasExactCommand(commands, want) {
+		t.Fatalf("exact command not executed: %#v\nall commands: %#v", want, commands)
+	}
+}
+
+func assertExactPush(t *testing.T, commands []Command, fixture *connectFixture, oid string) {
+	t.Helper()
+	if len(oid) != 40 {
+		t.Fatalf("captured push OID = %q, want full SHA-1", oid)
+	}
+	assertExactCommand(t, commands, networkCommand(fixture.root, false, fixture.remote,
+		"push", "--no-verify", "--porcelain", "origin", oid+":refs/heads/main"))
+}
+
+func assertNoForbiddenServiceCommands(t *testing.T, commands []Command) {
+	t.Helper()
+	for _, command := range commands {
+		if len(command.Args) == 0 {
+			continue
+		}
+		args := command.Args
+		switch args[0] {
+		case "reset", "rebase", "clean", "prune":
+			t.Fatalf("forbidden service command executed: %q", args)
+		case "merge":
+			if containsArg(args, "--abort") {
+				t.Fatalf("forbidden merge abort executed: %q", args)
+			}
+		case "branch":
+			if containsArg(args, "-d") || containsArg(args, "-D") || containsArg(args, "--delete") {
+				t.Fatalf("forbidden branch deletion executed: %q", args)
+			}
+		case "remote":
+			if len(args) > 1 && args[1] == "prune" {
+				t.Fatalf("forbidden remote prune executed: %q", args)
+			}
+		case "push":
+			for _, arg := range args[1:] {
+				if arg == "--force" || arg == "--force-with-lease" || arg == "--delete" ||
+					strings.HasPrefix(arg, "+") || strings.HasPrefix(arg, ":refs/") {
+					t.Fatalf("forbidden push argv executed: %q", args)
+				}
+			}
+		}
+		for _, arg := range args {
+			if arg == "--prune" {
+				t.Fatalf("forbidden prune argv executed: %q", args)
+			}
+			if !strings.HasPrefix(arg, "+") {
+				continue
+			}
+			want := "+refs/heads/main:refs/igonotes/fetch/" + testOperationID
+			if args[0] != "fetch" || arg != want {
+				t.Fatalf("leading + outside private fetch refspec: %q", args)
+			}
+		}
+		if args[0] == "update-ref" && (containsArg(args, "-d") || containsArg(args, "--delete")) {
+			t.Fatalf("forbidden ref deletion executed: %q", args)
+		}
 	}
 }
 
