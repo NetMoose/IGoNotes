@@ -2,11 +2,14 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	gitcmd "IGoNotes/internal/git"
@@ -111,6 +114,48 @@ type gitOperationsFake struct {
 	syncErr             error
 	syncCalls           int
 	syncRequest         gitcmd.SyncRequest
+}
+
+type concurrentGitOperationConfigurer struct {
+	snapshots map[string]gitcmd.ConfiguredBase
+}
+
+func (f concurrentGitOperationConfigurer) ConfigureGit(context.Context, string, model.GitConfigRequest) (model.GitConfigResponse, error) {
+	return model.GitConfigResponse{}, nil
+}
+
+func (f concurrentGitOperationConfigurer) DisableGit(context.Context, string) (model.GitConfigResponse, error) {
+	return model.GitConfigResponse{}, nil
+}
+
+func (f concurrentGitOperationConfigurer) ConfigureGitForInitialize(context.Context, string, model.GitConfigRequest) (model.GitConfigResponse, gitcmd.ConfiguredBase, error) {
+	return model.GitConfigResponse{}, gitcmd.ConfiguredBase{}, nil
+}
+
+func (f concurrentGitOperationConfigurer) GitSnapshot(base string) (gitcmd.ConfiguredBase, bool, error) {
+	snapshot, found := f.snapshots[base]
+	if !found {
+		return gitcmd.ConfiguredBase{}, false, service.ErrBaseNotFound
+	}
+	return snapshot, false, nil
+}
+
+type concurrentGitOperations struct {
+	mu         sync.Mutex
+	operations map[string]gitcmd.Operation
+	calls      map[string]int
+}
+
+func (f *concurrentGitOperations) QueueInitialize(context.Context, gitcmd.InitializeRequest) (gitcmd.Operation, bool, error) {
+	return gitcmd.Operation{}, false, errors.New("initialize is not expected")
+}
+
+func (f *concurrentGitOperations) QueueSync(_ context.Context, request gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls[request.Snapshot.Path]++
+	operation := f.operations[request.Snapshot.Path]
+	return operation, f.calls[request.Snapshot.Path] > 1, nil
 }
 
 func (f *gitOperationsFake) QueueInitialize(_ context.Context, request gitcmd.InitializeRequest) (gitcmd.Operation, bool, error) {
@@ -252,6 +297,62 @@ func TestGitHandlerOperationEndpointsRequireBaseAndDoNotLeakSafeErrorContext(t *
 		if strings.Contains(recorder.Body.String(), private) {
 			t.Errorf("response leaks private queue error %q: %q", private, recorder.Body.String())
 		}
+	}
+}
+
+func TestGitHandlerManualSyncConcurrentRequestsShareOperationsByBase(t *testing.T) {
+	first := gitcmd.ConfiguredBase{Name: "first", Path: "/notes/first", URL: "https://example.test/first.git", Branch: "main"}
+	second := gitcmd.ConfiguredBase{Name: "second", Path: "/notes/second", URL: "https://example.test/second.git", Branch: "main"}
+	operations := &concurrentGitOperations{
+		operations: map[string]gitcmd.Operation{
+			first.Path:  {ID: "11111111111111111111111111111111", State: gitcmd.OperationQueued},
+			second.Path: {ID: "22222222222222222222222222222222", State: gitcmd.OperationQueued},
+		},
+		calls: make(map[string]int),
+	}
+	handler := NewGitHandlerWithOperations(
+		&gitProberFake{},
+		concurrentGitOperationConfigurer{snapshots: map[string]gitcmd.ConfiguredBase{"first": first, "second": second}},
+		&gitStatusReaderFake{},
+		operations,
+	)
+
+	type response struct {
+		base string
+		body model.GitOperationResponse
+		err  error
+	}
+	responses := make(chan response, 3)
+	var group sync.WaitGroup
+	for _, base := range []string{"first", "first", "second"} {
+		group.Add(1)
+		go func(base string) {
+			defer group.Done()
+			recorder := httptest.NewRecorder()
+			handler.Sync(recorder, httptest.NewRequest(http.MethodPost, "/api/git/sync?base="+base, nil))
+			if recorder.Code != http.StatusAccepted {
+				responses <- response{base: base, err: fmt.Errorf("status = %d: %s", recorder.Code, recorder.Body.String())}
+				return
+			}
+			var body model.GitOperationResponse
+			responses <- response{base: base, body: body, err: json.Unmarshal(recorder.Body.Bytes(), &body)}
+		}(base)
+	}
+	group.Wait()
+	close(responses)
+
+	ids := make(map[string][]string)
+	for result := range responses {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		ids[result.base] = append(ids[result.base], result.body.OperationID)
+	}
+	if !reflect.DeepEqual(ids["first"], []string{"11111111111111111111111111111111", "11111111111111111111111111111111"}) {
+		t.Errorf("first IDs = %v, want one shared operation ID", ids["first"])
+	}
+	if !reflect.DeepEqual(ids["second"], []string{"22222222222222222222222222222222"}) {
+		t.Errorf("second IDs = %v, want its own operation ID", ids["second"])
 	}
 }
 
