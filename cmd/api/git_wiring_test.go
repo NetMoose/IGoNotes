@@ -120,7 +120,12 @@ func TestRunServerWiresGitFoundationBeforeSystemRoutesAndServing(t *testing.T) {
 		"settingsService, err := service.NewSettingsServiceWithGit(configService, noteService, coordinator, options.base, log.Default(), gitValidator, gitStatusRepo)",
 		"gitProbeService := service.NewGitProbeService(settingsService, gitClient)",
 		"gitStatusService := service.NewGitStatusService(settingsService, gitStatusRepo)",
-		"gitHandler := handlers.NewGitHandler(gitProbeService, settingsService, gitStatusService)",
+		"gitOperations := repository.NewGitOperationRepository(db)",
+		"gitService := gitcmd.NewService(gitRunner, gitClient)",
+		"gitManager := service.NewGitManager(gitService, gitStatusRepo, gitOperations, gitProbeService, settingsService.GitSnapshot, noteService, coordinator)",
+		"gitManager.RecoverLocal(ctx, configuredGitSnapshots(settingsService))",
+		"gitManager.Start()",
+		"gitHandler := handlers.NewGitHandlerWithOperations(gitProbeService, settingsService, gitStatusService, gitManager)",
 		"router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)",
 		"handlers.RegisterGitRoutes(router, gitHandler, settingsService)",
 		"registerSystemRoutes(router, systemHandler)",
@@ -136,7 +141,7 @@ func TestRunServerWiresGitFoundationBeforeSystemRoutesAndServing(t *testing.T) {
 	}
 }
 
-func TestRunServerGitWiringHasNoStartupExecution(t *testing.T) {
+func TestRunServerGitWiringRecoversLocallyBeforeServing(t *testing.T) {
 	source, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)
@@ -146,7 +151,7 @@ func TestRunServerGitWiringHasNoStartupExecution(t *testing.T) {
 	for _, forbidden := range []string{
 		"exec.LookPath",
 		".git",
-		".Run(",
+		".Initialize(",
 		".Probe(",
 		".Version(",
 		".InspectLocal(",
@@ -159,6 +164,8 @@ func TestRunServerGitWiringHasNoStartupExecution(t *testing.T) {
 	for _, required := range []string{
 		"service.NewSettingsServiceWithGit(",
 		"repository.NewGitStatusRepository(db)",
+		"gitManager.RecoverLocal(",
+		"gitManager.Start()",
 	} {
 		if !strings.Contains(runServerSource, required) {
 			t.Errorf("runServer does not use production Git wiring %q", required)

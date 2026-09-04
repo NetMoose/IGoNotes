@@ -101,7 +101,21 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	}
 	gitProbeService := service.NewGitProbeService(settingsService, gitClient)
 	gitStatusService := service.NewGitStatusService(settingsService, gitStatusRepo)
-	gitHandler := handlers.NewGitHandler(gitProbeService, settingsService, gitStatusService)
+	gitOperations := repository.NewGitOperationRepository(db)
+	gitService := gitcmd.NewService(gitRunner, gitClient)
+	gitManager := service.NewGitManager(gitService, gitStatusRepo, gitOperations, gitProbeService, settingsService.GitSnapshot, noteService, coordinator)
+	defer func() {
+		if err := gitManager.Close(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("закрыть менеджер Git: %w", err))
+		}
+	}()
+	if err := gitManager.RecoverLocal(ctx, configuredGitSnapshots(settingsService)); err != nil {
+		return fmt.Errorf("восстановить локальные репозитории Git: %w", err)
+	}
+	if err := gitManager.Start(); err != nil {
+		return fmt.Errorf("запустить менеджер Git: %w", err)
+	}
+	gitHandler := handlers.NewGitHandlerWithOperations(gitProbeService, settingsService, gitStatusService, gitManager)
 
 	go func() {
 		log.Println("Запуск первичной синхронизации файловой системы...")
@@ -138,6 +152,22 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 			}
 		}
 	}, gracefulShutdownTimeout)
+}
+
+func configuredGitSnapshots(settings *service.SettingsService) []gitcmd.ConfiguredBase {
+	config := settings.GetConfig()
+	snapshots := make([]gitcmd.ConfiguredBase, 0, len(config.Bases))
+	for _, base := range config.Bases {
+		if !base.GitConfigured() {
+			continue
+		}
+		snapshot, _, err := settings.GitSnapshot(base.Name)
+		if err != nil {
+			continue
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots
 }
 
 func runMain() error {
