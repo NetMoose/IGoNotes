@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +32,7 @@ type Command struct {
 	Scope    OperationScope
 	ReadOnly bool
 	Secrets  []string
+	Stdin    io.Reader
 }
 
 type Result struct {
@@ -101,6 +103,7 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 	stderr := &limitedBuffer{limit: r.outputLimit + longestString(command.Secrets)}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	cmd.Stdin = command.Stdin
 
 	runErr := cmd.Run()
 	diagnostic, diagnosticTruncated := redactAndLimit(

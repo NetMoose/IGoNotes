@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"reflect"
 	"testing"
@@ -8,6 +9,22 @@ import (
 
 type recordingRunner struct {
 	commands []Command
+}
+
+func TestServiceRunForwardsStdin(t *testing.T) {
+	runner := &recordingRunner{}
+	service := NewService(runner, unusedPorcelain{})
+	input := bytes.NewBufferString("conflict-path\x00")
+
+	if _, err := service.runLocalInput(context.Background(), "/canonical/notes", false, input, "add", "--stdin"); err != nil {
+		t.Fatalf("runLocalInput() error = %v", err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("runner calls = %d, want 1", len(runner.commands))
+	}
+	if runner.commands[0].Stdin != input {
+		t.Fatal("Service did not forward the original stdin reader")
+	}
 }
 
 func (r *recordingRunner) Run(_ context.Context, command Command) (Result, error) {
@@ -41,7 +58,7 @@ func TestServiceRunForwardsLandedCommand(t *testing.T) {
 	args := []string{"push", "origin", "abc:refs/heads/main"}
 	remoteURL := "https://user:token@example.com/notes.git"
 
-	if _, err := service.run(context.Background(), "/canonical/notes", NetworkOperation, false, remoteURL, args...); err != nil {
+	if _, err := service.run(context.Background(), "/canonical/notes", NetworkOperation, false, remoteURL, nil, args...); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 	args[0] = "mutated"

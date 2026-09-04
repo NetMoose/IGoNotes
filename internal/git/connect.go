@@ -473,7 +473,7 @@ func (s *Service) connectRun(
 			return Result{}, err
 		}
 	}
-	return s.run(ctx, path, scope, readOnly, secret, args...)
+	return s.run(ctx, path, scope, readOnly, secret, nil, args...)
 }
 
 func (s *Service) connectRunNetwork(ctx context.Context, path, secret string, readOnly bool, args ...string) (Result, error) {

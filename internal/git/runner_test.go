@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,8 +72,36 @@ func TestGitRunnerHelper(t *testing.T) {
 		os.Exit(23)
 	case "wait":
 		time.Sleep(30 * time.Second)
+	case "stdin-sha256":
+		contents, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "%x", sha256.Sum256(contents))
 	default:
 		t.Fatalf("unknown helper action %q", args[0])
+	}
+}
+
+func TestCommandRunnerForwardsStdinWithoutExposingIt(t *testing.T) {
+	secret := "stdin-secret-marker-5f5d1e8e"
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return helperCommand(ctx, "stdin-sha256")
+	})
+
+	result, err := runner.Run(context.Background(), Command{
+		Dir: t.TempDir(), Args: []string{"hash-object", "--stdin"}, Scope: LocalOperation, ReadOnly: true,
+		Stdin: strings.NewReader(secret),
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte(secret)))
+	if !strings.HasPrefix(result.Stdout, want) {
+		t.Errorf("stdout = %q, want SHA-256 prefix %q", result.Stdout, want)
+	}
+	if strings.Contains(result.Stdout, secret) || strings.Contains(result.Stderr, secret) {
+		t.Fatalf("result exposes stdin secret: %#v", result)
 	}
 }
 

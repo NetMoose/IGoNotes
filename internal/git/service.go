@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"io"
 	"time"
 )
 
@@ -27,6 +28,7 @@ func (s *Service) run(
 	scope OperationScope,
 	readOnly bool,
 	remoteURL string,
+	stdin io.Reader,
 	args ...string,
 ) (Result, error) {
 	secrets := make([]string, 0, 1)
@@ -39,13 +41,18 @@ func (s *Service) run(
 		Scope:    scope,
 		ReadOnly: readOnly,
 		Secrets:  append([]string(nil), secrets...),
+		Stdin:    stdin,
 	})
 }
 
 func (s *Service) runLocal(ctx context.Context, dir string, readOnly bool, args ...string) (Result, error) {
-	return s.run(ctx, dir, LocalOperation, readOnly, "", args...)
+	return s.run(ctx, dir, LocalOperation, readOnly, "", nil, args...)
 }
 
 func (s *Service) runNetwork(ctx context.Context, dir, remoteURL string, readOnly bool, args ...string) (Result, error) {
-	return s.run(ctx, dir, NetworkOperation, readOnly, remoteURL, args...)
+	return s.run(ctx, dir, NetworkOperation, readOnly, remoteURL, nil, args...)
+}
+
+func (s *Service) runLocalInput(ctx context.Context, dir string, readOnly bool, stdin io.Reader, args ...string) (Result, error) {
+	return s.run(ctx, dir, LocalOperation, readOnly, "", stdin, args...)
 }
