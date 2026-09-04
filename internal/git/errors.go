@@ -32,7 +32,29 @@ const (
 	CodeConfirmationRequired   ErrorCode = "git_confirmation_required"
 	CodeOperationInterrupted   ErrorCode = "operation_interrupted"
 	CodeBackupMismatch         ErrorCode = "backup_mismatch"
+	CodeConflictNotFound       ErrorCode = "git_conflict_not_found"
+	CodeConflictStale          ErrorCode = "git_conflict_stale"
+	CodeConflictUnresolved     ErrorCode = "git_conflict_unresolved"
+	CodeConflictUnsupported    ErrorCode = "git_conflict_unsupported"
+	CodeMergeNotInProgress     ErrorCode = "git_merge_not_in_progress"
+	CodeRecoveryRequired       ErrorCode = "git_recovery_required"
+	CodePaused                 ErrorCode = "git_paused"
 )
+
+var (
+	ErrConflictNotFound       = &SafeError{Code: CodeConflictNotFound, Message: "Git conflict was not found"}
+	ErrConflictStale          = &SafeError{Code: CodeConflictStale, Message: "Git conflict changed; refresh and try again"}
+	ErrConflictUnresolved     = &SafeError{Code: CodeConflictUnresolved, Message: "Git conflict still has unresolved paths"}
+	ErrConflictUnsupported    = &SafeError{Code: CodeConflictUnsupported, Message: "Git conflict type is unsupported"}
+	ErrMergeNotInProgress     = &SafeError{Code: CodeMergeNotInProgress, Message: "Git merge is not in progress"}
+	ErrRecoveryRequired       = &SafeError{Code: CodeRecoveryRequired, Message: "Git repository requires recovery"}
+	ErrGitPaused              = &SafeError{Code: CodePaused, Message: "Git synchronization is paused"}
+	ErrConflictStateAmbiguous = ErrRecoveryRequired
+)
+
+func newConflictFieldError(message, field string) *SafeError {
+	return &SafeError{Code: CodeConflictUnsupported, Message: message, Field: field}
+}
 
 type SafeError struct {
 	Code     ErrorCode

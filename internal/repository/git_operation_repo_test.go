@@ -97,6 +97,44 @@ func TestGitOperationRepositoryCreateCheckpointFinish(t *testing.T) {
 	}
 }
 
+func TestGitOperationRepositoryByIDAndLatestConflictByPath(t *testing.T) {
+	db, err := InitDB(filepath.Join(t.TempDir(), "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := NewGitOperationRepository(db)
+	ctx := context.Background()
+	first := completeGitOperation("conflict-old", "/notes/work", time.Now().UTC())
+	first.State, first.Stage = gitcmd.OperationQueued, gitcmd.StageQueued
+	if err := repo.CreateQueued(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	first.State, first.Stage = gitcmd.OperationConflict, gitcmd.StageMerging
+	first.ConflictPaths = []string{"old.md"}
+	if err := repo.Finish(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := completeGitOperation("conflict-new", "/notes/work", time.Now().UTC().Add(time.Nanosecond))
+	second.Kind, second.State, second.Stage = gitcmd.OperationConflictComplete, gitcmd.OperationQueued, gitcmd.StageQueued
+	if err := repo.CreateQueued(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	second.State, second.Stage = gitcmd.OperationConflict, gitcmd.StageConflictCompleting
+	second.ConflictPaths = []string{"new.md"}
+	if err := repo.Finish(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := repo.ByID(ctx, second.ID)
+	if err != nil || !found || got.ID != second.ID {
+		t.Fatalf("ByID = %#v, %v, %v", got, found, err)
+	}
+	latest, found, err := repo.LatestConflictByPath(ctx, second.RepoPath)
+	if err != nil || !found || latest.ID != second.ID {
+		t.Fatalf("LatestConflictByPath = %#v, %v, %v", latest, found, err)
+	}
+}
+
 func TestGitOperationRepositoryFinishPreservesAdmissionAndCheckpointData(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "metadata.db")
 	db, err := InitDB(dbPath)

@@ -12,8 +12,10 @@ type OperationState string
 type Stage string
 
 const (
-	OperationInitialize OperationKind = "initialize"
-	OperationSync       OperationKind = "sync"
+	OperationInitialize       OperationKind = "initialize"
+	OperationSync             OperationKind = "sync"
+	OperationConflictComplete OperationKind = "conflict_complete"
+	OperationConflictAbort    OperationKind = "conflict_abort"
 
 	OperationQueued    OperationState = "queued"
 	OperationRunning   OperationState = "running"
@@ -21,16 +23,22 @@ const (
 	OperationFailed    OperationState = "failed"
 	OperationConflict  OperationState = "conflict"
 
-	StageQueued       Stage = "queued"
-	StageProbing      Stage = "probing"
-	StageFetching     Stage = "fetching"
-	StageSnapshotting Stage = "snapshotting"
-	StageBackingUp    Stage = "backing_up"
-	StageSwitching    Stage = "switching"
-	StageMerging      Stage = "merging"
-	StageReindexing   Stage = "reindexing"
-	StagePushing      Stage = "pushing"
-	StageCompleted    Stage = "completed"
+	StageQueued             Stage = "queued"
+	StageProbing            Stage = "probing"
+	StageFetching           Stage = "fetching"
+	StageSnapshotting       Stage = "snapshotting"
+	StageBackingUp          Stage = "backing_up"
+	StageSwitching          Stage = "switching"
+	StageMerging            Stage = "merging"
+	StageReindexing         Stage = "reindexing"
+	StagePushing            Stage = "pushing"
+	StageCompleted          Stage = "completed"
+	StageConflictResolving  Stage = "conflict_resolving"
+	StageConflictCompleting Stage = "conflict_completing"
+	StageConflictCommitted  Stage = "conflict_committed"
+	StageConflictReindexed  Stage = "conflict_reindexed"
+	StageConflictPushing    Stage = "conflict_pushing"
+	StageConflictAborting   Stage = "conflict_aborting"
 )
 
 type Operation struct {

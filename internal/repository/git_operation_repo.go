@@ -155,6 +155,16 @@ func (r *GitOperationRepository) LatestByPath(ctx context.Context, path string) 
 	return operationLookupResult(operation, err, fmt.Sprintf("find latest Git operation for path %q", path))
 }
 
+func (r *GitOperationRepository) ByID(ctx context.Context, id string) (gitcmd.Operation, bool, error) {
+	operation, err := scanGitOperation(r.db.QueryRowContext(ctx, `SELECT `+gitOperationColumns+` FROM git_operations WHERE operation_id = ?`, id))
+	return operationLookupResult(operation, err, fmt.Sprintf("find Git operation %q", id))
+}
+
+func (r *GitOperationRepository) LatestConflictByPath(ctx context.Context, path string) (gitcmd.Operation, bool, error) {
+	operation, err := scanGitOperation(r.db.QueryRowContext(ctx, `SELECT `+gitOperationColumns+` FROM git_operations WHERE repo_path = ? AND state = 'conflict' ORDER BY updated_at DESC, operation_id DESC LIMIT 1`, path))
+	return operationLookupResult(operation, err, fmt.Sprintf("find latest conflict Git operation for path %q", path))
+}
+
 func (r *GitOperationRepository) ListUnfinished(ctx context.Context) ([]gitcmd.Operation, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT `+gitOperationColumns+`

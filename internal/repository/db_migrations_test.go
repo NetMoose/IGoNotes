@@ -16,8 +16,8 @@ func TestInitDBMigrationsFreshDatabaseInOrder(t *testing.T) {
 	}
 	defer db.Close()
 
-	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
-		t.Fatalf("migration versions = %v, want [1 2 3]", got)
+	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3, 4}) {
+		t.Fatalf("migration versions = %v, want [1 2 3 4]", got)
 	}
 
 	var indexName string
@@ -62,8 +62,8 @@ func TestInitDBUpgradesLegacySchemaWithoutDataLoss(t *testing.T) {
 	}
 	defer db.Close()
 
-	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
-		t.Errorf("migration versions = %v, want [1 2 3]", got)
+	if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3, 4}) {
+		t.Errorf("migration versions = %v, want [1 2 3 4]", got)
 	}
 	assertGitOperationSchema(t, db)
 	wantNotes := [][]string{{"legacy.md", "Legacy", "legacy.md", "", "file", "'2001-02-03 04:05:06'", "'2007-08-09 10:11:12'"}}
@@ -82,8 +82,8 @@ func TestInitDBRerunDoesNotDuplicateVersions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("InitDB() run %d error = %v", run, err)
 		}
-		if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
-			t.Errorf("run %d migration versions = %v, want [1 2 3]", run, got)
+		if got := migrationVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3, 4}) {
+			t.Errorf("run %d migration versions = %v, want [1 2 3 4]", run, got)
 		}
 		if err := db.Close(); err != nil {
 			t.Fatalf("close run %d: %v", run, err)
@@ -94,7 +94,7 @@ func TestInitDBRerunDoesNotDuplicateVersions(t *testing.T) {
 func TestInitDBMigrationFailureRollsBackSchemaAndVersion(t *testing.T) {
 	original := migrations
 	migrations = append(append([]migration(nil), migrations...), migration{
-		version: 4,
+		version: 5,
 		sql: `
 			CREATE TABLE migration_four_marker (id INTEGER PRIMARY KEY);
 			INSERT INTO table_that_does_not_exist (id) VALUES (1);
@@ -117,8 +117,8 @@ func TestInitDBMigrationFailureRollsBackSchemaAndVersion(t *testing.T) {
 
 	reopened := openRawDB(t, dbPath)
 	defer reopened.Close()
-	if got := migrationVersions(t, reopened); !reflect.DeepEqual(got, []int{1, 2, 3}) {
-		t.Errorf("migration versions after failure = %v, want [1 2 3]", got)
+	if got := migrationVersions(t, reopened); !reflect.DeepEqual(got, []int{1, 2, 3, 4}) {
+		t.Errorf("migration versions after failure = %v, want [1 2 3 4]", got)
 	}
 	assertGitOperationSchema(t, reopened)
 	var markerCount int
