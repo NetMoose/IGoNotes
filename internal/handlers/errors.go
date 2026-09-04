@@ -12,6 +12,11 @@ import (
 
 const internalErrorMessage = "Internal server error"
 
+var (
+	errGitOperationsNotInitialized = errors.New("Git operations are not initialized")
+	errInvalidGitStatusResponse    = errors.New("invalid Git status response")
+)
+
 type serviceErrorMapping struct {
 	kind    error
 	status  int
@@ -40,6 +45,7 @@ var serviceErrorMappings = []serviceErrorMapping{
 	{service.ErrInvalidGitInterval, http.StatusUnprocessableEntity, "invalid_auto_sync_interval", service.ErrInvalidGitInterval.Error()},
 	{service.ErrInvalidGitTemplate, http.StatusUnprocessableEntity, "invalid_commit_template", service.ErrInvalidGitTemplate.Error()},
 	{service.ErrGitRepositoryInUse, http.StatusConflict, "git_repository_in_use", service.ErrGitRepositoryInUse.Error()},
+	{service.ErrGitManagerClosed, http.StatusServiceUnavailable, "git_manager_closed", service.ErrGitManagerClosed.Error()},
 }
 
 func WriteAPIError(w http.ResponseWriter, status int, code, message, field string) {
@@ -66,7 +72,13 @@ func writeServiceError(w http.ResponseWriter, err error) {
 			status = http.StatusUnauthorized
 		case gitcmd.CodeRemoteUnreachable:
 			status = http.StatusBadGateway
-		case gitcmd.CodeRepositoryRoot, gitcmd.CodeRepositoryLocked:
+		case gitcmd.CodeRepositoryRoot,
+			gitcmd.CodeRepositoryLocked,
+			gitcmd.CodeOriginMismatch,
+			gitcmd.CodeBranchDeleted,
+			gitcmd.CodeRemoteHistoryRewritten,
+			gitcmd.CodePushRejected,
+			gitcmd.CodeNeedsReconnect:
 			status = http.StatusConflict
 		case gitcmd.CodeTimedOut:
 			status = http.StatusGatewayTimeout

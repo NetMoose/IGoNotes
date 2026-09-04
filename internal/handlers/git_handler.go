@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 )
 
@@ -23,14 +24,37 @@ type GitStatusReader interface {
 	Status(context.Context, string) (model.GitStatusResponse, error)
 }
 
+type GitOperationConfigurer interface {
+	GitConfigurer
+	ConfigureGitForInitialize(context.Context, string, model.GitConfigRequest) (model.GitConfigResponse, gitcmd.ConfiguredBase, error)
+	GitSnapshot(string) (gitcmd.ConfiguredBase, bool, error)
+}
+
+type GitOperations interface {
+	QueueInitialize(context.Context, gitcmd.InitializeRequest) (gitcmd.Operation, bool, error)
+	QueueSync(context.Context, gitcmd.SyncRequest) (gitcmd.Operation, bool, error)
+}
+
 type GitHandler struct {
-	prober     GitProber
-	configurer GitConfigurer
-	statuses   GitStatusReader
+	prober          GitProber
+	configurer      GitConfigurer
+	statuses        GitStatusReader
+	operationConfig GitOperationConfigurer
+	operations      GitOperations
 }
 
 func NewGitHandler(prober GitProber, configurer GitConfigurer, statuses GitStatusReader) *GitHandler {
 	return &GitHandler{prober: prober, configurer: configurer, statuses: statuses}
+}
+
+func NewGitHandlerWithOperations(prober GitProber, configurer GitOperationConfigurer, statuses GitStatusReader, operations GitOperations) *GitHandler {
+	return &GitHandler{
+		prober:          prober,
+		configurer:      configurer,
+		statuses:        statuses,
+		operationConfig: configurer,
+		operations:      operations,
+	}
 }
 
 func (h *GitHandler) Probe(w http.ResponseWriter, r *http.Request) {
@@ -80,12 +104,41 @@ func (h *GitHandler) Configure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := h.configurer.ConfigureGit(r.Context(), base, request)
+	if h.operationConfig == nil || h.operations == nil {
+		response, err := h.configurer.ConfigureGit(r.Context(), base, request)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
+	response, snapshot, err := h.operationConfig.ConfigureGitForInitialize(r.Context(), base, request)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, response)
+	operation, deduplicated, err := h.operations.QueueInitialize(r.Context(), gitcmd.InitializeRequest{
+		Snapshot:      snapshot,
+		Confirmations: request.Confirmations,
+	})
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	statuses, err := h.statuses.Status(r.Context(), base)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	if len(statuses.Statuses) != 1 {
+		writeServiceError(w, errInvalidGitStatusResponse)
+		return
+	}
+	response.Status = statuses.Statuses[0]
+	response.Operation = operationResponse(operation, deduplicated)
+	writeJSON(w, http.StatusAccepted, response)
 }
 
 func (h *GitHandler) Disable(w http.ResponseWriter, r *http.Request) {
@@ -114,6 +167,37 @@ func (h *GitHandler) Status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *GitHandler) Sync(w http.ResponseWriter, r *http.Request) {
+	base, ok := readBaseQuery(w, r, true)
+	if !ok {
+		return
+	}
+	if h.operationConfig == nil || h.operations == nil {
+		writeServiceError(w, errGitOperationsNotInitialized)
+		return
+	}
+
+	snapshot, _, err := h.operationConfig.GitSnapshot(base)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	operation, deduplicated, err := h.operations.QueueSync(r.Context(), gitcmd.SyncRequest{Snapshot: snapshot})
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, operationResponse(operation, deduplicated))
+}
+
+func operationResponse(operation gitcmd.Operation, deduplicated bool) *model.GitOperationResponse {
+	return &model.GitOperationResponse{
+		OperationID:  operation.ID,
+		Status:       string(operation.State),
+		Deduplicated: deduplicated,
+	}
 }
 
 func readBaseQuery(w http.ResponseWriter, r *http.Request, required bool) (string, bool) {

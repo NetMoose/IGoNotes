@@ -17,4 +17,7 @@ func RegisterGitRoutes(mux *http.ServeMux, handler *GitHandler, state SetupState
 	mux.Handle("/api/git/status", RequireLocalOrigin(methods(map[string]http.Handler{
 		http.MethodGet: guarded(http.HandlerFunc(handler.Status)),
 	})))
+	mux.Handle("/api/git/sync", RequireLocalOrigin(methods(map[string]http.Handler{
+		http.MethodPost: guarded(http.HandlerFunc(handler.Sync)),
+	})))
 }

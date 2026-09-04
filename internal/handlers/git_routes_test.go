@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 )
 
@@ -76,6 +77,24 @@ func TestGitRoutesRegisterExactMethods(t *testing.T) {
 	}
 }
 
+func TestGitRoutesRegisterManualSync(t *testing.T) {
+	configured := &gitOperationConfigurerFake{snapshot: gitcmd.ConfiguredBase{Name: "work", Path: "/notes", URL: "https://example.test/notes.git", Branch: "main"}}
+	operations := &gitOperationsFake{syncOperation: gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued}}
+	state := &gitRouteSetupState{completed: true}
+	mux := http.NewServeMux()
+	RegisterGitRoutes(mux, NewGitHandlerWithOperations(&gitProberFake{}, configured, &gitStatusReaderFake{}, operations), state)
+	recorder := httptest.NewRecorder()
+
+	mux.ServeHTTP(recorder, newLocalRouterRequest(http.MethodPost, "/api/git/sync?base=work", nil))
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body = %q", recorder.Code, http.StatusAccepted, recorder.Body.String())
+	}
+	if operations.syncCalls != 1 || state.calls != 1 {
+		t.Fatalf("sync/setup calls = %d/%d, want 1/1", operations.syncCalls, state.calls)
+	}
+}
+
 func TestGitRoutesRejectUnsupportedMethodsBeforeSetup(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -86,6 +105,7 @@ func TestGitRoutesRejectUnsupportedMethodsBeforeSetup(t *testing.T) {
 		{name: "probe", method: http.MethodGet, path: "/api/git/probe", allow: "POST"},
 		{name: "config sorted", method: http.MethodPost, path: "/api/git/config", allow: "DELETE, PUT"},
 		{name: "status", method: http.MethodPost, path: "/api/git/status", allow: "GET"},
+		{name: "sync", method: http.MethodGet, path: "/api/git/sync", allow: "POST"},
 	}
 
 	for _, test := range tests {
@@ -121,6 +141,7 @@ func TestGitRoutesRejectCrossOriginBeforeSetupAndHandlers(t *testing.T) {
 		{method: http.MethodPut, path: "/api/git/config?base=work"},
 		{method: http.MethodDelete, path: "/api/git/config?base=work"},
 		{method: http.MethodGet, path: "/api/git/status"},
+		{method: http.MethodPost, path: "/api/git/sync?base=work"},
 	}
 
 	for _, test := range tests {
@@ -155,6 +176,7 @@ func TestGitRoutesRequireSetupForAllowedMethods(t *testing.T) {
 		{method: http.MethodPut, path: "/api/git/config?base=work"},
 		{method: http.MethodDelete, path: "/api/git/config?base=work"},
 		{method: http.MethodGet, path: "/api/git/status"},
+		{method: http.MethodPost, path: "/api/git/sync?base=work"},
 	}
 
 	for _, test := range tests {

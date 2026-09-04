@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 
+	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 	"IGoNotes/internal/service"
 )
@@ -62,6 +64,195 @@ type gitStatusReaderFake struct {
 	base     string
 	response model.GitStatusResponse
 	err      error
+}
+
+type gitOperationConfigurerFake struct {
+	gitConfigurerFake
+	events             []string
+	initializeResponse model.GitConfigResponse
+	initializeSnapshot gitcmd.ConfiguredBase
+	initializeErr      error
+	initializeCalls    int
+	initializeContext  context.Context
+	initializeBase     string
+	initializeRequest  model.GitConfigRequest
+	snapshot           gitcmd.ConfiguredBase
+	snapshotActive     bool
+	snapshotErr        error
+	snapshotCalls      int
+	snapshotBase       string
+}
+
+func (f *gitOperationConfigurerFake) ConfigureGitForInitialize(ctx context.Context, base string, request model.GitConfigRequest) (model.GitConfigResponse, gitcmd.ConfiguredBase, error) {
+	f.events = append(f.events, "configure")
+	f.initializeCalls++
+	f.initializeContext = ctx
+	f.initializeBase = base
+	f.initializeRequest = request
+	return f.initializeResponse, f.initializeSnapshot, f.initializeErr
+}
+
+func (f *gitOperationConfigurerFake) GitSnapshot(base string) (gitcmd.ConfiguredBase, bool, error) {
+	f.events = append(f.events, "snapshot")
+	f.snapshotCalls++
+	f.snapshotBase = base
+	return f.snapshot, f.snapshotActive, f.snapshotErr
+}
+
+type gitOperationsFake struct {
+	events              *[]string
+	initializeOperation gitcmd.Operation
+	initializeDuplicate bool
+	initializeErr       error
+	initializeCalls     int
+	initializeRequest   gitcmd.InitializeRequest
+	syncOperation       gitcmd.Operation
+	syncDuplicate       bool
+	syncErr             error
+	syncCalls           int
+	syncRequest         gitcmd.SyncRequest
+}
+
+func (f *gitOperationsFake) QueueInitialize(_ context.Context, request gitcmd.InitializeRequest) (gitcmd.Operation, bool, error) {
+	if f.events != nil {
+		*f.events = append(*f.events, "queue_initialize")
+	}
+	f.initializeCalls++
+	f.initializeRequest = request
+	return f.initializeOperation, f.initializeDuplicate, f.initializeErr
+}
+
+func (f *gitOperationsFake) QueueSync(_ context.Context, request gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {
+	if f.events != nil {
+		*f.events = append(*f.events, "queue_sync")
+	}
+	f.syncCalls++
+	f.syncRequest = request
+	return f.syncOperation, f.syncDuplicate, f.syncErr
+}
+
+func TestGitHandlerConfigureReturnsAcceptedAndQueuesSavedSnapshot(t *testing.T) {
+	operation := gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued}
+	configured := &gitOperationConfigurerFake{
+		initializeResponse: model.GitConfigResponse{Base: model.Base{Name: "work"}},
+		initializeSnapshot: gitcmd.ConfiguredBase{Name: "work", Path: "/notes", URL: "https://example.test/notes.git", Branch: "main"},
+	}
+	operations := &gitOperationsFake{events: &configured.events, initializeOperation: operation}
+	statuses := &gitStatusReaderFake{response: model.GitStatusResponse{Statuses: []model.GitStatus{{Base: "work", State: model.GitStateInitializing, OperationID: operation.ID, Stage: "queued", ChangedPaths: []string{}}}}}
+	handler := NewGitHandlerWithOperations(&gitProberFake{}, configured, statuses, operations)
+	requestBody := model.GitConfigRequest{GitURL: "https://example.test/notes.git", GitBranch: "main", Confirmations: model.GitConfirmations{CreateRepository: true}}
+	recorder := httptest.NewRecorder()
+
+	handler.Configure(recorder, httptest.NewRequest(http.MethodPut, "/api/git/config?base=work", strings.NewReader(marshalHandlerJSON(t, requestBody))))
+
+	if !reflect.DeepEqual(configured.events, []string{"configure", "queue_initialize"}) {
+		t.Fatalf("events = %v, want configure then queue_initialize", configured.events)
+	}
+	if operations.initializeCalls != 1 || operations.initializeRequest.Snapshot != configured.initializeSnapshot || !reflect.DeepEqual(operations.initializeRequest.Confirmations, requestBody.Confirmations) {
+		t.Fatalf("QueueInitialize request = %#v, want saved snapshot and confirmations", operations.initializeRequest)
+	}
+	if statuses.calls != 1 || statuses.base != "work" {
+		t.Fatalf("Status calls/base = %d/%q, want 1/work", statuses.calls, statuses.base)
+	}
+	var got model.GitConfigResponse
+	decodeHandlerJSON(t, recorder, http.StatusAccepted, &got)
+	if got.Operation == nil || got.Operation.OperationID != operation.ID || got.Operation.Status != "queued" || got.Operation.Deduplicated {
+		t.Fatalf("operation = %#v, want queued operation", got.Operation)
+	}
+	if !reflect.DeepEqual(got.Status, statuses.response.Statuses[0]) {
+		t.Errorf("status = %#v, want %#v", got.Status, statuses.response.Statuses[0])
+	}
+}
+
+func TestGitHandlerConfigureKeepsSavedConfigWhenQueueFails(t *testing.T) {
+	configured := &gitOperationConfigurerFake{
+		initializeResponse: model.GitConfigResponse{Base: model.Base{Name: "work"}},
+		initializeSnapshot: gitcmd.ConfiguredBase{Name: "work", Path: "/notes", URL: "https://example.test/notes.git", Branch: "main"},
+	}
+	operations := &gitOperationsFake{events: &configured.events, initializeErr: &gitcmd.SafeError{Code: gitcmd.CodeNeedsReconnect, Message: "Git configuration changed; reconnect is required"}}
+	handler := NewGitHandlerWithOperations(&gitProberFake{}, configured, &gitStatusReaderFake{}, operations)
+	recorder := httptest.NewRecorder()
+
+	handler.Configure(recorder, httptest.NewRequest(http.MethodPut, "/api/git/config?base=work", strings.NewReader(`{"git_url":"https://example.test/notes.git","git_branch":"main"}`)))
+
+	assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "needs_reconnect", Message: "Git configuration changed; reconnect is required"})
+	if !reflect.DeepEqual(configured.events, []string{"configure", "queue_initialize"}) {
+		t.Fatalf("events = %v, want persisted config followed by failed queue", configured.events)
+	}
+}
+
+func TestGitHandlerManualSyncReturnsAccepted(t *testing.T) {
+	operation := gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued}
+	snapshot := gitcmd.ConfiguredBase{Name: "work", Path: "/notes", URL: "https://example.test/notes.git", Branch: "main"}
+	configured := &gitOperationConfigurerFake{snapshot: snapshot}
+	operations := &gitOperationsFake{events: &configured.events, syncOperation: operation}
+	handler := NewGitHandlerWithOperations(&gitProberFake{}, configured, &gitStatusReaderFake{}, operations)
+	recorder := httptest.NewRecorder()
+
+	handler.Sync(recorder, httptest.NewRequest(http.MethodPost, "/api/git/sync?base=work", nil))
+
+	if !reflect.DeepEqual(configured.events, []string{"snapshot", "queue_sync"}) || operations.syncCalls != 1 || operations.syncRequest.Snapshot != snapshot {
+		t.Fatalf("sync events/request = %v/%#v", configured.events, operations.syncRequest)
+	}
+	var got model.GitOperationResponse
+	decodeHandlerJSON(t, recorder, http.StatusAccepted, &got)
+	if got.OperationID != operation.ID || got.Status != "queued" || got.Deduplicated {
+		t.Errorf("response = %#v, want queued operation", got)
+	}
+}
+
+func TestGitHandlerOperationResponsesReportDeduplication(t *testing.T) {
+	operation := gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued}
+	snapshot := gitcmd.ConfiguredBase{Name: "work", Path: "/notes", URL: "https://example.test/notes.git", Branch: "main"}
+	configured := &gitOperationConfigurerFake{
+		initializeResponse: model.GitConfigResponse{Base: model.Base{Name: "work"}},
+		initializeSnapshot: snapshot,
+		snapshot:           snapshot,
+	}
+	operations := &gitOperationsFake{events: &configured.events, initializeOperation: operation, initializeDuplicate: true, syncOperation: operation, syncDuplicate: true}
+	statuses := &gitStatusReaderFake{response: model.GitStatusResponse{Statuses: []model.GitStatus{{Base: "work", State: model.GitStateInitializing, OperationID: operation.ID, Stage: "queued", ChangedPaths: []string{}}}}}
+	handler := NewGitHandlerWithOperations(&gitProberFake{}, configured, statuses, operations)
+
+	configureRecorder := httptest.NewRecorder()
+	handler.Configure(configureRecorder, httptest.NewRequest(http.MethodPut, "/api/git/config?base=work", strings.NewReader(`{"git_url":"https://example.test/notes.git","git_branch":"main"}`)))
+	var configureResponse model.GitConfigResponse
+	decodeHandlerJSON(t, configureRecorder, http.StatusAccepted, &configureResponse)
+	if configureResponse.Operation == nil || !configureResponse.Operation.Deduplicated || configureResponse.Operation.OperationID != operation.ID {
+		t.Fatalf("configure operation = %#v, want deduplicated %q", configureResponse.Operation, operation.ID)
+	}
+
+	syncRecorder := httptest.NewRecorder()
+	handler.Sync(syncRecorder, httptest.NewRequest(http.MethodPost, "/api/git/sync?base=work", nil))
+	var syncResponse model.GitOperationResponse
+	decodeHandlerJSON(t, syncRecorder, http.StatusAccepted, &syncResponse)
+	if !syncResponse.Deduplicated || syncResponse.OperationID != operation.ID {
+		t.Errorf("sync operation = %#v, want deduplicated %q", syncResponse, operation.ID)
+	}
+}
+
+func TestGitHandlerOperationEndpointsRequireBaseAndDoNotLeakSafeErrorContext(t *testing.T) {
+	configured := &gitOperationConfigurerFake{
+		initializeResponse: model.GitConfigResponse{Base: model.Base{Name: "work"}},
+		initializeSnapshot: gitcmd.ConfiguredBase{Name: "work", Path: "/notes", URL: "https://example.test/notes.git", Branch: "main"},
+	}
+	operations := &gitOperationsFake{events: &configured.events, initializeErr: fmt.Errorf("push https://user:secret@example.test/private.git: %w", &gitcmd.SafeError{Code: gitcmd.CodePushRejected, Message: "Git push was rejected"})}
+	handler := NewGitHandlerWithOperations(&gitProberFake{}, configured, &gitStatusReaderFake{}, operations)
+
+	missingConfigure := httptest.NewRecorder()
+	handler.Configure(missingConfigure, httptest.NewRequest(http.MethodPut, "/api/git/config", strings.NewReader(`{"git_url":"https://example.test/notes.git","git_branch":"main"}`)))
+	assertMissingField(t, missingConfigure, "base")
+	missingSync := httptest.NewRecorder()
+	handler.Sync(missingSync, httptest.NewRequest(http.MethodPost, "/api/git/sync", nil))
+	assertMissingField(t, missingSync, "base")
+
+	recorder := httptest.NewRecorder()
+	handler.Configure(recorder, httptest.NewRequest(http.MethodPut, "/api/git/config?base=work", strings.NewReader(`{"git_url":"https://example.test/notes.git","git_branch":"main"}`)))
+	assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "push_rejected", Message: "Git push was rejected"})
+	for _, private := range []string{"user:secret", "example.test", "private.git"} {
+		if strings.Contains(recorder.Body.String(), private) {
+			t.Errorf("response leaks private queue error %q: %q", private, recorder.Body.String())
+		}
+	}
 }
 
 func (f *gitStatusReaderFake) Status(ctx context.Context, base string) (model.GitStatusResponse, error) {
