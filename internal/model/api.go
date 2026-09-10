@@ -151,3 +151,72 @@ type GitOperationResponse struct {
 type GitStatusResponse struct {
 	Statuses []GitStatus `json:"statuses"`
 }
+
+type GitConflictKind string
+type GitConflictContentKind string
+type GitConflictAction string
+
+const (
+	GitConflictContent      GitConflictKind = "content"
+	GitConflictAddAdd       GitConflictKind = "add_add"
+	GitConflictModifyDelete GitConflictKind = "modify_delete"
+	GitConflictRenameDelete GitConflictKind = "rename_delete"
+
+	GitConflictText   GitConflictContentKind = "text"
+	GitConflictBinary GitConflictContentKind = "binary"
+
+	GitConflictUseLocal  GitConflictAction = "local"
+	GitConflictUseRemote GitConflictAction = "remote"
+	GitConflictManual    GitConflictAction = "manual"
+	GitConflictDelete    GitConflictAction = "delete"
+	GitConflictKeepBoth  GitConflictAction = "keep_both"
+)
+
+type GitConflictStage struct {
+	Path             string  `json:"path"`
+	OID              string  `json:"oid"`
+	Mode             string  `json:"mode"`
+	Size             int64   `json:"size"`
+	Content          *string `json:"content,omitempty"`
+	PreviewTruncated bool    `json:"preview_truncated"`
+}
+
+type GitConflict struct {
+	ID           string                 `json:"id"`
+	Kind         GitConflictKind        `json:"kind"`
+	ContentKind  GitConflictContentKind `json:"content_kind"`
+	Path         string                 `json:"path"`
+	OriginalPath string                 `json:"original_path,omitempty"`
+	Base         *GitConflictStage      `json:"base,omitempty"`
+	Local        *GitConflictStage      `json:"local,omitempty"`
+	Remote       *GitConflictStage      `json:"remote,omitempty"`
+	Actions      []GitConflictAction    `json:"actions"`
+}
+
+type GitConflictListResponse struct {
+	Base         string        `json:"base"`
+	OperationID  string        `json:"operation_id"`
+	HeadOID      string        `json:"head_oid"`
+	MergeHeadOID string        `json:"merge_head_oid"`
+	Conflicts    []GitConflict `json:"conflicts"`
+	CanComplete  bool          `json:"can_complete"`
+}
+
+type GitConflictResolveRequest struct {
+	Base        string            `json:"base"`
+	OperationID string            `json:"operation_id"`
+	ConflictID  string            `json:"conflict_id"`
+	Path        string            `json:"path"`
+	Action      GitConflictAction `json:"action"`
+	ResultPath  string            `json:"result_path,omitempty"`
+	Content     *string           `json:"content,omitempty"`
+	LocalPath   string            `json:"local_path,omitempty"`
+	RemotePath  string            `json:"remote_path,omitempty"`
+	LocalOID    string            `json:"local_oid,omitempty"`
+	RemoteOID   string            `json:"remote_oid,omitempty"`
+}
+
+type GitConflictResolveResponse struct {
+	ResolvedPath string                  `json:"resolved_path"`
+	Remaining    GitConflictListResponse `json:"remaining"`
+}
