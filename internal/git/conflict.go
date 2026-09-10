@@ -547,9 +547,24 @@ func (s *Service) materializeConflictStages(ctx context.Context, gitDir, temp st
 	stages := make(map[int]*ConflictStage, len(group.stages))
 	binaryContent := diffAttribute == "unset"
 	for number, index := range group.stages {
-		name, err := s.checkoutConflictStage(ctx, gitDir, temp, group.path, number)
+		name, err := s.checkoutConflictStageEntry(ctx, gitDir, temp, group.path, number, index.Mode)
 		if err != nil {
 			return nil, "", err
+		}
+		stage := &ConflictStage{Path: group.path, OID: index.OID, Mode: index.Mode}
+		if index.Mode == "120000" {
+			info, err := tempRoot.Lstat(name)
+			if err != nil || info.Mode()&os.ModeSymlink == 0 {
+				return nil, "", ErrRecoveryRequired
+			}
+			target, err := tempRoot.Readlink(name)
+			if err != nil {
+				return nil, "", ErrRecoveryRequired
+			}
+			stage.Size = int64(len(target))
+			stages[number] = stage
+			binaryContent = true
+			continue
 		}
 		file, err := tempRoot.Open(name)
 		if err != nil {
@@ -564,7 +579,7 @@ func (s *Service) materializeConflictStages(ctx context.Context, gitDir, temp st
 		if previewBinary {
 			binaryContent = true
 		}
-		stage := &ConflictStage{Path: group.path, OID: index.OID, Mode: index.Mode, Size: info.Size()}
+		stage.Size = info.Size()
 		if !binaryContent {
 			stage.Content = preview
 			stage.PreviewTruncated = truncated
@@ -634,6 +649,33 @@ func (s *Service) checkoutConflictStage(ctx context.Context, gitDir, tempRoot, i
 		return "", ErrRecoveryRequired
 	}
 	return mappings[0].TempPath, nil
+}
+
+func (s *Service) checkoutConflictStageEntry(ctx context.Context, gitDir, tempRoot, indexPath string, stage int, mode string) (string, error) {
+	name, err := s.checkoutConflictStage(ctx, gitDir, tempRoot, indexPath, stage)
+	if err != nil || mode != "120000" {
+		return name, err
+	}
+	root, err := os.OpenRoot(tempRoot)
+	if err != nil {
+		return "", ErrRecoveryRequired
+	}
+	defer root.Close()
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > conflictLinkTargetLimit {
+		return "", ErrRecoveryRequired
+	}
+	target, err := root.ReadFile(name)
+	if err != nil || len(target) > conflictLinkTargetLimit || bytes.IndexByte(target, 0) >= 0 {
+		return "", ErrRecoveryRequired
+	}
+	if err := root.Remove(name); err != nil {
+		return "", ErrRecoveryRequired
+	}
+	if err := root.Symlink(string(target), name); err != nil {
+		return "", ErrRecoveryRequired
+	}
+	return name, nil
 }
 
 func conflictIdentity(conflict Conflict) string {

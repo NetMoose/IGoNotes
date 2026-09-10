@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,7 +10,182 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"IGoNotes/internal/model"
 )
+
+func TestResolveLocalIntegration(t *testing.T) {
+	resolveContentConflictIntegration(t, model.GitConflictUseLocal, "local\n")
+}
+
+func TestResolveRemoteIntegration(t *testing.T) {
+	resolveContentConflictIntegration(t, model.GitConflictUseRemote, "remote\n")
+}
+
+func TestResolveManualIntegration(t *testing.T) {
+	resolveContentConflictIntegration(t, model.GitConflictManual, "manual\n")
+}
+
+func TestResolveDeleteIntegration(t *testing.T) {
+	fixture := newConflictFixture(t)
+	writeConflictFile(t, fixture.Local, "victim.md", []byte("local\n"))
+	conflictCommit(t, fixture.Local, "local modify")
+	removeConflictFile(t, fixture.Other, "victim.md")
+	conflictCommit(t, fixture.Other, "remote delete")
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+	service, base, operation := conflictResolver(t, fixture)
+	snapshot, err := service.Conflicts(context.Background(), base, operation)
+	if err != nil || len(snapshot.Conflicts) != 1 {
+		t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+	}
+	conflict := snapshot.Conflicts[0]
+	request := model.GitConflictResolveRequest{
+		OperationID: operation.ID,
+		ConflictID:  conflict.ID,
+		Path:        conflict.Path,
+		Action:      model.GitConflictDelete,
+	}
+	events := []string{}
+	resolved, err := service.ResolveConflict(context.Background(), base, operation, request, callbackOrderingTransaction(fixture.Local, &events))
+	if err != nil || !resolved.CanComplete || len(resolved.Conflicts) != 0 {
+		t.Fatalf("ResolveConflict() = %#v, %v", resolved, err)
+	}
+	if !reflect.DeepEqual(events, []string{"mutate", "callback_returned", "unlock"}) {
+		t.Fatalf("transaction events = %#v", events)
+	}
+	assertConflictStages(t, fixture, map[string][]int{})
+}
+
+func TestResolveSymlinkIntegration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink fixture requires Unix symlink support")
+	}
+	fixture := newConflictFixture(t)
+	for _, test := range []struct {
+		dir    string
+		target string
+		label  string
+	}{
+		{dir: fixture.Local, target: "local-target", label: "local symlink"},
+		{dir: fixture.Other, target: "remote-target", label: "remote symlink"},
+	} {
+		if err := os.Remove(filepath.Join(test.dir, "victim.md")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(test.target, filepath.Join(test.dir, "victim.md")); err != nil {
+			t.Fatal(err)
+		}
+		conflictCommit(t, test.dir, test.label)
+	}
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+	service, base, operation := conflictResolver(t, fixture)
+	snapshot, err := service.Conflicts(context.Background(), base, operation)
+	if err != nil || len(snapshot.Conflicts) != 1 {
+		t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+	}
+	conflict := snapshot.Conflicts[0]
+	if conflict.ContentKind != ContentBinary || conflict.Local == nil || conflict.Local.Mode != "120000" {
+		t.Fatalf("symlink conflict = %#v", conflict)
+	}
+	request := model.GitConflictResolveRequest{
+		OperationID: operation.ID, ConflictID: conflict.ID, Path: conflict.Path,
+		Action: model.GitConflictUseLocal, ResultPath: "resolved-link", LocalOID: conflict.Local.OID,
+	}
+	resolved, err := service.ResolveConflict(context.Background(), base, operation, request, callbackOrderingTransaction(fixture.Local, new([]string)))
+	if err != nil || !resolved.CanComplete {
+		t.Fatalf("ResolveConflict() = %#v, %v", resolved, err)
+	}
+	target, err := os.Readlink(filepath.Join(fixture.Local, "resolved-link"))
+	if err != nil || target != "local-target" {
+		t.Fatalf("resolved symlink target = %q, %v", target, err)
+	}
+}
+
+func resolveContentConflictIntegration(t *testing.T, action model.GitConflictAction, want string) {
+	t.Helper()
+	fixture := newConflictFixture(t)
+	writeConflictFile(t, fixture.Local, "victim.md", []byte("local\n"))
+	writeConflictFile(t, fixture.Local, "other.md", []byte("local other\n"))
+	conflictCommit(t, fixture.Local, "local conflicts")
+	writeConflictFile(t, fixture.Other, "victim.md", []byte("remote\n"))
+	writeConflictFile(t, fixture.Other, "other.md", []byte("remote other\n"))
+	conflictCommit(t, fixture.Other, "remote conflicts")
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+	service, base, operation := conflictResolver(t, fixture)
+	snapshot, err := service.Conflicts(context.Background(), base, operation)
+	if err != nil || len(snapshot.Conflicts) != 2 {
+		t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+	}
+	var conflict Conflict
+	for _, candidate := range snapshot.Conflicts {
+		if candidate.Path == "victim.md" {
+			conflict = candidate
+			break
+		}
+	}
+	if conflict.ID == "" {
+		t.Fatal("victim conflict missing")
+	}
+	request := model.GitConflictResolveRequest{
+		OperationID: operation.ID,
+		ConflictID:  conflict.ID,
+		Path:        conflict.Path,
+		Action:      action,
+		ResultPath:  "resolved.md",
+	}
+	switch action {
+	case model.GitConflictUseLocal:
+		request.LocalOID = conflict.Local.OID
+	case model.GitConflictUseRemote:
+		request.RemoteOID = conflict.Remote.OID
+	case model.GitConflictManual:
+		request.Content = &want
+	}
+	events := []string{}
+	resolved, err := service.ResolveConflict(context.Background(), base, operation, request, callbackOrderingTransaction(fixture.Local, &events))
+	if err != nil || len(resolved.Conflicts) != 1 || resolved.Conflicts[0].Path != "other.md" {
+		t.Fatalf("ResolveConflict() = %#v, %v", resolved, err)
+	}
+	if !reflect.DeepEqual(events, []string{"mutate", "callback_returned", "unlock"}) {
+		t.Fatalf("transaction events = %#v", events)
+	}
+	contents, err := os.ReadFile(filepath.Join(fixture.Local, "resolved.md"))
+	if err != nil || string(contents) != want {
+		t.Fatalf("resolved contents = %q, %v", contents, err)
+	}
+	assertConflictStages(t, fixture, map[string][]int{"other.md": {2, 3}})
+}
+
+func conflictResolver(t *testing.T, fixture *conflictFixture) (*Service, ConfiguredBase, Operation) {
+	t.Helper()
+	head := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "--verify", "HEAD^{commit}")))
+	remote := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "--verify", "MERGE_HEAD^{commit}")))
+	base := ConfiguredBase{Name: "notes", Path: fixture.Local, Branch: fixture.Branch}
+	operation := Operation{
+		ID: "0123456789abcdef0123456789abcdef", BaseName: base.Name, RepoPath: base.Path, Branch: base.Branch,
+		Kind: OperationSync, State: OperationConflict, LocalOID: head, CandidateOID: remote, RemoteOID: remote,
+	}
+	runner := NewCommandRunner()
+	return NewService(runner, NewClient(runner)), base, operation
+}
+
+func callbackOrderingTransaction(path string, events *[]string) WorktreeTransaction {
+	// This only models transaction callback ordering; Task11 owns note-index reindexing.
+	return func(_ context.Context, mutate func(string) error) error {
+		*events = append(*events, "mutate")
+		defer func() { *events = append(*events, "unlock") }()
+		if err := mutate(path); err != nil {
+			return err
+		}
+		*events = append(*events, "callback_returned")
+		return nil
+	}
+}
 
 type conflictFixture struct {
 	Remote string

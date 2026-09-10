@@ -1,8 +1,14 @@
 package git
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -21,6 +27,587 @@ type resolutionPlan struct {
 	RemovePaths []string
 	Writes      []resolutionWrite
 	StagePaths  []string
+}
+
+type materializedResolutionWrite struct {
+	resolutionWrite
+	source string
+	data   []byte
+	skip   bool
+}
+
+type materializedResolutionWrites struct {
+	root   *os.Root
+	temp   string
+	writes []materializedResolutionWrite
+}
+
+func (m *materializedResolutionWrites) Close() {
+	if m == nil {
+		return
+	}
+	if m.root != nil {
+		_ = m.root.Close()
+	}
+	if m.temp != "" {
+		_ = os.RemoveAll(m.temp)
+	}
+}
+
+func (m *materializedResolutionWrites) open(write materializedResolutionWrite) (io.ReadCloser, error) {
+	if write.source == "" {
+		return io.NopCloser(bytes.NewReader(write.data)), nil
+	}
+	return m.root.Open(write.source)
+}
+
+func (s *Service) ResolveConflict(
+	ctx context.Context,
+	base ConfiguredBase,
+	operation Operation,
+	request model.GitConflictResolveRequest,
+	worktree WorktreeTransaction,
+) (ConflictSnapshot, error) {
+	if request.OperationID == "" || request.OperationID != operation.ID {
+		return ConflictSnapshot{Conflicts: []Conflict{}}, ErrConflictStale
+	}
+	if worktree == nil {
+		return ConflictSnapshot{Conflicts: []Conflict{}}, ErrRecoveryRequired
+	}
+
+	snapshot, err := s.Conflicts(ctx, base, operation)
+	if err != nil {
+		return ConflictSnapshot{Conflicts: []Conflict{}}, err
+	}
+	conflict, ok, known := conflictForResolution(snapshot.Conflicts, request)
+	if !ok {
+		if known {
+			return ConflictSnapshot{Conflicts: []Conflict{}}, ErrConflictStale
+		}
+		return ConflictSnapshot{Conflicts: []Conflict{}}, ErrConflictNotFound
+	}
+	plan, err := buildResolutionPlan(conflict, snapshot.Conflicts, request)
+	if err != nil {
+		return ConflictSnapshot{Conflicts: []Conflict{}}, err
+	}
+
+	var resolved ConflictSnapshot
+	err = runWorktree(ctx, worktree, func(canonicalPath string) error {
+		if canonicalPath != base.Path || !filepath.IsAbs(canonicalPath) {
+			return ErrConflictStale
+		}
+		inside, err := s.Conflicts(ctx, base, operation)
+		if err != nil {
+			return err
+		}
+		current, ok, _ := conflictForResolution(inside.Conflicts, request)
+		if !ok {
+			return ErrConflictStale
+		}
+		currentPlan, err := buildResolutionPlan(current, inside.Conflicts, request)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(plan, currentPlan) {
+			return ErrConflictStale
+		}
+		local, err := s.porcelain.InspectLocal(ctx, canonicalPath)
+		if err != nil || validConflictInspection(base, local) != nil {
+			return ErrRecoveryRequired
+		}
+
+		root, err := os.OpenRoot(canonicalPath)
+		if err != nil {
+			return ErrRecoveryRequired
+		}
+		defer root.Close()
+		sources, err := resolutionSources(current)
+		if err != nil {
+			return err
+		}
+		if err := verifyResolutionDestinationOwnership(root, sources, currentPlan.Writes); err != nil {
+			return err
+		}
+		writes, err := s.materializeResolutionWrites(ctx, local.GitDir, current.Path, currentPlan.Writes)
+		if err != nil {
+			return err
+		}
+		defer writes.Close()
+		if err := s.verifyResolutionWriteOIDs(ctx, canonicalPath, writes); err != nil {
+			return err
+		}
+		if err := verifyResolutionDestinations(root, sources, writes); err != nil {
+			return err
+		}
+		if err := writeNonSourceResolutionOutputs(root, sources, writes); err != nil {
+			return err
+		}
+		if err := removeResolutionSources(root, currentPlan, sources, writes.writes); err != nil {
+			return err
+		}
+		if err := writeSourceResolutionOutputs(root, sources, writes); err != nil {
+			return err
+		}
+		if err := s.stageConflictResolution(ctx, canonicalPath, currentPlan.StagePaths); err != nil {
+			return err
+		}
+		resolved, err = s.Conflicts(ctx, base, operation)
+		return err
+	})
+	if err != nil {
+		return ConflictSnapshot{Conflicts: []Conflict{}}, err
+	}
+	return resolved, nil
+}
+
+func conflictForResolution(conflicts []Conflict, request model.GitConflictResolveRequest) (Conflict, bool, bool) {
+	known := false
+	for _, conflict := range conflicts {
+		if conflict.ID == request.ConflictID && conflict.Path == request.Path {
+			return conflict, true, true
+		}
+		if conflict.ID == request.ConflictID || conflict.Path == request.Path {
+			known = true
+		}
+	}
+	return Conflict{}, false, known
+}
+
+func (s *Service) materializeResolutionWrites(ctx context.Context, gitDir, sourcePath string, writes []resolutionWrite) (*materializedResolutionWrites, error) {
+	temp, err := os.MkdirTemp("", "igonotes-conflict-resolution-")
+	if err != nil {
+		return nil, ErrRecoveryRequired
+	}
+	if err := os.Chmod(temp, 0o700); err != nil {
+		_ = os.RemoveAll(temp)
+		return nil, ErrRecoveryRequired
+	}
+	tempRoot, err := os.OpenRoot(temp)
+	if err != nil {
+		_ = os.RemoveAll(temp)
+		return nil, ErrRecoveryRequired
+	}
+	entries := &materializedResolutionWrites{root: tempRoot, temp: temp, writes: make([]materializedResolutionWrite, 0, len(writes))}
+	fail := func(err error) (*materializedResolutionWrites, error) {
+		entries.Close()
+		return nil, err
+	}
+	for _, write := range writes {
+		entry := materializedResolutionWrite{resolutionWrite: write}
+		if write.Stage == 0 {
+			entry.data = append([]byte(nil), write.Data...)
+			entries.writes = append(entries.writes, entry)
+			continue
+		}
+		name, err := s.checkoutConflictStageEntry(ctx, gitDir, temp, sourcePath, write.Stage, write.Mode)
+		if err != nil {
+			return fail(err)
+		}
+		info, err := tempRoot.Lstat(name)
+		if err != nil {
+			return fail(ErrRecoveryRequired)
+		}
+		if write.Mode == "120000" {
+			if info.Mode()&os.ModeSymlink == 0 {
+				return fail(ErrRecoveryRequired)
+			}
+			target, err := tempRoot.Readlink(name)
+			if err != nil || len(target) > conflictLinkTargetLimit || strings.IndexByte(target, 0) >= 0 {
+				return fail(ErrRecoveryRequired)
+			}
+			entry.data = []byte(target)
+		} else {
+			if !info.Mode().IsRegular() {
+				return fail(ErrRecoveryRequired)
+			}
+			entry.source = name
+		}
+		entries.writes = append(entries.writes, entry)
+	}
+	return entries, nil
+}
+
+const conflictLinkTargetLimit = 1 << 20
+
+func (s *Service) verifyResolutionWriteOIDs(ctx context.Context, repo string, writes *materializedResolutionWrites) error {
+	for _, write := range writes.writes {
+		if write.Stage == 0 {
+			continue
+		}
+		content, err := writes.open(write)
+		if err != nil {
+			return ErrRecoveryRequired
+		}
+		oid, hashErr := s.hashConflictContent(ctx, repo, content)
+		closeErr := content.Close()
+		if hashErr != nil || closeErr != nil {
+			return ErrRecoveryRequired
+		}
+		if oid != write.OID {
+			return ErrConflictStale
+		}
+	}
+	return nil
+}
+
+func (s *Service) hashConflictContent(ctx context.Context, repo string, content io.Reader) (string, error) {
+	result, err := s.runLocalInput(ctx, repo, true, content, "hash-object", "--stdin")
+	if err != nil || result.StdoutTruncated || result.StderrTruncated || !strings.HasSuffix(result.Stdout, "\n") {
+		return "", ErrRecoveryRequired
+	}
+	oid := strings.TrimSuffix(result.Stdout, "\n")
+	if !validObjectID(oid) {
+		return "", ErrRecoveryRequired
+	}
+	return oid, nil
+}
+
+func verifyResolutionDestinations(root *os.Root, sources []string, writes *materializedResolutionWrites) error {
+	owned := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		owned[source] = struct{}{}
+	}
+	for index := range writes.writes {
+		write := &writes.writes[index]
+		content, err := writes.open(*write)
+		if err != nil {
+			return ErrRecoveryRequired
+		}
+		matches, exists, matchErr := conflictEntryMatches(root, write.Path, write.Mode, content)
+		closeErr := content.Close()
+		if matchErr != nil || closeErr != nil {
+			return ErrRecoveryRequired
+		}
+		if !exists {
+			continue
+		}
+		if !matches {
+			if _, isOwned := owned[write.Path]; !isOwned {
+				return ErrConflictStale
+			}
+			continue
+		}
+		write.skip = true
+	}
+	return nil
+}
+
+func verifyResolutionDestinationOwnership(root *os.Root, sources []string, writes []resolutionWrite) error {
+	owned := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		owned[source] = struct{}{}
+	}
+	for _, write := range writes {
+		_, exists, err := conflictEntryExists(root, write.Path, write.Mode)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		if _, isOwned := owned[write.Path]; !isOwned {
+			return ErrConflictStale
+		}
+	}
+	return nil
+}
+
+func conflictEntryExists(root *os.Root, name, mode string) (bool, bool, error) {
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if mode == "120000" {
+		return info.Mode()&os.ModeSymlink != 0, true, nil
+	}
+	return info.Mode().IsRegular(), true, nil
+}
+
+func conflictEntryMatches(root *os.Root, name, mode string, want io.Reader) (bool, bool, error) {
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if mode == "120000" {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return false, true, nil
+		}
+		target, err := root.Readlink(name)
+		if err != nil {
+			return false, true, err
+		}
+		expected, err := readConflictLinkTarget(want)
+		return err == nil && target == string(expected), true, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, true, nil
+	}
+	actual, err := root.Open(name)
+	if err != nil {
+		return false, true, err
+	}
+	match, compareErr := equalConflictContent(actual, want)
+	closeErr := actual.Close()
+	if compareErr != nil {
+		return false, true, compareErr
+	}
+	return match, true, closeErr
+}
+
+func writeNonSourceResolutionOutputs(root *os.Root, sources []string, writes *materializedResolutionWrites) error {
+	owned := resolutionSourceSet(sources)
+	for _, write := range writes.writes {
+		if write.skip {
+			continue
+		}
+		if _, isOwned := owned[write.Path]; isOwned {
+			continue
+		}
+		if err := writeMaterializedConflictEntry(root, writes, write); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeSourceResolutionOutputs(root *os.Root, sources []string, writes *materializedResolutionWrites) error {
+	owned := resolutionSourceSet(sources)
+	for _, write := range writes.writes {
+		if write.skip {
+			continue
+		}
+		if _, isOwned := owned[write.Path]; !isOwned {
+			continue
+		}
+		if err := writeMaterializedConflictEntry(root, writes, write); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeMaterializedConflictEntry(root *os.Root, writes *materializedResolutionWrites, write materializedResolutionWrite) error {
+	content, err := writes.open(write)
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+	writeErr := writeConflictEntry(root, write.Path, write.Mode, content)
+	closeErr := content.Close()
+	if writeErr != nil {
+		if errors.Is(writeErr, os.ErrExist) {
+			return ErrConflictStale
+		}
+		return writeErr
+	}
+	if closeErr != nil {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
+func resolutionSourceSet(sources []string) map[string]struct{} {
+	owned := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		owned[source] = struct{}{}
+	}
+	return owned
+}
+
+func removeResolutionSources(root *os.Root, plan resolutionPlan, sources []string, writes []materializedResolutionWrite) error {
+	remove := make(map[string]struct{}, len(plan.RemovePaths)+len(writes))
+	for _, name := range plan.RemovePaths {
+		remove[name] = struct{}{}
+	}
+	owned := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		owned[source] = struct{}{}
+	}
+	for _, write := range writes {
+		if !write.skip {
+			if _, isOwned := owned[write.Path]; isOwned {
+				remove[write.Path] = struct{}{}
+			}
+		}
+	}
+	names := make([]string, 0, len(remove))
+	for name := range remove {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		info, err := root.Lstat(name)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || (!info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0) {
+			return ErrRecoveryRequired
+		}
+		if err := root.Remove(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) stageConflictResolution(ctx context.Context, path string, paths []string) error {
+	input := make([]byte, 0)
+	for _, value := range paths {
+		input = append(input, value...)
+		input = append(input, 0)
+	}
+	result, err := s.runLocalInput(ctx, path, false, bytes.NewReader(input),
+		"--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul")
+	if err != nil || result.StdoutTruncated || result.StderrTruncated {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
+func writeConflictEntry(root *os.Root, name, mode string, content io.Reader) error {
+	if root == nil || !validResolutionMode(mode) {
+		return ErrConflictUnsupported
+	}
+	name, err := cleanConflictPath(name, "path")
+	if err != nil {
+		return err
+	}
+	if err := createConflictParents(root, name); err != nil {
+		return err
+	}
+	if mode == "120000" {
+		target, err := readConflictLinkTarget(content)
+		if err != nil {
+			return err
+		}
+		info, err := root.Lstat(name)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink == 0 {
+				return os.ErrExist
+			}
+			existing, err := root.Readlink(name)
+			if err != nil {
+				return err
+			}
+			if existing == string(target) {
+				return nil
+			}
+			return os.ErrExist
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return root.Symlink(string(target), name)
+	}
+
+	info, err := root.Lstat(name)
+	if err == nil {
+		if !info.Mode().IsRegular() {
+			return os.ErrExist
+		}
+		existing, err := root.Open(name)
+		if err != nil {
+			return err
+		}
+		match, compareErr := equalConflictContent(existing, content)
+		closeErr := existing.Close()
+		if compareErr != nil {
+			return compareErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if match {
+			return root.Chmod(name, conflictFileMode(mode))
+		}
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, conflictFileMode(mode))
+	if err != nil {
+		return err
+	}
+	_, writeErr := copyConflictContent(file, content)
+	chmodErr := file.Chmod(conflictFileMode(mode))
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if chmodErr != nil {
+		return chmodErr
+	}
+	return closeErr
+}
+
+func readConflictLinkTarget(content io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(content, conflictLinkTargetLimit+1))
+	if err != nil || len(data) > conflictLinkTargetLimit || bytes.IndexByte(data, 0) >= 0 {
+		return nil, ErrConflictUnsupported
+	}
+	return data, nil
+}
+
+func equalConflictContent(first, second io.Reader) (bool, error) {
+	left := make([]byte, 32*1024)
+	right := make([]byte, 32*1024)
+	for {
+		leftCount, leftErr := first.Read(left)
+		rightCount, rightErr := second.Read(right)
+		if leftCount != rightCount || !bytes.Equal(left[:leftCount], right[:rightCount]) {
+			return false, nil
+		}
+		if leftErr == io.EOF && rightErr == io.EOF {
+			return true, nil
+		}
+		if leftErr != nil && leftErr != io.EOF {
+			return false, leftErr
+		}
+		if rightErr != nil && rightErr != io.EOF {
+			return false, rightErr
+		}
+		if leftErr == io.EOF || rightErr == io.EOF {
+			return false, nil
+		}
+	}
+}
+
+func copyConflictContent(destination io.Writer, source io.Reader) (int64, error) {
+	return io.CopyBuffer(destination, source, make([]byte, 32*1024))
+}
+
+func createConflictParents(root *os.Root, name string) error {
+	parts := strings.Split(filepath.FromSlash(name), string(filepath.Separator))
+	for index := 1; index < len(parts); index++ {
+		parent := filepath.Join(parts[:index]...)
+		info, err := root.Lstat(parent)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := root.Mkdir(parent, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+				return err
+			}
+			info, err = root.Lstat(parent)
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return os.ErrExist
+		}
+	}
+	return nil
+}
+
+func conflictFileMode(mode string) os.FileMode {
+	if mode == "100755" {
+		return 0o755
+	}
+	return 0o644
 }
 
 func cleanConflictPath(value, field string) (string, error) {
