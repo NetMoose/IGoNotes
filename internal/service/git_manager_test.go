@@ -87,6 +87,21 @@ func (f managerRunnerFunc) Run(ctx context.Context, command gitcmd.Command) (git
 	return f(ctx, command)
 }
 
+type blockingManagerRunner struct {
+	runner  gitcmd.Runner
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingManagerRunner) Run(ctx context.Context, command gitcmd.Command) (gitcmd.Result, error) {
+	if slices.Equal(command.Args, []string{"--no-optional-locks", "status", "--porcelain=v2", "-z", "--untracked-files=no", "--renames"}) {
+		r.once.Do(func() { close(r.entered) })
+		<-r.release
+	}
+	return r.runner.Run(ctx, command)
+}
+
 type managerSnapshotStore struct {
 	mu     sync.RWMutex
 	bases  map[string]gitcmd.ConfiguredBase
@@ -226,6 +241,711 @@ func seedManagerTrust(t *testing.T, fixture *gitManagerFixture, base gitcmd.Conf
 		RemoteOID: oid, ChangedPaths: []string{},
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func seedManagerConflict(t *testing.T, fixture *gitManagerFixture, base gitcmd.ConfiguredBase, id string) gitcmd.Operation {
+
+	t.Helper()
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: id, BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageQueued,
+		Branch: base.Branch, LocalOID: managerOID, CandidateOID: managerOID, RemoteOID: managerOID,
+		ConflictPaths: []string{"note.md"}, ChangedPaths: []string{"note.md"}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	op.State = gitcmd.OperationConflict
+	op.Stage = gitcmd.StageMerging
+	if err := fixture.operations.Finish(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict,
+		OperationID: op.ID, Stage: string(op.Stage), ChangedPaths: []string{"note.md"}, RemoteOID: managerOID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fixture.coordinator.SetConflict(base.Path, true)
+	return op
+}
+
+func TestGitManagerConflictAPIsRequireCurrentConflictState(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, nil, nil, nil)
+	seedManagerTrust(t, fixture, base, managerOID)
+	if err := fixture.manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.manager.ListConflicts(context.Background(), base.Name); err == nil {
+		t.Fatal("ListConflicts() error = nil outside conflict state")
+	}
+	if _, err := fixture.manager.ResolveConflict(context.Background(), model.GitConflictResolveRequest{Base: base.Name}); err == nil {
+		t.Fatal("ResolveConflict() error = nil outside conflict state")
+	}
+	if _, _, err := fixture.manager.QueueConflictComplete(context.Background(), base.Name); err == nil {
+		t.Fatal("QueueConflictComplete() error = nil outside conflict state")
+	}
+	if _, _, err := fixture.manager.QueueConflictAbort(context.Background(), base.Name); err == nil {
+		t.Fatal("QueueConflictAbort() error = nil outside conflict state")
+	}
+}
+
+func TestGitManagerConflictSynchronousCallsHonorCanceledContext(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, nil, nil, nil)
+	op := seedManagerConflict(t, fixture, base, strings.Repeat("b", 32))
+	if err := fixture.manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := fixture.manager.ListConflicts(ctx, base.Name); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ListConflicts() error = %v, want context canceled", err)
+	}
+	if _, err := fixture.manager.ResolveConflict(ctx, model.GitConflictResolveRequest{Base: base.Name, OperationID: op.ID}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ResolveConflict() error = %v, want context canceled", err)
+	}
+}
+
+func TestGitManagerConflictPausedStateRejectsNewSynchronization(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, nil, nil, nil)
+	seedManagerTrust(t, fixture, base, managerOID)
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStatePaused, ChangedPaths: []string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base}); !errors.Is(err, gitcmd.ErrGitPaused) {
+		t.Fatalf("QueueSync() error = %v, want paused", err)
+	}
+	if _, _, err := fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base}); !errors.Is(err, gitcmd.ErrGitPaused) {
+		t.Fatalf("QueueInitialize() error = %v, want paused", err)
+	}
+}
+
+func TestGitManagerConflictRecoveryFinishesAbortedOperationPaused(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	oid := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("c", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictAbort, State: gitcmd.OperationQueued, Stage: gitcmd.StageConflictAborting,
+		Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid,
+		ChangedPaths: []string{"note.md"}, ConflictPaths: []string{"note.md"}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: op.ConflictPaths, RemoteOID: oid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	stored, found, err := fixture.operations.LatestByPath(context.Background(), root)
+	if err != nil || !found || stored.ID != op.ID || stored.State != gitcmd.OperationSucceeded || stored.Stage != gitcmd.StageCompleted {
+		t.Fatalf("recovered abort operation = %#v, %v, %v", stored, found, err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStatePaused || !reflect.DeepEqual(status.ChangedPaths, []string{"note.md"}) {
+		t.Fatalf("recovered abort status = %#v, %v, %v", status, found, err)
+	}
+	if err := fixture.coordinator.CheckMutation(root); err != nil {
+		t.Fatalf("recovered abort left mutation blocked: %v", err)
+	}
+}
+
+func TestGitManagerConflictAbortStatusFailureRetainsRecoverableIntent(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	oid := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("a", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictAbort, State: gitcmd.OperationQueued, Stage: gitcmd.StageConflictAborting,
+		Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid,
+		ChangedPaths: []string{"note.md"}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: op.ChangedPaths, RemoteOID: oid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`CREATE TRIGGER reject_abort_paused_status BEFORE UPDATE ON git_status
+		WHEN NEW.state = 'paused' BEGIN SELECT RAISE(ABORT, 'paused status unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := fixture.manager.finishAbortSuccess(op, base, gitcmd.OperationResult{ChangedPaths: op.ChangedPaths})
+	if finished || err == nil {
+		t.Fatalf("finishAbortSuccess() = %v, %v; want retained journal error", finished, err)
+	}
+	stored, found, err := fixture.operations.ActiveByPath(context.Background(), root)
+	if err != nil || !found || stored.ID != op.ID || (stored.State != gitcmd.OperationQueued && stored.State != gitcmd.OperationRunning) {
+		t.Fatalf("abort intent after status failure = %#v, %v, %v", stored, found, err)
+	}
+	if _, err := fixture.db.Exec("DROP TRIGGER reject_abort_paused_status"); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewGitManager(fixture.manager.gitService, fixture.statuses, fixture.operations, fixture.manager.prober, fixture.snapshots.get, fixture.notes, NewBaseOperationCoordinator())
+	t.Cleanup(func() { _ = restarted.Close() })
+	if err := restarted.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStatePaused {
+		t.Fatalf("recovered abort status = %#v, %v, %v", status, found, err)
+	}
+}
+
+func TestGitManagerConflictRecoveryAbortStatusFailureRetainsRecoverableIntent(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	oid := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("b", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictAbort, State: gitcmd.OperationQueued, Stage: gitcmd.StageConflictAborting,
+		Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid,
+		ChangedPaths: []string{"note.md"}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: op.ChangedPaths, RemoteOID: oid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`CREATE TRIGGER reject_recovered_abort_paused_status BEFORE UPDATE ON git_status
+		WHEN NEW.state = 'paused' BEGIN SELECT RAISE(ABORT, 'paused status unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err == nil {
+		t.Fatal("RecoverLocal() error = nil with rejected paused status")
+	}
+	stored, found, err := fixture.operations.ActiveByPath(context.Background(), root)
+	if err != nil || !found || stored.ID != op.ID || (stored.State != gitcmd.OperationQueued && stored.State != gitcmd.OperationRunning) {
+		t.Fatalf("abort intent after recovery status failure = %#v, %v, %v", stored, found, err)
+	}
+	if _, err := fixture.db.Exec("DROP TRIGGER reject_recovered_abort_paused_status"); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewGitManager(fixture.manager.gitService, fixture.statuses, fixture.operations, fixture.manager.prober, fixture.snapshots.get, fixture.notes, NewBaseOperationCoordinator())
+	t.Cleanup(func() { _ = restarted.Close() })
+	if err := restarted.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStatePaused {
+		t.Fatalf("recovered abort status = %#v, %v, %v", status, found, err)
+	}
+}
+
+func TestGitManagerConflictCompletionPublishesCheckpointedChangedPaths(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", nil, nil, nil)
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("d", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictComplete, State: gitcmd.OperationQueued, Stage: gitcmd.StageQueued,
+		Branch: base.Branch, LocalOID: managerOID, CandidateOID: managerOID, RemoteOID: managerOID,
+		ChangedPaths: []string{}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{"z.md", "a.md", "z.md"}
+	if err := fixture.operations.Checkpoint(context.Background(), op.ID, gitcmd.Checkpoint{
+		Stage: gitcmd.StageConflictPushing, LocalOID: managerOID, CandidateOID: managerOID, RemoteOID: managerOID,
+		PushOID: managerOID, ChangedPaths: paths, ConflictPaths: []string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.manager.finishSuccess(op, base, gitcmd.OperationResult{PushOID: managerOID, RemoteOID: managerOID}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), base.Path)
+	if err != nil || !found || !reflect.DeepEqual(status.ChangedPaths, []string{"a.md", "z.md"}) {
+		t.Fatalf("completion status = %#v, %v, %v", status, found, err)
+	}
+}
+
+func TestGitManagerConflictRecoveryFinishesPushedCompletionReady(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	oid := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("e", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictComplete, State: gitcmd.OperationQueued, Stage: gitcmd.StageConflictPushing,
+		Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+		ChangedPaths: []string{"note.md"}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.operations.Checkpoint(context.Background(), op.ID, gitcmd.Checkpoint{
+		Stage: gitcmd.StageConflictPushing, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+		ChangedPaths: op.ChangedPaths, ConflictPaths: op.ConflictPaths,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: []string{}, RemoteOID: oid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	stored, found, err := fixture.operations.LatestByPath(context.Background(), root)
+	if err != nil || !found || stored.ID != op.ID || stored.State != gitcmd.OperationSucceeded || stored.Stage != gitcmd.StageCompleted {
+		t.Fatalf("recovered completion operation = %#v, %v, %v", stored, found, err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStateReady || status.RemoteOID != oid {
+		t.Fatalf("recovered completion status = %#v, %v, %v", status, found, err)
+	}
+	if err := fixture.coordinator.CheckMutation(root); err != nil {
+		t.Fatalf("recovered completion left mutation blocked: %v", err)
+	}
+}
+
+func TestGitManagerConflictRecoveryPushedStatusFailureRetainsRecoverableIntent(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	oid := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("c", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictComplete, State: gitcmd.OperationQueued, Stage: gitcmd.StageConflictPushing,
+		Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+		ChangedPaths: []string{"note.md"}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.operations.Checkpoint(context.Background(), op.ID, gitcmd.Checkpoint{
+		Stage: op.Stage, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+		ChangedPaths: op.ChangedPaths, ConflictPaths: op.ConflictPaths,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: op.ChangedPaths, RemoteOID: oid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`CREATE TRIGGER reject_recovered_pushed_ready_status BEFORE UPDATE ON git_status
+		WHEN NEW.state = 'ready' BEGIN SELECT RAISE(ABORT, 'ready status unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err == nil {
+		t.Fatal("RecoverLocal() error = nil with rejected ready status")
+	}
+	stored, found, err := fixture.operations.ActiveByPath(context.Background(), root)
+	if err != nil || !found || stored.ID != op.ID || (stored.State != gitcmd.OperationQueued && stored.State != gitcmd.OperationRunning) {
+		t.Fatalf("completion intent after recovery status failure = %#v, %v, %v", stored, found, err)
+	}
+	if _, err := fixture.db.Exec("DROP TRIGGER reject_recovered_pushed_ready_status"); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewGitManager(fixture.manager.gitService, fixture.statuses, fixture.operations, fixture.manager.prober, fixture.snapshots.get, fixture.notes, NewBaseOperationCoordinator())
+	t.Cleanup(func() { _ = restarted.Close() })
+	if err := restarted.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStateReady {
+		t.Fatalf("recovered pushed status = %#v, %v, %v", status, found, err)
+	}
+}
+
+func TestGitManagerConflictRecoveryDoesNotPublishUnpushedCompletionReady(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		stage gitcmd.Stage
+	}{
+		{name: "needs reindex", stage: gitcmd.StageConflictCommitted},
+		{name: "push pending", stage: gitcmd.StageConflictReindexed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, remote := newManagerGitPair(t)
+			runManagerGit(t, root, "init", "--initial-branch", "main")
+			runManagerGit(t, root, "remote", "add", "origin", remote)
+			if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runManagerGit(t, root, "add", "--all")
+			runManagerGit(t, root, "commit", "-m", "initial")
+			oid := runManagerGit(t, root, "rev-parse", "HEAD")
+			runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+			base := configuredManagerBase("work", root)
+			base.URL = remote
+			delegate := gitcmd.NewCommandRunner()
+			fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+			now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+			op := gitcmd.Operation{
+				ID: strings.Repeat("f", 32), BaseName: base.Name, RepoPath: base.Path,
+				ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+				Kind: gitcmd.OperationConflictComplete, State: gitcmd.OperationQueued, Stage: test.stage,
+				Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+				ChangedPaths: []string{"note.md"}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.operations.Checkpoint(context.Background(), op.ID, gitcmd.Checkpoint{
+				Stage: test.stage, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+				ChangedPaths: op.ChangedPaths, ConflictPaths: op.ConflictPaths,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+				Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+				Stage: string(test.stage), ChangedPaths: []string{}, RemoteOID: oid,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+				t.Fatal(err)
+			}
+			stored, found, err := fixture.operations.LatestByPath(context.Background(), root)
+			if err != nil || !found || stored.State != gitcmd.OperationFailed {
+				t.Fatalf("recovered operation = %#v, %v, %v", stored, found, err)
+			}
+			status, found, err := fixture.statuses.Get(context.Background(), root)
+			if err != nil || !found || status.State != model.GitStateError || status.Error == nil || status.Error.Code != string(gitcmd.CodeOperationInterrupted) || status.RemoteOID != oid {
+				t.Fatalf("recovered status = %#v, %v, %v", status, found, err)
+			}
+			if err := fixture.coordinator.CheckMutation(root); err != nil {
+				t.Fatalf("recovered completion left mutation blocked: %v", err)
+			}
+		})
+	}
+}
+
+func TestGitManagerConflictRecoveryInterruptedStatusFailureRetainsRecoverableIntent(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	oid := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("d", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictComplete, State: gitcmd.OperationQueued, Stage: gitcmd.StageConflictReindexed,
+		Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+		ChangedPaths: []string{"note.md"}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.operations.Checkpoint(context.Background(), op.ID, gitcmd.Checkpoint{
+		Stage: op.Stage, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: oid,
+		ChangedPaths: op.ChangedPaths, ConflictPaths: op.ConflictPaths,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: op.ChangedPaths, RemoteOID: oid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`CREATE TRIGGER reject_recovered_interrupted_status BEFORE UPDATE ON git_status
+		WHEN NEW.state = 'error' BEGIN SELECT RAISE(ABORT, 'interrupted status unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err == nil {
+		t.Fatal("RecoverLocal() error = nil with rejected interrupted status")
+	}
+	stored, found, err := fixture.operations.ActiveByPath(context.Background(), root)
+	if err != nil || !found || stored.ID != op.ID || (stored.State != gitcmd.OperationQueued && stored.State != gitcmd.OperationRunning) {
+		t.Fatalf("completion intent after interrupted status failure = %#v, %v, %v", stored, found, err)
+	}
+	if _, err := fixture.db.Exec("DROP TRIGGER reject_recovered_interrupted_status"); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewGitManager(fixture.manager.gitService, fixture.statuses, fixture.operations, fixture.manager.prober, fixture.snapshots.get, fixture.notes, NewBaseOperationCoordinator())
+	t.Cleanup(func() { _ = restarted.Close() })
+	if err := restarted.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStateError || status.Error == nil || status.Error.Code != string(gitcmd.CodeOperationInterrupted) {
+		t.Fatalf("recovered interrupted status = %#v, %v, %v", status, found, err)
+	}
+}
+
+func TestGitManagerConflictRecoveryTerminalFailedCompletionStaysInterrupted(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "initial")
+	oid := runManagerGit(t, root, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("pushed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "commit", "-am", "pushed")
+	pushOID := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", oid)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("e", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationConflictComplete, State: gitcmd.OperationQueued, Stage: gitcmd.StageConflictPushing,
+		Branch: base.Branch, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: pushOID,
+		ChangedPaths: []string{"note.md"}, ConflictPaths: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.operations.Checkpoint(context.Background(), op.ID, gitcmd.Checkpoint{
+		Stage: op.Stage, LocalOID: oid, CandidateOID: oid, RemoteOID: oid, PushOID: pushOID,
+		ChangedPaths: op.ChangedPaths, ConflictPaths: op.ConflictPaths,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	op.State = gitcmd.OperationFailed
+	op.Error = &gitcmd.SafeError{Code: gitcmd.CodeOperationInterrupted, Message: "interrupted"}
+	if err := fixture.operations.Finish(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateError, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: op.ChangedPaths, RemoteOID: oid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), root)
+	if err != nil || !found || status.State != model.GitStateError || status.Error == nil || status.Error.Code != string(gitcmd.CodeRecoveryRequired) {
+		t.Fatalf("terminal completion status = %#v, %v, %v", status, found, err)
+	}
+	if err := fixture.coordinator.CheckMutation(root); err != nil {
+		t.Fatalf("terminal completion left mutation blocked: %v", err)
+	}
+}
+
+func TestGitManagerConflictInspectionDoesNotHoldManagerMutex(t *testing.T) {
+	root, remote := newManagerGitPair(t)
+	runManagerGit(t, root, "init", "--initial-branch", "main")
+	runManagerGit(t, root, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "base")
+	runManagerGit(t, root, "switch", "-c", "other")
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("other\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "remote.md"), []byte("remote\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "add", "--all")
+	runManagerGit(t, root, "commit", "-m", "other")
+	remoteOID := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "switch", "main")
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runManagerGit(t, root, "commit", "-am", "main")
+	localOID := runManagerGit(t, root, "rev-parse", "HEAD")
+	runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", remoteOID)
+	merge := exec.Command("git", "merge", "other")
+	merge.Dir = root
+	merge.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+	if err := merge.Run(); err == nil {
+		t.Fatal("git merge unexpectedly succeeded")
+	}
+
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	delegate := gitcmd.NewCommandRunner()
+	runner := &blockingManagerRunner{runner: delegate, entered: make(chan struct{}), release: make(chan struct{})}
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", runner, gitcmd.NewClient(runner), gitcmd.NewClient(runner))
+	now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{
+		ID: strings.Repeat("1", 32), BaseName: base.Name, RepoPath: base.Path,
+		ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+		Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageQueued,
+		Branch: base.Branch, LocalOID: localOID, CandidateOID: remoteOID, RemoteOID: remoteOID,
+		ChangedPaths: []string{}, ConflictPaths: []string{"note.md"}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.operations.CreateQueued(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	op.State = gitcmd.OperationConflict
+	op.Stage = gitcmd.StageMerging
+	if err := fixture.operations.Finish(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: op.ID,
+		Stage: string(op.Stage), ChangedPaths: op.ConflictPaths, RemoteOID: remoteOID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan struct {
+		operation gitcmd.Operation
+		err       error
+	}, 1)
+	go func() {
+		operation, _, err := fixture.manager.QueueConflictAbort(context.Background(), base.Name)
+		result <- struct {
+			operation gitcmd.Operation
+			err       error
+		}{operation, err}
+	}()
+	<-runner.entered
+	if !fixture.manager.mu.TryLock() {
+		close(runner.release)
+		t.Fatal("conflict inspection held GitManager.mu")
+	}
+	fixture.manager.mu.Unlock()
+	close(runner.release)
+	queued := <-result
+	if queued.err != nil {
+		t.Fatalf("QueueConflictAbort() error = %v", queued.err)
+	}
+	if !reflect.DeepEqual(queued.operation.ChangedPaths, []string{"note.md", "remote.md"}) {
+		t.Fatalf("queued abort changed paths = %#v, want current pre-abort paths", queued.operation.ChangedPaths)
+	}
+}
+
+func TestGitManagerResolveConflictClosesMutationGateBeforeInspection(t *testing.T) {
+	path := t.TempDir()
+	gitDir := filepath.Join(path, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := configuredManagerBase("work", path)
+	porcelain := permissiveManagerPorcelain(path)
+	porcelain.local.PendingOperation = "merge"
+	porcelain.local.GitDir = gitDir
+	runner := &blockingManagerRunner{
+		runner:  &mergeConflictRunner{gitDir: gitDir, oid: managerOID},
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", runner, porcelain, porcelain)
+	op := seedManagerConflict(t, fixture, base, strings.Repeat("2", 32))
+	fixture.coordinator.SetConflict(base.Path, false)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := fixture.manager.resolveConflict(context.Background(), model.GitConflictResolveRequest{Base: base.Name, OperationID: op.ID})
+		result <- err
+	}()
+	<-runner.entered
+	if !errors.Is(fixture.coordinator.CheckMutation(base.Path), ErrGitConflictPending) {
+		close(runner.release)
+		t.Fatal("resolve opened the mutation gate during conflict inspection")
+	}
+	close(runner.release)
+	if err := <-result; err == nil {
+		t.Fatal("resolve unexpectedly succeeded with an incomplete conflict runner")
 	}
 }
 
@@ -794,6 +1514,111 @@ func TestGitManagerQueueCompensationFailureRetainsActiveOperationAndReportsBothW
 	deduped, deduplicated, err := fixture.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base})
 	if err != nil || !deduplicated || deduped.ID != op.ID {
 		t.Fatalf("retry dedupe = %#v, %v, %v; want retained active operation", deduped, deduplicated, err)
+	}
+}
+
+func TestGitManagerConflictAdmissionCompensationFailureRetainsIdentityWithoutFIFO(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		queue   func(*GitManager, context.Context, string) (gitcmd.Operation, bool, error)
+		resolve bool
+	}{
+		{name: "complete", queue: (*GitManager).QueueConflictComplete, resolve: true},
+		{name: "abort", queue: (*GitManager).QueueConflictAbort},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, remote := newManagerGitPair(t)
+			runManagerGit(t, root, "init", "--initial-branch", "main")
+			runManagerGit(t, root, "remote", "add", "origin", remote)
+			if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("base\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runManagerGit(t, root, "add", "--all")
+			runManagerGit(t, root, "commit", "-m", "base")
+			runManagerGit(t, root, "switch", "-c", "other")
+			if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("other\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runManagerGit(t, root, "commit", "-am", "other")
+			remoteOID := runManagerGit(t, root, "rev-parse", "HEAD")
+			runManagerGit(t, root, "switch", "main")
+			if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("main\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runManagerGit(t, root, "commit", "-am", "main")
+			localOID := runManagerGit(t, root, "rev-parse", "HEAD")
+			runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", remoteOID)
+			merge := exec.Command("git", "merge", "other")
+			merge.Dir = root
+			merge.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+			if err := merge.Run(); err == nil {
+				t.Fatal("git merge unexpectedly succeeded")
+			}
+			if test.resolve {
+				if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("resolved\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				runManagerGit(t, root, "add", "note.md")
+			}
+
+			base := configuredManagerBase("work", root)
+			base.URL = remote
+			delegate := gitcmd.NewCommandRunner()
+			fixture := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", delegate, gitcmd.NewClient(delegate), gitcmd.NewClient(delegate))
+			now := time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC)
+			original := gitcmd.Operation{
+				ID: strings.Repeat("f", 32), BaseName: base.Name, RepoPath: base.Path,
+				ConfigFingerprint: base.Fingerprint, RemoteFingerprint: base.RemoteFingerprint,
+				Kind: gitcmd.OperationSync, State: gitcmd.OperationQueued, Stage: gitcmd.StageQueued,
+				Branch: base.Branch, LocalOID: localOID, CandidateOID: remoteOID, RemoteOID: remoteOID,
+				ChangedPaths: []string{"note.md"}, ConflictPaths: []string{"note.md"}, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := fixture.operations.CreateQueued(context.Background(), original); err != nil {
+				t.Fatal(err)
+			}
+			original.State = gitcmd.OperationConflict
+			original.Stage = gitcmd.StageMerging
+			if err := fixture.operations.Finish(context.Background(), original); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.statuses.Upsert(context.Background(), model.GitStatus{
+				Base: base.Name, RepositoryPath: base.Path, State: model.GitStateConflict, OperationID: original.ID,
+				Stage: string(original.Stage), ChangedPaths: original.ConflictPaths, RemoteOID: remoteOID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.db.Exec(`CREATE TRIGGER reject_conflict_queued_status BEFORE UPDATE ON git_status
+				WHEN NEW.stage = 'queued' BEGIN SELECT RAISE(ABORT, 'queued status unavailable'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.db.Exec(`CREATE TRIGGER reject_conflict_admission_compensation BEFORE UPDATE ON git_operations
+				WHEN NEW.state = 'failed' BEGIN SELECT RAISE(ABORT, 'compensation unavailable'); END`); err != nil {
+				t.Fatal(err)
+			}
+
+			op, deduplicated, err := test.queue(fixture.manager, context.Background(), base.Name)
+			if err == nil || deduplicated {
+				t.Fatalf("conflict admission = %#v, %v, %v; want compensation error", op, deduplicated, err)
+			}
+			active, found, lookupErr := fixture.operations.ActiveByPath(context.Background(), base.Path)
+			if lookupErr != nil || !found || active.ID != op.ID {
+				t.Fatalf("active journal = %#v, %v, %v", active, found, lookupErr)
+			}
+			fixture.manager.mu.Lock()
+			retained := fixture.manager.inFlight[base.Path]
+			queueLength := len(fixture.manager.queue)
+			fixture.manager.mu.Unlock()
+			if retained.ID != op.ID || queueLength != 0 {
+				t.Fatalf("retained inFlight/FIFO = %#v/%d", retained, queueLength)
+			}
+			if err := fixture.manager.Start(); err != nil {
+				t.Fatal(err)
+			}
+			active, found, lookupErr = fixture.operations.ActiveByPath(context.Background(), base.Path)
+			if lookupErr != nil || !found || active.ID != op.ID {
+				t.Fatalf("worker acted after failed admission = %#v, %v, %v", active, found, lookupErr)
+			}
+		})
 	}
 }
 

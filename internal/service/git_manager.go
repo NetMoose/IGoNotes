@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ type gitManagerJob struct {
 	operation     gitcmd.Operation
 	snapshot      gitcmd.ConfiguredBase
 	confirmations model.GitConfirmations
+	synchronous   func()
 }
 
 type GitManager struct {
@@ -109,6 +111,66 @@ func (m *GitManager) QueueSync(ctx context.Context, request gitcmd.SyncRequest) 
 	return m.queueOperation(ctx, request.Snapshot, gitcmd.OperationSync, model.GitConfirmations{})
 }
 
+// ListConflicts serializes inspection with all Git mutations without creating a journal row.
+func (m *GitManager) ListConflicts(ctx context.Context, base string) (model.GitConflictListResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return model.GitConflictListResponse{}, err
+	}
+	results := make(chan struct {
+		response model.GitConflictListResponse
+		err      error
+	}, 1)
+	if err := m.enqueueSynchronous(func() {
+		response, err := m.listConflicts(ctx, base)
+		results <- struct {
+			response model.GitConflictListResponse
+			err      error
+		}{response, err}
+	}); err != nil {
+		return model.GitConflictListResponse{}, err
+	}
+	select {
+	case result := <-results:
+		return result.response, result.err
+	case <-ctx.Done():
+		return model.GitConflictListResponse{}, ctx.Err()
+	}
+}
+
+// ResolveConflict serializes one resolution with all Git mutations without creating a journal row.
+func (m *GitManager) ResolveConflict(ctx context.Context, request model.GitConflictResolveRequest) (model.GitConflictResolveResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return model.GitConflictResolveResponse{}, err
+	}
+	results := make(chan struct {
+		response model.GitConflictResolveResponse
+		err      error
+	}, 1)
+	if err := m.enqueueSynchronous(func() {
+		response, err := m.resolveConflict(ctx, request)
+		results <- struct {
+			response model.GitConflictResolveResponse
+			err      error
+		}{response, err}
+	}); err != nil {
+		return model.GitConflictResolveResponse{}, err
+	}
+	select {
+	case result := <-results:
+		return result.response, result.err
+	case <-ctx.Done():
+		return model.GitConflictResolveResponse{}, ctx.Err()
+	}
+}
+
+func (m *GitManager) QueueConflictComplete(ctx context.Context, base string) (gitcmd.Operation, bool, error) {
+	return m.queueConflictOperation(ctx, base, gitcmd.OperationConflictComplete)
+}
+
+func (m *GitManager) QueueConflictAbort(ctx context.Context, base string) (gitcmd.Operation, bool, error) {
+	return m.queueConflictOperation(ctx, base, gitcmd.OperationConflictAbort)
+}
+
 func (m *GitManager) queueOperation(
 	ctx context.Context,
 	requested gitcmd.ConfiguredBase,
@@ -143,6 +205,10 @@ func (m *GitManager) queueOperation(
 	if kind == gitcmd.OperationSync && statusFound && status.State == model.GitStateNeedsReconnect {
 		m.coordinator.Unlock()
 		return gitcmd.Operation{}, false, needsReconnect("Git base directory must be reconnected")
+	}
+	if statusFound && status.State == model.GitStatePaused {
+		m.coordinator.Unlock()
+		return gitcmd.Operation{}, false, gitcmd.ErrGitPaused
 	}
 
 	m.mu.Lock()
@@ -247,6 +313,316 @@ func (m *GitManager) queueOperation(
 	return operation, false, nil
 }
 
+func (m *GitManager) enqueueSynchronous(run func()) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrGitManagerClosed
+	}
+	m.queue = append(m.queue, gitManagerJob{synchronous: run})
+	m.cond.Signal()
+	return nil
+}
+
+func (m *GitManager) listConflicts(ctx context.Context, base string) (model.GitConflictListResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return model.GitConflictListResponse{}, err
+	}
+	current, active, err := m.currentConflictSnapshot(base)
+	if err != nil {
+		return model.GitConflictListResponse{}, err
+	}
+	operation, _, err := m.currentConflictOperation(ctx, current)
+	if err != nil {
+		return model.GitConflictListResponse{}, err
+	}
+	snapshot, err := m.gitService.Conflicts(ctx, current, operation)
+	if err != nil {
+		return model.GitConflictListResponse{}, err
+	}
+	_ = active // The transaction is only needed by resolution.
+	return conflictListResponse(current.Name, operation.ID, snapshot), nil
+}
+
+func (m *GitManager) resolveConflict(ctx context.Context, request model.GitConflictResolveRequest) (model.GitConflictResolveResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return model.GitConflictResolveResponse{}, err
+	}
+	current, active, err := m.currentConflictSnapshot(request.Base)
+	if err != nil {
+		return model.GitConflictResolveResponse{}, err
+	}
+	operation, status, err := m.currentConflictOperation(ctx, current)
+	if err != nil {
+		return model.GitConflictResolveResponse{}, err
+	}
+	if request.OperationID != operation.ID {
+		return model.GitConflictResolveResponse{}, gitcmd.ErrConflictStale
+	}
+	m.coordinator.SetConflict(current.Path, true)
+	snapshot, err := m.gitService.ResolveConflict(ctx, current, operation, request, m.worktreeTransaction(current, active))
+	if err != nil {
+		return model.GitConflictResolveResponse{}, err
+	}
+	status.Stage = string(gitcmd.StageConflictResolving)
+	status.ChangedPaths = conflictSnapshotPaths(snapshot)
+	status.Error = nil
+	if err := m.statuses.Upsert(ctx, status); err != nil {
+		return model.GitConflictResolveResponse{}, persistenceError(err)
+	}
+	return model.GitConflictResolveResponse{
+		ResolvedPath: request.Path,
+		Remaining:    conflictListResponse(current.Name, operation.ID, snapshot),
+	}, nil
+}
+
+func (m *GitManager) queueConflictOperation(ctx context.Context, base string, kind gitcmd.OperationKind) (gitcmd.Operation, bool, error) {
+	m.coordinator.Lock()
+	defer m.coordinator.Unlock()
+	if err := ctx.Err(); err != nil {
+		return gitcmd.Operation{}, false, err
+	}
+	current, _, err := m.currentConflictSnapshot(base)
+	if err != nil {
+		return gitcmd.Operation{}, false, err
+	}
+	original, status, err := m.currentConflictOperation(ctx, current)
+	if err != nil {
+		return gitcmd.Operation{}, false, err
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return gitcmd.Operation{}, false, ErrGitManagerClosed
+	}
+	if active, found := m.inFlight[current.Path]; found {
+		if active.Kind == kind && sameManagerIdentity(active, current) {
+			m.mu.Unlock()
+			return active, true, nil
+		}
+		m.mu.Unlock()
+		return gitcmd.Operation{}, false, ErrGitRepositoryInUse
+	}
+	m.mu.Unlock()
+	active, found, err := m.operations.ActiveByPath(ctx, current.Path)
+	if err != nil {
+		return gitcmd.Operation{}, false, persistenceError(err)
+	}
+	if found {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.closed {
+			return gitcmd.Operation{}, false, ErrGitManagerClosed
+		}
+		if queued, queuedFound := m.inFlight[current.Path]; queuedFound {
+			if queued.Kind == kind && sameManagerIdentity(queued, current) {
+				return queued, true, nil
+			}
+			return gitcmd.Operation{}, false, ErrGitRepositoryInUse
+		}
+		if active.Kind == kind && sameManagerIdentity(active, current) {
+			m.inFlight[current.Path] = active
+			return active, true, nil
+		}
+		return gitcmd.Operation{}, false, ErrGitRepositoryInUse
+	}
+
+	inspection, err := m.gitService.Conflicts(ctx, current, original)
+	if err != nil {
+		return gitcmd.Operation{}, false, err
+	}
+	if kind == gitcmd.OperationConflictComplete && !inspection.CanComplete {
+		return gitcmd.Operation{}, false, gitcmd.ErrConflictUnresolved
+	}
+	changedPaths := append([]string(nil), original.ChangedPaths...)
+	if kind == gitcmd.OperationConflictAbort {
+		changedPaths, err = managerAbortChangedPaths(ctx, current, original.LocalOID)
+		if err != nil {
+			return gitcmd.Operation{}, false, err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return gitcmd.Operation{}, false, ErrGitManagerClosed
+	}
+	if active, found := m.inFlight[current.Path]; found {
+		if active.Kind == kind && sameManagerIdentity(active, current) {
+			return active, true, nil
+		}
+		return gitcmd.Operation{}, false, ErrGitRepositoryInUse
+	}
+	id, err := newManagerOperationID()
+	if err != nil {
+		return gitcmd.Operation{}, false, persistenceError(err)
+	}
+	now := m.now().UTC()
+	operation := gitcmd.Operation{
+		ID: id, BaseName: original.BaseName, RepoPath: original.RepoPath,
+		ConfigFingerprint: original.ConfigFingerprint, RemoteFingerprint: original.RemoteFingerprint,
+		Kind: kind, State: gitcmd.OperationQueued, Stage: gitcmd.StageQueued, Branch: original.Branch,
+		BackupRef: original.BackupRef, LocalOID: original.LocalOID, CandidateOID: original.CandidateOID,
+		RemoteOID: original.RemoteOID, PushOID: original.PushOID, ChangedPaths: sortedManagerPaths(changedPaths),
+		ConflictPaths: conflictSnapshotPaths(inspection), CreatedAt: now, UpdatedAt: now,
+	}
+	if kind == gitcmd.OperationConflictComplete {
+		operation.ConflictPaths = []string{}
+	}
+	if err := m.operations.CreateQueued(ctx, operation); err != nil {
+		return gitcmd.Operation{}, false, persistenceError(err)
+	}
+	status.OperationID = operation.ID
+	status.Stage = string(operation.Stage)
+	status.ChangedPaths = operation.ConflictPaths
+	status.Error = nil
+	if err := m.statuses.Upsert(ctx, status); err != nil {
+		operation.State = gitcmd.OperationFailed
+		operation.Error = statusPersistenceError(err)
+		compensationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), managerAdmissionCompensationTimeout)
+		finishErr := m.operations.Finish(compensationCtx, operation)
+		cancel()
+		if finishErr != nil {
+			operation.State = gitcmd.OperationQueued
+			operation.Error = nil
+			m.inFlight[current.Path] = operation
+		}
+		return operation, false, errors.Join(statusPersistenceError(err), managerJournalError(finishErr))
+	}
+	m.inFlight[current.Path] = operation
+	m.queue = append(m.queue, gitManagerJob{operation: operation, snapshot: current})
+	m.cond.Signal()
+	return operation, false, nil
+}
+
+func (m *GitManager) currentConflictSnapshot(base string) (gitcmd.ConfiguredBase, bool, error) {
+	current, active, err := m.snapshot(base)
+	if err != nil {
+		return gitcmd.ConfiguredBase{}, false, err
+	}
+	current, err = canonicalManagerSnapshot(current)
+	if err != nil {
+		return gitcmd.ConfiguredBase{}, false, needsReconnect("Git base directory must be reconnected")
+	}
+	return current, active, nil
+}
+
+func (m *GitManager) currentConflictOperation(ctx context.Context, current gitcmd.ConfiguredBase) (gitcmd.Operation, model.GitStatus, error) {
+	status, found, err := m.statuses.Get(ctx, current.Path)
+	if err != nil {
+		return gitcmd.Operation{}, model.GitStatus{}, persistenceError(err)
+	}
+	if !found || status.State != model.GitStateConflict {
+		return gitcmd.Operation{}, model.GitStatus{}, gitcmd.ErrRecoveryRequired
+	}
+	if status.OperationID == "" {
+		return gitcmd.Operation{}, model.GitStatus{}, gitcmd.ErrRecoveryRequired
+	}
+	operation, found, err := m.operations.ByID(ctx, status.OperationID)
+	if err != nil {
+		return gitcmd.Operation{}, model.GitStatus{}, persistenceError(err)
+	}
+	if found && operation.State == gitcmd.OperationConflict && originalConflictOperation(operation) && sameManagerIdentity(operation, current) {
+		return operation, status, nil
+	}
+	if !found || (operation.State != gitcmd.OperationQueued && operation.State != gitcmd.OperationRunning) ||
+		(operation.Kind != gitcmd.OperationConflictComplete && operation.Kind != gitcmd.OperationConflictAbort) {
+		return gitcmd.Operation{}, model.GitStatus{}, gitcmd.ErrRecoveryRequired
+	}
+	operation, found, err = m.operations.LatestConflictByPath(ctx, current.Path)
+	if err != nil {
+		return gitcmd.Operation{}, model.GitStatus{}, persistenceError(err)
+	}
+	if !found || !originalConflictOperation(operation) || !sameManagerIdentity(operation, current) {
+		return gitcmd.Operation{}, model.GitStatus{}, gitcmd.ErrRecoveryRequired
+	}
+	return operation, status, nil
+}
+
+func (m *GitManager) recoveryConflictOperation(ctx context.Context, current gitcmd.ConfiguredBase, status model.GitStatus) (gitcmd.Operation, bool, error) {
+	if status.State != model.GitStateConflict {
+		return gitcmd.Operation{}, false, nil
+	}
+	if status.OperationID != "" {
+		operation, found, err := m.operations.ByID(ctx, status.OperationID)
+		if err != nil {
+			return gitcmd.Operation{}, false, persistenceError(err)
+		}
+		if found && originalConflictOperation(operation) && sameManagerIdentity(operation, current) {
+			return operation, true, nil
+		}
+	}
+	operation, found, err := m.operations.LatestConflictByPath(ctx, current.Path)
+	if err != nil {
+		return gitcmd.Operation{}, false, persistenceError(err)
+	}
+	if !found || !originalConflictOperation(operation) || !sameManagerIdentity(operation, current) {
+		return gitcmd.Operation{}, false, nil
+	}
+	return operation, true, nil
+}
+
+func originalConflictOperation(operation gitcmd.Operation) bool {
+	return operation.Kind == gitcmd.OperationInitialize || operation.Kind == gitcmd.OperationSync
+}
+
+func conflictListResponse(base, operationID string, snapshot gitcmd.ConflictSnapshot) model.GitConflictListResponse {
+	conflicts := make([]model.GitConflict, 0, len(snapshot.Conflicts))
+	for _, conflict := range snapshot.Conflicts {
+		conflicts = append(conflicts, model.GitConflict{
+			ID: conflict.ID, Kind: model.GitConflictKind(conflict.Kind), ContentKind: model.GitConflictContentKind(conflict.ContentKind),
+			Path: conflict.Path, OriginalPath: conflict.OriginalPath, Base: conflictStageDTO(conflict.Base),
+			Local: conflictStageDTO(conflict.Local), Remote: conflictStageDTO(conflict.Remote), Actions: conflictActionsDTO(conflict.Actions),
+		})
+	}
+	return model.GitConflictListResponse{
+		Base: base, OperationID: operationID, HeadOID: snapshot.HeadOID, MergeHeadOID: snapshot.MergeHeadOID,
+		Conflicts: conflicts, CanComplete: snapshot.CanComplete,
+	}
+}
+
+func conflictStageDTO(stage *gitcmd.ConflictStage) *model.GitConflictStage {
+	if stage == nil {
+		return nil
+	}
+	return &model.GitConflictStage{Path: stage.Path, OID: stage.OID, Mode: stage.Mode, Size: stage.Size, Content: stage.Content, PreviewTruncated: stage.PreviewTruncated}
+}
+
+func conflictActionsDTO(actions []string) []model.GitConflictAction {
+	result := make([]model.GitConflictAction, len(actions))
+	for index, action := range actions {
+		result[index] = model.GitConflictAction(action)
+	}
+	return result
+}
+
+func conflictSnapshotPaths(snapshot gitcmd.ConflictSnapshot) []string {
+	paths := make([]string, 0, len(snapshot.Conflicts))
+	for _, conflict := range snapshot.Conflicts {
+		paths = append(paths, conflict.Path)
+	}
+	return sortedManagerPaths(paths)
+}
+
+func managerAbortChangedPaths(ctx context.Context, current gitcmd.ConfiguredBase, localOID string) ([]string, error) {
+	result, err := gitcmd.NewCommandRunner().Run(ctx, gitcmd.Command{
+		Dir: current.Path, Args: []string{"diff", "--name-only", "-z", localOID, "--"}, Scope: gitcmd.LocalOperation, ReadOnly: true,
+	})
+	if err != nil || result.StdoutTruncated || result.StderrTruncated || !strings.HasSuffix(result.Stdout, "\x00") {
+		return nil, gitcmd.ErrRecoveryRequired
+	}
+	paths := strings.Split(strings.TrimSuffix(result.Stdout, "\x00"), "\x00")
+	if len(paths) == 1 && paths[0] == "" {
+		return []string{}, nil
+	}
+	for _, path := range paths {
+		if path == "" {
+			return nil, gitcmd.ErrRecoveryRequired
+		}
+	}
+	return sortedManagerPaths(paths), nil
+}
+
 func (m *GitManager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -298,7 +674,11 @@ func (m *GitManager) worker() {
 		m.mu.Unlock()
 
 		m.coordinator.Lock()
-		m.runJob(job)
+		if job.synchronous != nil {
+			job.synchronous()
+		} else {
+			m.runJob(job)
+		}
 		m.coordinator.Unlock()
 	}
 }
@@ -337,7 +717,18 @@ func (m *GitManager) runJob(job gitManagerJob) {
 	if operation.Kind == gitcmd.OperationInitialize {
 		workingState = model.GitStateInitializing
 	}
+	if operation.Kind == gitcmd.OperationConflictComplete || operation.Kind == gitcmd.OperationConflictAbort {
+		workingState = model.GitStateConflict
+	}
+	conflictBlockCleared := false
 	progress := func(ctx context.Context, checkpoint gitcmd.Checkpoint) error {
+		if operation.Kind == gitcmd.OperationConflictComplete && checkpoint.Stage == gitcmd.StageConflictReindexed {
+			if active {
+				if err := m.notes.SyncFS(); err != nil {
+					return err
+				}
+			}
+		}
 		if err := m.operations.Checkpoint(ctx, operation.ID, checkpoint); err != nil {
 			return persistenceError(err)
 		}
@@ -352,11 +743,18 @@ func (m *GitManager) runJob(job gitManagerJob) {
 		operation.ConflictPaths = sortedManagerPaths(checkpoint.ConflictPaths)
 		published := managerWorkingStatus(operation, status, statusFound)
 		published.State = workingState
+		if operation.Kind == gitcmd.OperationConflictComplete && (checkpoint.Stage == gitcmd.StageConflictReindexed || conflictBlockCleared) {
+			published.State = model.GitStateSyncing
+		}
 		if err := m.statuses.Upsert(ctx, published); err != nil {
 			return persistenceError(err)
 		}
 		status = published
 		statusFound = true
+		if operation.Kind == gitcmd.OperationConflictComplete && checkpoint.Stage == gitcmd.StageConflictReindexed {
+			m.coordinator.SetConflict(current.Path, false)
+			conflictBlockCleared = true
+		}
 		return nil
 	}
 
@@ -364,6 +762,7 @@ func (m *GitManager) runJob(job gitManagerJob) {
 
 	var result gitcmd.OperationResult
 	var operationErr error
+	abortRecoveredLocally := false
 	switch operation.Kind {
 	case gitcmd.OperationInitialize:
 		if err := progress(m.lifetimeCtx, gitcmd.Checkpoint{Stage: gitcmd.StageProbing, RemoteOID: operation.RemoteOID}); err != nil {
@@ -407,19 +806,49 @@ func (m *GitManager) runJob(job gitManagerJob) {
 		result, operationErr = m.gitService.Sync(m.lifetimeCtx, gitcmd.SyncOptions{
 			Operation: operation, Snapshot: current, LastRemoteOID: lastRemoteOID,
 		}, transaction, progress)
+	case gitcmd.OperationConflictComplete:
+		var pushOID string
+		pushOID, operationErr = m.gitService.CompleteConflict(m.lifetimeCtx, current, operation, transaction, progress)
+		result.PushOID = pushOID
+		result.RemoteOID = pushOID
+	case gitcmd.OperationConflictAbort:
+		operationErr = m.gitService.AbortConflict(m.lifetimeCtx, current, operation, transaction, progress)
+		if operationErr == nil {
+			abortRecoveredLocally = true
+			latest, lookupErr := m.latestOperation(m.lifetimeCtx, operation)
+			if lookupErr != nil {
+				operationErr = persistenceError(lookupErr)
+			} else {
+				result.ChangedPaths = latest.ChangedPaths
+				if active {
+					operationErr = m.notes.SyncFS()
+				}
+			}
+		}
 	default:
 		operationErr = &gitcmd.SafeError{Code: gitcmd.CodeCommandFailed, Message: "Invalid Git operation"}
 	}
 
 	m.beforeTerminalPublication()
+	if abortRecoveredLocally && operationErr != nil {
+		m.coordinator.SetConflict(current.Path, true)
+		m.completeTerminal(current.Path, false, managerSafeError(operationErr))
+		return
+	}
 	var conflict *gitcmd.ConflictError
 	if errors.As(operationErr, &conflict) {
 		m.coordinator.SetConflict(current.Path, true)
 	}
-	if operationErr == nil {
+	if operationErr == nil && operation.Kind == gitcmd.OperationConflictAbort {
+		finished, terminalErr := m.finishAbortSuccess(operation, current, result)
+		m.completeTerminal(current.Path, finished, terminalErr)
+	} else if operationErr == nil {
 		finished, terminalErr := m.finishSuccess(operation, current, result)
 		m.completeTerminal(current.Path, finished, terminalErr)
 	} else {
+		if (operation.Kind == gitcmd.OperationConflictComplete || operation.Kind == gitcmd.OperationConflictAbort) && !conflictBlockCleared {
+			m.coordinator.SetConflict(current.Path, true)
+		}
 		finished, terminalErr := m.finishFailure(operation, current, result, managerSafeError(operationErr), conflict)
 		m.completeTerminal(current.Path, finished, terminalErr)
 	}
@@ -460,12 +889,40 @@ func (m *GitManager) finishSuccess(operation gitcmd.Operation, current gitcmd.Co
 	now := m.now().UTC()
 	operation.UpdatedAt = now
 	finishErr := m.operations.Finish(ctx, operation)
-	changed := sortedManagerPaths(result.ChangedPaths)
+	changedPaths := result.ChangedPaths
+	if changedPaths == nil {
+		changedPaths = operation.ChangedPaths
+	}
+	changed := sortedManagerPaths(changedPaths)
 	statusErr := m.statuses.Upsert(ctx, model.GitStatus{
 		Base: current.Name, RepositoryPath: current.Path, State: model.GitStateReady,
 		OperationID: operation.ID, Stage: string(gitcmd.StageCompleted), Ahead: result.Ahead, Behind: result.Behind,
 		LastAttempt: &now, LastSuccess: &now, ChangedPaths: changed, RemoteOID: result.RemoteOID,
 	})
+	return finishErr == nil, errors.Join(managerJournalError(lookupErr), managerJournalError(finishErr), managerStatusError(statusErr))
+}
+
+func (m *GitManager) finishAbortSuccess(operation gitcmd.Operation, current gitcmd.ConfiguredBase, result gitcmd.OperationResult) (bool, error) {
+	ctx := context.WithoutCancel(m.lifetimeCtx)
+	operation, lookupErr := m.latestOperation(ctx, operation)
+	operation.State = gitcmd.OperationSucceeded
+	operation.Stage = gitcmd.StageCompleted
+	applyManagerResult(&operation, result)
+	now := m.now().UTC()
+	operation.UpdatedAt = now
+	changed := sortedManagerPaths(result.ChangedPaths)
+	statusErr := m.statuses.Upsert(ctx, model.GitStatus{
+		Base: current.Name, RepositoryPath: current.Path, State: model.GitStatePaused,
+		OperationID: operation.ID, Stage: string(gitcmd.StageCompleted), LastAttempt: &now,
+		ChangedPaths: changed, RemoteOID: operation.RemoteOID,
+	})
+	if statusErr != nil {
+		return false, errors.Join(managerJournalError(lookupErr), managerStatusError(statusErr))
+	}
+	finishErr := m.operations.Finish(ctx, operation)
+	if finishErr == nil && statusErr == nil {
+		m.coordinator.SetConflict(current.Path, false)
+	}
 	return finishErr == nil, errors.Join(managerJournalError(lookupErr), managerJournalError(finishErr), managerStatusError(statusErr))
 }
 
@@ -578,21 +1035,64 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 			continue
 		}
 		latestMatches := latestFound && sameManagerIdentity(latest, current)
-		durableConflict := latestMatches && latest.State == gitcmd.OperationConflict ||
-			statusFound && existingStatus.State == model.GitStateConflict
+		active, activeFound := unfinishedByPath[current.Path]
+		unfinishedTransition := activeFound && sameManagerIdentity(active, current) &&
+			(active.Kind == gitcmd.OperationConflictComplete || active.Kind == gitcmd.OperationConflictAbort)
+		var recoveryOperation *gitcmd.Operation
+		var originalConflict *gitcmd.Operation
+		if unfinishedTransition {
+			activeCopy := active
+			recoveryOperation = &activeCopy
+		} else if statusFound && existingStatus.State == model.GitStateConflict {
+			conflictOperation, found, conflictErr := m.recoveryConflictOperation(ctx, current, existingStatus)
+			if conflictErr != nil {
+				recoveryErrors = append(recoveryErrors, conflictErr)
+				m.coordinator.SetConflict(current.Path, true)
+				m.coordinator.Unlock()
+				continue
+			}
+			if found {
+				conflictCopy := conflictOperation
+				recoveryOperation = &conflictCopy
+				originalConflict = &conflictCopy
+			}
+		} else if latestMatches && latest.State == gitcmd.OperationConflict && originalConflictOperation(latest) {
+			latestCopy := latest
+			recoveryOperation = &latestCopy
+			originalConflict = &latestCopy
+		} else if latestMatches {
+			latestCopy := latest
+			recoveryOperation = &latestCopy
+		}
+		if unfinishedTransition {
+			conflictOperation, found, conflictErr := m.recoveryConflictOperation(ctx, current, existingStatus)
+			if conflictErr == nil && found {
+				conflictCopy := conflictOperation
+				originalConflict = &conflictCopy
+			}
+			if originalConflict == nil {
+				conflictOperation, found, conflictErr = m.operations.LatestConflictByPath(ctx, current.Path)
+				if conflictErr != nil {
+					recoveryErrors = append(recoveryErrors, persistenceError(conflictErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				if found && originalConflictOperation(conflictOperation) && sameManagerIdentity(conflictOperation, current) {
+					conflictCopy := conflictOperation
+					originalConflict = &conflictCopy
+				}
+			}
+		}
+		durableConflict := !unfinishedTransition && originalConflict != nil
 		durableConflictPaths := []string(nil)
-		if latestMatches && latest.State == gitcmd.OperationConflict {
-			durableConflictPaths = append(durableConflictPaths, latest.ConflictPaths...)
+		if originalConflict != nil {
+			durableConflictPaths = append(durableConflictPaths, originalConflict.ConflictPaths...)
 		}
 		if statusFound && existingStatus.State == model.GitStateConflict {
 			durableConflictPaths = append(durableConflictPaths, existingStatus.ChangedPaths...)
 		}
-		var latestPointer *gitcmd.Operation
-		if latestMatches {
-			latestCopy := latest
-			latestPointer = &latestCopy
-		}
-		result, serviceErr := m.gitService.RecoverLocal(ctx, gitcmd.RecoveryOptions{Snapshot: current, Operation: latestPointer})
+		result, serviceErr := m.gitService.RecoverLocal(ctx, gitcmd.RecoveryOptions{Snapshot: current, Operation: recoveryOperation})
 		status := managerStatusFromPrevious(current, existingStatus, statusFound)
 		if result.RemoteOID != "" {
 			status.RemoteOID = result.RemoteOID
@@ -608,6 +1108,141 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 		}
 		var transitionErr error
 		if active, found := unfinishedByPath[current.Path]; found {
+			if active.Kind == gitcmd.OperationConflictAbort && isConflict && originalConflict != nil {
+				active.State = gitcmd.OperationFailed
+				active.Error = &gitcmd.SafeError{Code: gitcmd.CodeOperationInterrupted, Message: "Git conflict abort was interrupted"}
+				active.UpdatedAt = m.now().UTC()
+				if finishErr := m.operations.Finish(ctx, active); finishErr != nil {
+					recoveryErrors = append(recoveryErrors, persistenceError(finishErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				status.State = model.GitStateConflict
+				status.OperationID = originalConflict.ID
+				status.Stage = string(originalConflict.Stage)
+				status.ChangedPaths = sortedManagerPaths(append(result.ConflictPaths, conflict.Paths...))
+				status.Error = &model.APIError{Code: string(gitcmd.CodeGitConflict), Message: "Git merge has conflicts"}
+				if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
+					recoveryErrors = append(recoveryErrors, statusPersistenceError(statusErr))
+				}
+				m.coordinator.SetConflict(current.Path, true)
+				m.coordinator.Unlock()
+				continue
+			}
+			if active.Kind == gitcmd.OperationConflictComplete &&
+				(result.ConflictState == gitcmd.RecoveryNeedsReindex || result.ConflictState == gitcmd.RecoveryPushPending || result.ConflictState == gitcmd.RecoveryPushUnknown) {
+				if result.ConflictState == gitcmd.RecoveryNeedsReindex {
+					if _, activeNow, _ := m.snapshot(current.Name); activeNow {
+						if syncErr := m.notes.SyncFS(); syncErr != nil {
+							recoveryErrors = append(recoveryErrors, syncErr)
+							m.coordinator.SetConflict(current.Path, true)
+							m.coordinator.Unlock()
+							continue
+						}
+					}
+					checkpoint := gitcmd.Checkpoint{
+						Stage: gitcmd.StageConflictReindexed, BackupRef: active.BackupRef, LocalOID: active.LocalOID,
+						CandidateOID: active.CandidateOID, RemoteOID: active.RemoteOID, PushOID: active.PushOID,
+						ChangedPaths: active.ChangedPaths, ConflictPaths: active.ConflictPaths,
+					}
+					if checkpointErr := m.operations.Checkpoint(ctx, active.ID, checkpoint); checkpointErr != nil {
+						recoveryErrors = append(recoveryErrors, persistenceError(checkpointErr))
+						m.coordinator.SetConflict(current.Path, true)
+						m.coordinator.Unlock()
+						continue
+					}
+					active.Stage = gitcmd.StageConflictReindexed
+				}
+				active.State = gitcmd.OperationFailed
+				active.Error = &gitcmd.SafeError{Code: gitcmd.CodeOperationInterrupted, Message: "Git operation was interrupted"}
+				if result.ConflictState == gitcmd.RecoveryPushUnknown {
+					active.Error = &gitcmd.SafeError{Code: gitcmd.CodeRecoveryRequired, Message: "Git push outcome is unknown"}
+				}
+				active.UpdatedAt = m.now().UTC()
+				status.State = model.GitStateError
+				status.OperationID = active.ID
+				status.Stage = string(active.Stage)
+				status.ChangedPaths = sortedManagerPaths(active.ChangedPaths)
+				status.Error = &model.APIError{Code: string(active.Error.Code), Message: active.Error.Message}
+				if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
+					recoveryErrors = append(recoveryErrors, statusPersistenceError(statusErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				if finishErr := m.operations.Finish(ctx, active); finishErr != nil {
+					recoveryErrors = append(recoveryErrors, persistenceError(finishErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				m.coordinator.SetConflict(current.Path, false)
+				m.coordinator.Unlock()
+				continue
+			}
+			if active.Kind == gitcmd.OperationConflictComplete && result.ConflictState == gitcmd.RecoveryPushed {
+				if _, activeNow, _ := m.snapshot(current.Name); activeNow {
+					if syncErr := m.notes.SyncFS(); syncErr != nil {
+						recoveryErrors = append(recoveryErrors, syncErr)
+						m.coordinator.SetConflict(current.Path, true)
+						m.coordinator.Unlock()
+						continue
+					}
+				}
+				active.State = gitcmd.OperationSucceeded
+				active.Stage = gitcmd.StageCompleted
+				active.Error = nil
+				active.RemoteOID = result.RemoteOID
+				active.UpdatedAt = m.now().UTC()
+				status.State = model.GitStateReady
+				status.OperationID = active.ID
+				status.Stage = string(gitcmd.StageCompleted)
+				status.ChangedPaths = sortedManagerPaths(active.ChangedPaths)
+				status.RemoteOID = result.RemoteOID
+				status.Error = nil
+				if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
+					recoveryErrors = append(recoveryErrors, statusPersistenceError(statusErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				if finishErr := m.operations.Finish(ctx, active); finishErr != nil {
+					recoveryErrors = append(recoveryErrors, persistenceError(finishErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				m.coordinator.SetConflict(current.Path, false)
+				m.coordinator.Unlock()
+				continue
+			}
+			if active.Kind == gitcmd.OperationConflictAbort && result.ConflictState == gitcmd.RecoveryAborted {
+				active.State = gitcmd.OperationSucceeded
+				active.Stage = gitcmd.StageCompleted
+				active.Error = nil
+				active.UpdatedAt = m.now().UTC()
+				status.State = model.GitStatePaused
+				status.OperationID = active.ID
+				status.Stage = string(gitcmd.StageCompleted)
+				status.ChangedPaths = sortedManagerPaths(active.ChangedPaths)
+				status.Error = nil
+				if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
+					recoveryErrors = append(recoveryErrors, statusPersistenceError(statusErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				if finishErr := m.operations.Finish(ctx, active); finishErr != nil {
+					recoveryErrors = append(recoveryErrors, persistenceError(finishErr))
+					m.coordinator.SetConflict(current.Path, true)
+					m.coordinator.Unlock()
+					continue
+				}
+				m.coordinator.SetConflict(current.Path, false)
+				m.coordinator.Unlock()
+				continue
+			}
 			if result.RemoteOID != "" && active.RemoteOID != result.RemoteOID {
 				checkpoint := gitcmd.Checkpoint{
 					Stage: active.Stage, BackupRef: active.BackupRef, LocalOID: active.LocalOID,
@@ -634,6 +1269,36 @@ func (m *GitManager) RecoverLocal(ctx context.Context, configuredSnapshots []git
 					transitionErr = persistenceError(finishErr)
 				}
 			}
+		}
+		if _, found := unfinishedByPath[current.Path]; !found && recoveryOperation != nil &&
+			recoveryOperation.Kind == gitcmd.OperationConflictComplete &&
+			(result.ConflictState == gitcmd.RecoveryNeedsReindex || result.ConflictState == gitcmd.RecoveryPushPending || result.ConflictState == gitcmd.RecoveryPushUnknown) {
+			if result.ConflictState == gitcmd.RecoveryNeedsReindex {
+				if _, activeNow, _ := m.snapshot(current.Name); activeNow {
+					if syncErr := m.notes.SyncFS(); syncErr != nil {
+						recoveryErrors = append(recoveryErrors, syncErr)
+						m.coordinator.SetConflict(current.Path, true)
+						m.coordinator.Unlock()
+						continue
+					}
+				}
+			}
+			status.State = model.GitStateError
+			status.OperationID = recoveryOperation.ID
+			status.Stage = string(recoveryOperation.Stage)
+			status.ChangedPaths = sortedManagerPaths(recoveryOperation.ChangedPaths)
+			status.Error = &model.APIError{Code: string(gitcmd.CodeOperationInterrupted), Message: "Git operation was interrupted"}
+			if result.ConflictState == gitcmd.RecoveryPushUnknown {
+				status.Error = &model.APIError{Code: string(gitcmd.CodeRecoveryRequired), Message: "Git push outcome is unknown"}
+			}
+			if statusErr := m.statuses.Upsert(ctx, status); statusErr != nil {
+				recoveryErrors = append(recoveryErrors, statusPersistenceError(statusErr))
+				m.coordinator.SetConflict(current.Path, true)
+			} else {
+				m.coordinator.SetConflict(current.Path, false)
+			}
+			m.coordinator.Unlock()
+			continue
 		}
 		if transitionErr != nil {
 			recoveryErrors = append(recoveryErrors, transitionErr)
