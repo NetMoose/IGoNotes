@@ -65,6 +65,71 @@ describe('createGitStatusPoller', () => {
     expect(onError).toHaveBeenLastCalledWith(null);
   });
 
+  it('contains a throwing error callback and continues scheduling', async () => {
+    const unhandled = vi.fn();
+    const scheduled = [];
+    const onError = vi.fn((error) => {
+      if (error) {
+        throw new Error('consumer error');
+      }
+    });
+    const load = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({ statuses: [] });
+    const schedule = vi.fn((callback) => {
+      scheduled.push(callback);
+      return { id: scheduled.length };
+    });
+    const poller = createGitStatusPoller({
+      load,
+      onStatuses: vi.fn(),
+      onError,
+      schedule,
+    });
+
+    process.on('unhandledRejection', unhandled);
+    try {
+      poller.start();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(unhandled).not.toHaveBeenCalled();
+      expect(schedule).toHaveBeenCalledTimes(1);
+
+      scheduled[0]();
+      await Promise.resolve();
+      expect(schedule).toHaveBeenCalledTimes(2);
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
+  it('contains a throwing statuses callback and continues scheduling', async () => {
+    const unhandled = vi.fn();
+    const schedule = vi.fn();
+    const onError = vi.fn();
+    const poller = createGitStatusPoller({
+      load: vi.fn().mockResolvedValue({ statuses: [] }),
+      onStatuses: vi.fn(() => {
+        throw new Error('consumer statuses error');
+      }),
+      onError,
+      schedule,
+    });
+
+    process.on('unhandledRejection', unhandled);
+    try {
+      poller.start();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(unhandled).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledWith(null);
+      expect(schedule).toHaveBeenCalledTimes(1);
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
   it('refresh invalidates an older deferred response', async () => {
     vi.useFakeTimers();
     const older = deferred();

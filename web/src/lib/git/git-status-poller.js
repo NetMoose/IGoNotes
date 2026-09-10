@@ -17,6 +17,12 @@ export function createGitStatusPoller({
     }
   }
 
+  function notify(callback, value) {
+    try {
+      callback(value);
+    } catch {}
+  }
+
   async function run(current) {
     if (!active || current !== generation) {
       return null;
@@ -28,16 +34,16 @@ export function createGitStatusPoller({
         return null;
       }
 
-      onStatuses(payload.statuses);
+      notify(onStatuses, payload.statuses);
       if (!active || current !== generation) {
         return null;
       }
 
-      onError(null);
+      notify(onError, null);
       return payload.statuses;
     } catch (error) {
       if (active && current === generation) {
-        onError(error);
+        notify(onError, error);
       }
       return null;
     } finally {
