@@ -63,10 +63,10 @@ function gitStatus(base = 'work', state = 'ready') {
   }
 }
 
-function gitOperation() {
+function gitOperation(status = 'queued') {
   return {
     operation_id: 'operation-1',
-    status: 'queued',
+    status,
     deduplicated: false,
   }
 }
@@ -95,7 +95,7 @@ function gitProbe(base = 'work') {
   }
 }
 
-function gitConfigResponse(base = 'work', status = 202) {
+function gitConfigResponse(base = 'work', status = 202, operation = gitOperation()) {
   return jsonResponse({
     base: {
       name: base,
@@ -107,7 +107,7 @@ function gitConfigResponse(base = 'work', status = 202) {
       git_commit_message_template: 'sync {{base}}',
     },
     status: gitStatus(base, 'initializing'),
-    operation: gitOperation(),
+    operation,
   }, status)
 }
 
@@ -171,8 +171,8 @@ describe('frontend API client', () => {
     await expect(probeGit({ base: 'team/name', git_url: 'https://example.test/notes.git' })).resolves.toEqual(gitProbe('team/name'))
     await expect(configureGit('team/name', request)).resolves.toEqual(expect.objectContaining({ operation: gitOperation() }))
     await expect(disableGit('team/name')).resolves.toEqual(expect.objectContaining({ base: expect.objectContaining({ name: 'team/name' }) }))
-    await expect(getGitStatus('team/name')).resolves.toEqual([gitStatus('team/name')])
-    await expect(getGitStatus()).resolves.toEqual([gitStatus()])
+    await expect(getGitStatus('team/name')).resolves.toEqual({ statuses: [gitStatus('team/name')] })
+    await expect(getGitStatus()).resolves.toEqual({ statuses: [gitStatus()] })
     await expect(syncGit('team/name')).resolves.toEqual(gitOperation())
 
     expectJSONRequest(fetchMock, 0, '/api/git/probe', 'POST', {
@@ -216,14 +216,17 @@ describe('frontend API client', () => {
 
   it.each([
     ['probe without all required mutation flags', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), required_mutations: {} }, 200],
+    ['probe with an extra required mutation flag', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), required_mutations: { ...gitProbe().required_mutations, extra: true } }, 200],
     ['probe with an invalid blocking error', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), blocking_error: { code: 1, message: 'failure' } }, 200],
     ['config response with an invalid base', () => configureGit('work', {}), { base: { name: 'work', path: '/notes/work', auto_sync: 'true' }, status: gitStatus() }, 202],
     ['config response with an invalid status state', () => disableGit('work'), { base: { name: 'work', path: '/notes/work', auto_sync: false }, status: { ...gitStatus(), state: 'done' } }, 200],
     ['config response with an invalid operation', () => configureGit('work', {}), { base: { name: 'work', path: '/notes/work', auto_sync: false }, status: gitStatus(), operation: { operation_id: 'id', status: 'queued' } }, 202],
     ['status response with an invalid changed path', () => getGitStatus('work'), { statuses: [{ ...gitStatus(), changed_paths: [1] }] }, 200],
-    ['sync response with an invalid operation status', () => syncGit('work'), { ...gitOperation(), status: 1 }, 202],
-    ['sync response with an unsupported operation status', () => syncGit('work'), { ...gitOperation(), status: 'waiting' }, 202],
-    ['probe response with an unsupported history relation', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), history_relation: 'equal' }, 200],
+    ['sync response with a non-string operation status', () => syncGit('work'), { ...gitOperation(), status: 1 }, 202],
+    ['probe response with a null blocking error', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), blocking_error: null }, 200],
+    ['status response with an empty base', () => getGitStatus('work'), { statuses: [{ ...gitStatus(), base: '' }] }, 200],
+    ['status response with a negative ahead value', () => getGitStatus('work'), { statuses: [{ ...gitStatus(), ahead: -1 }] }, 200],
+    ['status response with a null error', () => getGitStatus('work'), { statuses: [{ ...gitStatus(), error: null }] }, 200],
   ])('rejects a malformed successful Git %s', async (_case, call, payload, status) => {
     fetchMock.mockResolvedValue(jsonResponse(payload, status))
 
@@ -232,33 +235,6 @@ describe('frontend API client', () => {
       status,
       code: 'invalid_response',
       message: 'Приложение вернуло некорректный JSON',
-    })
-  })
-
-  it.each([
-    'git_url',
-    'git_branch',
-    'auto_sync_interval_minutes',
-    'git_commit_message_template',
-  ])('rejects a Git config response without required base.%s', async (field) => {
-    const payload = {
-      base: {
-        name: 'work',
-        path: '/notes/work',
-        git_url: 'https://example.test/notes.git',
-        git_branch: 'main',
-        auto_sync: true,
-        auto_sync_interval_minutes: 15,
-        git_commit_message_template: 'sync {{base}}',
-      },
-      status: gitStatus(),
-    }
-    delete payload.base[field]
-    fetchMock.mockResolvedValue(jsonResponse(payload, 202))
-
-    await expect(configureGit('work', {})).rejects.toMatchObject({
-      status: 202,
-      code: 'invalid_response',
     })
   })
 
@@ -278,6 +254,20 @@ describe('frontend API client', () => {
       status: 200,
       code: 'invalid_response',
     })
+  })
+
+  it('accepts optional base fields and server-defined operation and history strings', async () => {
+    const base = { name: 'work', path: '/notes/work', auto_sync: false }
+    const probe = { ...gitProbe(), history_relation: 'server-defined' }
+    const operation = gitOperation('server-defined')
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(probe))
+      .mockResolvedValueOnce(jsonResponse({ base, status: gitStatus(), operation }, 202))
+      .mockResolvedValueOnce(jsonResponse(operation, 202))
+
+    await expect(probeGit({ base: 'work', git_url: 'url' })).resolves.toEqual(probe)
+    await expect(configureGit('work', {})).resolves.toEqual({ base, status: gitStatus(), operation })
+    await expect(syncGit('work')).resolves.toEqual(operation)
   })
 
   it('gets and decodes config using a Headers instance', async () => {

@@ -3,84 +3,10 @@ export const GIT_INTERVALS = [5, 15, 30, 60]
 export const GIT_TEMPLATE_VARIABLES = ['base', 'branch', 'date', 'datetime', 'count']
 
 const confirmationKeys = ['create_repository', 'replace_origin', 'create_branch', 'merge_histories']
+const controlCharacter = /[\u0000-\u001f\u007f]/
 
-function string(value) {
+function trim(value) {
   return typeof value === 'string' ? value.trim() : ''
-}
-
-function validGitURL(value) {
-  if (!value || value.startsWith('-') || /[\u0000-\u001f\u007f]/.test(value)) {
-    return false
-  }
-  if (value.includes('://')) {
-    let parsed
-    try {
-      parsed = new URL(value)
-    } catch {
-      return false
-    }
-    if (parsed.search || parsed.hash) {
-      return false
-    }
-    if (['http:', 'https:'].includes(parsed.protocol)) {
-      return Boolean(parsed.hostname) && !parsed.username && !parsed.password
-    }
-    if (parsed.protocol === 'ssh:') {
-      return Boolean(parsed.hostname) && !parsed.password
-    }
-    if (parsed.protocol === 'git:') {
-      return Boolean(parsed.hostname) && !parsed.username && !parsed.password
-    }
-    return parsed.protocol === 'file:' && !parsed.username && Boolean(parsed.pathname)
-  }
-  if (/^(?:http|https|ssh|git|file):/i.test(value) || value.includes('::')) {
-    return false
-  }
-  if (!value.includes(':')) {
-    return true
-  }
-  const colon = value.indexOf(':')
-  const separator = value.search(/[\\/]/)
-  if (separator >= 0 && separator < colon) {
-    return true
-  }
-  const match = /^(?:[^:@/\\\[\]\s]+@)?([^:/\\\[\]\s]+):(\S+)$/.exec(value)
-  return match !== null
-}
-
-function validBranch(value) {
-  const components = value.split('/')
-  return Boolean(value)
-    && !/[\u0000-\u001f\u007f ~^:?*\[\\]/.test(value)
-    && value !== '@'
-    && !value.includes('..')
-    && !value.includes('@{')
-    && components.every((component) => component
-      && !component.startsWith('.')
-      && !component.endsWith('.')
-      && !component.endsWith('.lock'))
-}
-
-function validTemplate(value) {
-  if (!value || value.length > 200 || /[\u0000-\u001f\u007f]/.test(value)) {
-    return false
-  }
-  let remainder = value
-  while (remainder) {
-    const start = remainder.indexOf('{{')
-    if (start < 0) {
-      return !remainder.includes('}}')
-    }
-    if (remainder.slice(0, start).includes('}}')) {
-      return false
-    }
-    const end = remainder.indexOf('}}', start + 2)
-    if (end < 0 || !GIT_TEMPLATE_VARIABLES.includes(remainder.slice(start + 2, end))) {
-      return false
-    }
-    remainder = remainder.slice(end + 2)
-  }
-  return true
 }
 
 function localRFC3339(date) {
@@ -92,48 +18,112 @@ function localRFC3339(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${zone}`
 }
 
+function remoteError(value) {
+  if (controlCharacter.test(value)) {
+    return 'URL должен быть одной строкой'
+  }
+  if (!trim(value)) {
+    return 'Укажите URL репозитория'
+  }
+  const remote = trim(value)
+  if (remote.startsWith('-')) {
+    return 'URL не может начинаться с дефиса'
+  }
+  if (!/^https?:/i.test(remote)) {
+    return ''
+  }
+  let parsed
+  try {
+    parsed = new URL(remote)
+  } catch {
+    return 'Укажите корректный HTTP(S) URL'
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+    return 'Укажите корректный HTTP(S) URL'
+  }
+  if (parsed.username || parsed.password) {
+    return 'Не добавляйте логин или токен в URL'
+  }
+  if (parsed.search || parsed.hash) {
+    return 'URL не должен содержать query или fragment'
+  }
+  return ''
+}
+
+function branchError(value) {
+  if (controlCharacter.test(value)) {
+    return 'Имя ветки должно быть одной строкой'
+  }
+  if (!trim(value)) {
+    return 'Выберите ветку'
+  }
+  return trim(value).startsWith('-') ? 'Ветка не может начинаться с дефиса' : ''
+}
+
+function templateError(value) {
+  const template = trim(value)
+  if (controlCharacter.test(value)) {
+    return 'Шаблон должен быть одной строкой'
+  }
+  if (!template) {
+    return ''
+  }
+  if (Array.from(template).length > 200) {
+    return 'Шаблон должен содержать не более 200 символов'
+  }
+  let remainder = template
+  while (remainder) {
+    const start = remainder.indexOf('{{')
+    if (start < 0) {
+      return remainder.includes('}}') ? 'Проверьте парные фигурные скобки' : ''
+    }
+    if (remainder.slice(0, start).includes('}}')) {
+      return 'Проверьте парные фигурные скобки'
+    }
+    const end = remainder.indexOf('}}', start + 2)
+    if (end < 0) {
+      return 'Проверьте парные фигурные скобки'
+    }
+    const token = remainder.slice(start + 2, end)
+    if (!GIT_TEMPLATE_VARIABLES.includes(token)) {
+      return `Неизвестная переменная {{${token}}}`
+    }
+    remainder = remainder.slice(end + 2)
+  }
+  return ''
+}
+
 function normalizedDraft(draft) {
   return {
-    git_url: string(draft?.git_url),
-    git_branch: string(draft?.git_branch),
-    auto_sync: draft?.auto_sync === true,
-    auto_sync_interval_minutes: draft?.auto_sync_interval_minutes,
-    git_commit_message_template: string(draft?.git_commit_message_template),
+    gitURL: trim(draft?.gitURL),
+    branch: trim(draft?.branch),
+    autoSync: draft?.autoSync === true,
+    interval: draft?.interval,
+    template: trim(draft?.template) || DEFAULT_GIT_COMMIT_TEMPLATE,
   }
 }
 
 export function gitConfigured(base) {
-  return Boolean(string(base?.git_url) && string(base?.git_branch))
+  return Boolean(trim(base?.git_url) && trim(base?.git_branch))
 }
 
 export function validateGitDraft(draft) {
-  const value = normalizedDraft(draft)
   const errors = {}
-  if (!value.git_url) {
-    errors.git_url = 'Укажите URL Git-репозитория'
-  } else if (!validGitURL(value.git_url)) {
-    errors.git_url = 'Укажите корректный URL Git-репозитория'
+  const remote = remoteError(draft?.gitURL)
+  const branch = branchError(draft?.branch)
+  const template = templateError(draft?.template)
+  if (remote) errors.gitURL = remote
+  if (branch) errors.branch = branch
+  if (draft?.autoSync === true && !GIT_INTERVALS.includes(draft?.interval)) {
+    errors.interval = 'Выберите интервал 5, 15, 30 или 60 минут'
   }
-  if (!value.git_branch) {
-    errors.git_branch = 'Укажите ветку Git'
-  } else if (!validBranch(value.git_branch)) {
-    errors.git_branch = 'Укажите корректное имя ветки Git'
-  }
-  if ((value.auto_sync || value.auto_sync_interval_minutes !== 0) && !GIT_INTERVALS.includes(value.auto_sync_interval_minutes)) {
-    errors.auto_sync_interval_minutes = 'Выберите интервал автосинхронизации'
-  }
-  if (!value.git_commit_message_template) {
-    errors.git_commit_message_template = 'Введите шаблон сообщения коммита'
-  } else if (!validTemplate(value.git_commit_message_template)) {
-    errors.git_commit_message_template = 'Шаблон содержит неподдерживаемую переменную'
-  }
+  if (template) errors.template = template
   return errors
 }
 
-export function renderGitCommitPreview(template, { base = '', branch = '', date = new Date(), count = 0 } = {}) {
-  const value = string(template) || DEFAULT_GIT_COMMIT_TEMPLATE
-  const datetime = localRFC3339(date)
-  return value
+export function renderGitCommitPreview(template, { base = '', branch = '', count = 3, at = new Date() } = {}) {
+  const datetime = localRFC3339(at)
+  return (trim(template) || DEFAULT_GIT_COMMIT_TEMPLATE)
     .replaceAll('{{base}}', base)
     .replaceAll('{{branch}}', branch)
     .replaceAll('{{date}}', datetime.slice(0, 10))
@@ -142,15 +132,18 @@ export function renderGitCommitPreview(template, { base = '', branch = '', date 
 }
 
 export function requiredConfirmationKeys(probe) {
-  const mutations = probe?.required_mutations
-  return confirmationKeys.filter((key) => mutations?.[key] === true)
+  return confirmationKeys.filter((key) => probe?.required_mutations?.[key] === true)
 }
 
 export function buildGitConfigRequest(draft, probe, checks = {}) {
   const value = normalizedDraft(draft)
   const required = new Set(requiredConfirmationKeys(probe))
   return {
-    ...value,
+    git_url: value.gitURL,
+    git_branch: value.branch,
+    auto_sync: value.autoSync,
+    auto_sync_interval_minutes: GIT_INTERVALS.includes(value.interval) ? value.interval : 15,
+    git_commit_message_template: value.template,
     confirmations: Object.fromEntries(confirmationKeys.map((key) => [key, required.has(key) && checks[key] === true])),
   }
 }

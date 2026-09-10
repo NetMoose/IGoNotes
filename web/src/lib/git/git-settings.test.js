@@ -15,11 +15,11 @@ import {
 } from './git-settings.js'
 
 const validDraft = {
-  git_url: ' https://example.test/notes.git ',
-  git_branch: ' main ',
-  auto_sync: true,
-  auto_sync_interval_minutes: 15,
-  git_commit_message_template: ' Sync {{base}} ',
+  gitURL: ' https://example.test/notes.git ',
+  branch: ' main ',
+  autoSync: true,
+  interval: 15,
+  template: ' Sync {{base}} ',
 }
 
 function probe(required_mutations = {}) {
@@ -53,30 +53,33 @@ describe('Git settings helpers', () => {
   })
 
   it.each([
-    ['an empty URL', { ...validDraft, git_url: ' ' }, { git_url: 'Укажите URL Git-репозитория' }],
-    ['a malformed URL', { ...validDraft, git_url: 'https://' }, { git_url: 'Укажите корректный URL Git-репозитория' }],
-    ['a URL with credentials', { ...validDraft, git_url: 'https://user:secret@example.test/repo.git' }, { git_url: 'Укажите корректный URL Git-репозитория' }],
-    ['a URL with a query', { ...validDraft, git_url: 'https://example.test/repo.git?token=secret' }, { git_url: 'Укажите корректный URL Git-репозитория' }],
-    ['an empty branch', { ...validDraft, git_branch: ' ' }, { git_branch: 'Укажите ветку Git' }],
-    ['an invalid branch', { ...validDraft, git_branch: 'feature..broken' }, { git_branch: 'Укажите корректное имя ветки Git' }],
-    ['the special branch name', { ...validDraft, git_branch: '@' }, { git_branch: 'Укажите корректное имя ветки Git' }],
-    ['a branch with an empty path component', { ...validDraft, git_branch: 'feature//topic' }, { git_branch: 'Укажите корректное имя ветки Git' }],
-    ['a branch ending in .lock', { ...validDraft, git_branch: 'topic.lock' }, { git_branch: 'Укажите корректное имя ветки Git' }],
-    ['an unsupported interval', { ...validDraft, auto_sync_interval_minutes: 10 }, { auto_sync_interval_minutes: 'Выберите интервал автосинхронизации' }],
-    ['a missing enabled interval', { ...validDraft, auto_sync_interval_minutes: 0 }, { auto_sync_interval_minutes: 'Выберите интервал автосинхронизации' }],
-    ['a blank template', { ...validDraft, git_commit_message_template: '   ' }, { git_commit_message_template: 'Введите шаблон сообщения коммита' }],
-    ['an unsupported template variable', { ...validDraft, git_commit_message_template: '{{repository}}' }, { git_commit_message_template: 'Шаблон содержит неподдерживаемую переменную' }],
-    ['unbalanced template braces', { ...validDraft, git_commit_message_template: '{{base}' }, { git_commit_message_template: 'Шаблон содержит неподдерживаемую переменную' }],
+    ['an empty remote', { ...validDraft, gitURL: ' ' }, { gitURL: 'Укажите URL репозитория' }],
+    ['a multiline remote', { ...validDraft, gitURL: 'https://example.test/repo\n' }, { gitURL: 'URL должен быть одной строкой' }],
+    ['a newline-only remote', { ...validDraft, gitURL: '\n' }, { gitURL: 'URL должен быть одной строкой' }],
+    ['a leading remote hyphen', { ...validDraft, gitURL: '-https://example.test/repo' }, { gitURL: 'URL не может начинаться с дефиса' }],
+    ['a malformed HTTP URL', { ...validDraft, gitURL: 'https://' }, { gitURL: 'Укажите корректный HTTP(S) URL' }],
+    ['HTTP credentials', { ...validDraft, gitURL: 'https://user:token@example.test/repo' }, { gitURL: 'Не добавляйте логин или токен в URL' }],
+    ['an HTTP query', { ...validDraft, gitURL: 'https://example.test/repo?token=secret' }, { gitURL: 'URL не должен содержать query или fragment' }],
+    ['an HTTP fragment', { ...validDraft, gitURL: 'https://example.test/repo#fragment' }, { gitURL: 'URL не должен содержать query или fragment' }],
+    ['an empty branch', { ...validDraft, branch: ' ' }, { branch: 'Выберите ветку' }],
+    ['a multiline branch', { ...validDraft, branch: 'main\n' }, { branch: 'Имя ветки должно быть одной строкой' }],
+    ['a newline-only branch', { ...validDraft, branch: '\n' }, { branch: 'Имя ветки должно быть одной строкой' }],
+    ['a leading branch hyphen', { ...validDraft, branch: '-main' }, { branch: 'Ветка не может начинаться с дефиса' }],
+    ['an invalid enabled interval', { ...validDraft, interval: 10 }, { interval: 'Выберите интервал 5, 15, 30 или 60 минут' }],
+    ['a multiline template', { ...validDraft, template: 'sync\n{{base}}' }, { template: 'Шаблон должен быть одной строкой' }],
+    ['a newline-only template', { ...validDraft, template: '\n' }, { template: 'Шаблон должен быть одной строкой' }],
+    ['an oversized template', { ...validDraft, template: '👍'.repeat(201) }, { template: 'Шаблон должен содержать не более 200 символов' }],
+    ['an unknown template token', { ...validDraft, template: '{{X}}' }, { template: 'Неизвестная переменная {{X}}' }],
+    ['unmatched template braces', { ...validDraft, template: '{{base}' }, { template: 'Проверьте парные фигурные скобки' }],
   ])('validates %s', (_case, draft, expected) => {
     expect(validateGitDraft(draft)).toEqual(expected)
   })
 
-  it('allows supported Git URLs, branch names, intervals, and templates', () => {
-    for (const git_url of ['https://example.test/repo.git', 'ssh://git@example.test/repo.git', 'git@example.test:repo.git', 'file:///notes/repo']) {
-      expect(validateGitDraft({ ...validDraft, git_url })).toEqual({})
+  it('allows empty templates and ref-like branches outside the frozen checks', () => {
+    for (const branch of ['@', 'feature//topic', 'topic.lock']) {
+      expect(validateGitDraft({ ...validDraft, branch, template: '' })).toEqual({})
     }
-    expect(validateGitDraft({ ...validDraft, git_branch: 'feature/topic-1', git_commit_message_template: '{{base}} {{branch}} {{date}} {{datetime}} {{count}}' })).toEqual({})
-    expect(validateGitDraft({ ...validDraft, auto_sync: false, auto_sync_interval_minutes: 0 })).toEqual({})
+    expect(validateGitDraft({ ...validDraft, autoSync: false, interval: 0 })).toEqual({})
   })
 
   it('renders every commit template variable with local RFC3339 time', () => {
@@ -87,10 +90,9 @@ describe('Git settings helpers', () => {
     expect(renderGitCommitPreview('{{base}}/{{branch}} {{date}} {{datetime}} {{count}}', {
       base: 'work',
       branch: 'main',
-      date: now,
-      count: 3,
+      at: now,
     })).toBe(`work/main ${localDateTime.slice(0, 10)} ${localDateTime} 3`)
-    expect(renderGitCommitPreview('', { base: 'work', branch: 'main', date: now, count: 3 })).toBe(
+    expect(renderGitCommitPreview('', { base: 'work', branch: 'main', at: now })).toBe(
       `IGoNotes: sync work at ${localDateTime} (3 files)`,
     )
   })
@@ -105,7 +107,7 @@ describe('Git settings helpers', () => {
   })
 
   it('builds a trimmed request with every confirmation field', () => {
-    expect(buildGitConfigRequest(validDraft, probe({ create_repository: true, replace_origin: true }), {
+    expect(buildGitConfigRequest({ ...validDraft, template: '' }, probe({ create_repository: true, replace_origin: true }), {
       create_repository: true,
       replace_origin: false,
       create_branch: true,
@@ -114,13 +116,19 @@ describe('Git settings helpers', () => {
       git_branch: 'main',
       auto_sync: true,
       auto_sync_interval_minutes: 15,
-      git_commit_message_template: 'Sync {{base}}',
+      git_commit_message_template: DEFAULT_GIT_COMMIT_TEMPLATE,
       confirmations: {
         create_repository: true,
         replace_origin: false,
         create_branch: false,
         merge_histories: false,
       },
+    })
+  })
+
+  it.each([undefined, 10])('falls back to a 15-minute interval for %j', (interval) => {
+    expect(buildGitConfigRequest({ ...validDraft, interval }, probe(), {})).toMatchObject({
+      auto_sync_interval_minutes: 15,
     })
   })
 
