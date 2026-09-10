@@ -82,7 +82,7 @@ function gitProbe(base = 'work') {
     remote_branches: ['main'],
     empty_remote: false,
     identity_configured: true,
-    history_relation: 'equal',
+    history_relation: 'shared',
     can_configure: true,
     required_mutations: {
       create_repository: false,
@@ -222,6 +222,8 @@ describe('frontend API client', () => {
     ['config response with an invalid operation', () => configureGit('work', {}), { base: { name: 'work', path: '/notes/work', auto_sync: false }, status: gitStatus(), operation: { operation_id: 'id', status: 'queued' } }, 202],
     ['status response with an invalid changed path', () => getGitStatus('work'), { statuses: [{ ...gitStatus(), changed_paths: [1] }] }, 200],
     ['sync response with an invalid operation status', () => syncGit('work'), { ...gitOperation(), status: 1 }, 202],
+    ['sync response with an unsupported operation status', () => syncGit('work'), { ...gitOperation(), status: 'waiting' }, 202],
+    ['probe response with an unsupported history relation', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), history_relation: 'equal' }, 200],
   ])('rejects a malformed successful Git %s', async (_case, call, payload, status) => {
     fetchMock.mockResolvedValue(jsonResponse(payload, status))
 
@@ -230,6 +232,51 @@ describe('frontend API client', () => {
       status,
       code: 'invalid_response',
       message: 'Приложение вернуло некорректный JSON',
+    })
+  })
+
+  it.each([
+    'git_url',
+    'git_branch',
+    'auto_sync_interval_minutes',
+    'git_commit_message_template',
+  ])('rejects a Git config response without required base.%s', async (field) => {
+    const payload = {
+      base: {
+        name: 'work',
+        path: '/notes/work',
+        git_url: 'https://example.test/notes.git',
+        git_branch: 'main',
+        auto_sync: true,
+        auto_sync_interval_minutes: 15,
+        git_commit_message_template: 'sync {{base}}',
+      },
+      status: gitStatus(),
+    }
+    delete payload.base[field]
+    fetchMock.mockResolvedValue(jsonResponse(payload, 202))
+
+    await expect(configureGit('work', {})).rejects.toMatchObject({
+      status: 202,
+      code: 'invalid_response',
+    })
+  })
+
+  it.each([
+    'base',
+    'state',
+    'ahead',
+    'behind',
+    'consecutive_failures',
+    'changed_paths',
+  ])('rejects a Git status response without required status.%s', async (field) => {
+    const status = gitStatus()
+    delete status[field]
+    fetchMock.mockResolvedValue(jsonResponse({ statuses: [status] }))
+
+    await expect(getGitStatus('work')).rejects.toMatchObject({
+      status: 200,
+      code: 'invalid_response',
     })
   })
 

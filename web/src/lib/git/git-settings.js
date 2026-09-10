@@ -49,14 +49,16 @@ function validGitURL(value) {
 }
 
 function validBranch(value) {
+  const components = value.split('/')
   return Boolean(value)
     && !/[\u0000-\u001f\u007f ~^:?*\[\\]/.test(value)
-    && !value.startsWith('.')
-    && !value.startsWith('/')
-    && !value.endsWith('.')
-    && !value.endsWith('/')
+    && value !== '@'
     && !value.includes('..')
     && !value.includes('@{')
+    && components.every((component) => component
+      && !component.startsWith('.')
+      && !component.endsWith('.')
+      && !component.endsWith('.lock'))
 }
 
 function validTemplate(value) {

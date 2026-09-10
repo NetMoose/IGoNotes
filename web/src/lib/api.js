@@ -114,10 +114,10 @@ function validGitBase(value) {
     && typeof value.name === 'string'
     && typeof value.path === 'string'
     && typeof value.auto_sync === 'boolean'
-    && hasString(value, 'git_url', { optional: true })
-    && hasString(value, 'git_branch', { optional: true })
-    && hasString(value, 'git_commit_message_template', { optional: true })
-    && (value.auto_sync_interval_minutes === undefined || hasInteger(value, 'auto_sync_interval_minutes'))
+    && hasString(value, 'git_url')
+    && hasString(value, 'git_branch')
+    && hasString(value, 'git_commit_message_template')
+    && hasInteger(value, 'auto_sync_interval_minutes')
 }
 
 const gitStates = new Set([
@@ -130,6 +130,9 @@ const gitStates = new Set([
   'conflict',
   'needs_reconnect',
 ])
+
+const gitOperationStates = new Set(['queued', 'running', 'succeeded', 'failed', 'conflict'])
+const gitHistoryRelations = new Set(['none', 'shared', 'unrelated', 'unknown'])
 
 function validGitStatus(value) {
   return isObject(value)
@@ -152,7 +155,7 @@ function validGitStatus(value) {
 function validGitOperation(value) {
   return isObject(value)
     && typeof value.operation_id === 'string'
-    && typeof value.status === 'string'
+    && gitOperationStates.has(value.status)
     && typeof value.deduplicated === 'boolean'
 }
 
@@ -169,7 +172,7 @@ function validGitProbe(value) {
     && value.remote_branches.every((branch) => typeof branch === 'string')
     && typeof value.empty_remote === 'boolean'
     && typeof value.identity_configured === 'boolean'
-    && typeof value.history_relation === 'string'
+    && gitHistoryRelations.has(value.history_relation)
     && typeof value.can_configure === 'boolean'
     && isObject(mutations)
     && ['create_repository', 'add_origin', 'replace_origin', 'create_branch', 'merge_histories']
