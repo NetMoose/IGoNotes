@@ -147,7 +147,7 @@
     if (!active) return
     setBusy('')
     if (!discoveryIsValid(result)) {
-      await showProbeError(result?.blocking_error, 'Репозиторий нельзя настроить')
+      await showProbeError(result?.blocking_error, 'Сервер вернул некорректный ответ при поиске веток')
       return
     }
     reconcileBranch(result)
@@ -186,7 +186,10 @@
     if (!active) return
     setBusy('')
     if (!selectedProbeIsValid(result)) {
-      await showProbeError(result?.blocking_error, 'Репозиторий нельзя настроить')
+      const fallback = result?.base !== base?.name
+        ? 'Сервер вернул некорректный ответ проверки ветки'
+        : 'Репозиторий нельзя настроить'
+      await showProbeError(result?.blocking_error, fallback)
       return
     }
     configurationProbe = result
@@ -309,7 +312,7 @@
       {#if error}<div bind:this={alertElement} role="alert" tabindex="-1" class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>{/if}
       <div class="flex justify-end gap-3">
         <button type="button" onclick={onCancel} disabled={busy} aria-busy={busy}>Отмена</button>
-        <button type="submit" disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">Проверить репозиторий</button>
+        <button type="submit" disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">Проверить настройки</button>
       </div>
     </form>
   {:else if step === 2}
@@ -398,7 +401,7 @@
     {#if error}<div bind:this={alertElement} role="alert" tabindex="-1" class="mt-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>{/if}
     <div class="mt-6 flex justify-between gap-3">
       <button type="button" onclick={backToSchedule} disabled={busy} aria-busy={busy}>Назад</button>
-      <button type="button" onclick={configure} disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">Настроить Git</button>
+      <button type="button" onclick={configure} disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">Сохранить Git-настройки</button>
     </div>
   {/if}
 </section>

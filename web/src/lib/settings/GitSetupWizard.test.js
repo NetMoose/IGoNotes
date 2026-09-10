@@ -64,7 +64,7 @@ function renderWizard(overrides = {}) {
 
 async function completeDiscovery(user, result = discovery()) {
   vi.mocked(probeGit).mockResolvedValueOnce(result)
-  await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
+  await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
   await screen.findByRole('heading', { name: 'Шаг 2 из 4: ветка' })
 }
 
@@ -126,14 +126,14 @@ describe('GitSetupWizard', () => {
     ['configurable discovery', discovery({ can_configure: true })],
     ['empty remote with refs', discovery({ empty_remote: true, remote_branches: ['main'] })],
     ['nonempty remote without refs', discovery({ empty_remote: false, remote_branches: [] })],
-  ])('keeps discovery on step one for %s', async (_case, result) => {
+  ])('reports the frozen branch-discovery diagnostic for %s', async (_case, result) => {
     const user = userEvent.setup()
     vi.mocked(probeGit).mockResolvedValueOnce(result)
     renderWizard()
 
-    await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
 
-    expect(await screen.findByRole('alert')).toBeVisible()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Сервер вернул некорректный ответ при поиске веток')
     expect(screen.getByRole('heading', { name: 'Шаг 1 из 4: репозиторий' })).toBeVisible()
     await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
   })
@@ -143,7 +143,7 @@ describe('GitSetupWizard', () => {
     vi.mocked(probeGit).mockResolvedValueOnce(discovery({ blocking_error: { message: 'Git недоступен' } }))
     renderWizard()
 
-    await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Git недоступен')
     await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
@@ -236,7 +236,7 @@ describe('GitSetupWizard', () => {
     if (apiError.field === 'git_url') await completeDiscovery(user)
     vi.mocked(probeGit).mockRejectedValueOnce(apiError)
 
-    await user.click(screen.getByRole('button', { name: apiError.field === 'git_url' ? 'Продолжить' : 'Проверить репозиторий' }))
+    await user.click(screen.getByRole('button', { name: apiError.field === 'git_url' ? 'Продолжить' : 'Проверить настройки' }))
 
     expect(await screen.findByRole('heading', { name: heading })).toBeVisible()
     await waitFor(() => expect(screen.getByLabelText(label)).toHaveFocus())
@@ -247,7 +247,7 @@ describe('GitSetupWizard', () => {
     vi.mocked(probeGit).mockRejectedValueOnce(new ApiError({ message: 'Сеть недоступна' }))
     renderWizard()
 
-    await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
 
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('Сеть недоступна')
@@ -255,10 +255,10 @@ describe('GitSetupWizard', () => {
   })
 
   it.each([
-    ['wrong base', selected({ base: 'other' })],
-    ['not configurable', selected({ can_configure: false })],
-    ['blocking error', selected({ blocking_error: { message: 'Ветка недоступна' } })],
-  ])('keeps selected branch on step two for %s', async (_case, result) => {
+    ['wrong base', selected({ base: 'other' }), 'Сервер вернул некорректный ответ проверки ветки'],
+    ['not configurable', selected({ can_configure: false }), 'Репозиторий нельзя настроить'],
+    ['blocking error', selected({ blocking_error: { message: 'Ветка недоступна' } }), 'Ветка недоступна'],
+  ])('reports the frozen selected-branch diagnostic for %s', async (_case, result, expected) => {
     const user = userEvent.setup()
     renderWizard()
     await completeDiscovery(user)
@@ -266,7 +266,7 @@ describe('GitSetupWizard', () => {
 
     await user.click(screen.getByRole('button', { name: 'Продолжить' }))
 
-    expect(await screen.findByRole('alert')).toBeVisible()
+    expect(await screen.findByRole('alert')).toHaveTextContent(expected)
     await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
   })
 
@@ -320,7 +320,7 @@ describe('GitSetupWizard', () => {
     expect(screen.getByText('Локальные коммиты будут синхронизированы')).toBeVisible()
     expect(screen.getByText('Проверьте права доступа')).toBeVisible()
 
-    await user.click(screen.getByRole('button', { name: 'Настроить Git' }))
+    await user.click(screen.getByRole('button', { name: 'Сохранить Git-настройки' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Подтвердите обязательные последствия')
     await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
   })
@@ -333,7 +333,7 @@ describe('GitSetupWizard', () => {
     renderWizard({ onConfigured })
     await reachReview(user)
 
-    await user.click(screen.getByRole('button', { name: 'Настроить Git' }))
+    await user.click(screen.getByRole('button', { name: 'Сохранить Git-настройки' }))
 
     expect(configureGit).toHaveBeenCalledOnce()
     expect(configureGit).toHaveBeenCalledWith('work', {
@@ -363,7 +363,7 @@ describe('GitSetupWizard', () => {
     renderWizard()
     await reachReview(user)
 
-    await user.click(screen.getByRole('button', { name: 'Настроить Git' }))
+    await user.click(screen.getByRole('button', { name: 'Сохранить Git-настройки' }))
 
     expect(await screen.findByRole('heading', { name: heading })).toBeVisible()
     expect(screen.getByLabelText(label)).toBeVisible()
@@ -379,7 +379,7 @@ describe('GitSetupWizard', () => {
     vi.mocked(configureGit).mockReturnValue(request.promise)
     const { unmount } = renderWizard({ onConfigured, onBusyChange })
     await reachReview(user)
-    const submit = screen.getByRole('button', { name: 'Настроить Git' })
+    const submit = screen.getByRole('button', { name: 'Сохранить Git-настройки' })
 
     await fireEvent.click(submit)
     await fireEvent.click(submit)
