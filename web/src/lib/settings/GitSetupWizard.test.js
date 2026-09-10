@@ -64,7 +64,7 @@ function renderWizard(overrides = {}) {
 
 async function completeDiscovery(user, result = discovery()) {
   vi.mocked(probeGit).mockResolvedValueOnce(result)
-  await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
+  await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
   await screen.findByRole('heading', { name: 'Шаг 2 из 4: ветка' })
 }
 
@@ -77,7 +77,7 @@ async function completeBranch(user, result = selected()) {
 async function reachReview(user) {
   await completeDiscovery(user)
   await completeBranch(user)
-  await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+  await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
   await screen.findByRole('heading', { name: 'Шаг 4 из 4: подтверждение' })
 }
 
@@ -85,6 +85,19 @@ describe('GitSetupWizard', () => {
   beforeEach(() => {
     vi.mocked(configureGit).mockReset()
     vi.mocked(probeGit).mockReset()
+  })
+
+  it('uses the exact submit text for repository and settings steps', async () => {
+    const user = userEvent.setup()
+    renderWizard()
+    expect(screen.getByRole('button', { name: 'Проверить репозиторий' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Проверить настройки' })).not.toBeInTheDocument()
+
+    await completeDiscovery(user)
+    await completeBranch(user)
+
+    expect(screen.getByRole('button', { name: 'Проверить настройки' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Проверить репозиторий' })).not.toBeInTheDocument()
   })
 
   it('uses exact two-pass probes and reconciles an absent saved branch before selection', async () => {
@@ -131,7 +144,7 @@ describe('GitSetupWizard', () => {
     vi.mocked(probeGit).mockResolvedValueOnce(result)
     renderWizard()
 
-    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Сервер вернул некорректный ответ при поиске веток')
     expect(screen.getByRole('heading', { name: 'Шаг 1 из 4: репозиторий' })).toBeVisible()
@@ -143,7 +156,7 @@ describe('GitSetupWizard', () => {
     vi.mocked(probeGit).mockResolvedValueOnce(discovery({ blocking_error: { message: 'Git недоступен' } }))
     renderWizard()
 
-    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Git недоступен')
     await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
@@ -199,12 +212,12 @@ describe('GitSetupWizard', () => {
     renderWizard()
     await completeDiscovery(user)
     await completeBranch(user, selected({ required_mutations: mutations }))
-    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
     await user.click(screen.getByLabelText('Создать Git-репозиторий'))
     await user.click(screen.getByRole('button', { name: 'Назад' }))
     await user.click(screen.getByRole('button', { name: 'Назад' }))
     await completeBranch(user, selected({ required_mutations: mutations }))
-    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
 
     expect(screen.getByLabelText('Создать Git-репозиторий')).not.toBeChecked()
   })
@@ -215,43 +228,33 @@ describe('GitSetupWizard', () => {
     renderWizard()
     await completeDiscovery(user)
     await completeBranch(user, selected({ required_mutations: mutations }))
-    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
     await user.click(screen.getByLabelText('Создать Git-репозиторий'))
     await user.click(screen.getByRole('button', { name: 'Назад' }))
     await user.click(screen.getByRole('button', { name: 'Назад' }))
     await user.click(screen.getByRole('button', { name: 'Назад' }))
     await completeDiscovery(user)
     await completeBranch(user, selected({ required_mutations: mutations }))
-    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
 
     expect(screen.getByLabelText('Создать Git-репозиторий')).not.toBeChecked()
   })
 
   it.each([
-    ['a branch field error from discovery', new ApiError({ field: 'git_branch', message: 'Выберите ветку' }), 'Шаг 2 из 4: ветка', 'Ветка'],
-    ['a URL field error from branch selection', new ApiError({ field: 'git_url', message: 'Проверьте URL' }), 'Шаг 1 из 4: репозиторий', 'URL репозитория'],
-  ])('moves probe %s to its field', async (_case, apiError, heading, label) => {
+    ['a URL field error', new ApiError({ field: 'git_url', message: 'Проверьте URL' }), 'URL репозитория'],
+    ['a branch field error', new ApiError({ field: 'git_branch', message: 'Выберите ветку' }), 'alert'],
+    ['an unknown field error', new ApiError({ field: 'auto_sync', message: 'Неверное поле' }), 'alert'],
+    ['a fieldless error', new ApiError({ message: 'Сеть недоступна' }), 'alert'],
+  ])('keeps discovery %s on step one', async (_case, apiError, focusTarget) => {
     const user = userEvent.setup()
     renderWizard()
-    if (apiError.field === 'git_url') await completeDiscovery(user)
     vi.mocked(probeGit).mockRejectedValueOnce(apiError)
 
-    await user.click(screen.getByRole('button', { name: apiError.field === 'git_url' ? 'Продолжить' : 'Проверить настройки' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
 
-    expect(await screen.findByRole('heading', { name: heading })).toBeVisible()
-    await waitFor(() => expect(screen.getByLabelText(label)).toHaveFocus())
-  })
-
-  it('focuses an alert for a fieldless probe error', async () => {
-    const user = userEvent.setup()
-    vi.mocked(probeGit).mockRejectedValueOnce(new ApiError({ message: 'Сеть недоступна' }))
-    renderWizard()
-
-    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
-
-    const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent('Сеть недоступна')
-    await waitFor(() => expect(alert).toHaveFocus())
+    expect(await screen.findByRole('heading', { name: 'Шаг 1 из 4: репозиторий' })).toBeVisible()
+    const focusElement = focusTarget === 'alert' ? screen.getByRole('alert') : screen.getByLabelText(focusTarget)
+    await waitFor(() => expect(focusElement).toHaveFocus())
   })
 
   it.each([
@@ -290,7 +293,7 @@ describe('GitSetupWizard', () => {
     await completeBranch(user)
     await user.click(screen.getByRole('radio', { name: 'Автоматически' }))
     await user.selectOptions(screen.getByLabelText('Интервал'), '')
-    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
 
     expect(await screen.findByRole('alert')).toBeVisible()
     await waitFor(() => expect(screen.getByLabelText('Интервал')).toHaveFocus())
@@ -310,7 +313,7 @@ describe('GitSetupWizard', () => {
       },
       warnings: ['Локальные коммиты будут синхронизированы', 'Проверьте права доступа'],
     }))
-    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByRole('button', { name: 'Проверить настройки' }))
 
     expect(screen.getByRole('region', { name: 'Проверка Git-настроек' })).toHaveTextContent('Создать Git-репозиторий')
     expect(screen.getByText('Добавить origin')).toBeVisible()

@@ -140,14 +140,14 @@
     } catch (requestError) {
       if (!active) return
       setBusy('')
-      await showProbeError(requestError, 'Не удалось проверить репозиторий')
+      await showDiscoveryError(requestError, 'Не удалось проверить репозиторий')
       return
     }
 
     if (!active) return
     setBusy('')
     if (!discoveryIsValid(result)) {
-      await showProbeError(result?.blocking_error, 'Сервер вернул некорректный ответ при поиске веток')
+      await showDiscoveryError(result?.blocking_error, 'Сервер вернул некорректный ответ при поиске веток')
       return
     }
     reconcileBranch(result)
@@ -288,6 +288,13 @@
       await focus(() => alertElement)
     }
   }
+
+  async function showDiscoveryError(requestError, fallback) {
+    error = message(requestError, fallback)
+    step = 1
+    if (requestError?.field === 'git_url') await focus(() => urlInput)
+    else await focus(() => alertElement)
+  }
 </script>
 
 <section class="mx-auto w-full max-w-2xl" aria-label="Настройка Git">
@@ -312,7 +319,7 @@
       {#if error}<div bind:this={alertElement} role="alert" tabindex="-1" class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>{/if}
       <div class="flex justify-end gap-3">
         <button type="button" onclick={onCancel} disabled={busy} aria-busy={busy}>Отмена</button>
-        <button type="submit" disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">Проверить настройки</button>
+        <button type="submit" disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">Проверить репозиторий</button>
       </div>
     </form>
   {:else if step === 2}
@@ -369,7 +376,7 @@
       {#if error}<div bind:this={alertElement} role="alert" tabindex="-1" class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>{/if}
       <div class="flex justify-between gap-3">
         <button type="button" onclick={() => { step = 2; focus(() => stepTwoHeading) }} disabled={busy} aria-busy={busy}>Назад</button>
-        <button type="submit" disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">К подтверждению</button>
+        <button type="submit" disabled={busy} aria-busy={busy} class="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">Проверить настройки</button>
       </div>
     </form>
   {:else}
