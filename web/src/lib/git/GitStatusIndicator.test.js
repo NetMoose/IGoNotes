@@ -34,6 +34,16 @@ describe('GitStatusIndicator', () => {
     }
   })
 
+  it('shows a configured ready base with no ahead commits as synchronized and syncable', async () => {
+    const user = userEvent.setup()
+    renderIndicator({ status: { state: 'ready', ahead: 0 } })
+
+    const details = screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' })
+    await user.click(details)
+
+    expect(screen.getByRole('button', { name: 'Синхронизировать Git' })).toBeEnabled()
+  })
+
   it('opens prop-provided details and syncs the exact base name', async () => {
     const user = userEvent.setup()
     const onSync = vi.fn()
