@@ -1,9 +1,10 @@
 <script>
   import { onMount } from 'svelte'
 
-  import { deleteNote, getConfig, getNote, renameNote, saveNote, switchBase } from './lib/api.js'
+  import { deleteNote, getConfig, getGitStatus, getNote, renameNote, saveNote, switchBase, syncGit } from './lib/api.js'
   import { openSettingsSafely, switchBaseSafely } from './lib/app-transitions.js'
   import { activeBase } from './lib/base-draft.js'
+  import { createGitStatusPoller } from './lib/git/git-status-poller.js'
   import NotesWorkspace from './lib/NotesWorkspace.svelte'
   import SettingsWorkspace from './lib/settings/SettingsWorkspace.svelte'
   import SetupWizard from './lib/setup/SetupWizard.svelte'
@@ -19,6 +20,10 @@
   let dirty = $state(false)
   let transitioning = $state(false)
   let notesWorkspace = $state()
+  let gitStatuses = $state([])
+  let gitPollError = $state('')
+  let gitBusyBase = $state('')
+  let gitActionErrors = $state({})
 
   let saveTimer = null
   let statusTimer = null
@@ -30,6 +35,12 @@
   let mounted = false
   let loadToken = 0
   let noteRequestToken = 0
+  let gitPoller = null
+  let gitPolling = false
+  const workspaceFlushFailures = new WeakSet()
+
+  let currentBase = $derived(activeBase(config))
+  let activeGitStatus = $derived(gitStatuses.find((status) => status.base === config?.current_base) ?? null)
 
   function errorMessage(error, fallback) {
     return typeof error?.message === 'string' && error.message ? error.message : fallback
@@ -77,6 +88,22 @@
 
     config = savedConfig
     basePath = typeof current?.path === 'string' ? current.path : ''
+    ensureGitPolling()
+  }
+
+  function applyGitStatuses(statuses) {
+    gitStatuses = Array.isArray(statuses) ? statuses : []
+  }
+
+  function ensureGitPolling() {
+    if (!mounted || !config?.setup_completed || gitPolling || !gitPoller) return
+    gitPolling = true
+    gitPoller.start()
+  }
+
+  async function refreshGitStatuses() {
+    ensureGitPolling()
+    return gitPoller?.refresh?.()
   }
 
   function resetEditorState() {
@@ -240,10 +267,41 @@
   }
 
   async function flushWorkspace() {
-    await flushEditorUploads()
-    await flushPendingSave()
-    await flushEditorUploads()
-    await flushPendingSave()
+    try {
+      await flushEditorUploads()
+      await flushPendingSave()
+      await flushEditorUploads()
+      await flushPendingSave()
+    } catch (error) {
+      if (error && typeof error === 'object') workspaceFlushFailures.add(error)
+      throw error
+    }
+  }
+
+  async function runGitSync(baseName) {
+    if (!mounted || gitBusyBase !== '') return
+
+    gitBusyBase = baseName
+    gitActionErrors = { ...gitActionErrors, [baseName]: '' }
+
+    try {
+      await flushWorkspace()
+      await syncGit(baseName)
+      await refreshGitStatuses()
+    } catch (error) {
+      const flushError = Boolean(error && typeof error === 'object' && workspaceFlushFailures.has(error))
+      if (flushError && saveStatus !== 'error') showSaveError(error)
+      if (mounted) {
+        gitActionErrors = {
+          ...gitActionErrors,
+          [baseName]: errorMessage(error, flushError
+            ? 'Не удалось сохранить рабочую область перед Git-синхронизацией'
+            : 'Не удалось запустить Git-синхронизацию'),
+        }
+      }
+    } finally {
+      if (gitBusyBase === baseName) gitBusyBase = ''
+    }
   }
 
   function affectsActiveNote(id) {
@@ -341,6 +399,13 @@
 
   onMount(() => {
     mounted = true
+    gitPoller = createGitStatusPoller({
+      load: getGitStatus,
+      onStatuses: applyGitStatuses,
+      onError: (error) => {
+        gitPollError = error ? errorMessage(error, 'Не удалось получить статус Git') : ''
+      },
+    })
     void loadApplication()
 
     return () => {
@@ -350,6 +415,9 @@
       resetTransitionState()
       clearSaveTimer()
       clearStatusTimer()
+      gitPoller?.stop()
+      gitPoller = null
+      gitPolling = false
     }
   })
 </script>
@@ -385,6 +453,10 @@
       bind:content={markdownContent}
       {saveStatus}
       {basePath}
+      gitBase={currentBase}
+      gitStatus={activeGitStatus}
+      gitSyncBusy={gitBusyBase === config?.current_base}
+      gitSyncError={gitActionErrors[config?.current_base] || ''}
       {transitioning}
       error={transitionError}
       onSelectNote={loadNote}
@@ -392,13 +464,20 @@
       onDeleteNote={deleteNode}
       onSave={saveNow}
       onOpenSettings={openSettings}
+      onGitSync={runGitSync}
     />
   {:else if screen === 'settings'}
     <SettingsWorkspace
       {config}
+      gitStatuses={gitStatuses}
+      {gitPollError}
+      {gitBusyBase}
+      {gitActionErrors}
       onConfigChange={applyConfig}
       onSwitch={openBase}
       onBack={() => screen = 'editor'}
+      onGitSync={runGitSync}
+      onGitRefresh={refreshGitStatuses}
     />
   {/if}
 </div>

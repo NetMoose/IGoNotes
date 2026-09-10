@@ -7,11 +7,16 @@ vi.mock('./lib/Editor.svelte', async () => ({
   default: (await import('./test/EditorStub.svelte')).default,
 }))
 
+vi.mock('./lib/git/git-status-poller.js', () => ({
+  createGitStatusPoller: vi.fn(),
+}))
+
 vi.mock('./lib/api.js', async (importOriginal) => {
   const actual = await importOriginal()
   return {
     ...actual,
     getConfig: vi.fn(),
+    getGitStatus: vi.fn(),
     completeSetup: vi.fn(),
     selectDirectory: vi.fn(),
     createBase: vi.fn(),
@@ -22,6 +27,7 @@ vi.mock('./lib/api.js', async (importOriginal) => {
     saveNote: vi.fn(),
     getNotes: vi.fn(),
     syncNotes: vi.fn(),
+    syncGit: vi.fn(),
     createNote: vi.fn(),
     renameNote: vi.fn(),
     deleteNote: vi.fn(),
@@ -38,6 +44,7 @@ import {
   deleteNote,
   forgetBase,
   getConfig,
+  getGitStatus,
   getNote,
   getNotes,
   renameNote,
@@ -45,9 +52,11 @@ import {
   selectDirectory,
   switchBase,
   syncNotes,
+  syncGit,
   updateBase,
   uploadAsset,
 } from './lib/api.js'
+import { createGitStatusPoller } from './lib/git/git-status-poller.js'
 
 const firstRunConfig = {
   base_dir: '/home/user/.igonotes/bases',
@@ -82,6 +91,7 @@ const apiMocks = [
   deleteNote,
   forgetBase,
   getConfig,
+  getGitStatus,
   getNote,
   getNotes,
   renameNote,
@@ -89,9 +99,13 @@ const apiMocks = [
   selectDirectory,
   switchBase,
   syncNotes,
+  syncGit,
   updateBase,
   uploadAsset,
 ]
+
+let gitPoller
+let gitPollerOptions
 
 function deferred() {
   let resolve
@@ -128,6 +142,7 @@ describe('App setup gate', () => {
     setEditorFlush()
     for (const mock of apiMocks) vi.mocked(mock).mockReset()
     vi.mocked(getConfig).mockResolvedValue(completedConfig)
+    vi.mocked(getGitStatus).mockResolvedValue({ statuses: [] })
     vi.mocked(completeSetup).mockResolvedValue(completedConfig)
     vi.mocked(selectDirectory).mockResolvedValue(null)
     vi.mocked(createBase).mockResolvedValue(completedConfig)
@@ -138,10 +153,21 @@ describe('App setup gate', () => {
     vi.mocked(saveNote).mockResolvedValue(null)
     vi.mocked(getNotes).mockResolvedValue([])
     vi.mocked(syncNotes).mockResolvedValue(null)
+    vi.mocked(syncGit).mockResolvedValue({ operation_id: 'sync-1', status: 'queued', deduplicated: false })
     vi.mocked(createNote).mockResolvedValue(null)
     vi.mocked(renameNote).mockResolvedValue(null)
     vi.mocked(deleteNote).mockResolvedValue(null)
     vi.mocked(uploadAsset).mockResolvedValue({ path: '' })
+    gitPoller = {
+      start: vi.fn(),
+      refresh: vi.fn().mockResolvedValue([]),
+      stop: vi.fn(),
+    }
+    gitPollerOptions = null
+    vi.mocked(createGitStatusPoller).mockReset().mockImplementation((options) => {
+      gitPollerOptions = options
+      return gitPoller
+    })
   })
 
   it('blocks the notes workspace while first-run configuration is loading', async () => {
@@ -1051,5 +1077,163 @@ describe('App setup gate', () => {
     await tick()
 
     expect(getNotes).not.toHaveBeenCalled()
+  })
+
+  it('polls all Git bases once, retains statuses through an error, derives the exact current base, and stops on cleanup', async () => {
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({
+        ...base,
+        git_url: `https://example.test/${base.name}.git`,
+        git_branch: 'main',
+      })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+
+    const { unmount } = render(App)
+
+    await screen.findByText('Выберите заметку')
+    expect(createGitStatusPoller).toHaveBeenCalledOnce()
+    expect(gitPoller.start).toHaveBeenCalledOnce()
+    await gitPollerOptions.load()
+    expect(getGitStatus).toHaveBeenCalledWith()
+
+    gitPollerOptions.onStatuses([
+      { base: 'work', state: 'ready', ahead: 1, behind: 0, changed_paths: [] },
+      { base: 'personal', state: 'ready', ahead: 7, behind: 2, changed_paths: [] },
+    ])
+    await tick()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть детали Git: Есть локальные изменения' }))
+    expect(screen.getByRole('region', { name: 'Детали Git' })).toHaveTextContent('7')
+    expect(screen.getByRole('region', { name: 'Детали Git' })).toHaveTextContent('2')
+
+    gitPollerOptions.onError(new Error('Git временно недоступен'))
+    await tick()
+    expect(screen.getByRole('button', { name: 'Открыть детали Git: Есть локальные изменения' })).toBeVisible()
+
+    unmount()
+    expect(gitPoller.stop).toHaveBeenCalledOnce()
+  })
+
+  it('flushes a dirty footer edit before syncing Git and refreshes its status', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({
+        ...base,
+        git_url: `https://example.test/${base.name}.git`,
+        git_branch: 'main',
+      })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Before sync')
+    gitPollerOptions.onStatuses([{ base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] }])
+    await tick()
+    await user.click(screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' }))
+    await user.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
+
+    await waitFor(() => expect(syncGit).toHaveBeenCalledWith('personal'))
+    expect(saveNote).toHaveBeenCalledWith(note.id, '# Before sync')
+    expect(saveNote.mock.invocationCallOrder[0]).toBeLessThan(syncGit.mock.invocationCallOrder[0])
+    expect(gitPoller.refresh).toHaveBeenCalledOnce()
+  })
+
+  it('does not sync Git when flushing a dirty footer edit fails and retains the editor buffer', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({
+        ...base,
+        git_url: `https://example.test/${base.name}.git`,
+        git_branch: 'main',
+      })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(saveNote).mockRejectedValue(new Error('Диск недоступен'))
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Keep this')
+    gitPollerOptions.onStatuses([{ base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] }])
+    await tick()
+    await user.click(screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' }))
+    await user.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
+
+    expect(await screen.findByText('Не удалось сохранить заметку: Диск недоступен')).toBeVisible()
+    expect(syncGit).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Keep this')
+  })
+
+  it('uses the shared Git sync action from settings while the notes workspace is unmounted', async () => {
+    const user = userEvent.setup()
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({
+        ...base,
+        git_url: `https://example.test/${base.name}.git`,
+        git_branch: 'main',
+      })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+
+    render(App)
+    await screen.findByText('Выберите заметку')
+    gitPollerOptions.onStatuses([
+      { base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] },
+      { base: 'work', state: 'ready', ahead: 0, behind: 0, changed_paths: [] },
+    ])
+    await tick()
+    await user.click(await screen.findByRole('button', { name: 'Открыть настройки' }))
+    await user.click(screen.getByRole('tab', { name: 'Git-синхронизация' }))
+    await user.click(within(screen.getByRole('article', { name: 'Git для базы work' }))
+      .getByRole('button', { name: 'Синхронизировать сейчас' }))
+
+    await waitFor(() => expect(syncGit).toHaveBeenCalledWith('work'))
+    expect(gitPoller.refresh).toHaveBeenCalledOnce()
+  })
+
+  it('allows only one Git sync across settings cards', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({
+        ...base,
+        git_url: `https://example.test/${base.name}.git`,
+        git_branch: 'main',
+      })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+    vi.mocked(syncGit).mockReturnValue(request.promise)
+
+    render(App)
+    await screen.findByText('Выберите заметку')
+    gitPollerOptions.onStatuses([
+      { base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] },
+      { base: 'work', state: 'ready', ahead: 0, behind: 0, changed_paths: [] },
+    ])
+    await tick()
+    await user.click(await screen.findByRole('button', { name: 'Открыть настройки' }))
+    await user.click(screen.getByRole('tab', { name: 'Git-синхронизация' }))
+    const work = within(screen.getByRole('article', { name: 'Git для базы work' }))
+    const personal = within(screen.getByRole('article', { name: 'Git для базы personal' }))
+    await user.click(work.getByRole('button', { name: 'Синхронизировать сейчас' }))
+    await user.click(personal.getByRole('button', { name: 'Синхронизировать сейчас' }))
+
+    expect(syncGit).toHaveBeenCalledOnce()
+    expect(syncGit).toHaveBeenCalledWith('work')
+    request.resolve({ operation_id: 'sync-1', status: 'queued', deduplicated: false })
+    await request.promise
   })
 })
