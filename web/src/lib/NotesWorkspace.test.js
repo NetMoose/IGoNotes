@@ -136,6 +136,44 @@ describe('NotesWorkspace', () => {
     expect(onGitSync).toHaveBeenCalledWith('work')
   })
 
+  it('syncs Git without waiting for pending editor uploads', async () => {
+    const user = userEvent.setup()
+    const upload = deferred()
+    const flush = vi.fn(() => upload.promise)
+    const onGitSync = vi.fn()
+    let uploadSettled = false
+    upload.promise.then(() => {
+      uploadSettled = true
+    })
+    setEditorFlush(flush)
+
+    try {
+      const { props } = await renderWorkspace({
+        activeNote: fileNode('current.md'),
+        content: '# Current',
+        gitBase: {
+          name: 'work',
+          git_url: 'https://example.test/notes.git',
+          git_branch: 'main',
+        },
+        gitStatus: { base: 'work', state: 'ready', ahead: 0 },
+        onGitSync,
+      })
+
+      expect(screen.getByLabelText('Markdown')).toHaveValue('# Current')
+      await user.click(screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' }))
+      await user.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
+
+      expect(onGitSync).toHaveBeenCalledOnce()
+      expect(onGitSync).toHaveBeenCalledWith('work')
+      expect(flush).not.toHaveBeenCalled()
+      expect(props.onSave).not.toHaveBeenCalled()
+      expect(uploadSettled).toBe(false)
+    } finally {
+      upload.resolve()
+    }
+  })
+
   it.each([
     ['a conflict', { state: 'conflict' }, false, ''],
     ['a busy sync', { state: 'ready' }, true, ''],
