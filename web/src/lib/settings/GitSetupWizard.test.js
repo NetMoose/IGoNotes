@@ -135,10 +135,10 @@ describe('GitSetupWizard', () => {
 
     expect(await screen.findByRole('alert')).toBeVisible()
     expect(screen.getByRole('heading', { name: 'Шаг 1 из 4: репозиторий' })).toBeVisible()
-    await waitFor(() => expect(screen.getByLabelText('URL репозитория')).toHaveFocus())
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
   })
 
-  it('keeps blocking discovery errors on the URL field', async () => {
+  it('focuses a blocking discovery error without a field', async () => {
     const user = userEvent.setup()
     vi.mocked(probeGit).mockResolvedValueOnce(discovery({ blocking_error: { message: 'Git недоступен' } }))
     renderWizard()
@@ -146,7 +146,7 @@ describe('GitSetupWizard', () => {
     await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Git недоступен')
-    await waitFor(() => expect(screen.getByLabelText('URL репозитория')).toHaveFocus())
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
   })
 
   it('lets an empty remote use an editable branch and clears it when the URL changes', async () => {
@@ -162,7 +162,7 @@ describe('GitSetupWizard', () => {
     expect(screen.getByLabelText('Новая ветка')).toHaveValue('')
   })
 
-  it('probes the literal branch entered for an empty remote', async () => {
+  it('trims the branch entered for an empty remote before probing', async () => {
     const user = userEvent.setup()
     renderWizard()
     await completeDiscovery(user, discovery({ empty_remote: true, remote_branches: [] }))
@@ -174,8 +174,84 @@ describe('GitSetupWizard', () => {
     expect(probeGit).toHaveBeenLastCalledWith({
       base: 'work',
       git_url: 'https://example.test/notes.git',
-      git_branch: ' feature/editor ',
+      git_branch: 'feature/editor',
     })
+  })
+
+  it('preserves an empty-remote branch when its newly discovered URL is checked again', async () => {
+    const user = userEvent.setup()
+    renderWizard()
+    const url = screen.getByLabelText('URL репозитория')
+    await user.clear(url)
+    await user.type(url, 'https://example.test/new.git')
+    await completeDiscovery(user, discovery({ empty_remote: true, remote_branches: [] }))
+    await user.clear(screen.getByLabelText('Новая ветка'))
+    await user.type(screen.getByLabelText('Новая ветка'), 'topic')
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    await completeDiscovery(user, discovery({ empty_remote: true, remote_branches: [] }))
+
+    expect(screen.getByLabelText('Новая ветка')).toHaveValue('topic')
+  })
+
+  it('resets confirmations after a successful selected-branch probe', async () => {
+    const user = userEvent.setup()
+    const mutations = { create_repository: true, add_origin: false, replace_origin: false, create_branch: false, merge_histories: false }
+    renderWizard()
+    await completeDiscovery(user)
+    await completeBranch(user, selected({ required_mutations: mutations }))
+    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByLabelText('Создать Git-репозиторий'))
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    await completeBranch(user, selected({ required_mutations: mutations }))
+    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+
+    expect(screen.getByLabelText('Создать Git-репозиторий')).not.toBeChecked()
+  })
+
+  it('resets confirmations after a successful repository discovery', async () => {
+    const user = userEvent.setup()
+    const mutations = { create_repository: true, add_origin: false, replace_origin: false, create_branch: false, merge_histories: false }
+    renderWizard()
+    await completeDiscovery(user)
+    await completeBranch(user, selected({ required_mutations: mutations }))
+    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+    await user.click(screen.getByLabelText('Создать Git-репозиторий'))
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    await completeDiscovery(user)
+    await completeBranch(user, selected({ required_mutations: mutations }))
+    await user.click(screen.getByRole('button', { name: 'К подтверждению' }))
+
+    expect(screen.getByLabelText('Создать Git-репозиторий')).not.toBeChecked()
+  })
+
+  it.each([
+    ['a branch field error from discovery', new ApiError({ field: 'git_branch', message: 'Выберите ветку' }), 'Шаг 2 из 4: ветка', 'Ветка'],
+    ['a URL field error from branch selection', new ApiError({ field: 'git_url', message: 'Проверьте URL' }), 'Шаг 1 из 4: репозиторий', 'URL репозитория'],
+  ])('moves probe %s to its field', async (_case, apiError, heading, label) => {
+    const user = userEvent.setup()
+    renderWizard()
+    if (apiError.field === 'git_url') await completeDiscovery(user)
+    vi.mocked(probeGit).mockRejectedValueOnce(apiError)
+
+    await user.click(screen.getByRole('button', { name: apiError.field === 'git_url' ? 'Продолжить' : 'Проверить репозиторий' }))
+
+    expect(await screen.findByRole('heading', { name: heading })).toBeVisible()
+    await waitFor(() => expect(screen.getByLabelText(label)).toHaveFocus())
+  })
+
+  it('focuses an alert for a fieldless probe error', async () => {
+    const user = userEvent.setup()
+    vi.mocked(probeGit).mockRejectedValueOnce(new ApiError({ message: 'Сеть недоступна' }))
+    renderWizard()
+
+    await user.click(screen.getByRole('button', { name: 'Проверить репозиторий' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Сеть недоступна')
+    await waitFor(() => expect(alert).toHaveFocus())
   })
 
   it.each([
@@ -191,7 +267,7 @@ describe('GitSetupWizard', () => {
     await user.click(screen.getByRole('button', { name: 'Продолжить' }))
 
     expect(await screen.findByRole('alert')).toBeVisible()
-    await waitFor(() => expect(screen.getByLabelText('Ветка')).toHaveFocus())
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus())
   })
 
   it('renders preview and every supported template variable', async () => {

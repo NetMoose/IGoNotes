@@ -21,6 +21,7 @@
   let discovery = $state(null)
   let configurationProbe = $state(null)
   let confirmations = $state({})
+  let branchURL = $state(initialBranchURL())
   let active = true
   let stepOneHeading = $state()
   let stepTwoHeading = $state()
@@ -56,6 +57,10 @@
       interval: base?.auto_sync_interval_minutes ?? 15,
       template: String(base?.git_commit_message_template ?? '') || DEFAULT_GIT_COMMIT_TEMPLATE,
     }
+  }
+
+  function initialBranchURL() {
+    return normalizedURL(base?.git_url)
   }
 
   function normalizedURL(value) {
@@ -107,7 +112,7 @@
   function reconcileBranch(result) {
     const current = String(draft.branch ?? '')
     if (result.empty_remote) {
-      if (normalizedURL(draft.gitURL) !== normalizedURL(base?.git_url)) draft.branch = ''
+      if (normalizedURL(draft.gitURL) !== branchURL) draft.branch = ''
       return
     }
     if (result.remote_branches.includes(current)) return
@@ -135,20 +140,20 @@
     } catch (requestError) {
       if (!active) return
       setBusy('')
-      error = message(requestError, 'Не удалось проверить репозиторий')
-      await focus(urlInput)
+      await showProbeError(requestError, 'Не удалось проверить репозиторий')
       return
     }
 
     if (!active) return
     setBusy('')
     if (!discoveryIsValid(result)) {
-      error = result?.blocking_error?.message || 'Репозиторий нельзя настроить'
-      await focus(urlInput)
+      await showProbeError(result?.blocking_error, 'Репозиторий нельзя настроить')
       return
     }
     reconcileBranch(result)
     discovery = result
+    branchURL = normalizedURL(draft.gitURL)
+    confirmations = {}
     step = 2
     await focus(() => stepTwoHeading)
   }
@@ -169,24 +174,23 @@
       result = await probeGit({
         base: base.name,
         git_url: normalizedURL(draft.gitURL),
-        git_branch: String(draft.branch ?? ''),
+        git_branch: String(draft.branch ?? '').trim(),
       })
     } catch (requestError) {
       if (!active) return
       setBusy('')
-      error = message(requestError, 'Не удалось проверить ветку')
-      await focus(branchInput)
+      await showProbeError(requestError, 'Не удалось проверить ветку')
       return
     }
 
     if (!active) return
     setBusy('')
     if (!selectedProbeIsValid(result)) {
-      error = result?.blocking_error?.message || 'Репозиторий нельзя настроить'
-      await focus(branchInput)
+      await showProbeError(result?.blocking_error, 'Репозиторий нельзя настроить')
       return
     }
     configurationProbe = result
+    confirmations = {}
     step = 3
     await focus(() => stepThreeHeading)
   }
@@ -264,6 +268,19 @@
     } else if (field === 'git_commit_message_template') {
       step = 3
       await focus(() => templateInput)
+    } else {
+      await focus(() => alertElement)
+    }
+  }
+
+  async function showProbeError(requestError, fallback) {
+    error = message(requestError, fallback)
+    if (requestError?.field === 'git_url') {
+      step = 1
+      await focus(() => urlInput)
+    } else if (requestError?.field === 'git_branch') {
+      step = 2
+      await focus(() => branchInput)
     } else {
       await focus(() => alertElement)
     }
