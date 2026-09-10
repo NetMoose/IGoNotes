@@ -1,13 +1,27 @@
 <script>
-  import { onDestroy, tick } from 'svelte'
+  import { onDestroy, onMount, tick } from 'svelte'
 
   import Modal from '../Modal.svelte'
   import { createBase, forgetBase, updateBase } from '../api.js'
   import BaseForm from '../setup/BaseForm.svelte'
   import BaseCard from './BaseCard.svelte'
+  import GitSettingsSection from './GitSettingsSection.svelte'
 
-  let { config, onConfigChange, onSwitch, onBack } = $props()
+  let {
+    config,
+    gitStatuses = [],
+    gitPollError = '',
+    gitBusyBase = '',
+    gitActionErrors = {},
+    onConfigChange,
+    onSwitch,
+    onBack,
+    onGitSync = () => {},
+    onGitRefresh = () => {},
+  } = $props()
 
+  let selectedTab = $state('bases')
+  let isDesktop = $state(false)
   let panel = $state('list')
   let editingBase = $state(null)
   let pendingForget = $state(null)
@@ -16,15 +30,27 @@
   let operationErrors = $state({})
   let formError = $state(null)
   let workspaceError = $state('')
+  let gitSectionBusy = $state(false)
   let listHeading = $state()
   let panelHeading = $state()
   let active = true
 
   let bases = $derived(Array.isArray(config?.bases) ? config.bases : [])
   let existingNames = $derived(bases.map((base) => base.name))
+  let workspaceBusy = $derived(busyAction !== '' || Boolean(gitBusyBase) || gitSectionBusy)
+  let baseBusyAction = $derived(workspaceBusy ? busyAction || `git:${gitBusyBase || 'section'}` : '')
 
   onDestroy(() => {
     active = false
+  })
+
+  onMount(() => {
+    if (typeof window.matchMedia !== 'function') return
+    const media = window.matchMedia('(min-width: 768px)')
+    const updateOrientation = (event) => isDesktop = event.matches
+    updateOrientation(media)
+    media.addEventListener('change', updateOrientation)
+    return () => media.removeEventListener('change', updateOrientation)
   })
 
   function errorMessage(error, fallback) {
@@ -34,6 +60,30 @@
   function clearOperationError(name) {
     if (!operationErrors[name]) return
     operationErrors = { ...operationErrors, [name]: '' }
+  }
+
+  function selectTab(tab) {
+    if (workspaceBusy) return
+    selectedTab = tab
+  }
+
+  async function navigateTabs(event, tab) {
+    if (workspaceBusy) return
+    const tabs = ['bases', 'git']
+    const current = tabs.indexOf(tab)
+    let next = -1
+    if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = tabs.length - 1
+    else if ((isDesktop && event.key === 'ArrowUp') || (!isDesktop && event.key === 'ArrowLeft')) {
+      next = (current + tabs.length - 1) % tabs.length
+    } else if ((isDesktop && event.key === 'ArrowDown') || (!isDesktop && event.key === 'ArrowRight')) {
+      next = (current + 1) % tabs.length
+    } else return
+
+    event.preventDefault()
+    selectedTab = tabs[next]
+    await tick()
+    document.getElementById(`settings-${selectedTab}-tab`)?.focus()
   }
 
   async function transitionPanel(nextPanel, base = null) {
@@ -48,20 +98,20 @@
   }
 
   async function showAdd() {
-    if (busyAction !== '') return
+    if (workspaceBusy) return
     workspaceError = ''
     await transitionPanel('add')
   }
 
   async function showEdit(base) {
-    if (busyAction !== '') return
+    if (workspaceBusy) return
     workspaceError = ''
     clearOperationError(base.name)
     await transitionPanel('edit', base)
   }
 
   async function showList() {
-    if (busyAction !== '') return
+    if (workspaceBusy) return
     await transitionPanel('list')
   }
 
@@ -78,7 +128,7 @@
   }
 
   async function addBase(draft) {
-    if (!active || busyAction !== '') return
+    if (!active || workspaceBusy) return
     busyAction = 'add'
     formError = null
     workspaceError = ''
@@ -101,7 +151,7 @@
   }
 
   async function editBase(draft) {
-    if (!active || busyAction !== '' || !editingBase) return
+    if (!active || workspaceBusy || !editingBase) return
     const originalName = editingBase.name
     busyAction = `edit:${originalName}`
     formError = null
@@ -125,7 +175,7 @@
   }
 
   async function openBase(name) {
-    if (!active || busyAction !== '') return
+    if (!active || workspaceBusy) return
     busyAction = `switch:${name}`
     workspaceError = ''
     clearOperationError(name)
@@ -146,7 +196,7 @@
   }
 
   function askForget(base, trigger) {
-    if (busyAction !== '') return
+    if (workspaceBusy) return
     workspaceError = ''
     clearOperationError(base.name)
     forgetTrigger = trigger
@@ -161,7 +211,7 @@
   }
 
   async function cancelForget() {
-    if (busyAction !== '') return
+    if (workspaceBusy) return
     const trigger = forgetTrigger
     pendingForget = null
     forgetTrigger = null
@@ -169,7 +219,7 @@
   }
 
   async function confirmForget() {
-    if (!active || busyAction !== '' || !pendingForget) return
+    if (!active || workspaceBusy || !pendingForget) return
     const base = pendingForget
     const trigger = forgetTrigger
     const latestBase = bases.find((candidate) => candidate.name === base.name)
@@ -218,7 +268,7 @@
       <button
         type="button"
         onclick={onBack}
-        disabled={busyAction !== ''}
+        disabled={workspaceBusy}
         class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
       >
         Назад к заметкам
@@ -228,15 +278,23 @@
 
   <main class="mx-auto grid max-w-7xl md:grid-cols-[15rem_minmax(0,1fr)]">
     <nav class="border-b border-slate-200 bg-white p-4 md:min-h-[calc(100vh-73px)] md:border-b-0 md:border-r md:p-6" aria-label="Настройки">
-      <div role="tablist" aria-label="Разделы настроек" class="flex gap-2 overflow-x-auto md:sticky md:top-6 md:flex-col">
+      <div
+        role="tablist"
+        aria-label="Разделы настроек"
+        aria-orientation={isDesktop ? 'vertical' : 'horizontal'}
+        class="flex gap-2 overflow-x-auto md:sticky md:top-6 md:flex-col"
+      >
         <button
           id="settings-bases-tab"
           type="button"
           role="tab"
-          aria-selected="true"
-          aria-current="page"
+          aria-selected={selectedTab === 'bases'}
           aria-controls="settings-bases-panel"
-          class="shrink-0 whitespace-nowrap rounded-lg bg-blue-50 px-3 py-2 text-left text-sm font-semibold text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 md:w-full"
+          tabindex={selectedTab === 'bases' ? 0 : -1}
+          onclick={() => selectTab('bases')}
+          onkeydown={(event) => navigateTabs(event, 'bases')}
+          disabled={workspaceBusy}
+          class={`shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50 md:w-full ${selectedTab === 'bases' ? 'bg-blue-50 text-blue-700' : 'text-slate-600 hover:bg-slate-50'}`}
         >
           Базы заметок
         </button>
@@ -244,13 +302,15 @@
           id="settings-git-tab"
           type="button"
           role="tab"
-          aria-selected="false"
-          aria-disabled="true"
-          tabindex="-1"
-          disabled
-          class="shrink-0 cursor-not-allowed whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 md:w-full"
+          aria-selected={selectedTab === 'git'}
+          aria-controls="settings-git-panel"
+          tabindex={selectedTab === 'git' ? 0 : -1}
+          onclick={() => selectTab('git')}
+          onkeydown={(event) => navigateTabs(event, 'git')}
+          disabled={workspaceBusy}
+          class={`shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50 md:w-full ${selectedTab === 'git' ? 'bg-blue-50 text-blue-700' : 'text-slate-600 hover:bg-slate-50'}`}
         >
-          Git, скоро
+          Git-синхронизация
         </button>
       </div>
     </nav>
@@ -259,6 +319,7 @@
       id="settings-bases-panel"
       role="tabpanel"
       aria-labelledby="settings-bases-tab"
+      hidden={selectedTab !== 'bases'}
       class="min-w-0 p-4 sm:p-6 lg:p-8"
     >
       {#if panel === 'list'}
@@ -276,7 +337,7 @@
           <button
             type="button"
             onclick={showAdd}
-            disabled={busyAction !== ''}
+            disabled={workspaceBusy}
             class="shrink-0 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Добавить базу
@@ -295,7 +356,7 @@
               {base}
               current={base.name === config.current_base}
               canForget={bases.length > 1}
-              {busyAction}
+              busyAction={baseBusyAction}
               error={operationErrors[base.name] || ''}
               onOpen={openBase}
               onEdit={showEdit}
@@ -316,7 +377,7 @@
             mode="create"
             {existingNames}
             submitLabel="Добавить"
-            busy={busyAction !== ''}
+            busy={workspaceBusy}
             apiError={formError}
             showMode={true}
             onSubmit={addBase}
@@ -339,13 +400,33 @@
             {existingNames}
             originalName={editingBase.name}
             submitLabel="Сохранить"
-            busy={busyAction !== ''}
+            busy={workspaceBusy}
             apiError={formError}
             onSubmit={editBase}
             onCancel={showList}
           />
         </div>
       {/if}
+    </div>
+
+    <div
+      id="settings-git-panel"
+      role="tabpanel"
+      aria-labelledby="settings-git-tab"
+      hidden={selectedTab !== 'git'}
+      class="min-w-0 p-4 sm:p-6 lg:p-8"
+    >
+      <GitSettingsSection
+        {config}
+        statuses={gitStatuses}
+        pollError={gitPollError}
+        busyBase={gitBusyBase}
+        actionErrors={gitActionErrors}
+        {onConfigChange}
+        onSync={onGitSync}
+        onRefresh={onGitRefresh}
+        onBusyChange={(busy) => gitSectionBusy = busy}
+      />
     </div>
   </main>
 

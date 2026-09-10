@@ -30,11 +30,6 @@
     {/if}
   </div>
 
-  <div class="mt-5 flex flex-wrap gap-2 text-xs font-medium text-slate-500">
-    <span class="rounded-full bg-slate-100 px-2.5 py-1">Git не настроен</span>
-    <span class="rounded-full bg-slate-100 px-2.5 py-1">Автосинхронизация выключена</span>
-  </div>
-
   {#if error}
     <p role="alert" class="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
       {error}

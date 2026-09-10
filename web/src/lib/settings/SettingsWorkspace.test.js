@@ -102,34 +102,107 @@ describe('SettingsWorkspace', () => {
   it('renders the bases tab, paths, current state, and only an eligible Forget action', () => {
     renderWorkspace()
 
+    const basesPanel = screen.getByRole('tabpanel', { name: 'Базы заметок' })
     expect(screen.getByRole('heading', { name: 'Базы заметок' })).toBeVisible()
-    expect(screen.getByText('/notes/personal')).toBeVisible()
-    expect(screen.getByText('/srv/work')).toBeVisible()
+    expect(within(basesPanel).getByText('/notes/personal')).toBeVisible()
+    expect(within(basesPanel).getByText('/srv/work')).toBeVisible()
     expect(within(baseArticle('personal')).getByText('Текущая')).toBeVisible()
     const basesTab = screen.getByRole('tab', { name: 'Базы заметок' })
-    const gitTab = screen.getByRole('tab', { name: 'Git, скоро' })
-    const panel = screen.getByRole('tabpanel')
-    expect(basesTab).toHaveAttribute('aria-current', 'page')
-    expect(basesTab.id).not.toBe('')
-    expect(panel.id).not.toBe('')
-    expect(basesTab).toHaveAttribute('aria-controls', panel.id)
-    expect(panel).toHaveAttribute('aria-labelledby', basesTab.id)
-    expect(gitTab).toHaveAttribute('aria-disabled', 'true')
-    expect(gitTab).toHaveAttribute('tabindex', '-1')
+    const gitTab = screen.getByRole('tab', { name: 'Git-синхронизация' })
+    const gitPanel = document.getElementById('settings-git-panel')
+    expect(basesTab).toHaveAttribute('id', 'settings-bases-tab')
+    expect(basesTab).toHaveAttribute('aria-selected', 'true')
+    expect(basesTab).toHaveAttribute('aria-controls', 'settings-bases-panel')
+    expect(gitTab).toHaveAttribute('id', 'settings-git-tab')
+    expect(gitTab).toHaveAttribute('aria-selected', 'false')
+    expect(gitTab).toHaveAttribute('aria-controls', 'settings-git-panel')
+    expect(basesPanel).toHaveAttribute('id', 'settings-bases-panel')
+    expect(basesPanel).toHaveAttribute('aria-labelledby', 'settings-bases-tab')
+    expect(gitPanel).toHaveAttribute('id', 'settings-git-panel')
+    expect(gitPanel).toHaveAttribute('aria-labelledby', 'settings-git-tab')
+    expect(gitTab).toBeEnabled()
     expect(screen.getAllByRole('button', { name: 'Забыть' })).toHaveLength(1)
-    expect(screen.getAllByText('Git не настроен')).toHaveLength(2)
-    expect(screen.getAllByText('Автосинхронизация выключена')).toHaveLength(2)
+    expect(screen.queryByText('Git, скоро')).not.toBeInTheDocument()
+    expect(screen.queryByText('Автосинхронизация выключена')).not.toBeInTheDocument()
   })
 
   it('uses responsive horizontal-to-sidebar settings navigation', () => {
     renderWorkspace()
 
     const tablist = screen.getByRole('tablist', { name: 'Разделы настроек' })
-    expect(tablist).toHaveClass('flex', 'overflow-x-auto', 'md:flex-col')
+    expect(tablist).toHaveClass('flex', 'overflow-x-auto', 'md:sticky', 'md:flex-col')
     expect(tablist).not.toHaveClass('grid-cols-2', 'md:grid-cols-1')
     for (const tab of screen.getAllByRole('tab')) {
       expect(tab).toHaveClass('shrink-0')
     }
+  })
+
+  it('selects and focuses enabled tabs with responsive arrow-key navigation', async () => {
+    const user = userEvent.setup()
+    const listeners = []
+    vi.stubGlobal('matchMedia', vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn((event, listener) => listeners.push(listener)),
+      removeEventListener: vi.fn(),
+    })))
+
+    try {
+      renderWorkspace()
+      const tablist = screen.getByRole('tablist', { name: 'Разделы настроек' })
+      const basesTab = screen.getByRole('tab', { name: 'Базы заметок' })
+      const gitTab = screen.getByRole('tab', { name: 'Git-синхронизация' })
+      expect(tablist).toHaveAttribute('aria-orientation', 'horizontal')
+
+      basesTab.focus()
+      await user.keyboard('{ArrowRight}')
+      expect(gitTab).toHaveFocus()
+      expect(gitTab).toHaveAttribute('aria-selected', 'true')
+      expect(screen.getByRole('tabpanel', { name: 'Git-синхронизация' })).not.toHaveAttribute('hidden')
+
+      listeners[0]({ matches: true })
+      await waitFor(() => expect(tablist).toHaveAttribute('aria-orientation', 'vertical'))
+      await user.keyboard('{ArrowUp}')
+      expect(basesTab).toHaveFocus()
+      expect(basesTab).toHaveAttribute('aria-selected', 'true')
+      await user.keyboard('{End}')
+      expect(gitTab).toHaveFocus()
+      await user.keyboard('{Home}')
+      expect(basesTab).toHaveFocus()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('forwards Git data and sync callback through the enabled Git panel', async () => {
+    const user = userEvent.setup()
+    const onGitSync = vi.fn()
+    const gitConfig = {
+      ...config,
+      bases: [{ ...config.bases[0], git_url: 'origin', git_branch: 'main' }, config.bases[1]],
+    }
+    renderWorkspace({
+      config: gitConfig,
+      onGitSync,
+      gitStatuses: [{ base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] }],
+    })
+
+    await user.click(screen.getByRole('tab', { name: 'Git-синхронизация' }))
+    const gitPanel = screen.getByRole('tabpanel', { name: 'Git-синхронизация' })
+    await user.click(within(gitPanel).getByRole('button', { name: 'Синхронизировать сейчас' }))
+
+    expect(onGitSync).toHaveBeenCalledOnce()
+    expect(onGitSync).toHaveBeenCalledWith('personal')
+  })
+
+  it('locks workspace navigation and base management while a Git action is pending', () => {
+    renderWorkspace({ gitBusyBase: 'personal' })
+
+    expect(screen.getByRole('button', { name: 'Назад к заметкам' })).toBeDisabled()
+    expect(screen.getByRole('tab', { name: 'Базы заметок' })).toBeDisabled()
+    expect(screen.getByRole('tab', { name: 'Git-синхронизация' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Добавить базу' })).toBeDisabled()
+    expect(within(baseArticle('personal')).getByRole('button', { name: 'Изменить' })).toBeDisabled()
+    expect(within(baseArticle('work')).getByRole('button', { name: 'Открыть' })).toBeDisabled()
   })
 
   it('keeps only Edit actions when there is one active base', () => {

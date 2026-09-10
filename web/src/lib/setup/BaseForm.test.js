@@ -181,6 +181,14 @@ describe('BaseForm', () => {
     expect(screen.getByLabelText('Каталог существующей базы')).toBeInTheDocument()
   })
 
+  it('does not render deferred Git configuration controls', () => {
+    render(BaseForm, formProps())
+
+    expect(screen.queryByLabelText('Git URL')).not.toBeInTheDocument()
+    expect(screen.queryByText('Git, скоро')).not.toBeInTheDocument()
+    expect(screen.queryByText('Автосинхронизация будет доступна позже')).not.toBeInTheDocument()
+  })
+
   it('shows a general API alert and a nonblocking directory picker hint', async () => {
     const user = userEvent.setup()
     vi.mocked(selectDirectory).mockRejectedValue(new ApiError({
