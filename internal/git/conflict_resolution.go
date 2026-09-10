@@ -43,6 +43,233 @@ type materializedResolutionWrites struct {
 	writes []materializedResolutionWrite
 }
 
+type conflictCompletionCheckpoint struct {
+	progress Progress
+	value    Checkpoint
+}
+
+func newConflictCompletionCheckpoint(operation Operation, progress Progress) *conflictCompletionCheckpoint {
+	return &conflictCompletionCheckpoint{
+		progress: progress,
+		value: Checkpoint{
+			Stage:         operation.Stage,
+			BackupRef:     operation.BackupRef,
+			LocalOID:      operation.LocalOID,
+			CandidateOID:  operation.CandidateOID,
+			RemoteOID:     operation.RemoteOID,
+			PushOID:       operation.PushOID,
+			ChangedPaths:  append([]string(nil), operation.ChangedPaths...),
+			ConflictPaths: append([]string(nil), operation.ConflictPaths...),
+		},
+	}
+}
+
+func (c *conflictCompletionCheckpoint) save(ctx context.Context, stage Stage) error {
+	c.value.Stage = stage
+	c.value.ChangedPaths = sortedUnique(c.value.ChangedPaths)
+	c.value.ConflictPaths = sortedUnique(c.value.ConflictPaths)
+	checkpoint := c.value
+	checkpoint.ChangedPaths = append([]string(nil), checkpoint.ChangedPaths...)
+	checkpoint.ConflictPaths = append([]string(nil), checkpoint.ConflictPaths...)
+	return c.progress(ctx, checkpoint)
+}
+
+func (s *Service) verifyConflictCompletion(ctx context.Context, base ConfiguredBase, operation Operation) error {
+	if s == nil || s.runner == nil || s.porcelain == nil || !validConflictCompletionRequest(base, operation) {
+		return ErrRecoveryRequired
+	}
+	local, err := s.porcelain.InspectLocal(ctx, base.Path)
+	if err != nil || !local.HasRepository || local.RepositoryRoot != base.Path || !filepath.IsAbs(local.GitDir) ||
+		local.DetachedHead || local.CurrentBranch != base.Branch {
+		return ErrRecoveryRequired
+	}
+	if local.PendingOperation != "" && local.PendingOperation != "merge" {
+		return ErrRecoveryRequired
+	}
+	mergeMarker, err := mergeMarkerExists(local.GitDir)
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+	if !mergeMarker {
+		return ErrMergeNotInProgress
+	}
+	if local.PendingOperation != "merge" {
+		return ErrRecoveryRequired
+	}
+	if err := conflictMarkersClear(local.GitDir); err != nil {
+		return ErrRecoveryRequired
+	}
+
+	unmerged, err := s.conflictRun(ctx, local.RepositoryRoot, "ls-files", "--unmerged", "--stage", "--full-name", "-z")
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+	stages, err := parseIndexStagesZ([]byte(unmerged.Stdout))
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+	if len(stages) != 0 {
+		return ErrConflictUnresolved
+	}
+	head, err := s.conflictCommit(ctx, local.RepositoryRoot, "HEAD^{commit}")
+	if err != nil || head != operation.LocalOID {
+		return ErrRecoveryRequired
+	}
+	mergeHead, err := s.conflictCommit(ctx, local.RepositoryRoot, "MERGE_HEAD^{commit}")
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+	trusted, err := s.conflictCommit(ctx, local.RepositoryRoot, managedRemoteRef(base.Branch)+"^{commit}")
+	if err != nil || mergeHead != operation.CandidateOID || mergeHead != operation.RemoteOID || trusted != operation.RemoteOID {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
+func validConflictCompletionRequest(base ConfiguredBase, operation Operation) bool {
+	if base.Name == "" || !filepath.IsAbs(base.Path) || !validLiteralBranch(base.Branch) || !validOperationID(operation.ID) ||
+		operation.BaseName != base.Name || operation.RepoPath != base.Path || operation.Branch != base.Branch ||
+		!validObjectID(operation.LocalOID) || !validObjectID(operation.CandidateOID) || !validObjectID(operation.RemoteOID) {
+		return false
+	}
+	return operation.Kind == OperationInitialize || operation.Kind == OperationSync || operation.Kind == OperationConflictComplete
+}
+
+func (s *Service) CompleteConflict(
+	ctx context.Context,
+	base ConfiguredBase,
+	operation Operation,
+	worktree WorktreeTransaction,
+	progress Progress,
+) (string, error) {
+	if worktree == nil || progress == nil || base.URL == "" || strings.HasPrefix(base.URL, "-") || containsControlOutputByte(base.URL) {
+		return "", ErrRecoveryRequired
+	}
+	ctx, err := pinConnectBase(ctx, base.Path)
+	if err != nil {
+		return "", err
+	}
+	if err := s.verifyConflictCompletion(ctx, base, operation); err != nil {
+		return "", err
+	}
+	checkpoint := newConflictCompletionCheckpoint(operation, progress)
+	if err := checkpoint.save(ctx, StageConflictCompleting); err != nil {
+		return "", err
+	}
+
+	err = runWorktree(ctx, worktree, func(callbackPath string) error {
+		if callbackPath != base.Path || !filepath.IsAbs(callbackPath) {
+			return ErrRecoveryRequired
+		}
+		if err := s.verifyConflictCompletion(ctx, base, operation); err != nil {
+			return err
+		}
+		if err := requireConnectBase(ctx, callbackPath); err != nil {
+			return err
+		}
+		result, err := s.runLocal(ctx, callbackPath, false, "commit", "--no-edit")
+		if err != nil || result.StdoutTruncated || result.StderrTruncated {
+			return ErrRecoveryRequired
+		}
+		pushOID, err := s.conflictCommit(ctx, callbackPath, "HEAD^{commit}")
+		if err != nil {
+			return ErrRecoveryRequired
+		}
+		if err := s.verifyConflictMergeParents(ctx, callbackPath, pushOID, operation.LocalOID, operation.RemoteOID); err != nil {
+			return err
+		}
+		changedPaths, err := s.conflictCompletionPaths(ctx, callbackPath, operation.LocalOID, pushOID)
+		if err != nil {
+			return err
+		}
+		checkpoint.value.PushOID = pushOID
+		checkpoint.value.ChangedPaths = changedPaths
+		return checkpoint.save(ctx, StageConflictCommitted)
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := checkpoint.save(ctx, StageConflictReindexed); err != nil {
+		return "", err
+	}
+	if err := checkpoint.save(ctx, StageConflictPushing); err != nil {
+		return "", err
+	}
+	if err := s.verifyConflictPushBranch(ctx, base, checkpoint.value.PushOID); err != nil {
+		return "", err
+	}
+	if err := requireConnectBase(ctx, base.Path); err != nil {
+		return "", err
+	}
+	refspec := checkpoint.value.PushOID + ":refs/heads/" + base.Branch
+	result, err := s.runNetwork(ctx, base.Path, base.URL, false, "push", "--no-verify", "--porcelain", "origin", refspec)
+	if err != nil || result.StdoutTruncated || result.StderrTruncated {
+		if err != nil {
+			return "", err
+		}
+		return "", ErrRecoveryRequired
+	}
+	if err := s.verifyConflictPushBranch(ctx, base, checkpoint.value.PushOID); err != nil {
+		return "", err
+	}
+	if err := requireConnectBase(ctx, base.Path); err != nil {
+		return "", err
+	}
+	if _, err := s.runLocal(ctx, base.Path, false, "update-ref", managedRemoteRef(base.Branch), checkpoint.value.PushOID, operation.RemoteOID); err != nil {
+		return "", err
+	}
+	checkpoint.value.CandidateOID = checkpoint.value.PushOID
+	checkpoint.value.RemoteOID = checkpoint.value.PushOID
+	if err := checkpoint.save(ctx, StageCompleted); err != nil {
+		return "", err
+	}
+	return checkpoint.value.PushOID, nil
+}
+
+func (s *Service) verifyConflictMergeParents(ctx context.Context, path, pushOID, localOID, remoteOID string) error {
+	result, err := s.runLocal(ctx, path, true, "rev-list", "--parents", "-n", "1", pushOID)
+	if err != nil || result.StdoutTruncated || result.StderrTruncated || !strings.HasSuffix(result.Stdout, "\n") {
+		return ErrRecoveryRequired
+	}
+	fields := strings.Fields(strings.TrimSuffix(result.Stdout, "\n"))
+	if len(fields) != 3 || fields[0] != pushOID || fields[1] != localOID || fields[2] != remoteOID {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
+func (s *Service) conflictCompletionPaths(ctx context.Context, path, localOID, pushOID string) ([]string, error) {
+	result, err := s.runLocal(ctx, path, true, "diff-tree", "-r", "--no-commit-id", "--name-only", "-z", localOID, pushOID)
+	if err != nil {
+		return nil, ErrRecoveryRequired
+	}
+	paths, err := parseNULPaths(result)
+	if err != nil {
+		return nil, ErrRecoveryRequired
+	}
+	return paths, nil
+}
+
+func (s *Service) verifyConflictPushBranch(ctx context.Context, base ConfiguredBase, pushOID string) error {
+	local, err := s.porcelain.InspectLocal(ctx, base.Path)
+	if err != nil || !local.HasRepository || local.RepositoryRoot != base.Path || local.DetachedHead || local.CurrentBranch != base.Branch ||
+		local.PendingOperation != "" {
+		return ErrRecoveryRequired
+	}
+	mergeMarker, err := mergeMarkerExists(local.GitDir)
+	if err != nil || mergeMarker || conflictMarkersClear(local.GitDir) != nil {
+		return ErrRecoveryRequired
+	}
+	if err := s.requireOrigin(ctx, base.Path, base.URL); err != nil {
+		return err
+	}
+	head, err := s.conflictCommit(ctx, base.Path, "HEAD^{commit}")
+	if err != nil || head != pushOID {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
 func (m *materializedResolutionWrites) Close() {
 	if m == nil {
 		return

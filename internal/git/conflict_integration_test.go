@@ -276,6 +276,144 @@ func TestResolveSymlinkIntegration(t *testing.T) {
 	}
 }
 
+func TestCompleteConflictIntegration(t *testing.T) {
+	fixture := newConflictFixture(t)
+	writeConflictFile(t, fixture.Local, "victim.md", []byte("local\n"))
+	conflictCommit(t, fixture.Local, "local conflict")
+	writeConflictFile(t, fixture.Other, "victim.md", []byte("remote\n"))
+	conflictCommit(t, fixture.Other, "remote conflict")
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+	service, base, original := conflictResolver(t, fixture)
+	base.URL = fixture.Remote
+	snapshot, err := service.Conflicts(context.Background(), base, original)
+	if err != nil || len(snapshot.Conflicts) != 1 {
+		t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+	}
+	conflict := snapshot.Conflicts[0]
+	_, err = service.ResolveConflict(context.Background(), base, original, model.GitConflictResolveRequest{
+		OperationID: original.ID, ConflictID: conflict.ID, Path: conflict.Path,
+		Action: model.GitConflictUseLocal, ResultPath: "resolved.md", LocalOID: conflict.Local.OID,
+	}, callbackOrderingTransaction(fixture.Local, new([]string)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hook := filepath.Join(fixture.Local, ".git", "hooks", "pre-push")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	completion := Operation{
+		ID: "fedcba9876543210fedcba9876543210", BaseName: base.Name, RepoPath: base.Path, Branch: base.Branch,
+		Kind: OperationConflictComplete, State: OperationRunning,
+		LocalOID: original.LocalOID, CandidateOID: original.CandidateOID, RemoteOID: original.RemoteOID,
+	}
+	events := []string{}
+	var checkpoints []Checkpoint
+	transaction := func(_ context.Context, mutate func(string) error) error {
+		events = append(events, "mutate")
+		if err := mutate(fixture.Local); err != nil {
+			return err
+		}
+		events = append(events, "reindex")
+		writeConflictFile(t, fixture.Local, "late.md", []byte("not in merge commit\n"))
+		events = append(events, "unlock")
+		return nil
+	}
+	pushOID, err := service.CompleteConflict(context.Background(), base, completion, transaction, func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"mutate", "reindex", "unlock"}) {
+		t.Fatalf("transaction events = %#v", events)
+	}
+
+	parents := strings.Fields(string(runConflictGit(t, fixture.Local, "rev-list", "--parents", "-n", "1", pushOID)))
+	if !reflect.DeepEqual(parents, []string{pushOID, original.LocalOID, original.RemoteOID}) {
+		t.Fatalf("merge parents = %#v", parents)
+	}
+	remoteOID := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "--git-dir="+fixture.Remote, "rev-parse", "--verify", "refs/heads/"+fixture.Branch+"^{commit}")))
+	trustedOID := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "--verify", managedRemoteRef(fixture.Branch)+"^{commit}")))
+	if remoteOID != pushOID || trustedOID != pushOID {
+		t.Fatalf("remote OID = %q, trusted OID = %q, want %q", remoteOID, trustedOID, pushOID)
+	}
+	if output, err := runConflictGitResult(fixture.Remote, []string{"show", "refs/heads/" + fixture.Branch + ":late.md"}); err == nil {
+		t.Fatalf("late worktree edit was pushed: %q", output)
+	}
+	paths, err := parseNULPaths(Result{Stdout: string(runConflictGit(t, fixture.Local, "diff-tree", "-r", "--no-commit-id", "--name-only", "-z", original.LocalOID, pushOID))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 5 || checkpoints[1].PushOID != pushOID || !reflect.DeepEqual(checkpoints[1].ChangedPaths, paths) ||
+		checkpoints[4].RemoteOID != pushOID || checkpoints[4].CandidateOID != pushOID {
+		t.Fatalf("completion checkpoints = %#v", checkpoints)
+	}
+}
+
+func TestCompleteConflictRejectsRemoteAdvanceWithoutLosingLocalMerge(t *testing.T) {
+	fixture := newConflictFixture(t)
+	writeConflictFile(t, fixture.Local, "victim.md", []byte("local\n"))
+	conflictCommit(t, fixture.Local, "local conflict")
+	writeConflictFile(t, fixture.Other, "victim.md", []byte("remote\n"))
+	conflictCommit(t, fixture.Other, "remote conflict")
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+	service, base, original := conflictResolver(t, fixture)
+	base.URL = fixture.Remote
+	snapshot, err := service.Conflicts(context.Background(), base, original)
+	if err != nil || len(snapshot.Conflicts) != 1 {
+		t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+	}
+	conflict := snapshot.Conflicts[0]
+	_, err = service.ResolveConflict(context.Background(), base, original, model.GitConflictResolveRequest{
+		OperationID: original.ID, ConflictID: conflict.ID, Path: conflict.Path,
+		Action: model.GitConflictUseLocal, ResultPath: "resolved.md", LocalOID: conflict.Local.OID,
+	}, callbackOrderingTransaction(fixture.Local, new([]string)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	completion := Operation{
+		ID: "fedcba9876543210fedcba9876543210", BaseName: base.Name, RepoPath: base.Path, Branch: base.Branch,
+		Kind: OperationConflictComplete, State: OperationRunning,
+		LocalOID: original.LocalOID, CandidateOID: original.CandidateOID, RemoteOID: original.RemoteOID,
+	}
+	var checkpoints []Checkpoint
+	_, err = service.CompleteConflict(context.Background(), base, completion, func(_ context.Context, mutate func(string) error) error {
+		if err := mutate(fixture.Local); err != nil {
+			return err
+		}
+		writeConflictFile(t, fixture.Other, "remote-advance.md", []byte("advance\n"))
+		conflictCommit(t, fixture.Other, "advance remote before push")
+		fixture.pushOther(t)
+		return nil
+	}, func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if !isPushRejected(err) {
+		t.Fatalf("CompleteConflict() error = %#v, want push rejection", err)
+	}
+	localMerge := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "--verify", "HEAD^{commit}")))
+	parents := strings.Fields(string(runConflictGit(t, fixture.Local, "rev-list", "--parents", "-n", "1", localMerge)))
+	if !reflect.DeepEqual(parents, []string{localMerge, original.LocalOID, original.RemoteOID}) {
+		t.Fatalf("local merge parents = %#v", parents)
+	}
+	remoteOID := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "--git-dir="+fixture.Remote, "rev-parse", "--verify", "refs/heads/"+fixture.Branch+"^{commit}")))
+	trustedOID := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "--verify", managedRemoteRef(fixture.Branch)+"^{commit}")))
+	if remoteOID == localMerge || trustedOID != original.RemoteOID {
+		t.Fatalf("remote OID = %q, trusted OID = %q, local merge = %q", remoteOID, trustedOID, localMerge)
+	}
+	if len(checkpoints) != 4 || checkpoints[3].Stage != StageConflictPushing || checkpoints[3].PushOID != localMerge || checkpoints[3].RemoteOID != original.RemoteOID {
+		t.Fatalf("push-rejection checkpoints = %#v", checkpoints)
+	}
+}
+
 func resolveContentConflictIntegration(t *testing.T, action model.GitConflictAction, want string) {
 	t.Helper()
 	fixture := newConflictFixture(t)

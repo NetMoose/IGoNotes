@@ -823,6 +823,378 @@ func TestBuildResolutionPlan(t *testing.T) {
 	})
 }
 
+func TestConflictCompletionPreconditions(t *testing.T) {
+	const (
+		localOID  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		remoteOID = "cccccccccccccccccccccccccccccccccccccccc"
+	)
+	basePath := t.TempDir()
+	gitDir := filepath.Join(basePath, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "MERGE_HEAD"), []byte(remoteOID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := ConfiguredBase{Name: "notes", Path: basePath, Branch: "main"}
+	operation := Operation{ID: "0123456789abcdef0123456789abcdef", BaseName: "notes", RepoPath: basePath, Branch: "main", Kind: OperationSync, State: OperationConflict, LocalOID: localOID, CandidateOID: remoteOID, RemoteOID: remoteOID}
+
+	for _, test := range []struct {
+		name   string
+		runner *resolutionRunner
+		local  LocalInspection
+		want   error
+	}{
+		{"ready to complete", &resolutionRunner{localOID: localOID, remoteOID: remoteOID, resolved: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}, nil},
+		{"merge head absent", &resolutionRunner{localOID: localOID, remoteOID: remoteOID, resolved: true, mergeHeadAbsent: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}, ErrMergeNotInProgress},
+		{"merge head absent after Git clears pending state", &resolutionRunner{localOID: localOID, remoteOID: remoteOID, resolved: true, mergeHeadAbsent: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main"}, ErrMergeNotInProgress},
+		{"unmerged stage remains", &resolutionRunner{baseOID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", localOID: localOID, remoteOID: remoteOID}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}, ErrConflictUnresolved},
+		{"trusted ref changed", &resolutionRunner{localOID: localOID, remoteOID: "dddddddddddddddddddddddddddddddddddddddd", resolved: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}, ErrRecoveryRequired},
+		{"detached", &resolutionRunner{localOID: localOID, remoteOID: remoteOID, resolved: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, DetachedHead: true, CurrentBranch: "main", PendingOperation: "merge"}, ErrRecoveryRequired},
+		{"foreign operation", &resolutionRunner{localOID: localOID, remoteOID: remoteOID, resolved: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "rebase"}, ErrRecoveryRequired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.runner.mergeHeadAbsent {
+				if err := os.Remove(filepath.Join(gitDir, "MERGE_HEAD")); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.WriteFile(filepath.Join(gitDir, "MERGE_HEAD"), []byte(remoteOID+"\n"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}()
+			}
+			service := NewService(test.runner, conflictPorcelain{local: test.local})
+			if err := service.verifyConflictCompletion(context.Background(), base, operation); err != test.want {
+				t.Fatalf("verifyConflictCompletion() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name      string
+		operation Operation
+		runner    *resolutionRunner
+		local     LocalInspection
+	}{
+		{"local OID changed", operation, &resolutionRunner{localOID: "dddddddddddddddddddddddddddddddddddddddd", remoteOID: remoteOID, resolved: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}},
+		{"candidate OID changed", func() Operation {
+			changed := operation
+			changed.CandidateOID = "dddddddddddddddddddddddddddddddddddddddd"
+			return changed
+		}(), &resolutionRunner{localOID: localOID, remoteOID: remoteOID, resolved: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}},
+		{"branch changed", operation, &resolutionRunner{localOID: localOID, remoteOID: remoteOID, resolved: true}, LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "other", PendingOperation: "merge"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := NewService(test.runner, conflictPorcelain{local: test.local})
+			if err := service.verifyConflictCompletion(context.Background(), base, test.operation); err != ErrRecoveryRequired {
+				t.Fatalf("verifyConflictCompletion() error = %v, want ErrRecoveryRequired", err)
+			}
+		})
+	}
+}
+
+func TestCompleteConflictPushesExactOID(t *testing.T) {
+	const (
+		localOID  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		remoteOID = "cccccccccccccccccccccccccccccccccccccccc"
+		pushOID   = "dddddddddddddddddddddddddddddddddddddddd"
+	)
+	basePath := t.TempDir()
+	gitDir := filepath.Join(basePath, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "MERGE_HEAD"), []byte(remoteOID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &resolutionRunner{localOID: localOID, remoteOID: remoteOID, pushOID: pushOID, resolved: true}
+	service := NewService(runner, completionPorcelain{
+		conflictPorcelain: conflictPorcelain{local: LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}},
+		runner:            runner,
+	})
+	base := ConfiguredBase{Name: "notes", Path: basePath, URL: "https://example.invalid/notes.git", Branch: "main"}
+	operation := Operation{ID: "0123456789abcdef0123456789abcdef", BaseName: base.Name, RepoPath: base.Path, Branch: base.Branch, Kind: OperationConflictComplete, State: OperationRunning, LocalOID: localOID, CandidateOID: remoteOID, RemoteOID: remoteOID}
+	var checkpoints []Checkpoint
+	events := []string{}
+	transaction := func(_ context.Context, mutate func(string) error) error {
+		events = append(events, "mutate")
+		if err := mutate(basePath); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(gitDir, "MERGE_HEAD")); err != nil {
+			return err
+		}
+		events = append(events, "reindex", "unlock")
+		if len(runner.pushCalls) != 0 {
+			t.Fatal("push started before worktree transaction unlocked")
+		}
+		return nil
+	}
+	progress := func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	}
+
+	got, err := service.CompleteConflict(context.Background(), base, operation, transaction, progress)
+	if err != nil || got != pushOID {
+		t.Fatalf("CompleteConflict() = %q, %v", got, err)
+	}
+	if !reflect.DeepEqual(events, []string{"mutate", "reindex", "unlock"}) {
+		t.Fatalf("transaction events = %#v", events)
+	}
+	if len(runner.pushCalls) != 1 || runner.pushCalls[0].Scope != NetworkOperation || runner.pushCalls[0].ReadOnly || !reflect.DeepEqual(runner.pushCalls[0].Args, []string{"push", "--no-verify", "--porcelain", "origin", pushOID + ":refs/heads/main"}) {
+		t.Fatalf("push command = %#v", runner.pushCalls)
+	}
+	if len(runner.updateRefCalls) != 1 || runner.updateRefCalls[0].ReadOnly || !reflect.DeepEqual(runner.updateRefCalls[0].Args, []string{"update-ref", "refs/igonotes/remotes/main", pushOID, remoteOID}) {
+		t.Fatalf("trusted ref CAS = %#v", runner.updateRefCalls)
+	}
+	stages := make([]Stage, len(checkpoints))
+	for index, checkpoint := range checkpoints {
+		stages[index] = checkpoint.Stage
+	}
+	if !reflect.DeepEqual(stages, []Stage{StageConflictCompleting, StageConflictCommitted, StageConflictReindexed, StageConflictPushing, StageCompleted}) {
+		t.Fatalf("checkpoint stages = %#v", stages)
+	}
+	completed := checkpoints[len(checkpoints)-1]
+	if completed.PushOID != pushOID || completed.CandidateOID != pushOID || completed.RemoteOID != pushOID || !reflect.DeepEqual(completed.ChangedPaths, []string{"a.md", "z.md"}) {
+		t.Fatalf("completed checkpoint = %#v", completed)
+	}
+	for _, command := range runner.calls {
+		if command.Scope != LocalOperation {
+			continue
+		}
+		if reflect.DeepEqual(command.Args, []string{"commit", "--no-edit"}) || command.Args[0] == "update-ref" {
+			if command.ReadOnly {
+				t.Fatalf("mutating local command marked read-only: %#v", command)
+			}
+		} else if !command.ReadOnly {
+			t.Fatalf("inspection command marked mutating: %#v", command)
+		}
+	}
+}
+
+func TestCompleteConflictPushFailureRetainsCommittedCheckpoint(t *testing.T) {
+	const (
+		localOID  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		remoteOID = "cccccccccccccccccccccccccccccccccccccccc"
+		pushOID   = "dddddddddddddddddddddddddddddddddddddddd"
+	)
+	basePath := t.TempDir()
+	gitDir := filepath.Join(basePath, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "MERGE_HEAD"), []byte(remoteOID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &resolutionRunner{localOID: localOID, remoteOID: remoteOID, pushOID: pushOID, resolved: true, pushErr: errors.New("push failed")}
+	service := NewService(runner, conflictPorcelain{local: LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}})
+	base := ConfiguredBase{Name: "notes", Path: basePath, URL: "https://example.invalid/notes.git", Branch: "main"}
+	operation := Operation{ID: "0123456789abcdef0123456789abcdef", BaseName: base.Name, RepoPath: base.Path, Branch: base.Branch, Kind: OperationConflictComplete, State: OperationRunning, LocalOID: localOID, CandidateOID: remoteOID, RemoteOID: remoteOID}
+	var checkpoints []Checkpoint
+	_, err := service.CompleteConflict(context.Background(), base, operation, directResolutionTransaction(basePath), func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if err == nil || len(runner.updateRefCalls) != 0 {
+		t.Fatalf("CompleteConflict() error = %v, trusted ref updates = %#v", err, runner.updateRefCalls)
+	}
+	if len(checkpoints) != 4 || checkpoints[3].Stage != StageConflictPushing || checkpoints[3].PushOID != pushOID || checkpoints[3].RemoteOID != remoteOID {
+		t.Fatalf("push-failure checkpoints = %#v", checkpoints)
+	}
+}
+
+func TestCompleteConflictRejectsOriginMismatchBeforePush(t *testing.T) {
+	runner, service, base, operation, mergeHeadPath := completionTestFixture(t)
+	runner.originURL = "https://example.invalid/other.git"
+	var checkpoints []Checkpoint
+	_, err := service.CompleteConflict(context.Background(), base, operation, completionTestTransaction(t, base.Path, mergeHeadPath), func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	var safeErr *SafeError
+	if !errors.As(err, &safeErr) || safeErr.Code != CodeOriginMismatch || len(runner.pushCalls) != 0 || len(runner.updateRefCalls) != 0 {
+		t.Fatalf("CompleteConflict() error = %#v, push = %#v, trusted ref updates = %#v", err, runner.pushCalls, runner.updateRefCalls)
+	}
+	if len(checkpoints) != 4 || checkpoints[3].Stage != StageConflictPushing || checkpoints[3].PushOID == "" || checkpoints[3].RemoteOID != operation.RemoteOID {
+		t.Fatalf("origin mismatch checkpoints = %#v", checkpoints)
+	}
+}
+
+func TestCompleteConflictRejectsMergeStateRemainingAfterCommit(t *testing.T) {
+	runner, _, base, operation, _ := completionTestFixture(t)
+	basePath := base.Path
+	gitDir := filepath.Join(basePath, ".git")
+	service := NewService(runner, completionPorcelain{
+		conflictPorcelain: conflictPorcelain{local: LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}},
+		runner:            runner,
+		keepPending:       true,
+	})
+	var checkpoints []Checkpoint
+	_, err := service.CompleteConflict(context.Background(), base, operation, directResolutionTransaction(basePath), func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if err != ErrRecoveryRequired || len(runner.pushCalls) != 0 || len(runner.updateRefCalls) != 0 {
+		t.Fatalf("CompleteConflict() error = %v, push = %#v, trusted ref updates = %#v", err, runner.pushCalls, runner.updateRefCalls)
+	}
+	if len(checkpoints) != 4 || checkpoints[3].Stage != StageConflictPushing || checkpoints[3].PushOID == "" || checkpoints[3].RemoteOID != operation.RemoteOID {
+		t.Fatalf("remaining merge checkpoints = %#v", checkpoints)
+	}
+}
+
+func TestCompleteConflictPushWaitsForTransactionReturn(t *testing.T) {
+	runner, service, base, operation, mergeHeadPath := completionTestFixture(t)
+	runner.pushStarted = make(chan struct{})
+	callbackStarted := make(chan struct{})
+	releaseTransaction := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.CompleteConflict(context.Background(), base, operation, func(_ context.Context, mutate func(string) error) error {
+			if err := mutate(base.Path); err != nil {
+				return err
+			}
+			if err := os.Remove(mergeHeadPath); err != nil {
+				return err
+			}
+			close(callbackStarted)
+			<-releaseTransaction
+			return nil
+		}, func(context.Context, Checkpoint) error { return nil })
+		done <- err
+	}()
+	<-callbackStarted
+	select {
+	case <-runner.pushStarted:
+		t.Fatal("push started before WorktreeTransaction returned")
+	default:
+	}
+	close(releaseTransaction)
+	<-runner.pushStarted
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompleteConflictTrustedRefCASFailureRetainsCheckpoint(t *testing.T) {
+	runner, service, base, operation, mergeHeadPath := completionTestFixture(t)
+	runner.updateRefErr = errors.New("trusted ref changed")
+	var checkpoints []Checkpoint
+	_, err := service.CompleteConflict(context.Background(), base, operation, completionTestTransaction(t, base.Path, mergeHeadPath), func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if err == nil || len(runner.pushCalls) != 1 || len(runner.updateRefCalls) != 1 {
+		t.Fatalf("CompleteConflict() error = %v, push = %#v, trusted ref updates = %#v", err, runner.pushCalls, runner.updateRefCalls)
+	}
+	if len(checkpoints) != 4 || checkpoints[3].Stage != StageConflictPushing || checkpoints[3].PushOID == "" || checkpoints[3].RemoteOID != operation.RemoteOID {
+		t.Fatalf("trusted ref CAS checkpoints = %#v", checkpoints)
+	}
+}
+
+func TestCompleteConflictPushTimeoutRetainsCommittedCheckpoint(t *testing.T) {
+	runner, service, base, operation, mergeHeadPath := completionTestFixture(t)
+	runner.pushErr = context.DeadlineExceeded
+	var checkpoints []Checkpoint
+	_, err := service.CompleteConflict(context.Background(), base, operation, completionTestTransaction(t, base.Path, mergeHeadPath), func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || len(runner.updateRefCalls) != 0 {
+		t.Fatalf("CompleteConflict() error = %v, trusted ref updates = %#v", err, runner.updateRefCalls)
+	}
+	if len(checkpoints) != 4 || checkpoints[3].Stage != StageConflictPushing || checkpoints[3].PushOID == "" || checkpoints[3].RemoteOID != operation.RemoteOID {
+		t.Fatalf("push-timeout checkpoints = %#v", checkpoints)
+	}
+}
+
+func TestCompleteConflictWithholdsTrustedRefCASWhenMergeStateAppearsAfterPush(t *testing.T) {
+	runner, service, base, operation, mergeHeadPath := completionTestFixture(t)
+	runner.foreignAfterPush = true
+	var checkpoints []Checkpoint
+	_, err := service.CompleteConflict(context.Background(), base, operation, completionTestTransaction(t, base.Path, mergeHeadPath), func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if err != ErrRecoveryRequired || len(runner.pushCalls) != 1 || len(runner.updateRefCalls) != 0 {
+		t.Fatalf("CompleteConflict() error = %v, push = %#v, trusted ref updates = %#v", err, runner.pushCalls, runner.updateRefCalls)
+	}
+	if len(checkpoints) != 4 || checkpoints[3].Stage != StageConflictPushing || checkpoints[3].PushOID == "" || checkpoints[3].RemoteOID != operation.RemoteOID {
+		t.Fatalf("post-push merge-state checkpoints = %#v", checkpoints)
+	}
+}
+
+func TestCompleteConflictRejectsBaseReplacementBeforeCommit(t *testing.T) {
+	runner, service, base, operation, _ := completionTestFixture(t)
+	runner.replaceBase = func() {
+		if err := os.Rename(base.Path, base.Path+"-replaced"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(base.Path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := service.CompleteConflict(context.Background(), base, operation, directResolutionTransaction(base.Path), func(context.Context, Checkpoint) error { return nil })
+	var safeErr *SafeError
+	if !errors.As(err, &safeErr) || safeErr.Code != CodeNeedsReconnect || runner.committed || len(runner.pushCalls) != 0 || len(runner.updateRefCalls) != 0 {
+		t.Fatalf("CompleteConflict() error = %#v, committed = %t, push = %#v, trusted ref updates = %#v", err, runner.committed, runner.pushCalls, runner.updateRefCalls)
+	}
+}
+
+func completionTestFixture(t *testing.T) (*resolutionRunner, *Service, ConfiguredBase, Operation, string) {
+	t.Helper()
+	const (
+		localOID  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		remoteOID = "cccccccccccccccccccccccccccccccccccccccc"
+		pushOID   = "dddddddddddddddddddddddddddddddddddddddd"
+	)
+	basePath := t.TempDir()
+	gitDir := filepath.Join(basePath, ".git")
+	if err := os.Mkdir(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mergeHeadPath := filepath.Join(gitDir, "MERGE_HEAD")
+	if err := os.WriteFile(mergeHeadPath, []byte(remoteOID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &resolutionRunner{localOID: localOID, remoteOID: remoteOID, pushOID: pushOID, resolved: true}
+	base := ConfiguredBase{Name: "notes", Path: basePath, URL: "https://example.invalid/notes.git", Branch: "main"}
+	service := NewService(runner, completionPorcelain{
+		conflictPorcelain: conflictPorcelain{local: LocalInspection{HasRepository: true, RepositoryRoot: basePath, GitDir: gitDir, CurrentBranch: "main", PendingOperation: "merge"}},
+		runner:            runner,
+	})
+	operation := Operation{ID: "0123456789abcdef0123456789abcdef", BaseName: base.Name, RepoPath: base.Path, Branch: base.Branch, Kind: OperationConflictComplete, State: OperationRunning, LocalOID: localOID, CandidateOID: remoteOID, RemoteOID: remoteOID}
+	return runner, service, base, operation, mergeHeadPath
+}
+
+func completionTestTransaction(t *testing.T, path, mergeHeadPath string) WorktreeTransaction {
+	t.Helper()
+	return func(_ context.Context, mutate func(string) error) error {
+		if err := mutate(path); err != nil {
+			return err
+		}
+		return os.Remove(mergeHeadPath)
+	}
+}
+
+type completionPorcelain struct {
+	conflictPorcelain
+	runner      *resolutionRunner
+	keepPending bool
+}
+
+func (p completionPorcelain) InspectLocal(ctx context.Context, path string) (LocalInspection, error) {
+	local, err := p.conflictPorcelain.InspectLocal(ctx, path)
+	if p.runner.committed && !p.keepPending {
+		local.PendingOperation = ""
+	}
+	if p.runner.pushed && p.runner.foreignAfterPush {
+		local.PendingOperation = "rebase"
+	}
+	return local, err
+}
+
 type resolutionRunner struct {
 	stageContents      map[int]string
 	stageSymlinks      map[int]string
@@ -832,6 +1204,7 @@ type resolutionRunner struct {
 	baseOID            string
 	localOID           string
 	remoteOID          string
+	pushOID            string
 	hashOID            string
 	allStages          string
 	allStagesSet       bool
@@ -839,13 +1212,54 @@ type resolutionRunner struct {
 	allStageOutputs    []string
 	allStageCalls      int
 	resolved           bool
+	committed          bool
+	mergeHeadAbsent    bool
 	calls              []Command
 	addCalls           []Command
 	addInputs          [][]byte
+	pushCalls          []Command
+	updateRefCalls     []Command
+	pushErr            error
+	updateRefErr       error
+	originURL          string
+	pushStarted        chan struct{}
+	pushed             bool
+	foreignAfterPush   bool
+	managedRefCalls    int
+	replaceBase        func()
 }
 
 func (r *resolutionRunner) Run(_ context.Context, command Command) (Result, error) {
 	r.calls = append(r.calls, command)
+	if reflect.DeepEqual(command.Args, []string{"commit", "--no-edit"}) {
+		r.committed = true
+		return Result{}, nil
+	}
+	if len(command.Args) == 5 && reflect.DeepEqual(command.Args[:3], []string{"rev-list", "--parents", "-n"}) {
+		return Result{Stdout: r.pushOID + " " + r.localOID + " " + r.remoteOID + "\n"}, nil
+	}
+	if len(command.Args) == 7 && reflect.DeepEqual(command.Args[:5], []string{"diff-tree", "-r", "--no-commit-id", "--name-only", "-z"}) {
+		return Result{Stdout: "z.md\x00a.md\x00z.md\x00"}, nil
+	}
+	if len(command.Args) == 5 && command.Args[0] == "push" {
+		r.pushCalls = append(r.pushCalls, command)
+		r.pushed = true
+		if r.pushStarted != nil {
+			close(r.pushStarted)
+		}
+		return Result{}, r.pushErr
+	}
+	if len(command.Args) == 4 && command.Args[0] == "update-ref" {
+		r.updateRefCalls = append(r.updateRefCalls, command)
+		return Result{}, r.updateRefErr
+	}
+	if startsArgs(command, "remote", "get-url", "--all") {
+		origin := r.originURL
+		if origin == "" {
+			origin = "https://example.invalid/notes.git"
+		}
+		return Result{Stdout: origin + "\n"}, nil
+	}
 	if strings.Contains(strings.Join(command.Args, "\x00"), "checkout-index") {
 		input, err := io.ReadAll(command.Stdin)
 		if err != nil {
@@ -937,9 +1351,22 @@ func (r *resolutionRunner) Run(_ context.Context, command Command) (Result, erro
 		return Result{Stdout: "100644 " + r.baseOID + " 1\tnote.md\x00100644 " + r.localOID + " 2\tnote.md\x00100644 " + r.remoteOID + " 3\tnote.md\x00"}, nil
 	}
 	if hasArgs([]Command{command}, "rev-parse", "--verify", "HEAD^{commit}") {
+		if r.committed {
+			return Result{Stdout: r.pushOID + "\n"}, nil
+		}
 		return Result{Stdout: r.localOID + "\n"}, nil
 	}
-	if hasArgs([]Command{command}, "rev-parse", "--verify", "MERGE_HEAD^{commit}") || hasArgs([]Command{command}, "rev-parse", "--verify", "refs/igonotes/remotes/main^{commit}") {
+	if hasArgs([]Command{command}, "rev-parse", "--verify", "MERGE_HEAD^{commit}") {
+		if r.mergeHeadAbsent {
+			return Result{}, errors.New("MERGE_HEAD missing")
+		}
+		return Result{Stdout: r.remoteOID + "\n"}, nil
+	}
+	if hasArgs([]Command{command}, "rev-parse", "--verify", "refs/igonotes/remotes/main^{commit}") {
+		r.managedRefCalls++
+		if r.managedRefCalls == 2 && r.replaceBase != nil {
+			r.replaceBase()
+		}
 		return Result{Stdout: r.remoteOID + "\n"}, nil
 	}
 	if hasArgs([]Command{command}, "merge-base", "--all", "HEAD", "MERGE_HEAD") {
