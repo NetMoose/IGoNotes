@@ -7,7 +7,10 @@ import {
   createNote,
   deleteNote,
   forgetBase,
+  configureGit,
+  disableGit,
   getConfig,
+  getGitStatus,
   getInfo,
   getNote,
   getNotes,
@@ -16,6 +19,8 @@ import {
   selectDirectory,
   switchBase,
   syncNotes,
+  syncGit,
+  probeGit,
   updateBase,
   updateConfig,
   uploadAsset,
@@ -45,6 +50,65 @@ function configFixture(name = 'work', path = `/notes/${name}`) {
 function requestAt(fetchMock, index = 0) {
   const [path, options] = fetchMock.mock.calls[index]
   return { path, options }
+}
+
+function gitStatus(base = 'work', state = 'ready') {
+  return {
+    base,
+    state,
+    ahead: 0,
+    behind: 0,
+    consecutive_failures: 0,
+    changed_paths: [],
+  }
+}
+
+function gitOperation() {
+  return {
+    operation_id: 'operation-1',
+    status: 'queued',
+    deduplicated: false,
+  }
+}
+
+function gitProbe(base = 'work') {
+  return {
+    base,
+    git_version: '2.49.0',
+    has_repository: true,
+    repository_root_matches: true,
+    detached_head: false,
+    working_tree_clean: true,
+    remote_branches: ['main'],
+    empty_remote: false,
+    identity_configured: true,
+    history_relation: 'equal',
+    can_configure: true,
+    required_mutations: {
+      create_repository: false,
+      add_origin: false,
+      replace_origin: false,
+      create_branch: false,
+      merge_histories: false,
+    },
+    warnings: [],
+  }
+}
+
+function gitConfigResponse(base = 'work', status = 202) {
+  return jsonResponse({
+    base: {
+      name: base,
+      path: `/notes/${base}`,
+      git_url: 'https://example.test/notes.git',
+      git_branch: 'main',
+      auto_sync: true,
+      auto_sync_interval_minutes: 15,
+      git_commit_message_template: 'sync {{base}}',
+    },
+    status: gitStatus(base, 'initializing'),
+    operation: gitOperation(),
+  }, status)
 }
 
 function expectJSONRequest(fetchMock, index, path, method, body) {
@@ -78,6 +142,94 @@ describe('frontend API client', () => {
       code: 'network_error',
       field: '',
       message: '',
+    })
+  })
+
+  it('uses exact Git endpoint methods, bodies, and encoded base names', async () => {
+    const confirmations = {
+      create_repository: true,
+      replace_origin: false,
+      create_branch: false,
+      merge_histories: false,
+    }
+    const request = {
+      git_url: 'https://example.test/notes.git',
+      git_branch: 'main',
+      auto_sync: true,
+      auto_sync_interval_minutes: 15,
+      git_commit_message_template: 'sync {{base}}',
+      confirmations,
+    }
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(gitProbe('team/name')))
+      .mockResolvedValueOnce(gitConfigResponse('team/name'))
+      .mockResolvedValueOnce(gitConfigResponse('team/name', 200))
+      .mockResolvedValueOnce(jsonResponse({ statuses: [gitStatus('team/name')] }))
+      .mockResolvedValueOnce(jsonResponse({ statuses: [gitStatus()] }))
+      .mockResolvedValueOnce(jsonResponse(gitOperation(), 202))
+
+    await expect(probeGit({ base: 'team/name', git_url: 'https://example.test/notes.git' })).resolves.toEqual(gitProbe('team/name'))
+    await expect(configureGit('team/name', request)).resolves.toEqual(expect.objectContaining({ operation: gitOperation() }))
+    await expect(disableGit('team/name')).resolves.toEqual(expect.objectContaining({ base: expect.objectContaining({ name: 'team/name' }) }))
+    await expect(getGitStatus('team/name')).resolves.toEqual([gitStatus('team/name')])
+    await expect(getGitStatus()).resolves.toEqual([gitStatus()])
+    await expect(syncGit('team/name')).resolves.toEqual(gitOperation())
+
+    expectJSONRequest(fetchMock, 0, '/api/git/probe', 'POST', {
+      base: 'team/name',
+      git_url: 'https://example.test/notes.git',
+      git_branch: '',
+    })
+    expectJSONRequest(fetchMock, 1, '/api/git/config?base=team%2Fname', 'PUT', request)
+    expect(requestAt(fetchMock, 2)).toMatchObject({
+      path: '/api/git/config?base=team%2Fname',
+      options: { method: 'DELETE' },
+    })
+    expect(requestAt(fetchMock, 2).options.body).toBeUndefined()
+    expect(requestAt(fetchMock, 3)).toMatchObject({
+      path: '/api/git/status?base=team%2Fname',
+      options: { method: 'GET' },
+    })
+    expect(requestAt(fetchMock, 4)).toMatchObject({ path: '/api/git/status', options: { method: 'GET' } })
+    expect(requestAt(fetchMock, 5)).toMatchObject({
+      path: '/api/git/sync?base=team%2Fname',
+      options: { method: 'POST' },
+    })
+    expect(requestAt(fetchMock, 5).options.body).toBeUndefined()
+  })
+
+  it('preserves Git API errors', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      code: 'invalid_branch',
+      message: 'invalid Git branch',
+      field: 'git_branch',
+    }, 422))
+
+    await expect(configureGit('work', {})).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 422,
+      code: 'invalid_branch',
+      message: 'invalid Git branch',
+      field: 'git_branch',
+    })
+  })
+
+  it.each([
+    ['probe without all required mutation flags', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), required_mutations: {} }, 200],
+    ['probe with an invalid blocking error', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), blocking_error: { code: 1, message: 'failure' } }, 200],
+    ['config response with an invalid base', () => configureGit('work', {}), { base: { name: 'work', path: '/notes/work', auto_sync: 'true' }, status: gitStatus() }, 202],
+    ['config response with an invalid status state', () => disableGit('work'), { base: { name: 'work', path: '/notes/work', auto_sync: false }, status: { ...gitStatus(), state: 'done' } }, 200],
+    ['config response with an invalid operation', () => configureGit('work', {}), { base: { name: 'work', path: '/notes/work', auto_sync: false }, status: gitStatus(), operation: { operation_id: 'id', status: 'queued' } }, 202],
+    ['status response with an invalid changed path', () => getGitStatus('work'), { statuses: [{ ...gitStatus(), changed_paths: [1] }] }, 200],
+    ['sync response with an invalid operation status', () => syncGit('work'), { ...gitOperation(), status: 1 }, 202],
+  ])('rejects a malformed successful Git %s', async (_case, call, payload, status) => {
+    fetchMock.mockResolvedValue(jsonResponse(payload, status))
+
+    await expect(call()).rejects.toMatchObject({
+      name: 'ApiError',
+      status,
+      code: 'invalid_response',
+      message: 'Приложение вернуло некорректный JSON',
     })
   })
 

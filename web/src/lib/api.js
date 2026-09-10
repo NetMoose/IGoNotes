@@ -82,6 +82,115 @@ function jsonBody(value) {
   return JSON.stringify(value)
 }
 
+function invalidResponse(status) {
+  return new ApiError({
+    status,
+    code: 'invalid_response',
+    message: 'Приложение вернуло некорректный JSON',
+  })
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function hasString(value, key, { optional = false } = {}) {
+  return (optional && value[key] === undefined) || typeof value[key] === 'string'
+}
+
+function hasInteger(value, key) {
+  return Number.isInteger(value[key])
+}
+
+function validAPIError(value) {
+  return isObject(value)
+    && typeof value.code === 'string'
+    && typeof value.message === 'string'
+    && hasString(value, 'field', { optional: true })
+}
+
+function validGitBase(value) {
+  return isObject(value)
+    && typeof value.name === 'string'
+    && typeof value.path === 'string'
+    && typeof value.auto_sync === 'boolean'
+    && hasString(value, 'git_url', { optional: true })
+    && hasString(value, 'git_branch', { optional: true })
+    && hasString(value, 'git_commit_message_template', { optional: true })
+    && (value.auto_sync_interval_minutes === undefined || hasInteger(value, 'auto_sync_interval_minutes'))
+}
+
+const gitStates = new Set([
+  'unconfigured',
+  'initializing',
+  'ready',
+  'syncing',
+  'error',
+  'paused',
+  'conflict',
+  'needs_reconnect',
+])
+
+function validGitStatus(value) {
+  return isObject(value)
+    && typeof value.base === 'string'
+    && gitStates.has(value.state)
+    && hasInteger(value, 'ahead')
+    && hasInteger(value, 'behind')
+    && hasInteger(value, 'consecutive_failures')
+    && Array.isArray(value.changed_paths)
+    && value.changed_paths.every((path) => typeof path === 'string')
+    && hasString(value, 'repository_path', { optional: true })
+    && hasString(value, 'operation_id', { optional: true })
+    && hasString(value, 'stage', { optional: true })
+    && hasString(value, 'last_attempt', { optional: true })
+    && hasString(value, 'last_success', { optional: true })
+    && hasString(value, 'remote_oid', { optional: true })
+    && (value.error === undefined || value.error === null || validAPIError(value.error))
+}
+
+function validGitOperation(value) {
+  return isObject(value)
+    && typeof value.operation_id === 'string'
+    && typeof value.status === 'string'
+    && typeof value.deduplicated === 'boolean'
+}
+
+function validGitProbe(value) {
+  const mutations = value?.required_mutations
+  return isObject(value)
+    && typeof value.base === 'string'
+    && typeof value.git_version === 'string'
+    && typeof value.has_repository === 'boolean'
+    && typeof value.repository_root_matches === 'boolean'
+    && typeof value.detached_head === 'boolean'
+    && typeof value.working_tree_clean === 'boolean'
+    && Array.isArray(value.remote_branches)
+    && value.remote_branches.every((branch) => typeof branch === 'string')
+    && typeof value.empty_remote === 'boolean'
+    && typeof value.identity_configured === 'boolean'
+    && typeof value.history_relation === 'string'
+    && typeof value.can_configure === 'boolean'
+    && isObject(mutations)
+    && ['create_repository', 'add_origin', 'replace_origin', 'create_branch', 'merge_histories']
+      .every((key) => typeof mutations[key] === 'boolean')
+    && Array.isArray(value.warnings)
+    && value.warnings.every((warning) => typeof warning === 'string')
+    && hasString(value, 'repository_root', { optional: true })
+    && hasString(value, 'current_branch', { optional: true })
+    && hasString(value, 'existing_origin_url', { optional: true })
+    && hasString(value, 'pending_operation', { optional: true })
+    && (value.blocking_error === undefined || value.blocking_error === null || validAPIError(value.blocking_error))
+}
+
+async function requestGit(path, options, validate) {
+  const { status, payload } = await requestWithStatus(path, options)
+  if (!validate(payload)) {
+    throw invalidResponse(status)
+  }
+  return payload
+}
+
 async function mutateConfig(path, options) {
   const { status, payload } = await requestWithStatus(path, options)
   if (
@@ -104,6 +213,46 @@ async function mutateConfig(path, options) {
 
 export function getConfig() {
   return request('/api/config', { method: 'GET' })
+}
+
+export function probeGit({ base, git_url, git_branch = '' }) {
+  return requestGit('/api/git/probe', {
+    method: 'POST',
+    body: jsonBody({ base, git_url, git_branch }),
+  }, validGitProbe)
+}
+
+export function configureGit(base, request) {
+  return requestGit(`/api/git/config?base=${encodeURIComponent(base)}`, {
+    method: 'PUT',
+    body: jsonBody(request),
+  }, (payload) => isObject(payload)
+    && validGitBase(payload.base)
+    && validGitStatus(payload.status)
+    && (payload.operation === undefined || payload.operation === null || validGitOperation(payload.operation)))
+}
+
+export function disableGit(base) {
+  return requestGit(`/api/git/config?base=${encodeURIComponent(base)}`, {
+    method: 'DELETE',
+  }, (payload) => isObject(payload)
+    && validGitBase(payload.base)
+    && validGitStatus(payload.status)
+    && (payload.operation === undefined || payload.operation === null || validGitOperation(payload.operation)))
+}
+
+export async function getGitStatus(base = '') {
+  const query = base ? `?base=${encodeURIComponent(base)}` : ''
+  const payload = await requestGit(`/api/git/status${query}`, { method: 'GET' }, (value) => isObject(value)
+    && Array.isArray(value.statuses)
+    && value.statuses.every(validGitStatus))
+  return payload.statuses
+}
+
+export function syncGit(base) {
+  return requestGit(`/api/git/sync?base=${encodeURIComponent(base)}`, {
+    method: 'POST',
+  }, validGitOperation)
 }
 
 export function updateConfig(config) {
