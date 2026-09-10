@@ -109,6 +109,36 @@ func TestWriteServiceErrorUsesOnlySafeErrorPublicFields(t *testing.T) {
 	}
 }
 
+func TestWriteServiceErrorGitConflict(t *testing.T) {
+	private := "https://user:secret@example.test/private.git"
+	tests := []struct {
+		name   string
+		err    *gitcmd.SafeError
+		status int
+	}{
+		{name: "not found", err: gitcmd.ErrConflictNotFound, status: http.StatusNotFound},
+		{name: "stale", err: gitcmd.ErrConflictStale, status: http.StatusConflict},
+		{name: "unresolved", err: gitcmd.ErrConflictUnresolved, status: http.StatusConflict},
+		{name: "recovery required", err: gitcmd.ErrRecoveryRequired, status: http.StatusConflict},
+		{name: "unsupported", err: gitcmd.ErrConflictUnsupported, status: http.StatusUnprocessableEntity},
+		{name: "merge not in progress", err: gitcmd.ErrMergeNotInProgress, status: http.StatusConflict},
+		{name: "paused", err: gitcmd.ErrGitPaused, status: http.StatusConflict},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+
+			writeServiceError(recorder, fmt.Errorf("%s: %w", private, test.err))
+
+			assertAPIErrorResponse(t, recorder, test.status, model.APIError{Code: string(test.err.Code), Message: test.err.Message})
+			if strings.Contains(recorder.Body.String(), private) {
+				t.Fatalf("response leaks private wrapper detail: %q", recorder.Body.String())
+			}
+		})
+	}
+}
+
 type gitBranchValidatorFunc func(context.Context, string, string) error
 
 func (f gitBranchValidatorFunc) ValidateBranch(ctx context.Context, dir, branch string) error {

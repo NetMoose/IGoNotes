@@ -70,6 +70,10 @@ func writeServiceError(w http.ResponseWriter, err error) {
 			status = http.StatusUnprocessableEntity
 		case gitcmd.CodeAuthentication:
 			status = http.StatusUnauthorized
+		case gitcmd.CodeConflictNotFound:
+			status = http.StatusNotFound
+		case gitcmd.CodeConflictUnsupported:
+			status = http.StatusUnprocessableEntity
 		case gitcmd.CodeRemoteUnreachable:
 			status = http.StatusBadGateway
 		case gitcmd.CodeRepositoryRoot,
@@ -78,7 +82,12 @@ func writeServiceError(w http.ResponseWriter, err error) {
 			gitcmd.CodeBranchDeleted,
 			gitcmd.CodeRemoteHistoryRewritten,
 			gitcmd.CodePushRejected,
-			gitcmd.CodeNeedsReconnect:
+			gitcmd.CodeNeedsReconnect,
+			gitcmd.CodeConflictStale,
+			gitcmd.CodeConflictUnresolved,
+			gitcmd.CodeRecoveryRequired,
+			gitcmd.CodeMergeNotInProgress,
+			gitcmd.CodePaused:
 			status = http.StatusConflict
 		case gitcmd.CodeTimedOut:
 			status = http.StatusGatewayTimeout

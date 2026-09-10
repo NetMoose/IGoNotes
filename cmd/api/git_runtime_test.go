@@ -72,3 +72,31 @@ func TestRecoveryUsesNoNetworkCommand(t *testing.T) {
 		t.Fatal("startup runs network Git work before local recovery")
 	}
 }
+
+func TestConflictRecoveryReusesLocalRecoveryBeforeWorkerAndInitialIndex(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	runServerSource := sourceFunction(t, string(source), "func runServer(", "func runMain(")
+
+	if got := strings.Count(runServerSource, "gitManager.RecoverLocal("); got != 1 {
+		t.Fatalf("RecoverLocal calls = %d, want exactly 1", got)
+	}
+	for _, forbidden := range []string{".Sync(", ".Initialize(", ".Probe("} {
+		if strings.Contains(runServerSource[:strings.Index(runServerSource, "gitManager.RecoverLocal(")], forbidden) {
+			t.Fatalf("startup runs network Git work before local recovery: %s", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"gitManager.RecoverLocal(ctx, configuredGitSnapshots(settingsService))",
+		"gitManager.Start()",
+		"noteService.SyncFS()",
+		"gitConflictHandler := handlers.NewGitConflictHandler(gitManager)",
+		"handlers.RegisterGitConflictRoutes(router, gitConflictHandler, settingsService)",
+	} {
+		if strings.Index(runServerSource, required) < 0 {
+			t.Fatalf("runServer does not contain %q", required)
+		}
+	}
+}

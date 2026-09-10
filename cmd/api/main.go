@@ -139,6 +139,8 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
 	handlers.RegisterGitRoutes(router, gitHandler, settingsService)
+	gitConflictHandler := handlers.NewGitConflictHandler(gitManager)
+	handlers.RegisterGitConflictRoutes(router, gitConflictHandler, settingsService)
 	registerSystemRoutes(router, systemHandler)
 
 	address, url := localServerEndpoint(options.port)

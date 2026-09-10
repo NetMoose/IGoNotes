@@ -192,7 +192,7 @@ func TestGitConflictHandlerDelegatesRedactedServiceErrors(t *testing.T) {
 
 	handler.Resolve(recorder, httptest.NewRequest(http.MethodPut, "/api/git/conflicts/resolve", strings.NewReader(`{"base":"work","operation_id":"operation-1","conflict_id":"sha256:abc","path":"notes/idea.md","action":"local"}`)))
 
-	assertAPIErrorResponse(t, recorder, http.StatusInternalServerError, model.APIError{Code: "internal_error", Message: "Internal server error"})
+	assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "git_conflict_stale", Message: "Git conflict changed; refresh and try again"})
 	if strings.Contains(recorder.Body.String(), private) || manager.resolveCalls != 1 {
 		t.Fatalf("response leaks private data or did not call manager: %q", recorder.Body.String())
 	}

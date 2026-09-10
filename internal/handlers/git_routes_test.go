@@ -95,6 +95,139 @@ func TestGitRoutesRegisterManualSync(t *testing.T) {
 	}
 }
 
+func TestGitRoutesRegisterConflictRoutes(t *testing.T) {
+	operation := gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued}
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		status int
+		called func(*gitConflictManagerFake) int
+	}{
+		{name: "list", method: http.MethodGet, path: "/api/git/conflicts?base=work", status: http.StatusOK, called: func(f *gitConflictManagerFake) int { return f.listCalls }},
+		{name: "resolve", method: http.MethodPut, path: "/api/git/conflicts/resolve", body: `{"base":"work","operation_id":"operation-1","conflict_id":"sha256:abc","path":"notes/idea.md","action":"local"}`, status: http.StatusOK, called: func(f *gitConflictManagerFake) int { return f.resolveCalls }},
+		{name: "complete", method: http.MethodPost, path: "/api/git/conflicts/complete?base=work", status: http.StatusAccepted, called: func(f *gitConflictManagerFake) int { return f.completeCalls }},
+		{name: "abort", method: http.MethodPost, path: "/api/git/conflicts/abort?base=work", status: http.StatusAccepted, called: func(f *gitConflictManagerFake) int { return f.abortCalls }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := &gitConflictManagerFake{
+				listResponse:      model.GitConflictListResponse{Conflicts: []model.GitConflict{}},
+				resolveResponse:   model.GitConflictResolveResponse{Remaining: model.GitConflictListResponse{Conflicts: []model.GitConflict{}}},
+				completeOperation: operation,
+				abortOperation:    operation,
+			}
+			state := &gitRouteSetupState{completed: true}
+			mux := http.NewServeMux()
+			RegisterGitConflictRoutes(mux, NewGitConflictHandler(manager), state)
+			recorder := httptest.NewRecorder()
+
+			mux.ServeHTTP(recorder, newLocalRouterRequest(test.method, test.path, strings.NewReader(test.body)))
+
+			if recorder.Code != test.status {
+				t.Fatalf("status = %d, want %d; body = %q", recorder.Code, test.status, recorder.Body.String())
+			}
+			if test.called(manager) != 1 || state.calls != 1 {
+				t.Fatalf("handler/setup calls = %d/%d, want 1/1", test.called(manager), state.calls)
+			}
+		})
+	}
+}
+
+func TestGitRoutesConflictRoutesRejectUnsupportedMethodsBeforeSetup(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		allow  string
+	}{
+		{name: "list", method: http.MethodPost, path: "/api/git/conflicts", allow: "GET"},
+		{name: "resolve", method: http.MethodGet, path: "/api/git/conflicts/resolve", allow: "PUT"},
+		{name: "complete", method: http.MethodGet, path: "/api/git/conflicts/complete", allow: "POST"},
+		{name: "abort", method: http.MethodGet, path: "/api/git/conflicts/abort", allow: "POST"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := &gitConflictManagerFake{}
+			state := &gitRouteSetupState{}
+			mux := http.NewServeMux()
+			RegisterGitConflictRoutes(mux, NewGitConflictHandler(manager), state)
+			recorder := httptest.NewRecorder()
+
+			mux.ServeHTTP(recorder, newLocalRouterRequest(test.method, test.path, nil))
+
+			assertAPIErrorResponse(t, recorder, http.StatusMethodNotAllowed, model.APIError{Code: "method_not_allowed", Message: "Method not allowed"})
+			if got := recorder.Header().Get("Allow"); got != test.allow {
+				t.Errorf("Allow = %q, want %q", got, test.allow)
+			}
+			assertGitConflictRouteNotCalled(t, manager)
+			if state.calls != 0 {
+				t.Errorf("SetupCompleted calls = %d, want 0", state.calls)
+			}
+		})
+	}
+}
+
+func TestGitRoutesConflictRoutesUseLocalOriginAndSetupGuards(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "list", method: http.MethodGet, path: "/api/git/conflicts?base=work"},
+		{name: "resolve", method: http.MethodPut, path: "/api/git/conflicts/resolve", body: `{"base":"work","operation_id":"operation-1","conflict_id":"sha256:abc","path":"notes/idea.md","action":"local"}`},
+		{name: "complete", method: http.MethodPost, path: "/api/git/conflicts/complete?base=work"},
+		{name: "abort", method: http.MethodPost, path: "/api/git/conflicts/abort?base=work"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+" cross origin", func(t *testing.T) {
+			manager := &gitConflictManagerFake{}
+			state := &gitRouteSetupState{}
+			mux := http.NewServeMux()
+			RegisterGitConflictRoutes(mux, NewGitConflictHandler(manager), state)
+			request := newLocalRouterRequest(test.method, test.path, strings.NewReader(test.body))
+			request.Header.Set("Origin", "https://evil.example")
+			recorder := httptest.NewRecorder()
+
+			mux.ServeHTTP(recorder, request)
+
+			assertAPIErrorResponse(t, recorder, http.StatusForbidden, model.APIError{Code: "forbidden_origin", Message: "Forbidden request"})
+			assertGitConflictRouteNotCalled(t, manager)
+			if state.calls != 0 {
+				t.Errorf("SetupCompleted calls = %d, want 0", state.calls)
+			}
+		})
+
+		t.Run(test.name+" setup", func(t *testing.T) {
+			manager := &gitConflictManagerFake{}
+			state := &gitRouteSetupState{}
+			mux := http.NewServeMux()
+			RegisterGitConflictRoutes(mux, NewGitConflictHandler(manager), state)
+			recorder := httptest.NewRecorder()
+
+			mux.ServeHTTP(recorder, newLocalRouterRequest(test.method, test.path, strings.NewReader(test.body)))
+
+			assertAPIErrorResponse(t, recorder, http.StatusPreconditionRequired, model.APIError{Code: "setup_required", Message: "setup required"})
+			assertGitConflictRouteNotCalled(t, manager)
+			if state.calls != 1 {
+				t.Errorf("SetupCompleted calls = %d, want 1", state.calls)
+			}
+		})
+	}
+}
+
+func assertGitConflictRouteNotCalled(t *testing.T, manager *gitConflictManagerFake) {
+	t.Helper()
+	if manager.listCalls != 0 || manager.resolveCalls != 0 || manager.completeCalls != 0 || manager.abortCalls != 0 {
+		t.Errorf("conflict manager calls = list %d, resolve %d, complete %d, abort %d; want all 0", manager.listCalls, manager.resolveCalls, manager.completeCalls, manager.abortCalls)
+	}
+}
+
 func TestGitRoutesRejectUnsupportedMethodsBeforeSetup(t *testing.T) {
 	tests := []struct {
 		name   string
