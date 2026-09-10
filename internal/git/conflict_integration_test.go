@@ -414,6 +414,210 @@ func TestCompleteConflictRejectsRemoteAdvanceWithoutLosingLocalMerge(t *testing.
 	}
 }
 
+func TestAbortConflictIntegration(t *testing.T) {
+	fixture := newConflictFixture(t)
+	writeConflictFile(t, fixture.Local, "victim.md", []byte("local\n"))
+	conflictCommit(t, fixture.Local, "local conflict")
+	writeConflictFile(t, fixture.Other, "victim.md", []byte("remote\n"))
+	conflictCommit(t, fixture.Other, "remote conflict")
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+	service, base, original := conflictResolver(t, fixture)
+	runner := &interceptRunner{delegate: NewCommandRunner()}
+	service = NewService(runner, NewClient(runner))
+	abort := original
+	abort.Kind = OperationConflictAbort
+	abort.State = OperationRunning
+	abort.Stage = StageConflictAborting
+	abort.ConflictPaths = []string{"victim.md"}
+	var checkpoints []Checkpoint
+	events := []string{}
+	err := service.AbortConflict(context.Background(), base, abort, func(_ context.Context, mutate func(string) error) error {
+		events = append(events, "mutate")
+		if err := mutate(fixture.Local); err != nil {
+			return err
+		}
+		events = append(events, "reindex", "unlock")
+		return nil
+	}, func(_ context.Context, checkpoint Checkpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"mutate", "reindex", "unlock"}) {
+		t.Fatalf("transaction events = %#v", events)
+	}
+	if head := strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "HEAD^{commit}"))); head != original.LocalOID {
+		t.Fatalf("HEAD = %q, want %q", head, original.LocalOID)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.Local, ".git", "MERGE_HEAD")); !os.IsNotExist(err) {
+		t.Fatalf("MERGE_HEAD remains after abort: %v", err)
+	}
+	if len(checkpoints) != 1 || checkpoints[0].Stage != StageConflictAborting || !reflect.DeepEqual(checkpoints[0].ChangedPaths, []string{"victim.md"}) ||
+		!reflect.DeepEqual(checkpoints[0].ConflictPaths, abort.ConflictPaths) {
+		t.Fatalf("abort checkpoints = %#v", checkpoints)
+	}
+	for _, command := range runner.commands {
+		if command.Scope == NetworkOperation {
+			t.Fatalf("AbortConflict() used a network command: %#v", command)
+		}
+	}
+	assertConflictStages(t, fixture, map[string][]int{})
+}
+
+func TestAbortConflictRejectsInvalidIdentityAndPreconditions(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Operation)
+	}{
+		{name: "identity", mutate: func(operation *Operation) { operation.BaseName = "other" }},
+		{name: "head", mutate: func(operation *Operation) { operation.LocalOID = operation.CandidateOID }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newConflictFixture(t)
+			writeConflictFile(t, fixture.Local, "victim.md", []byte("local\n"))
+			conflictCommit(t, fixture.Local, "local conflict")
+			writeConflictFile(t, fixture.Other, "victim.md", []byte("remote\n"))
+			conflictCommit(t, fixture.Other, "remote conflict")
+			fixture.pushOther(t)
+			fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+			service, base, operation := conflictResolver(t, fixture)
+			operation.Kind = OperationConflictAbort
+			operation.State = OperationRunning
+			test.mutate(&operation)
+			called := false
+			err := service.AbortConflict(context.Background(), base, operation, func(_ context.Context, mutate func(string) error) error {
+				called = true
+				return mutate(fixture.Local)
+			}, func(context.Context, Checkpoint) error { return nil })
+			if err != ErrRecoveryRequired || called {
+				t.Fatalf("AbortConflict() = %v, transaction called = %t", err, called)
+			}
+			if _, err := os.Stat(filepath.Join(fixture.Local, ".git", "MERGE_HEAD")); err != nil {
+				t.Fatalf("MERGE_HEAD changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestConflictRestartIntegration(t *testing.T) {
+	newRestartConflict := func(t *testing.T) (*conflictFixture, *Service, ConfiguredBase, Operation) {
+		t.Helper()
+		fixture := newConflictFixture(t)
+		for _, path := range []string{"victim.md", "space name.md"} {
+			writeConflictFile(t, fixture.Local, path, []byte("local\n"))
+		}
+		conflictCommit(t, fixture.Local, "local conflicts")
+		for _, path := range []string{"victim.md", "space name.md"} {
+			writeConflictFile(t, fixture.Other, path, []byte("remote\n"))
+		}
+		conflictCommit(t, fixture.Other, "remote conflicts")
+		fixture.pushOther(t)
+		fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+		service, base, operation := conflictResolver(t, fixture)
+		base.URL = fixture.Remote
+		base.Fingerprint = "config-v1"
+		base.RemoteFingerprint = "remote-v1"
+		operation.ConfigFingerprint = base.Fingerprint
+		operation.RemoteFingerprint = base.RemoteFingerprint
+		return fixture, service, base, operation
+	}
+
+	recover := func(t *testing.T, service *Service, base ConfiguredBase, operation *Operation, want ConflictRecoveryState, blocking bool) RecoveryResult {
+		t.Helper()
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		service = NewService(runner, NewClient(runner))
+		result, _ := service.RecoverLocal(context.Background(), RecoveryOptions{Snapshot: base, Operation: operation})
+		if result.ConflictState != want || result.Blocking != blocking {
+			t.Fatalf("RecoverLocal() = %#v, want state %q blocking %t", result, want, blocking)
+		}
+		assertRecoveryLocalReadOnly(t, runner.commands)
+		return result
+	}
+
+	resolveAll := func(t *testing.T, fixture *conflictFixture) {
+		t.Helper()
+		for _, path := range []string{"victim.md", "space name.md"} {
+			writeConflictFile(t, fixture.Local, path, []byte("resolved\n"))
+			runConflictGit(t, fixture.Local, "add", "--", path)
+		}
+	}
+
+	t.Run("partial and all staged merges preserve recovery decisions", func(t *testing.T) {
+		fixture, service, base, operation := newRestartConflict(t)
+		writeConflictFile(t, fixture.Local, "victim.md", []byte("resolved\n"))
+		runConflictGit(t, fixture.Local, "add", "--", "victim.md")
+		recover(t, service, base, &operation, RecoveryConflict, true)
+		writeConflictFile(t, fixture.Local, "space name.md", []byte("resolved\n"))
+		runConflictGit(t, fixture.Local, "add", "--", "space name.md")
+		recover(t, service, base, &operation, RecoveryCanComplete, true)
+	})
+
+	for _, test := range []struct {
+		name  string
+		stage Stage
+		state ConflictRecoveryState
+	}{
+		{name: "crash after merge commit", stage: StageConflictCommitted, state: RecoveryNeedsReindex},
+		{name: "crash after reindex", stage: StageConflictReindexed, state: RecoveryPushPending},
+		{name: "crash during push", stage: StageConflictPushing, state: RecoveryPushUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, service, base, original := newRestartConflict(t)
+			resolveAll(t, fixture)
+			runConflictGit(t, fixture.Local, "commit", "--no-edit")
+			operation := original
+			operation.Kind = OperationConflictComplete
+			operation.State = OperationRunning
+			operation.Stage = test.stage
+			operation.PushOID = strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "HEAD")))
+			recovered := recover(t, service, base, &operation, test.state, false)
+			if recovered.PushOID != operation.PushOID {
+				t.Fatalf("PushOID = %q, want %q", recovered.PushOID, operation.PushOID)
+			}
+		})
+	}
+
+	t.Run("completed abort before journal finish", func(t *testing.T) {
+		fixture, service, base, operation := newRestartConflict(t)
+		runConflictGit(t, fixture.Local, "merge", "--abort")
+		operation.Kind = OperationConflictAbort
+		operation.State = OperationRunning
+		operation.Stage = StageConflictAborting
+		recover(t, service, base, &operation, RecoveryAborted, false)
+	})
+
+	t.Run("unrelated external commit is ambiguous", func(t *testing.T) {
+		fixture, service, base, original := newRestartConflict(t)
+		resolveAll(t, fixture)
+		runConflictGit(t, fixture.Local, "commit", "--no-edit")
+		operation := original
+		operation.Kind = OperationConflictComplete
+		operation.State = OperationRunning
+		operation.Stage = StageConflictCommitted
+		operation.PushOID = strings.TrimSpace(string(runConflictGit(t, fixture.Local, "rev-parse", "HEAD")))
+		writeConflictFile(t, fixture.Local, "external.md", []byte("external\n"))
+		conflictCommit(t, fixture.Local, "external commit")
+		recover(t, service, base, &operation, RecoveryAmbiguous, true)
+	})
+
+	t.Run("untouched index lock is retained", func(t *testing.T) {
+		fixture, service, base, operation := newRestartConflict(t)
+		lock := filepath.Join(fixture.Local, ".git", "index.lock")
+		if err := os.WriteFile(lock, []byte("owned elsewhere\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		recover(t, service, base, &operation, RecoveryLocked, true)
+		if contents, err := os.ReadFile(lock); err != nil || string(contents) != "owned elsewhere\n" {
+			t.Fatalf("index lock = %q, %v", contents, err)
+		}
+	})
+}
+
 func resolveContentConflictIntegration(t *testing.T, action model.GitConflictAction, want string) {
 	t.Helper()
 	fixture := newConflictFixture(t)

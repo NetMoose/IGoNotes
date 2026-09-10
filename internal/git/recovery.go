@@ -3,8 +3,117 @@ package git
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 )
+
+func (s *Service) AbortConflict(
+	ctx context.Context,
+	base ConfiguredBase,
+	operation Operation,
+	worktree WorktreeTransaction,
+	progress Progress,
+) error {
+	if worktree == nil || progress == nil {
+		return ErrRecoveryRequired
+	}
+	ctx, err := pinConnectBase(ctx, base.Path)
+	if err != nil {
+		return err
+	}
+	if err := s.verifyConflictAbort(ctx, base, operation); err != nil {
+		return err
+	}
+	return runWorktree(ctx, worktree, func(path string) error {
+		if path != base.Path || !filepath.IsAbs(path) {
+			return ErrRecoveryRequired
+		}
+		if err := requireConnectBase(ctx, path); err != nil {
+			return err
+		}
+		if err := s.verifyConflictAbort(ctx, base, operation); err != nil {
+			return err
+		}
+		paths, err := s.conflictAbortPaths(ctx, path, operation.LocalOID)
+		if err != nil {
+			return err
+		}
+		if err := progress(ctx, Checkpoint{
+			BackupRef:     operation.BackupRef,
+			Stage:         StageConflictAborting,
+			LocalOID:      operation.LocalOID,
+			CandidateOID:  operation.CandidateOID,
+			RemoteOID:     operation.RemoteOID,
+			PushOID:       operation.PushOID,
+			ChangedPaths:  paths,
+			ConflictPaths: append([]string(nil), operation.ConflictPaths...),
+		}); err != nil {
+			return err
+		}
+		if result, err := s.runLocal(ctx, path, false, "merge", "--abort"); err != nil || result.StdoutTruncated || result.StderrTruncated {
+			return ErrRecoveryRequired
+		}
+		head, mergeHead, mergeExists, paths, err := s.abortResult(ctx, path)
+		if err != nil || mergeExists || len(paths) != 0 || head != operation.LocalOID || mergeHead != "" {
+			return ErrRecoveryRequired
+		}
+		return nil
+	})
+}
+
+func (s *Service) verifyConflictAbort(ctx context.Context, base ConfiguredBase, operation Operation) error {
+	if s == nil || s.runner == nil || s.porcelain == nil || !validConflictAbortRequest(base, operation) {
+		return ErrRecoveryRequired
+	}
+	local, err := s.porcelain.InspectLocal(ctx, base.Path)
+	if err != nil || validConflictInspection(base, local) != nil || conflictMarkersClear(local.GitDir) != nil {
+		return ErrRecoveryRequired
+	}
+	head, err := s.conflictCommit(ctx, local.RepositoryRoot, "HEAD^{commit}")
+	if err != nil || head != operation.LocalOID {
+		return ErrRecoveryRequired
+	}
+	mergeHead, err := s.conflictCommit(ctx, local.RepositoryRoot, "MERGE_HEAD^{commit}")
+	if err != nil || mergeHead != operation.CandidateOID || mergeHead != operation.RemoteOID {
+		return ErrRecoveryRequired
+	}
+	trusted, err := s.conflictCommit(ctx, local.RepositoryRoot, managedRemoteRef(base.Branch)+"^{commit}")
+	if err != nil || trusted != operation.RemoteOID {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
+func validConflictAbortRequest(base ConfiguredBase, operation Operation) bool {
+	return base.Name != "" && filepath.IsAbs(base.Path) && validLiteralBranch(base.Branch) && validOperationID(operation.ID) &&
+		operation.Kind == OperationConflictAbort && operation.BaseName == base.Name && operation.RepoPath == base.Path &&
+		operation.Branch == base.Branch && validObjectID(operation.LocalOID) && validObjectID(operation.CandidateOID) &&
+		validObjectID(operation.RemoteOID)
+}
+
+func (s *Service) conflictAbortPaths(ctx context.Context, path, localOID string) ([]string, error) {
+	result, err := s.runLocal(ctx, path, true, "diff", "--name-only", "-z", localOID, "--")
+	if err != nil {
+		return nil, ErrRecoveryRequired
+	}
+	paths, err := parseNULPaths(result)
+	if err != nil {
+		return nil, ErrRecoveryRequired
+	}
+	return paths, nil
+}
+
+func (s *Service) abortResult(ctx context.Context, path string) (string, string, bool, []string, error) {
+	head, err := s.conflictCommit(ctx, path, "HEAD^{commit}")
+	if err != nil {
+		return "", "", false, nil, err
+	}
+	mergeHead, mergeExists, paths, err := s.inspectMergeState(ctx, path)
+	if err != nil {
+		return "", "", false, nil, err
+	}
+	return head, mergeHead, mergeExists, paths, nil
+}
 
 func (s *Service) RecoverLocal(ctx context.Context, options RecoveryOptions) (RecoveryResult, error) {
 	path, err := s.validateRecovery(options)
@@ -39,10 +148,10 @@ func (s *Service) RecoverLocal(ctx context.Context, options RecoveryOptions) (Re
 	}
 	locked, err := syncIndexLocked(local.GitDir)
 	if err != nil {
-		return RecoveryResult{Blocking: true}, &SafeError{Code: CodeCommandFailed, Message: "Git repository inspection failed", cause: err}
+		return RecoveryResult{Blocking: true, ConflictState: RecoveryAmbiguous}, &SafeError{Code: CodeCommandFailed, Message: "Git repository inspection failed", cause: err}
 	}
 	if locked {
-		return RecoveryResult{Blocking: true}, &SafeError{Code: CodeRepositoryLocked, Message: "Git repository is locked"}
+		return RecoveryResult{Blocking: true, ConflictState: RecoveryLocked}, &SafeError{Code: CodeRepositoryLocked, Message: "Git repository is locked"}
 	}
 
 	head, _, err := s.optionalCommitOID(ctx, path, "HEAD")
@@ -53,7 +162,7 @@ func (s *Service) RecoverLocal(ctx context.Context, options RecoveryOptions) (Re
 	if err != nil {
 		return RecoveryResult{HeadOID: head, Blocking: true}, err
 	}
-	result := RecoveryResult{HeadOID: head}
+	result := RecoveryResult{HeadOID: head, PushOID: recoveryPushOID(options.Operation)}
 	if managedExists {
 		result.RemoteOID = managed
 	}
@@ -64,11 +173,17 @@ func (s *Service) RecoverLocal(ctx context.Context, options RecoveryOptions) (Re
 	result.MergeHeadOID = mergeHead
 	result.ConflictPaths = paths
 	if mergeStateErr != nil {
-		result.Blocking = true
+		result.Blocking, result.ConflictState = true, RecoveryAmbiguous
 		return result, errors.Join(newConflictError(paths), interruptedMergeState(), mergeStateErr, trustErr)
 	}
+	if local.PendingOperation != "" && local.PendingOperation != "merge" {
+		result.Blocking, result.ConflictState = true, RecoveryAmbiguous
+		return result, errors.Join(
+			&SafeError{Code: CodeOperationInterrupted, Message: "Git repository has an unfinished operation"}, trustErr,
+		)
+	}
 	if len(paths) != 0 {
-		result.Blocking = true
+		result.Blocking, result.ConflictState = true, RecoveryConflict
 		conflictErr := newConflictError(paths)
 		if !mergeExists {
 			return result, errors.Join(conflictErr, interruptedMergeState(), trustErr)
@@ -76,22 +191,70 @@ func (s *Service) RecoverLocal(ctx context.Context, options RecoveryOptions) (Re
 		return result, errors.Join(conflictErr, trustErr)
 	}
 	if local.PendingOperation == "merge" || mergeExists {
-		result.Blocking = true
+		result.Blocking, result.ConflictState = true, RecoveryCanComplete
 		return result, errors.Join(
 			&SafeError{Code: CodeOperationInterrupted, Message: "Git merge is awaiting completion"}, trustErr,
 		)
 	}
-	if local.PendingOperation != "" {
-		result.Blocking = true
-		return result, errors.Join(
-			&SafeError{Code: CodeOperationInterrupted, Message: "Git repository has an unfinished operation"}, trustErr,
-		)
+	state := recoveryConflictState(options.Operation, head, managed, managedExists)
+	if state == RecoveryAborted || state == RecoveryNeedsReindex || state == RecoveryPushPending || state == RecoveryPushUnknown || state == RecoveryPushed {
+		result.ConflictState = state
+		if trustErr == nil || state != RecoveryPushed {
+			return result, nil
+		}
 	}
-	if trustErr != nil {
-		result.Blocking = true
+	if trustErr != nil || state == RecoveryAmbiguous {
+		result.Blocking, result.ConflictState = true, RecoveryAmbiguous
+		if trustErr == nil {
+			trustErr = ErrRecoveryRequired
+		}
 		return result, trustErr
 	}
 	return result, nil
+}
+
+func recoveryPushOID(operation *Operation) string {
+	if operation == nil || operation.Kind != OperationConflictComplete || !validObjectID(operation.PushOID) {
+		return ""
+	}
+	switch operation.Stage {
+	case StageConflictCommitted, StageConflictReindexed, StageConflictPushing, StageCompleted:
+		return operation.PushOID
+	default:
+		return ""
+	}
+}
+
+func recoveryConflictState(operation *Operation, head, managed string, managedExists bool) ConflictRecoveryState {
+	if operation == nil {
+		return ""
+	}
+	if operation.Kind == OperationConflictAbort {
+		if (operation.State == OperationQueued || operation.State == OperationRunning) && head == operation.LocalOID {
+			return RecoveryAborted
+		}
+		return RecoveryAmbiguous
+	}
+	if operation.Kind == OperationConflictComplete {
+		if recoveryPushOID(operation) == "" || head != operation.PushOID {
+			return RecoveryAmbiguous
+		}
+		switch operation.Stage {
+		case StageConflictCommitted:
+			return RecoveryNeedsReindex
+		case StageConflictReindexed:
+			return RecoveryPushPending
+		case StageConflictPushing, StageCompleted:
+			if managedExists && managed == operation.PushOID {
+				return RecoveryPushed
+			}
+			return RecoveryPushUnknown
+		}
+	}
+	if operation.State == OperationConflict {
+		return RecoveryAmbiguous
+	}
+	return ""
 }
 
 func (s *Service) recoveryRemoteOID(

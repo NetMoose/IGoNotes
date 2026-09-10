@@ -81,6 +81,198 @@ func TestRecoverLocalPreservesPartiallyResolvedIndex(t *testing.T) {
 	}
 }
 
+func TestRecoverLocalConflictStateTable(t *testing.T) {
+	assertState := func(t *testing.T, fixture *connectFixture, options SyncOptions, operation *Operation, want ConflictRecoveryState, blocking bool) {
+		t.Helper()
+		runner := &interceptRunner{delegate: NewCommandRunner()}
+		result, _ := runRecovery(t, fixture, runner, recoveryOptions(options, operation))
+		if result.ConflictState != want || result.Blocking != blocking {
+			t.Fatalf("RecoverLocal() = %#v, want state %q blocking %t", result, want, blocking)
+		}
+		assertRecoveryLocalReadOnly(t, runner.commands)
+	}
+
+	newCommittedConflict := func(t *testing.T) (*connectFixture, SyncOptions, Operation) {
+		t.Helper()
+		fixture, options, original := makeSyncConflict(t)
+		fixture.write("remote.md", "resolved\n")
+		fixture.git(fixture.root, "add", "--", "remote.md")
+		fixture.git(fixture.root, "commit", "--no-edit")
+		completion := original
+		completion.Kind = OperationConflictComplete
+		completion.State = OperationRunning
+		completion.PushOID = fixture.git(fixture.root, "rev-parse", "HEAD")
+		return fixture, options, completion
+	}
+
+	t.Run("unresolved merge", func(t *testing.T) {
+		fixture, options, operation := makeSyncConflict(t)
+		assertState(t, fixture, options, &operation, RecoveryConflict, true)
+	})
+
+	t.Run("partially resolved merge", func(t *testing.T) {
+		fixture, options := preparedSyncFixture(t)
+		fixture.write("remote.md", "local\n")
+		fixture.write("second.md", "local\n")
+		seedRemoteAdvance(t, fixture, "remote.md", "remote changed\n")
+		seedRemoteAdvance(t, fixture, "second.md", "remote\n")
+		operation := options.Operation
+		_, _ = runSync(t, fixture, nil, options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+			applyCheckpoint(&operation, checkpoint)
+			return nil
+		})
+		fixture.write("remote.md", "resolved\n")
+		fixture.git(fixture.root, "add", "--", "remote.md")
+		assertState(t, fixture, options, &operation, RecoveryConflict, true)
+	})
+
+	t.Run("foreign pending operation overrides unmerged index", func(t *testing.T) {
+		for _, test := range []struct {
+			name   string
+			marker string
+			dir    bool
+		}{
+			{name: "rebase", marker: "rebase-merge", dir: true},
+			{name: "cherry-pick", marker: "CHERRY_PICK_HEAD"},
+			{name: "revert", marker: "REVERT_HEAD"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				fixture, options, operation := makeSyncConflict(t)
+				gitDir := filepath.Join(fixture.root, ".git")
+				if err := os.Remove(filepath.Join(gitDir, "MERGE_HEAD")); err != nil {
+					t.Fatal(err)
+				}
+				marker := filepath.Join(gitDir, test.marker)
+				if test.dir {
+					if err := os.Mkdir(marker, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(marker, []byte(fixture.git(fixture.root, "rev-parse", "HEAD")+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				assertState(t, fixture, options, &operation, RecoveryAmbiguous, true)
+			})
+		}
+	})
+
+	t.Run("all staged merge can complete", func(t *testing.T) {
+		fixture, options, operation := makeSyncConflict(t)
+		fixture.write("remote.md", "resolved\n")
+		fixture.git(fixture.root, "add", "--", "remote.md")
+
+		result, err := runRecovery(t, fixture, nil, recoveryOptions(options, &operation))
+		if !errorHasSafeCode(err, CodeOperationInterrupted) || !result.Blocking || result.ConflictState != RecoveryCanComplete || len(result.ConflictPaths) != 0 {
+			t.Fatalf("RecoverLocal() = %#v, %v", result, err)
+		}
+	})
+
+	t.Run("committed merge needs reindex", func(t *testing.T) {
+		fixture, options, operation := newCommittedConflict(t)
+		operation.Stage = StageConflictCommitted
+		assertState(t, fixture, options, &operation, RecoveryNeedsReindex, false)
+	})
+
+	t.Run("reindexed merge is push pending", func(t *testing.T) {
+		fixture, options, operation := newCommittedConflict(t)
+		operation.Stage = StageConflictReindexed
+		assertState(t, fixture, options, &operation, RecoveryPushPending, false)
+	})
+
+	t.Run("pushing merge is push unknown without trusted proof", func(t *testing.T) {
+		fixture, options, operation := newCommittedConflict(t)
+		operation.Stage = StageConflictPushing
+		assertState(t, fixture, options, &operation, RecoveryPushUnknown, false)
+	})
+
+	t.Run("pushing merge is pushed only with matching trusted ref", func(t *testing.T) {
+		fixture, options, operation := newCommittedConflict(t)
+		operation.Stage = StageConflictPushing
+		fixture.git(fixture.root, "update-ref", managedRemoteRef(options.Snapshot.Branch), operation.PushOID, operation.RemoteOID)
+		result, err := runRecovery(t, fixture, nil, recoveryOptions(options, &operation))
+		if err != nil || result.ConflictState != RecoveryPushed || result.PushOID != operation.PushOID || result.RemoteOID != operation.PushOID {
+			t.Fatalf("RecoverLocal() = %#v, %v", result, err)
+		}
+	})
+
+	t.Run("completed abort is recovered only by abort journal", func(t *testing.T) {
+		fixture, options, operation := makeSyncConflict(t)
+		operation.LocalOID = fixture.git(fixture.root, "rev-parse", "HEAD")
+		fixture.git(fixture.root, "merge", "--abort")
+		operation.Kind = OperationConflictAbort
+		operation.State = OperationRunning
+		operation.Stage = StageConflictAborting
+		assertState(t, fixture, options, &operation, RecoveryAborted, false)
+	})
+
+	t.Run("abort recovery requires an unfinished abort journal", func(t *testing.T) {
+		for _, test := range []struct {
+			name     string
+			state    OperationState
+			stage    Stage
+			want     ConflictRecoveryState
+			blocking bool
+		}{
+			{name: "queued", state: OperationQueued, stage: StageQueued, want: RecoveryAborted},
+			{name: "running", state: OperationRunning, stage: StageConflictAborting, want: RecoveryAborted},
+			{name: "failed", state: OperationFailed, stage: StageConflictAborting, want: RecoveryAmbiguous, blocking: true},
+			{name: "conflict", state: OperationConflict, stage: StageConflictAborting, want: RecoveryAmbiguous, blocking: true},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				fixture, options, operation := makeSyncConflict(t)
+				operation.LocalOID = fixture.git(fixture.root, "rev-parse", "HEAD")
+				fixture.git(fixture.root, "merge", "--abort")
+				operation.Kind = OperationConflictAbort
+				operation.State = test.state
+				operation.Stage = test.stage
+				assertState(t, fixture, options, &operation, test.want, test.blocking)
+			})
+		}
+	})
+
+	t.Run("original conflict without merge marker is ambiguous", func(t *testing.T) {
+		fixture, options, operation := makeSyncConflict(t)
+		fixture.git(fixture.root, "merge", "--abort")
+		operation.State = OperationConflict
+		assertState(t, fixture, options, &operation, RecoveryAmbiguous, true)
+	})
+
+	t.Run("unrelated head is ambiguous", func(t *testing.T) {
+		fixture, options, operation := newCommittedConflict(t)
+		operation.Stage = StageConflictCommitted
+		fixture.write("external.md", "external\n")
+		fixture.git(fixture.root, "add", "--", "external.md")
+		fixture.git(fixture.root, "commit", "-m", "external commit")
+		assertState(t, fixture, options, &operation, RecoveryAmbiguous, true)
+	})
+
+	t.Run("lock is reported without deletion", func(t *testing.T) {
+		fixture, options := preparedSyncFixture(t)
+		lock := filepath.Join(fixture.root, ".git", "index.lock")
+		if err := os.WriteFile(lock, []byte("external\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertState(t, fixture, options, nil, RecoveryLocked, true)
+		if _, err := os.Stat(lock); err != nil {
+			t.Fatalf("index lock was removed: %v", err)
+		}
+	})
+
+	t.Run("foreign operation is ambiguous", func(t *testing.T) {
+		fixture, options := preparedSyncFixture(t)
+		head := fixture.git(fixture.root, "rev-parse", "HEAD")
+		marker := filepath.Join(fixture.root, ".git", "CHERRY_PICK_HEAD")
+		if err := os.WriteFile(marker, []byte(head+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertState(t, fixture, options, nil, RecoveryAmbiguous, true)
+	})
+
+	t.Run("clean repository has no conflict decision", func(t *testing.T) {
+		fixture, options := preparedSyncFixture(t)
+		assertState(t, fixture, options, nil, "", false)
+	})
+}
+
 func TestRecoverLocalDetectsOrphanedUnmergedIndex(t *testing.T) {
 	fixture, options, operation := makeSyncConflict(t)
 	if err := os.Remove(filepath.Join(fixture.root, ".git", "MERGE_HEAD")); err != nil {
