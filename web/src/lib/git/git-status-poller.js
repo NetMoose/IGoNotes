@@ -18,6 +18,10 @@ export function createGitStatusPoller({
   }
 
   async function run(current) {
+    if (!active || current !== generation) {
+      return null;
+    }
+
     try {
       const payload = await load();
       if (!active || current !== generation) {
@@ -25,6 +29,10 @@ export function createGitStatusPoller({
       }
 
       onStatuses(payload.statuses);
+      if (!active || current !== generation) {
+        return null;
+      }
+
       onError(null);
       return payload.statuses;
     } catch (error) {

@@ -123,8 +123,87 @@ describe('createGitStatusPoller', () => {
     late.resolve({ statuses: [{ base: 'notes', ahead: 4 }] });
     await Promise.resolve();
 
+    expect(load).toHaveBeenCalledTimes(1);
     expect(onStatuses).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenCalledTimes(1);
     expect(schedule).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not load from a scheduled callback invalidated by refresh', async () => {
+    const scheduled = [];
+    const schedule = vi.fn((callback) => {
+      scheduled.push(callback);
+      return { id: scheduled.length };
+    });
+    const load = vi.fn().mockResolvedValue({ statuses: [] });
+    const poller = createGitStatusPoller({
+      load,
+      onStatuses: vi.fn(),
+      onError: vi.fn(),
+      schedule,
+    });
+
+    poller.start();
+    await Promise.resolve();
+    await poller.refresh();
+
+    scheduled[0]();
+    await Promise.resolve();
+
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not complete a successful run when onStatuses stops the poller', async () => {
+    const schedule = vi.fn();
+    const onError = vi.fn();
+    let poller;
+    const onStatuses = vi.fn(() => poller.stop());
+    const load = vi.fn().mockResolvedValue({ statuses: [] });
+    poller = createGitStatusPoller({ load, onStatuses, onError, schedule });
+
+    poller.start();
+    await Promise.resolve();
+
+    expect(onStatuses).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(schedule).not.toHaveBeenCalled();
+  });
+
+  it('does not complete a successful run when onStatuses refreshes the poller', async () => {
+    const next = deferred();
+    const schedule = vi.fn();
+    const onError = vi.fn();
+    let poller;
+    const onStatuses = vi.fn(() => poller.refresh());
+    const load = vi
+      .fn()
+      .mockResolvedValueOnce({ statuses: [] })
+      .mockReturnValueOnce(next.promise);
+    poller = createGitStatusPoller({ load, onStatuses, onError, schedule });
+
+    poller.start();
+    await Promise.resolve();
+
+    expect(onStatuses).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(schedule).not.toHaveBeenCalled();
+  });
+
+  it('ignores a deferred initial load that settles after stop', async () => {
+    const initial = deferred();
+    const schedule = vi.fn();
+    const onStatuses = vi.fn();
+    const onError = vi.fn();
+    const load = vi.fn().mockReturnValue(initial.promise);
+    const poller = createGitStatusPoller({ load, onStatuses, onError, schedule });
+
+    poller.start();
+    poller.stop();
+    initial.resolve({ statuses: [] });
+    await Promise.resolve();
+
+    expect(onStatuses).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    expect(schedule).not.toHaveBeenCalled();
   });
 });
