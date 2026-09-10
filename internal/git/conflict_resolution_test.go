@@ -177,12 +177,121 @@ func TestResolveConflictVerifiesDestinationsBeforeMaterializingStages(t *testing
 		t.Fatal(err)
 	}
 	runner := service.runner.(*resolutionRunner)
+	unmerged := "100644 " + runner.baseOID + " 1\tnote.md\x00100644 " + runner.localOID + " 2\tnote.md\x00100644 " + runner.remoteOID + " 3\tnote.md\x00"
+	runner.allStageOutputs = []string{unmerged, unmerged, "100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\t" + request.ResultPath + "\x00"}
 	if _, err := service.ResolveConflict(context.Background(), base, operation, request, directResolutionTransaction(base.Path)); err != ErrConflictStale {
 		t.Fatalf("ResolveConflict() error = %v, want ErrConflictStale", err)
 	}
 	if len(runner.checkoutInputs) != 6 {
 		t.Fatalf("stage checkout happened before destination verification: %#v", runner.checkoutInputs)
 	}
+}
+
+func TestResolutionDestination(t *testing.T) {
+	const (
+		selectedOID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		otherOID    = "dddddddddddddddddddddddddddddddddddddddd"
+	)
+
+	newRoot := func(t *testing.T) *os.Root {
+		t.Helper()
+		root, err := os.OpenRoot(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = root.Close() })
+		return root
+	}
+	write := resolutionWrite{Path: "resolved.md", Field: "result_path", Stage: 2, OID: selectedOID, Mode: "100644"}
+
+	t.Run("rejects tracked output even when its bytes match", func(t *testing.T) {
+		root := newRoot(t)
+		if err := root.WriteFile(write.Path, []byte("selected\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runner := &resolutionRunner{allStages: "100644 " + selectedOID + " 0\tresolved.md\x00"}
+		if err := verifyResolutionDestination(context.Background(), root, runner, t.TempDir(), write, nil); err != ErrConflictStale {
+			t.Fatalf("verifyResolutionDestination() error = %v, want ErrConflictStale", err)
+		}
+	})
+
+	t.Run("rejects an untracked output with different content", func(t *testing.T) {
+		root := newRoot(t)
+		if err := root.WriteFile(write.Path, []byte("external\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runner := &resolutionRunner{allStagesSet: true, hashOID: otherOID}
+		assertConflictField(t, verifyResolutionDestination(context.Background(), root, runner, t.TempDir(), write, nil), "result_path")
+	})
+
+	t.Run("allows an owned source without hashing it", func(t *testing.T) {
+		root := newRoot(t)
+		if err := root.WriteFile(write.Path, []byte("conflict marker\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runner := &resolutionRunner{allStages: "100644 " + selectedOID + " 0\tresolved.md\x00"}
+		if err := verifyResolutionDestination(context.Background(), root, runner, t.TempDir(), write, map[string]struct{}{write.Path: {}}); err != nil {
+			t.Fatalf("verifyResolutionDestination() error = %v", err)
+		}
+		for _, command := range runner.calls {
+			if strings.Contains(strings.Join(command.Args, "\x00"), "hash-object") {
+				t.Fatalf("owned source was hashed: %#v", command)
+			}
+		}
+	})
+
+	t.Run("accepts matching untracked output through path-aware hashing", func(t *testing.T) {
+		root := newRoot(t)
+		if err := root.WriteFile(write.Path, []byte("selected\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runner := &resolutionRunner{allStagesSet: true, hashOID: selectedOID}
+		if err := verifyResolutionDestination(context.Background(), root, runner, t.TempDir(), write, nil); err != nil {
+			t.Fatalf("verifyResolutionDestination() error = %v", err)
+		}
+		if len(runner.calls) != 2 || !reflect.DeepEqual(runner.calls[1].Args, []string{"hash-object", "--path=resolved.md", "--stdin"}) {
+			t.Fatalf("hash command = %#v", runner.calls)
+		}
+	})
+
+	t.Run("hashes symlink target bytes without path filters", func(t *testing.T) {
+		root := newRoot(t)
+		linkWrite := resolutionWrite{Path: "resolved-link", Field: "result_path", Stage: 2, OID: selectedOID, Mode: "120000"}
+		if err := root.Symlink("target/path", linkWrite.Path); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		runner := &resolutionRunner{allStagesSet: true, hashOID: selectedOID}
+		if err := verifyResolutionDestination(context.Background(), root, runner, t.TempDir(), linkWrite, nil); err != nil {
+			t.Fatalf("verifyResolutionDestination() error = %v", err)
+		}
+		if len(runner.calls) != 2 || !reflect.DeepEqual(runner.calls[1].Args, []string{"hash-object", "--stdin"}) {
+			t.Fatalf("symlink hash command = %#v", runner.calls)
+		}
+	})
+
+	t.Run("rejects truncated complete index output", func(t *testing.T) {
+		root := newRoot(t)
+		runner := &resolutionRunner{allStages: "100644 " + selectedOID + " 0\tresolved.md\x00", allStagesTruncated: true}
+		if err := verifyResolutionDestination(context.Background(), root, runner, t.TempDir(), write, nil); err != ErrRecoveryRequired {
+			t.Fatalf("verifyResolutionDestination() error = %v, want ErrRecoveryRequired", err)
+		}
+	})
+
+	t.Run("uses pathspec-looking output literally", func(t *testing.T) {
+		root := newRoot(t)
+		pathspecWrite := write
+		pathspecWrite.Path = ":(glob)*.md"
+		if err := root.WriteFile(pathspecWrite.Path, []byte("selected\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runner := &resolutionRunner{allStagesSet: true, hashOID: selectedOID}
+		if err := verifyResolutionDestination(context.Background(), root, runner, t.TempDir(), pathspecWrite, nil); err != nil {
+			t.Fatalf("verifyResolutionDestination() error = %v", err)
+		}
+		if len(runner.calls) != 2 || !reflect.DeepEqual(runner.calls[1].Args, []string{"hash-object", "--path=:(glob)*.md", "--stdin"}) {
+			t.Fatalf("literal hash command = %#v", runner.calls)
+		}
+	})
 }
 
 func TestResolveConflictRejectsMismatchedCheckoutBlobBeforeMutation(t *testing.T) {
@@ -591,19 +700,19 @@ func TestBuildResolutionPlan(t *testing.T) {
 			name:     "local",
 			request:  resolutionRequest(model.GitConflictUseLocal, model.GitConflictResolveRequest{ResultPath: "local.md", LocalOID: "local-oid"}),
 			conflict: resolutionTestConflict(),
-			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "local.md", Stage: 2, OID: "local-oid", Mode: "100755"}}, StagePaths: []string{"local.md", "note.md", "old.md"}},
+			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "local.md", Stage: 2, OID: "local-oid", Mode: "100755"}}, StagePaths: []string{"local.md", "note.md"}},
 		},
 		{
 			name:     "remote",
 			request:  resolutionRequest(model.GitConflictUseRemote, model.GitConflictResolveRequest{ResultPath: "remote.md", RemoteOID: "remote-oid"}),
 			conflict: resolutionTestConflict(),
-			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "remote.md", Stage: 3, OID: "remote-oid", Mode: "120000"}}, StagePaths: []string{"note.md", "old.md", "remote.md"}},
+			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "remote.md", Stage: 3, OID: "remote-oid", Mode: "120000"}}, StagePaths: []string{"note.md", "remote.md"}},
 		},
 		{
 			name:     "manual uses local mode and exact data",
 			request:  resolutionRequest(model.GitConflictManual, model.GitConflictResolveRequest{ResultPath: "manual.md", Content: &content}),
 			conflict: resolutionTestConflict(),
-			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "manual.md", Mode: "100755", Data: []byte(content)}}, StagePaths: []string{"manual.md", "note.md", "old.md"}},
+			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "manual.md", Mode: "100755", Data: []byte(content)}}, StagePaths: []string{"manual.md", "note.md"}},
 		},
 		{
 			name:     "manual falls back to remote mode",
@@ -621,19 +730,19 @@ func TestBuildResolutionPlan(t *testing.T) {
 			name:     "keep both",
 			request:  resolutionRequest(model.GitConflictKeepBoth, model.GitConflictResolveRequest{LocalPath: "local.md", RemotePath: "remote.md", LocalOID: "local-oid", RemoteOID: "remote-oid"}),
 			conflict: resolutionTestConflict(),
-			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "local.md", Stage: 2, OID: "local-oid", Mode: "100755"}, {Path: "remote.md", Stage: 3, OID: "remote-oid", Mode: "120000"}}, StagePaths: []string{"local.md", "note.md", "old.md", "remote.md"}},
+			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{{Path: "local.md", Field: "local_path", Stage: 2, OID: "local-oid", Mode: "100755"}, {Path: "remote.md", Field: "remote_path", Stage: 3, OID: "remote-oid", Mode: "120000"}}, StagePaths: []string{"local.md", "note.md", "remote.md"}},
 		},
 		{
 			name:     "delete",
 			request:  resolutionRequest(model.GitConflictDelete, model.GitConflictResolveRequest{}),
 			conflict: resolutionTestConflict(),
-			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{}, StagePaths: []string{"note.md", "old.md"}},
+			want:     resolutionPlan{RemovePaths: []string{"note.md", "old.md"}, Writes: []resolutionWrite{}, StagePaths: []string{"note.md"}},
 		},
 		{
 			name:     "reused source is not removed",
 			request:  resolutionRequest(model.GitConflictUseLocal, model.GitConflictResolveRequest{ResultPath: "note.md", LocalOID: "local-oid"}),
 			conflict: resolutionTestConflict(),
-			want:     resolutionPlan{RemovePaths: []string{"old.md"}, Writes: []resolutionWrite{{Path: "note.md", Stage: 2, OID: "local-oid", Mode: "100755"}}, StagePaths: []string{"note.md", "old.md"}},
+			want:     resolutionPlan{RemovePaths: []string{"old.md"}, Writes: []resolutionWrite{{Path: "note.md", Stage: 2, OID: "local-oid", Mode: "100755"}}, StagePaths: []string{"note.md"}},
 		},
 		{
 			name:     "only reused source has an explicit empty removal list",
@@ -645,7 +754,7 @@ func TestBuildResolutionPlan(t *testing.T) {
 			name:     "sorts unsorted keep both inputs bytewise",
 			request:  resolutionRequest(model.GitConflictKeepBoth, model.GitConflictResolveRequest{Path: "z-source.md", LocalPath: "z-output.md", RemotePath: "a-output.md", LocalOID: "local-oid", RemoteOID: "remote-oid"}),
 			conflict: Conflict{ID: "conflict-id", Path: "z-source.md", OriginalPath: "a-source.md", Actions: []string{"keep_both"}, Local: &ConflictStage{OID: "local-oid", Mode: "100755"}, Remote: &ConflictStage{OID: "remote-oid", Mode: "120000"}},
-			want:     resolutionPlan{RemovePaths: []string{"a-source.md", "z-source.md"}, Writes: []resolutionWrite{{Path: "a-output.md", Stage: 3, OID: "remote-oid", Mode: "120000"}, {Path: "z-output.md", Stage: 2, OID: "local-oid", Mode: "100755"}}, StagePaths: []string{"a-output.md", "a-source.md", "z-output.md", "z-source.md"}},
+			want:     resolutionPlan{RemovePaths: []string{"a-source.md", "z-source.md"}, Writes: []resolutionWrite{{Path: "a-output.md", Field: "remote_path", Stage: 3, OID: "remote-oid", Mode: "120000"}, {Path: "z-output.md", Field: "local_path", Stage: 2, OID: "local-oid", Mode: "100755"}}, StagePaths: []string{"a-output.md", "z-output.md", "z-source.md"}},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -715,19 +824,24 @@ func TestBuildResolutionPlan(t *testing.T) {
 }
 
 type resolutionRunner struct {
-	stageContents    map[int]string
-	stageSymlinks    map[int]string
-	checkoutPath     string
-	checkoutTempPath string
-	checkoutInputs   [][]byte
-	baseOID          string
-	localOID         string
-	remoteOID        string
-	hashOID          string
-	resolved         bool
-	calls            []Command
-	addCalls         []Command
-	addInputs        [][]byte
+	stageContents      map[int]string
+	stageSymlinks      map[int]string
+	checkoutPath       string
+	checkoutTempPath   string
+	checkoutInputs     [][]byte
+	baseOID            string
+	localOID           string
+	remoteOID          string
+	hashOID            string
+	allStages          string
+	allStagesSet       bool
+	allStagesTruncated bool
+	allStageOutputs    []string
+	allStageCalls      int
+	resolved           bool
+	calls              []Command
+	addCalls           []Command
+	addInputs          [][]byte
 }
 
 func (r *resolutionRunner) Run(_ context.Context, command Command) (Result, error) {
@@ -776,6 +890,16 @@ func (r *resolutionRunner) Run(_ context.Context, command Command) (Result, erro
 		r.resolved = true
 		return Result{}, nil
 	}
+	if len(command.Args) == 3 && command.Args[0] == "hash-object" && strings.HasPrefix(command.Args[1], "--path=") && command.Args[2] == "--stdin" {
+		if _, err := io.ReadAll(command.Stdin); err != nil {
+			return Result{}, err
+		}
+		oid := r.hashOID
+		if oid == "" {
+			oid = r.localOID
+		}
+		return Result{Stdout: oid + "\n"}, nil
+	}
 	if reflect.DeepEqual(command.Args, []string{"hash-object", "--stdin"}) {
 		if _, err := io.ReadAll(command.Stdin); err != nil {
 			return Result{}, err
@@ -799,6 +923,14 @@ func (r *resolutionRunner) Run(_ context.Context, command Command) (Result, erro
 		return Result{Stdout: "100644 " + r.baseOID + " 1\tnote.md\x00100644 " + r.localOID + " 2\tnote.md\x00100644 " + r.remoteOID + " 3\tnote.md\x00"}, nil
 	}
 	if startsArgs(command, "ls-files", "--stage") {
+		if r.allStageCalls < len(r.allStageOutputs) {
+			output := r.allStageOutputs[r.allStageCalls]
+			r.allStageCalls++
+			return Result{Stdout: output}, nil
+		}
+		if r.allStagesSet || r.allStages != "" || r.allStagesTruncated {
+			return Result{Stdout: r.allStages, StdoutTruncated: r.allStagesTruncated}, nil
+		}
 		if r.resolved {
 			return Result{}, nil
 		}

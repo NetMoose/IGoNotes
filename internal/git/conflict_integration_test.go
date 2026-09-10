@@ -57,6 +57,178 @@ func TestResolveDeleteIntegration(t *testing.T) {
 	assertConflictStages(t, fixture, map[string][]int{})
 }
 
+func TestResolveAddAddKeepBothIntegration(t *testing.T) {
+	fixture := newConflictFixture(t)
+	local := []byte{0, 1, 2, 3, 4}
+	remote := []byte{5, 6, 7, 8, 9}
+	writeConflictFile(t, fixture.Local, "photo.png", local)
+	conflictCommit(t, fixture.Local, "local add image")
+	writeConflictFile(t, fixture.Other, "photo.png", remote)
+	conflictCommit(t, fixture.Other, "remote add image")
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+	service, base, operation := conflictResolver(t, fixture)
+	snapshot, err := service.Conflicts(context.Background(), base, operation)
+	if err != nil || len(snapshot.Conflicts) != 1 {
+		t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+	}
+	conflict := snapshot.Conflicts[0]
+	if conflict.Kind != ConflictAddAdd || conflict.Local == nil || conflict.Remote == nil {
+		t.Fatalf("add/add conflict = %#v", conflict)
+	}
+	request := model.GitConflictResolveRequest{
+		OperationID: operation.ID, ConflictID: conflict.ID, Path: conflict.Path,
+		Action:    model.GitConflictKeepBoth,
+		LocalPath: "assets/images/photo-local.png", RemotePath: "assets/images/photo-remote.png",
+		LocalOID: conflict.Local.OID, RemoteOID: conflict.Remote.OID,
+	}
+	resolved, err := service.ResolveConflict(context.Background(), base, operation, request, callbackOrderingTransaction(fixture.Local, new([]string)))
+	if err != nil || !resolved.CanComplete || len(resolved.Conflicts) != 0 {
+		t.Fatalf("ResolveConflict() = %#v, %v", resolved, err)
+	}
+	for name, want := range map[string][]byte{
+		"assets/images/photo-local.png":  local,
+		"assets/images/photo-remote.png": remote,
+	} {
+		got, err := os.ReadFile(filepath.Join(fixture.Local, name))
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s = %v, %v; want %v", name, got, err, want)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.Local, "photo.png")); !os.IsNotExist(err) {
+		t.Fatalf("unused source remains: %v", err)
+	}
+	assertConflictStages(t, fixture, map[string][]int{})
+	assertStageZeroPaths(t, fixture, "assets/images/photo-local.png", "assets/images/photo-remote.png")
+}
+
+func TestResolveRenameDeleteIntegration(t *testing.T) {
+	for _, orientation := range []struct {
+		name        string
+		localDelete bool
+		renamed     string
+	}{
+		{name: "local retained", renamed: "local-renamed.md"},
+		{name: "remote retained", localDelete: true, renamed: "remote-renamed.md"},
+	} {
+		t.Run(orientation.name, func(t *testing.T) {
+			for _, test := range []struct {
+				name   string
+				output string
+				manual bool
+				delete bool
+			}{
+				{name: "retained renamed", output: orientation.renamed},
+				{name: "alternate", output: "alternate.md"},
+				{name: "manual", output: "manual.md", manual: true},
+				{name: "delete", delete: true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					fixture := newConflictFixture(t)
+					if orientation.localDelete {
+						removeConflictFile(t, fixture.Local, "victim.md")
+						renameConflictFile(t, fixture.Other, "victim.md", orientation.renamed)
+					} else {
+						renameConflictFile(t, fixture.Local, "victim.md", orientation.renamed)
+						removeConflictFile(t, fixture.Other, "victim.md")
+					}
+					conflictCommit(t, fixture.Local, "local rename delete")
+					conflictCommit(t, fixture.Other, "remote rename delete")
+					fixture.pushOther(t)
+					fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+					service, base, operation := conflictResolver(t, fixture)
+					snapshot, err := service.Conflicts(context.Background(), base, operation)
+					if err != nil || len(snapshot.Conflicts) != 1 {
+						t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+					}
+					conflict := snapshot.Conflicts[0]
+					if conflict.Kind != ConflictRenameDelete || conflict.OriginalPath != "victim.md" {
+						t.Fatalf("rename/delete conflict = %#v", conflict)
+					}
+					request := model.GitConflictResolveRequest{OperationID: operation.ID, ConflictID: conflict.ID, Path: conflict.Path}
+					switch {
+					case test.delete:
+						request.Action = model.GitConflictDelete
+					case test.manual:
+						content := "manual text\n"
+						request.Action, request.ResultPath, request.Content = model.GitConflictManual, test.output, &content
+					case conflict.Local != nil:
+						request.Action, request.ResultPath, request.LocalOID = model.GitConflictUseLocal, test.output, conflict.Local.OID
+					default:
+						request.Action, request.ResultPath, request.RemoteOID = model.GitConflictUseRemote, test.output, conflict.Remote.OID
+					}
+					resolved, err := service.ResolveConflict(context.Background(), base, operation, request, callbackOrderingTransaction(fixture.Local, new([]string)))
+					if err != nil || !resolved.CanComplete || len(resolved.Conflicts) != 0 {
+						t.Fatalf("ResolveConflict() = %#v, %v", resolved, err)
+					}
+					if _, err := os.Lstat(filepath.Join(fixture.Local, "victim.md")); !os.IsNotExist(err) {
+						t.Fatalf("original path remains: %v", err)
+					}
+					if test.delete {
+						if _, err := os.Lstat(filepath.Join(fixture.Local, orientation.renamed)); !os.IsNotExist(err) {
+							t.Fatalf("renamed path remains after delete: %v", err)
+						}
+					} else {
+						contents, err := os.ReadFile(filepath.Join(fixture.Local, test.output))
+						want := "base\n"
+						if test.manual {
+							want = "manual text\n"
+						}
+						if err != nil || string(contents) != want {
+							t.Fatalf("%s = %q, %v; want %q", test.output, contents, err, want)
+						}
+						if test.output != orientation.renamed {
+							if _, err := os.Lstat(filepath.Join(fixture.Local, orientation.renamed)); !os.IsNotExist(err) {
+								t.Fatalf("unused renamed path remains: %v", err)
+							}
+						}
+					}
+					assertConflictStages(t, fixture, map[string][]int{})
+				})
+			}
+		})
+	}
+}
+
+func TestResolvePathspecLiteralIntegration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pathspec-looking filenames are not supported on Windows")
+	}
+	fixture := newConflictFixture(t)
+	name := ":(glob)*.md"
+	writeConflictFile(t, fixture.Local, name, []byte("local glob\n"))
+	conflictCommit(t, fixture.Local, "local literal glob")
+	writeConflictFile(t, fixture.Other, name, []byte("remote glob\n"))
+	conflictCommit(t, fixture.Other, "remote literal glob")
+	fixture.pushOther(t)
+	fixture.mergeCapturedOID(t, fixture.fetchManagedRemoteOID(t))
+
+	service, base, operation := conflictResolver(t, fixture)
+	snapshot, err := service.Conflicts(context.Background(), base, operation)
+	if err != nil || len(snapshot.Conflicts) != 1 {
+		t.Fatalf("Conflicts() = %#v, %v", snapshot, err)
+	}
+	conflict := snapshot.Conflicts[0]
+	request := model.GitConflictResolveRequest{
+		OperationID: operation.ID, ConflictID: conflict.ID, Path: conflict.Path,
+		Action: model.GitConflictUseLocal, ResultPath: name, LocalOID: conflict.Local.OID,
+	}
+	resolved, err := service.ResolveConflict(context.Background(), base, operation, request, callbackOrderingTransaction(fixture.Local, new([]string)))
+	if err != nil || !resolved.CanComplete || len(resolved.Conflicts) != 0 {
+		t.Fatalf("ResolveConflict() = %#v, %v", resolved, err)
+	}
+	for _, contents := range [][]byte{
+		mustReadConflictFile(t, filepath.Join(fixture.Local, "victim.md")),
+		runConflictGit(t, fixture.Local, "show", ":victim.md"),
+	} {
+		if string(contents) != "base\n" {
+			t.Fatalf("victim changed to %q", contents)
+		}
+	}
+}
+
 func TestResolveSymlinkIntegration(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink fixture requires Unix symlink support")
@@ -580,6 +752,34 @@ func assertConflictStages(t *testing.T, fixture *conflictFixture, want map[strin
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unmerged stages = %#v, want %#v", got, want)
 	}
+}
+
+func assertStageZeroPaths(t *testing.T, fixture *conflictFixture, paths ...string) {
+	t.Helper()
+	stages, err := parseIndexStagesZ(runConflictGit(t, fixture.Local, "ls-files", "--stage", "--full-name", "-z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := make(map[string]struct{}, len(stages))
+	for _, stage := range stages {
+		if stage.Stage == 0 {
+			actual[stage.Path] = struct{}{}
+		}
+	}
+	for _, path := range paths {
+		if _, found := actual[path]; !found {
+			t.Fatalf("stage-0 path %q missing from %#v", path, actual)
+		}
+	}
+}
+
+func mustReadConflictFile(t *testing.T, path string) []byte {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contents
 }
 
 func assertRenameDeleteEvidence(t *testing.T, retainedDir, base, retainedTip, oldPath, path, deletedDir, deletedBase, deletedTip string) {

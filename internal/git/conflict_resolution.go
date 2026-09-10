@@ -17,6 +17,7 @@ import (
 
 type resolutionWrite struct {
 	Path  string
+	Field string
 	Stage int
 	OID   string
 	Mode  string
@@ -125,7 +126,7 @@ func (s *Service) ResolveConflict(
 		if err != nil {
 			return err
 		}
-		if err := verifyResolutionDestinationOwnership(root, sources, currentPlan.Writes); err != nil {
+		if err := verifyResolutionDestinations(ctx, root, s.runner, canonicalPath, sources, currentPlan.Writes); err != nil {
 			return err
 		}
 		writes, err := s.materializeResolutionWrites(ctx, local.GitDir, current.Path, currentPlan.Writes)
@@ -136,13 +137,10 @@ func (s *Service) ResolveConflict(
 		if err := s.verifyResolutionWriteOIDs(ctx, canonicalPath, writes); err != nil {
 			return err
 		}
-		if err := verifyResolutionDestinations(root, sources, writes); err != nil {
-			return err
-		}
 		if err := writeNonSourceResolutionOutputs(root, sources, writes); err != nil {
 			return err
 		}
-		if err := removeResolutionSources(root, currentPlan, sources, writes.writes); err != nil {
+		if err := removeResolutionSources(root, currentPlan); err != nil {
 			return err
 		}
 		if err := writeSourceResolutionOutputs(root, sources, writes); err != nil {
@@ -262,34 +260,150 @@ func (s *Service) hashConflictContent(ctx context.Context, repo string, content 
 	return oid, nil
 }
 
-func verifyResolutionDestinations(root *os.Root, sources []string, writes *materializedResolutionWrites) error {
-	owned := make(map[string]struct{}, len(sources))
-	for _, source := range sources {
-		owned[source] = struct{}{}
+func verifyResolutionDestinations(ctx context.Context, root *os.Root, runner Runner, canonicalRepoPath string, sources []string, writes []resolutionWrite) error {
+	stageZero, err := resolutionStageZero(ctx, runner, canonicalRepoPath)
+	if err != nil {
+		return err
 	}
-	for index := range writes.writes {
-		write := &writes.writes[index]
-		content, err := writes.open(*write)
+	owned := resolutionSourceSet(sources)
+	for _, write := range writes {
+		_, err := verifyResolutionDestinationWithStageZero(ctx, root, runner, canonicalRepoPath, write, owned, stageZero)
 		if err != nil {
-			return ErrRecoveryRequired
+			return err
 		}
-		matches, exists, matchErr := conflictEntryMatches(root, write.Path, write.Mode, content)
-		closeErr := content.Close()
-		if matchErr != nil || closeErr != nil {
-			return ErrRecoveryRequired
-		}
-		if !exists {
-			continue
-		}
-		if !matches {
-			if _, isOwned := owned[write.Path]; !isOwned {
-				return ErrConflictStale
-			}
-			continue
-		}
-		write.skip = true
 	}
 	return nil
+}
+
+func verifyResolutionDestination(ctx context.Context, root *os.Root, runner Runner, canonicalRepoPath string, write resolutionWrite, owned map[string]struct{}) error {
+	stageZero, err := resolutionStageZero(ctx, runner, canonicalRepoPath)
+	if err != nil {
+		return err
+	}
+	_, err = verifyResolutionDestinationWithStageZero(ctx, root, runner, canonicalRepoPath, write, owned, stageZero)
+	return err
+}
+
+func resolutionStageZero(ctx context.Context, runner Runner, canonicalRepoPath string) (map[string]struct{}, error) {
+	if runner == nil || !filepath.IsAbs(canonicalRepoPath) {
+		return nil, ErrRecoveryRequired
+	}
+	result, err := runner.Run(ctx, Command{
+		Dir: canonicalRepoPath, Args: []string{"ls-files", "--stage", "--full-name", "-z"}, Scope: LocalOperation, ReadOnly: true,
+	})
+	if err != nil || result.StdoutTruncated || result.StderrTruncated {
+		return nil, ErrRecoveryRequired
+	}
+	stages, err := parseIndexStagesZ([]byte(result.Stdout))
+	if err != nil {
+		return nil, ErrRecoveryRequired
+	}
+	stageZero := make(map[string]struct{}, len(stages))
+	for _, stage := range stages {
+		if stage.Stage == 0 {
+			stageZero[stage.Path] = struct{}{}
+		}
+	}
+	return stageZero, nil
+}
+
+func verifyResolutionDestinationWithStageZero(ctx context.Context, root *os.Root, runner Runner, canonicalRepoPath string, write resolutionWrite, owned, stageZero map[string]struct{}) (bool, error) {
+	name, err := cleanConflictPath(write.Path, write.Field)
+	if err != nil || root == nil || !validResolutionMode(write.Mode) {
+		if err != nil {
+			return false, err
+		}
+		return false, ErrRecoveryRequired
+	}
+	if _, exists := owned[name]; exists {
+		return false, nil
+	}
+	if _, exists := stageZero[name]; exists {
+		return false, ErrConflictStale
+	}
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, ErrRecoveryRequired
+	}
+
+	expected, err := resolutionWriteOID(ctx, runner, canonicalRepoPath, write)
+	if err != nil {
+		return false, err
+	}
+	var actual string
+	if write.Mode == "120000" {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return false, resolutionDestinationCollision(write)
+		}
+		target, err := root.Readlink(name)
+		if err != nil {
+			return false, ErrRecoveryRequired
+		}
+		actual, err = hashResolutionLinkTarget(ctx, runner, canonicalRepoPath, bytes.NewReader([]byte(target)))
+	} else {
+		if !info.Mode().IsRegular() {
+			return false, resolutionDestinationCollision(write)
+		}
+		content, err := root.Open(name)
+		if err != nil {
+			return false, ErrRecoveryRequired
+		}
+		actual, err = hashResolutionContent(ctx, runner, canonicalRepoPath, name, content)
+		closeErr := content.Close()
+		if err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		return false, ErrRecoveryRequired
+	}
+	if actual != expected {
+		return false, resolutionDestinationCollision(write)
+	}
+	return true, nil
+}
+
+func resolutionWriteOID(ctx context.Context, runner Runner, canonicalRepoPath string, write resolutionWrite) (string, error) {
+	if write.Stage != 0 {
+		if !validObjectID(write.OID) {
+			return "", ErrRecoveryRequired
+		}
+		return write.OID, nil
+	}
+	return hashResolutionContent(ctx, runner, canonicalRepoPath, write.Path, bytes.NewReader(write.Data))
+}
+
+func hashResolutionContent(ctx context.Context, runner Runner, canonicalRepoPath, name string, content io.Reader) (string, error) {
+	return hashResolutionInput(ctx, runner, canonicalRepoPath, []string{"hash-object", "--path=" + name, "--stdin"}, content)
+}
+
+func hashResolutionLinkTarget(ctx context.Context, runner Runner, canonicalRepoPath string, content io.Reader) (string, error) {
+	return hashResolutionInput(ctx, runner, canonicalRepoPath, []string{"hash-object", "--stdin"}, content)
+}
+
+func hashResolutionInput(ctx context.Context, runner Runner, canonicalRepoPath string, args []string, content io.Reader) (string, error) {
+	result, err := runner.Run(ctx, Command{
+		Dir: canonicalRepoPath, Args: args, Scope: LocalOperation, ReadOnly: true, Stdin: content,
+	})
+	if err != nil || result.StdoutTruncated || result.StderrTruncated || !strings.HasSuffix(result.Stdout, "\n") {
+		return "", ErrRecoveryRequired
+	}
+	oid := strings.TrimSuffix(result.Stdout, "\n")
+	if !validObjectID(oid) {
+		return "", ErrRecoveryRequired
+	}
+	return oid, nil
+}
+
+func resolutionDestinationCollision(write resolutionWrite) error {
+	field := write.Field
+	if field == "" {
+		field = "result_path"
+	}
+	return newConflictFieldError("Conflict destination already exists", field)
 }
 
 func verifyResolutionDestinationOwnership(root *os.Root, sources []string, writes []resolutionWrite) error {
@@ -385,9 +499,35 @@ func writeSourceResolutionOutputs(root *os.Root, sources []string, writes *mater
 		if _, isOwned := owned[write.Path]; !isOwned {
 			continue
 		}
+		if err := removeMismatchedSourceResolutionOutput(root, writes, write); err != nil {
+			return err
+		}
 		if err := writeMaterializedConflictEntry(root, writes, write); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func removeMismatchedSourceResolutionOutput(root *os.Root, writes *materializedResolutionWrites, write materializedResolutionWrite) error {
+	content, err := writes.open(write)
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+	matches, exists, matchErr := conflictEntryMatches(root, write.Path, write.Mode, content)
+	closeErr := content.Close()
+	if matchErr != nil || closeErr != nil {
+		return ErrRecoveryRequired
+	}
+	if !exists || matches {
+		return nil
+	}
+	info, err := root.Lstat(write.Path)
+	if err != nil || (!info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0) {
+		return ErrRecoveryRequired
+	}
+	if err := root.Remove(write.Path); err != nil {
+		return err
 	}
 	return nil
 }
@@ -419,21 +559,10 @@ func resolutionSourceSet(sources []string) map[string]struct{} {
 	return owned
 }
 
-func removeResolutionSources(root *os.Root, plan resolutionPlan, sources []string, writes []materializedResolutionWrite) error {
-	remove := make(map[string]struct{}, len(plan.RemovePaths)+len(writes))
+func removeResolutionSources(root *os.Root, plan resolutionPlan) error {
+	remove := make(map[string]struct{}, len(plan.RemovePaths))
 	for _, name := range plan.RemovePaths {
 		remove[name] = struct{}{}
-	}
-	owned := make(map[string]struct{}, len(sources))
-	for _, source := range sources {
-		owned[source] = struct{}{}
-	}
-	for _, write := range writes {
-		if !write.skip {
-			if _, isOwned := owned[write.Path]; isOwned {
-				remove[write.Path] = struct{}{}
-			}
-		}
 	}
 	names := make([]string, 0, len(remove))
 	for name := range remove {
@@ -761,6 +890,8 @@ func buildResolutionPlan(conflict Conflict, conflicts []Conflict, request model.
 		if err != nil {
 			return resolutionPlan{}, err
 		}
+		local.Field = "local_path"
+		remote.Field = "remote_path"
 		plan.Writes = append(plan.Writes, local, remote)
 	case model.GitConflictDelete:
 	default:
@@ -779,7 +910,7 @@ func buildResolutionPlan(conflict Conflict, conflicts []Conflict, request model.
 	if err := rejectResolutionCollision(conflict, conflicts, append(append([]string(nil), sources...), resolutionWritePaths(plan.Writes)...)); err != nil {
 		return resolutionPlan{}, err
 	}
-	return sortResolutionPlan(plan), nil
+	return sortResolutionPlan(plan, sources), nil
 }
 
 func resolutionSources(conflict Conflict) ([]string, error) {
@@ -857,7 +988,7 @@ func resolutionWritePaths(writes []resolutionWrite) []string {
 	return paths
 }
 
-func sortResolutionPlan(plan resolutionPlan) resolutionPlan {
+func sortResolutionPlan(plan resolutionPlan, sources []string) resolutionPlan {
 	sort.Strings(plan.RemovePaths)
 	sort.Slice(plan.Writes, func(i, j int) bool {
 		if plan.Writes[i].Path != plan.Writes[j].Path {
@@ -873,6 +1004,9 @@ func sortResolutionPlan(plan resolutionPlan) resolutionPlan {
 	})
 	stagePaths := make(map[string]struct{}, len(plan.RemovePaths)+len(plan.Writes))
 	for _, remove := range plan.RemovePaths {
+		if len(sources) > 1 && remove == sources[1] {
+			continue
+		}
 		stagePaths[remove] = struct{}{}
 	}
 	for _, write := range plan.Writes {
