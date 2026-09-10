@@ -42,10 +42,14 @@ export function createGitStatusPoller({
       return null;
     } finally {
       if (active && current === generation) {
-        timer = schedule(() => {
-          timer = null;
+        let scheduledTimer;
+        scheduledTimer = schedule(() => {
+          if (timer === scheduledTimer) {
+            timer = null;
+          }
           void run(current);
         }, interval);
+        timer = scheduledTimer;
       }
     }
   }

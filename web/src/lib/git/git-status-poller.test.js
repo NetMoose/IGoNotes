@@ -153,6 +153,35 @@ describe('createGitStatusPoller', () => {
     expect(load).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps a newer timer handle when a stale callback runs', async () => {
+    const scheduled = [];
+    const handles = [];
+    const schedule = vi.fn((callback) => {
+      const handle = { id: handles.length };
+      scheduled.push(callback);
+      handles.push(handle);
+      return handle;
+    });
+    const cancel = vi.fn();
+    const poller = createGitStatusPoller({
+      load: vi.fn().mockResolvedValue({ statuses: [] }),
+      onStatuses: vi.fn(),
+      onError: vi.fn(),
+      schedule,
+      cancel,
+    });
+
+    poller.start();
+    await Promise.resolve();
+    await poller.refresh();
+
+    scheduled[0]();
+    poller.stop();
+
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenLastCalledWith(handles[1]);
+  });
+
   it('does not complete a successful run when onStatuses stops the poller', async () => {
     const schedule = vi.fn();
     const onError = vi.fn();
