@@ -141,6 +141,23 @@ describe('GitSettingsSection', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
+  it('clears a card local error when opening that base Git wizard', async () => {
+    const user = userEvent.setup()
+    vi.mocked(disableGit).mockRejectedValueOnce(new Error('Не удалось отключить Git'))
+    renderSection()
+
+    const work = screen.getByRole('article', { name: 'Git для базы work' })
+    await user.click(within(work).getByRole('button', { name: 'Отключить Git' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Отключить Git' }))
+    expect(await screen.findByText('Не удалось отключить Git')).toBeVisible()
+
+    await user.click(within(screen.getByRole('article', { name: 'Git для базы work' }))
+      .getByRole('button', { name: 'Изменить настройки' }))
+    await user.click(screen.getByRole('button', { name: 'Отмена' }))
+
+    expect(screen.queryByText('Не удалось отключить Git')).not.toBeInTheDocument()
+  })
+
   it('keeps polling and parent action errors visible and keeps disable confirmation single-flight', async () => {
     const request = Promise.withResolvers()
     vi.mocked(disableGit).mockReturnValue(request.promise)

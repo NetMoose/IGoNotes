@@ -58,6 +58,7 @@
 
   function showWizard(base) {
     if (!active || sectionBusy) return
+    localErrors = { ...localErrors, [base.name]: '' }
     panel = 'wizard'
     wizardBase = base
   }
