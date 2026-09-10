@@ -286,6 +286,7 @@
 
     try {
       await flushWorkspace()
+      if (!mounted) return
       await syncGit(baseName)
       await refreshGitStatuses()
     } catch (error) {

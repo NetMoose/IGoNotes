@@ -1145,6 +1145,43 @@ describe('App setup gate', () => {
     expect(gitPoller.refresh).toHaveBeenCalledOnce()
   })
 
+  it('does not start Git sync when the app unmounts while the footer flush is pending', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const flush = deferred()
+    const flushUploads = vi.fn(() => flush.promise)
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({
+        ...base,
+        git_url: `https://example.test/${base.name}.git`,
+        git_branch: 'main',
+      })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+
+    const { unmount } = render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    setEditorFlush(flushUploads)
+    gitPollerOptions.onStatuses([{ base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] }])
+    await tick()
+    await user.click(screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' }))
+    await user.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
+
+    expect(flushUploads).toHaveBeenCalledOnce()
+    unmount()
+    flush.resolve()
+    await flush.promise
+    await Promise.resolve()
+    await Promise.resolve()
+    await tick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(syncGit).not.toHaveBeenCalled()
+  })
+
   it('does not sync Git when flushing a dirty footer edit fails and retains the editor buffer', async () => {
     const user = userEvent.setup()
     const note = fileNode('draft.md')
