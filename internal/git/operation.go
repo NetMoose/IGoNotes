@@ -127,12 +127,28 @@ type OperationResult struct {
 	Behind        int
 }
 
+type ConflictRecoveryState string
+
+const (
+	RecoveryConflict     ConflictRecoveryState = "conflict"
+	RecoveryCanComplete  ConflictRecoveryState = "can_complete"
+	RecoveryNeedsReindex ConflictRecoveryState = "needs_reindex"
+	RecoveryPushPending  ConflictRecoveryState = "push_pending"
+	RecoveryPushUnknown  ConflictRecoveryState = "push_unknown"
+	RecoveryPushed       ConflictRecoveryState = "pushed"
+	RecoveryAborted      ConflictRecoveryState = "aborted"
+	RecoveryAmbiguous    ConflictRecoveryState = "ambiguous"
+	RecoveryLocked       ConflictRecoveryState = "locked"
+)
+
 type RecoveryResult struct {
 	HeadOID       string
 	MergeHeadOID  string
 	RemoteOID     string
+	PushOID       string
 	ConflictPaths []string
 	Blocking      bool
+	ConflictState ConflictRecoveryState
 }
 
 type RecoveryOptions struct {
