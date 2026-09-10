@@ -90,6 +90,7 @@ describe('NotesWorkspace', () => {
     expect(screen.getByText('Выберите заметку')).toBeVisible()
     const basePath = screen.getByTitle('Текущая база заметок')
     expect(basePath).toHaveTextContent('/notes/work')
+    expect(screen.queryByRole('button', { name: /Открыть детали Git:/ })).not.toBeInTheDocument()
     const settings = screen.getByRole('button', { name: 'Открыть настройки' })
     expect(settings).toHaveAttribute('title', 'Настройки')
     expect(settings).toBeEnabled()
@@ -98,6 +99,71 @@ describe('NotesWorkspace', () => {
     await user.click(settings)
 
     expect(props.onOpenSettings).toHaveBeenCalledOnce()
+  })
+
+  it('renders a wrapping footer and forwards Git sync from its details', async () => {
+    const user = userEvent.setup()
+    const onGitSync = vi.fn()
+    await renderWorkspace({
+      gitBase: {
+        name: 'work',
+        git_url: 'https://example.test/notes.git',
+        git_branch: 'main',
+      },
+      gitStatus: { base: 'work', state: 'ready', ahead: 0 },
+      onGitSync,
+    })
+
+    const basePath = screen.getByTitle('Текущая база заметок')
+    const footer = basePath.closest('footer')
+    expect(footer).toHaveClass(
+      'min-h-6',
+      'shrink-0',
+      'flex',
+      'flex-wrap',
+      'items-center',
+      'justify-between',
+      'gap-x-3',
+      'gap-y-1',
+    )
+    expect(footer).not.toHaveClass('h-6')
+    expect(basePath).toHaveClass('flex-1', 'min-w-0', 'truncate')
+
+    await user.click(screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' }))
+    await user.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
+
+    expect(onGitSync).toHaveBeenCalledOnce()
+    expect(onGitSync).toHaveBeenCalledWith('work')
+  })
+
+  it.each([
+    ['a conflict', { state: 'conflict' }, false, ''],
+    ['a busy sync', { state: 'ready' }, true, ''],
+    ['a sync error', { state: 'ready' }, false, 'Не удалось синхронизировать Git'],
+  ])('shows Git details for %s with its safe sync state', async (_name, gitStatus, gitSyncBusy, gitSyncError) => {
+    const user = userEvent.setup()
+    await renderWorkspace({
+      gitBase: {
+        name: 'work',
+        git_url: 'https://example.test/notes.git',
+        git_branch: 'main',
+      },
+      gitStatus,
+      gitSyncBusy,
+      gitSyncError,
+    })
+
+    await user.click(screen.getByRole('button', { name: /Открыть детали Git:/ }))
+    const sync = screen.getByRole('button', { name: 'Синхронизировать Git' })
+
+    if (gitStatus.state === 'conflict' || gitSyncBusy) {
+      expect(sync).toBeDisabled()
+    } else {
+      expect(sync).toBeEnabled()
+    }
+    if (gitSyncError) {
+      expect(screen.getByRole('alert')).toHaveTextContent(gitSyncError)
+    }
   })
 
   it('exposes explicit names and decorative SVGs for icon-only controls', async () => {

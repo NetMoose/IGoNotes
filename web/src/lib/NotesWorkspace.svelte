@@ -1,12 +1,18 @@
 <script>
   import Sidebar from './Sidebar.svelte';
   import Editor from './Editor.svelte';
+  import GitStatusIndicator from './git/GitStatusIndicator.svelte';
 
   let {
     activeNote,
     content = $bindable(''),
     saveStatus = 'idle',
     basePath = '',
+    gitBase = null,
+    gitStatus = null,
+    gitSyncBusy = false,
+    gitSyncError = '',
+    onGitSync,
     error = '',
     transitioning = false,
     onSelectNote,
@@ -100,8 +106,8 @@
     </main>
   </div>
 
-  <footer class="bg-gray-100 border-t border-gray-200 px-3 py-1 flex items-center shrink-0 h-6">
-    <span class="text-[11px] text-gray-500 font-mono truncate flex items-center gap-1" title="Текущая база заметок">
+  <footer class="bg-gray-100 border-t border-gray-200 px-3 py-1 min-h-6 shrink-0 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+    <span class="text-[11px] text-gray-500 font-mono flex flex-1 min-w-0 truncate items-center gap-1" title="Текущая база заметок">
       {#if basePath}
         <svg class="h-3 w-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>
         {basePath}
@@ -109,5 +115,8 @@
         Загрузка информации о базе...
       {/if}
     </span>
+    {#if gitBase}
+      <GitStatusIndicator base={gitBase} status={gitStatus} busy={gitSyncBusy} error={gitSyncError} onSync={onGitSync} />
+    {/if}
   </footer>
 </div>
