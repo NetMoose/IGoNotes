@@ -216,7 +216,6 @@ describe('frontend API client', () => {
 
   it.each([
     ['probe without all required mutation flags', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), required_mutations: {} }, 200],
-    ['probe with an extra required mutation flag', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), required_mutations: { ...gitProbe().required_mutations, extra: true } }, 200],
     ['probe with an invalid blocking error', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), blocking_error: { code: 1, message: 'failure' } }, 200],
     ['config response with an invalid base', () => configureGit('work', {}), { base: { name: 'work', path: '/notes/work', auto_sync: 'true' }, status: gitStatus() }, 202],
     ['config response with an invalid status state', () => disableGit('work'), { base: { name: 'work', path: '/notes/work', auto_sync: false }, status: { ...gitStatus(), state: 'done' } }, 200],
@@ -268,6 +267,24 @@ describe('frontend API client', () => {
     await expect(probeGit({ base: 'work', git_url: 'url' })).resolves.toEqual(probe)
     await expect(configureGit('work', {})).resolves.toEqual({ base, status: gitStatus(), operation })
     await expect(syncGit('work')).resolves.toEqual(operation)
+  })
+
+  it('accepts extra probe mutations and ignores a disable operation payload', async () => {
+    const probe = {
+      ...gitProbe(),
+      required_mutations: { ...gitProbe().required_mutations, server_extension: true },
+    }
+    const disabled = {
+      base: { name: 'work', path: '/notes/work', auto_sync: false },
+      status: gitStatus(),
+      operation: { operation_id: 1 },
+    }
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(probe))
+      .mockResolvedValueOnce(jsonResponse(disabled))
+
+    await expect(probeGit({ base: 'work', git_url: 'url' })).resolves.toEqual(probe)
+    await expect(disableGit('work')).resolves.toEqual(disabled)
   })
 
   it('gets and decodes config using a Headers instance', async () => {

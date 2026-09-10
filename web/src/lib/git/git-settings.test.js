@@ -39,6 +39,12 @@ function gitStatus(base = 'work', state = 'ready', ahead = 0) {
   return { base, state, ahead }
 }
 
+function draftErrors(overrides = {}) {
+  return { gitURL: '', branch: '', interval: '', template: '', ...overrides }
+}
+
+const configuredBase = { git_url: 'https://example.test/notes.git', git_branch: 'main' }
+
 describe('Git settings helpers', () => {
   it('exports the backend-supported constants', () => {
     expect(DEFAULT_GIT_COMMIT_TEMPLATE).toBe('IGoNotes: sync {{base}} at {{datetime}} ({{count}} files)')
@@ -72,14 +78,18 @@ describe('Git settings helpers', () => {
     ['an unknown template token', { ...validDraft, template: '{{X}}' }, { template: 'Неизвестная переменная {{X}}' }],
     ['unmatched template braces', { ...validDraft, template: '{{base}' }, { template: 'Проверьте парные фигурные скобки' }],
   ])('validates %s', (_case, draft, expected) => {
-    expect(validateGitDraft(draft)).toEqual(expected)
+    expect(validateGitDraft(draft)).toEqual(draftErrors(expected))
   })
 
   it('allows empty templates and ref-like branches outside the frozen checks', () => {
     for (const branch of ['@', 'feature//topic', 'topic.lock']) {
-      expect(validateGitDraft({ ...validDraft, branch, template: '' })).toEqual({})
+      expect(validateGitDraft({ ...validDraft, branch, template: '' })).toEqual(draftErrors())
     }
-    expect(validateGitDraft({ ...validDraft, autoSync: false, interval: 0 })).toEqual({})
+    expect(validateGitDraft({ ...validDraft, autoSync: false, interval: 0 })).toEqual(draftErrors())
+  })
+
+  it('only treats NUL, CR, and LF as line breaks', () => {
+    expect(validateGitDraft({ ...validDraft, gitURL: 'git\u001fremote', branch: 'topic\u001fname', template: 'sync\u001f{{base}}' })).toEqual(draftErrors())
   })
 
   it('renders every commit template variable with local RFC3339 time', () => {
@@ -95,6 +105,7 @@ describe('Git settings helpers', () => {
     expect(renderGitCommitPreview('', { base: 'work', branch: 'main', at: now })).toBe(
       `IGoNotes: sync work at ${localDateTime} (3 files)`,
     )
+    expect(renderGitCommitPreview('  {{base}}  ', { base: 'work', date: new Date(0), at: now })).toBe('  work  ')
   })
 
   it('returns only confirmation keys required by the probe in API order', () => {
@@ -132,6 +143,22 @@ describe('Git settings helpers', () => {
     })
   })
 
+  it('normalizes camelCase draft values with String, Boolean, Number, and trim', () => {
+    expect(buildGitConfigRequest({
+      gitURL: 42,
+      branch: 7,
+      autoSync: 'yes',
+      interval: '30',
+      template: '  custom {{base}}  ',
+    }, probe(), {})).toMatchObject({
+      git_url: '42',
+      git_branch: '7',
+      auto_sync: true,
+      auto_sync_interval_minutes: 30,
+      git_commit_message_template: 'custom {{base}}',
+    })
+  })
+
   it('replaces exactly one config base immutably by its name', () => {
     const config = { bases: [{ name: 'work', path: '/old' }, { name: 'Work', path: '/case-sensitive' }] }
     const updated = { name: 'work', path: '/new' }
@@ -143,23 +170,24 @@ describe('Git settings helpers', () => {
   it('looks up status by exact base name only', () => {
     const statuses = [gitStatus('work'), gitStatus('Work', 'error')]
 
-    expect(gitStatusFor(statuses, 'work')).toEqual(gitStatus('work'))
-    expect(gitStatusFor(statuses, 'WORK')).toBeNull()
+    expect(gitStatusFor('work', statuses)).toEqual(gitStatus('work'))
+    expect(gitStatusFor('WORK', statuses)).toBeNull()
   })
 
   it.each([
-    [null, 'Git не настроен', 'slate', false, false],
-    [gitStatus('work', 'unconfigured'), 'Git не настроен', 'slate', false, false],
-    [gitStatus('work', 'initializing'), 'Выполняется', 'blue', true, false],
-    [gitStatus('work', 'syncing'), 'Выполняется', 'blue', true, false],
-    [gitStatus('work', 'ready', 1), 'Есть локальные изменения', 'amber', false, true],
-    [gitStatus('work', 'ready'), 'Синхронизировано', 'green', false, true],
-    [gitStatus('work', 'error'), 'Ошибка', 'red', false, true],
-    [gitStatus('work', 'paused'), 'Приостановлено', 'amber', false, false],
-    [gitStatus('work', 'conflict'), 'Конфликт', 'red', false, false],
-    [gitStatus('work', 'needs_reconnect'), 'Требуется переподключение', 'amber', false, false],
-    [gitStatus('work', 'other'), 'Статус неизвестен', 'slate', false, false],
-  ])('presents %o as public status', (status, label, tone, busy, canSync) => {
-    expect(presentGitStatus(status)).toEqual({ label, tone, busy, canSync })
+    [null, null, 'Git не настроен', 'slate', false, false],
+    [null, gitStatus('work', 'ready'), 'Git не настроен', 'slate', false, false],
+    [configuredBase, gitStatus('work', 'unconfigured'), 'Git не настроен', 'slate', false, false],
+    [configuredBase, gitStatus('work', 'initializing'), 'Выполняется', 'blue', true, false],
+    [configuredBase, gitStatus('work', 'syncing'), 'Выполняется', 'blue', true, false],
+    [configuredBase, gitStatus('work', 'ready', 1), 'Есть локальные изменения', 'amber', false, true],
+    [configuredBase, gitStatus('work', 'ready'), 'Синхронизировано', 'green', false, true],
+    [configuredBase, gitStatus('work', 'error'), 'Ошибка', 'red', false, true],
+    [configuredBase, gitStatus('work', 'paused'), 'Приостановлено', 'amber', false, false],
+    [configuredBase, gitStatus('work', 'conflict'), 'Конфликт', 'red', false, false],
+    [configuredBase, gitStatus('work', 'needs_reconnect'), 'Требуется переподключение', 'amber', false, false],
+    [configuredBase, gitStatus('work', 'other'), 'Статус неизвестен', 'slate', false, false],
+  ])('presents %o as public status', (base, status, label, tone, busy, canSync) => {
+    expect(presentGitStatus(base, status)).toEqual({ label, tone, busy, canSync })
   })
 })

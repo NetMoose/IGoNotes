@@ -176,7 +176,6 @@ function validGitProbe(value) {
     && typeof value.history_relation === 'string'
     && typeof value.can_configure === 'boolean'
     && isObject(mutations)
-    && Object.keys(mutations).length === mutationKeys.length
     && mutationKeys
       .every((key) => typeof mutations[key] === 'boolean')
     && Array.isArray(value.warnings)
@@ -245,8 +244,7 @@ export function disableGit(base) {
     method: 'DELETE',
   }, (payload) => isObject(payload)
     && validGitBase(payload.base)
-    && validGitStatus(payload.status)
-    && (payload.operation === undefined || payload.operation === null || validGitOperation(payload.operation)))
+    && validGitStatus(payload.status))
 }
 
 export async function getGitStatus(base = '') {

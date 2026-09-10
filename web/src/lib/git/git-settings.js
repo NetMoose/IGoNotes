@@ -3,7 +3,7 @@ export const GIT_INTERVALS = [5, 15, 30, 60]
 export const GIT_TEMPLATE_VARIABLES = ['base', 'branch', 'date', 'datetime', 'count']
 
 const confirmationKeys = ['create_repository', 'replace_origin', 'create_branch', 'merge_histories']
-const controlCharacter = /[\u0000-\u001f\u007f]/
+const lineBreak = /\0|\r|\n/
 
 function trim(value) {
   return typeof value === 'string' ? value.trim() : ''
@@ -19,7 +19,7 @@ function localRFC3339(date) {
 }
 
 function remoteError(value) {
-  if (controlCharacter.test(value)) {
+  if (lineBreak.test(value)) {
     return 'URL должен быть одной строкой'
   }
   if (!trim(value)) {
@@ -51,7 +51,7 @@ function remoteError(value) {
 }
 
 function branchError(value) {
-  if (controlCharacter.test(value)) {
+  if (lineBreak.test(value)) {
     return 'Имя ветки должно быть одной строкой'
   }
   if (!trim(value)) {
@@ -61,8 +61,8 @@ function branchError(value) {
 }
 
 function templateError(value) {
-  const template = trim(value)
-  if (controlCharacter.test(value)) {
+  const template = String(value ?? '') || DEFAULT_GIT_COMMIT_TEMPLATE
+  if (lineBreak.test(template)) {
     return 'Шаблон должен быть одной строкой'
   }
   if (!template) {
@@ -93,37 +93,23 @@ function templateError(value) {
   return ''
 }
 
-function normalizedDraft(draft) {
-  return {
-    gitURL: trim(draft?.gitURL),
-    branch: trim(draft?.branch),
-    autoSync: draft?.autoSync === true,
-    interval: draft?.interval,
-    template: trim(draft?.template) || DEFAULT_GIT_COMMIT_TEMPLATE,
-  }
-}
-
 export function gitConfigured(base) {
   return Boolean(trim(base?.git_url) && trim(base?.git_branch))
 }
 
 export function validateGitDraft(draft) {
-  const errors = {}
-  const remote = remoteError(draft?.gitURL)
-  const branch = branchError(draft?.branch)
-  const template = templateError(draft?.template)
-  if (remote) errors.gitURL = remote
-  if (branch) errors.branch = branch
-  if (draft?.autoSync === true && !GIT_INTERVALS.includes(draft?.interval)) {
-    errors.interval = 'Выберите интервал 5, 15, 30 или 60 минут'
+  return {
+    gitURL: remoteError(draft?.gitURL),
+    branch: branchError(draft?.branch),
+    interval: draft?.autoSync && !GIT_INTERVALS.includes(Number(draft?.interval)) ? 'Выберите интервал 5, 15, 30 или 60 минут' : '',
+    template: templateError(draft?.template),
   }
-  if (template) errors.template = template
-  return errors
 }
 
 export function renderGitCommitPreview(template, { base = '', branch = '', count = 3, at = new Date() } = {}) {
-  const datetime = localRFC3339(at)
-  return (trim(template) || DEFAULT_GIT_COMMIT_TEMPLATE)
+  const date = at
+  const datetime = localRFC3339(date)
+  return (String(template ?? '') || DEFAULT_GIT_COMMIT_TEMPLATE)
     .replaceAll('{{base}}', base)
     .replaceAll('{{branch}}', branch)
     .replaceAll('{{date}}', datetime.slice(0, 10))
@@ -136,14 +122,13 @@ export function requiredConfirmationKeys(probe) {
 }
 
 export function buildGitConfigRequest(draft, probe, checks = {}) {
-  const value = normalizedDraft(draft)
   const required = new Set(requiredConfirmationKeys(probe))
   return {
-    git_url: value.gitURL,
-    git_branch: value.branch,
-    auto_sync: value.autoSync,
-    auto_sync_interval_minutes: GIT_INTERVALS.includes(value.interval) ? value.interval : 15,
-    git_commit_message_template: value.template,
+    git_url: String(draft.gitURL ?? '').trim(),
+    git_branch: String(draft.branch ?? '').trim(),
+    auto_sync: Boolean(draft.autoSync),
+    auto_sync_interval_minutes: GIT_INTERVALS.includes(Number(draft.interval)) ? Number(draft.interval) : 15,
+    git_commit_message_template: String(draft.template ?? '').trim() || DEFAULT_GIT_COMMIT_TEMPLATE,
     confirmations: Object.fromEntries(confirmationKeys.map((key) => [key, required.has(key) && checks[key] === true])),
   }
 }
@@ -157,11 +142,14 @@ export function replaceConfigBase(config, base) {
   }
 }
 
-export function gitStatusFor(statuses, base) {
-  return Array.isArray(statuses) ? statuses.find((status) => status?.base === base) ?? null : null
+export function gitStatusFor(baseName, statuses) {
+  return Array.isArray(statuses) ? statuses.find((status) => status?.base === baseName) ?? null : null
 }
 
-export function presentGitStatus(status) {
+export function presentGitStatus(base, status) {
+  if (!gitConfigured(base) || status?.state === 'unconfigured') {
+    return { label: 'Git не настроен', tone: 'slate', busy: false, canSync: false }
+  }
   switch (status?.state) {
     case 'initializing':
     case 'syncing':
@@ -178,10 +166,7 @@ export function presentGitStatus(status) {
       return { label: 'Конфликт', tone: 'red', busy: false, canSync: false }
     case 'needs_reconnect':
       return { label: 'Требуется переподключение', tone: 'amber', busy: false, canSync: false }
-    case 'unconfigured':
     default:
-      return status?.state && status.state !== 'unconfigured'
-        ? { label: 'Статус неизвестен', tone: 'slate', busy: false, canSync: false }
-        : { label: 'Git не настроен', tone: 'slate', busy: false, canSync: false }
+      return { label: 'Статус неизвестен', tone: 'slate', busy: false, canSync: false }
   }
 }
