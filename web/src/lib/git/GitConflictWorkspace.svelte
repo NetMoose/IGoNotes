@@ -12,7 +12,7 @@
   import DeleteConflictResolver from './DeleteConflictResolver.svelte'
   import TextConflictResolver from './TextConflictResolver.svelte'
 
-  const terminalStates = new Set(['ready', 'error', 'paused', 'needs_reconnect', 'unconfigured'])
+  const terminalStates = new Set(['ready', 'error', 'paused'])
 
   let {
     base,
@@ -32,13 +32,16 @@
   let terminalOperationId = $state('')
   let terminalNotified = $state(false)
   let abortDialogOpen = $state(false)
+  let switchTarget = $state('')
   let loadedKey = $state('')
   let requestToken = 0
+  let completeButton = $state()
 
   let baseName = $derived(typeof base === 'string' ? base : base?.name ?? '')
   let operationId = $derived(status?.operation_id ?? '')
   let conflictStatus = $derived(!status?.state || status.state === 'conflict')
   let conflicts = $derived(workspace?.conflicts ?? [])
+  let switchableBases = $derived(bases.filter((candidate) => candidate.name !== baseName))
   let selectedConflict = $derived(conflicts.find((conflict) => conflict.id === selectedId) ?? null)
   let controlsDisabled = $derived(busy || loading || actionPending || terminalPending)
 
@@ -55,6 +58,36 @@
     conflictButton(selectedId)?.focus()
   }
 
+  async function focusAfterResolution() {
+    await tick()
+    if (conflicts.length === 0) {
+      completeButton?.focus()
+      return
+    }
+    conflictButton(selectedId)?.focus()
+  }
+
+  function applyWorkspace(result) {
+    if (result.base !== baseName || result.operation_id !== operationId) {
+      workspace = null
+      selectedId = ''
+      error = 'Операция разрешения конфликтов изменилась'
+      return false
+    }
+
+    const previousId = selectedId
+    const previousIndex = conflicts.findIndex((conflict) => conflict.id === previousId)
+    workspace = result
+    const nextIndex = result.conflicts.findIndex((conflict) => conflict.id === previousId)
+    if (nextIndex >= 0) {
+      selectedId = previousId
+    } else {
+      const nearestIndex = Math.min(Math.max(previousIndex, 0), result.conflicts.length - 1)
+      selectedId = result.conflicts[nearestIndex]?.id ?? ''
+    }
+    return true
+  }
+
   async function loadConflicts() {
     const expectedBase = baseName
     const expectedOperation = operationId
@@ -66,30 +99,13 @@
     }
 
     const token = ++requestToken
-    const previousConflicts = conflicts
-    const previousId = selectedId
-    const previousIndex = previousConflicts.findIndex((conflict) => conflict.id === previousId)
     loading = true
     error = ''
 
     try {
       const result = await getGitConflicts(expectedBase)
       if (token !== requestToken || expectedBase !== baseName || expectedOperation !== operationId) return
-      if (result.base !== expectedBase || result.operation_id !== expectedOperation) {
-        workspace = null
-        selectedId = ''
-        error = 'Операция разрешения конфликтов изменилась'
-        return
-      }
-
-      workspace = result
-      const nextIndex = result.conflicts.findIndex((conflict) => conflict.id === previousId)
-      if (nextIndex >= 0) {
-        selectedId = previousId
-      } else {
-        const nearestIndex = Math.min(Math.max(previousIndex, 0), result.conflicts.length - 1)
-        selectedId = result.conflicts[nearestIndex]?.id ?? ''
-      }
+      applyWorkspace(result)
     } catch (cause) {
       if (token === requestToken) error = messageFor(cause, 'Не удалось загрузить конфликты')
       throw cause
@@ -107,11 +123,16 @@
   })
 
   $effect(() => {
+    if (switchableBases.some((candidate) => candidate.name === switchTarget)) return
+    switchTarget = ''
+  })
+
+  $effect(() => {
     if (
       !terminalPending
       || terminalNotified
       || !terminalStates.has(status?.state)
-      || (status?.operation_id && status.operation_id !== terminalOperationId)
+      || status?.operation_id !== terminalOperationId
     ) return
 
     terminalNotified = true
@@ -142,27 +163,36 @@
     if (controlsDisabled) return
     actionPending = true
     error = ''
+    let resolved = false
     try {
-      await resolveGitConflict(resolution)
-      actionPending = false
+      const result = await resolveGitConflict(resolution)
+      resolved = applyWorkspace(result.remaining)
+    } catch (cause) {
+      if (cause?.code !== 'stale_conflict') throw cause
       await loadConflicts()
-      await focusSelectedConflict()
+      resolved = true
     } finally {
       actionPending = false
     }
+    if (resolved) await focusAfterResolution()
   }
 
-  async function switchBase(event) {
-    if (controlsDisabled) return
+  async function switchBase() {
+    if (controlsDisabled || !switchTarget) return
     actionPending = true
     error = ''
     try {
-      await onBaseSwitch(event.currentTarget.value)
+      await onBaseSwitch(switchTarget)
     } catch (cause) {
       error = messageFor(cause, 'Не удалось переключить базу')
     } finally {
       actionPending = false
     }
+  }
+
+  function retryLoad() {
+    if (controlsDisabled) return
+    loadConflicts().catch(() => {})
   }
 
   async function beginTerminal(action) {
@@ -195,19 +225,28 @@
 
 <main class="grid min-h-screen min-w-0 bg-slate-100 lg:grid-cols-[18rem_minmax(0,1fr)]" aria-busy={controlsDisabled}>
   <aside class="border-b border-slate-200 bg-white p-4 lg:min-h-screen lg:border-b-0 lg:border-r lg:p-6">
-    <label class="block text-sm font-semibold text-slate-800">
-      База заметок
+    <p class="text-sm text-slate-600">Текущая база: <span class="font-semibold text-slate-900">{baseName}</span></p>
+    <label class="mt-4 block text-sm font-semibold text-slate-800">
+      База для переключения
       <select
-        value={baseName}
+        bind:value={switchTarget}
         disabled={controlsDisabled}
-        onchange={switchBase}
         class="mt-1 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
       >
-        {#each bases as candidate (candidate.name)}
+        <option value="" disabled>Выберите базу</option>
+        {#each switchableBases as candidate (candidate.name)}
           <option value={candidate.name}>{candidate.name}</option>
         {/each}
       </select>
     </label>
+    <button
+      type="button"
+      disabled={controlsDisabled || !switchTarget}
+      onclick={switchBase}
+      class="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      Открыть базу
+    </button>
 
     <nav class="mt-6" aria-label="Конфликтующие файлы">
       <h1 class="text-lg font-bold text-slate-950">Конфликты Git</h1>
@@ -236,8 +275,9 @@
 
     <div class="mt-6 space-y-2">
       <button
+        bind:this={completeButton}
         type="button"
-        disabled={controlsDisabled || !workspace?.can_complete}
+        disabled={controlsDisabled || !workspace?.can_complete || conflicts.length > 0}
         onclick={() => beginTerminal('complete')}
         class="w-full rounded-lg bg-blue-600 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
       >
@@ -263,6 +303,16 @@
 
     {#if error}
       <p role="alert" class="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>
+      {#if !workspace}
+        <button
+          type="button"
+          disabled={controlsDisabled}
+          onclick={retryLoad}
+          class="mt-3 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Повторить загрузку
+        </button>
+      {/if}
     {/if}
 
     {#if loading && !workspace}
