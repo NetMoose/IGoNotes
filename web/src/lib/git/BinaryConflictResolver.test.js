@@ -14,6 +14,11 @@ const conflict = {
   local: { path: 'assets/photo.png', oid: 'local-oid', mode: '100644', size: 2048, content: binaryBody },
   remote: { path: 'assets/photo.png', oid: 'remote-oid', mode: '100644', size: 4096, content: binaryBody },
 }
+const addAddConflict = {
+  ...conflict,
+  kind: 'add_add',
+  base: null,
+}
 
 function resolverProps(overrides = {}) {
   return {
@@ -37,17 +42,20 @@ describe('BinaryConflictResolver', () => {
     expect(container.querySelectorAll('textarea')).toHaveLength(0)
   })
 
-  it('offers only supported native radio actions without selecting one', () => {
-    render(BinaryConflictResolver, resolverProps({ conflict: { ...conflict, actions: ['local', 'delete'] } }))
+  it('offers only local, remote, and keep-both native actions without selecting one', () => {
+    render(BinaryConflictResolver, resolverProps())
 
     const options = screen.getAllByRole('radio')
     expect(screen.getByRole('group', { name: 'Способ разрешения' })).toContainElement(options[0])
     expect(options).toEqual(expect.arrayContaining([
       screen.getByRole('radio', { name: 'Оставить версию на этом устройстве' }),
-      screen.getByRole('radio', { name: 'Удалить файл' }),
+      screen.getByRole('radio', { name: 'Оставить версию из репозитория' }),
+      screen.getByRole('radio', { name: 'Сохранить обе версии' }),
     ]))
+    expect(options).toHaveLength(3)
     expect(options.every((option) => !option.checked)).toBe(true)
     expect(screen.queryByRole('radio', { name: 'Объединить вручную' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'Удалить файл' })).not.toBeInTheDocument()
   })
 
   it.each([
@@ -71,17 +79,21 @@ describe('BinaryConflictResolver', () => {
     })
   })
 
-  it('submits exact keep-both and delete resolutions with only their required drafts', async () => {
+  it('uses distinct suggested paths and safety guidance for binary add/add keep-both', async () => {
     const user = userEvent.setup()
-    const keepBothProps = resolverProps()
-    const keepBoth = render(BinaryConflictResolver, keepBothProps)
+    const props = resolverProps({ conflict: addAddConflict })
+    render(BinaryConflictResolver, props)
 
     await user.click(screen.getByRole('radio', { name: 'Сохранить обе версии' }))
     const localPath = screen.getByRole('textbox', { name: 'Путь версии на этом устройстве' })
+    const remotePath = screen.getByRole('textbox', { name: 'Путь версии из репозитория' })
+    expect(localPath).toHaveValue('assets/photo-local.png')
+    expect(remotePath).toHaveValue('assets/photo-remote.png')
+    expect(screen.getByText('Оба файла будут записаны под явно заданными разными именами; существующие несвязанные файлы не будут перезаписаны.')).toBeVisible()
     await user.clear(localPath)
     await user.type(localPath, 'assets/photo-local.png')
     await user.click(screen.getByRole('button', { name: 'Применить решение' }))
-    expect(keepBothProps.onResolve).toHaveBeenCalledWith({
+    expect(props.onResolve).toHaveBeenCalledWith({
       base: 'work',
       operation_id: 'operation-1',
       conflict_id: 'sha256:binary-conflict',
@@ -91,20 +103,6 @@ describe('BinaryConflictResolver', () => {
       remote_path: 'assets/photo-remote.png',
       local_oid: 'local-oid',
       remote_oid: 'remote-oid',
-    })
-
-    keepBoth.unmount()
-    const deleteProps = resolverProps({ conflict: { ...conflict, actions: ['delete'] } })
-    render(BinaryConflictResolver, deleteProps)
-    await user.click(screen.getByRole('radio', { name: 'Удалить файл' }))
-    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Применить решение' }))
-    expect(deleteProps.onResolve).toHaveBeenCalledWith({
-      base: 'work',
-      operation_id: 'operation-1',
-      conflict_id: 'sha256:binary-conflict',
-      path: 'assets/photo.png',
-      action: 'delete',
     })
   })
 

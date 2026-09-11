@@ -6,7 +6,6 @@
     local: 'Оставить версию на этом устройстве',
     remote: 'Оставить версию из репозитория',
     keep_both: 'Сохранить обе версии',
-    delete: 'Удалить файл',
   }
 
   let {
@@ -93,25 +92,28 @@
     {/if}
 
     {#if action === 'keep_both'}
-      <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <label class="block text-sm font-medium text-slate-700">
-          Путь версии на этом устройстве
-          <input
-            type="text"
-            bind:value={localPath}
-            disabled={controlsDisabled}
-            class="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
-          />
-        </label>
-        <label class="block text-sm font-medium text-slate-700">
-          Путь версии из репозитория
-          <input
-            type="text"
-            bind:value={remotePath}
-            disabled={controlsDisabled}
-            class="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
-          />
-        </label>
+      <div class="space-y-2">
+        <p class="text-sm text-slate-600">Оба файла будут записаны под явно заданными разными именами; существующие несвязанные файлы не будут перезаписаны.</p>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <label class="block text-sm font-medium text-slate-700">
+            Путь версии на этом устройстве
+            <input
+              type="text"
+              bind:value={localPath}
+              disabled={controlsDisabled}
+              class="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
+            />
+          </label>
+          <label class="block text-sm font-medium text-slate-700">
+            Путь версии из репозитория
+            <input
+              type="text"
+              bind:value={remotePath}
+              disabled={controlsDisabled}
+              class="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
+            />
+          </label>
+        </div>
       </div>
     {/if}
 
