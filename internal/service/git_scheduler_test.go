@@ -80,6 +80,23 @@ func TestGitSchedulerUsesPersistedLastAttemptAsIntervalAnchor(t *testing.T) {
 	<-queue.calls
 }
 
+func TestGitSchedulerNeverSchedulesNewBaseBeforeStaggerSlot(t *testing.T) {
+	now := schedulerTestNow()
+	clock := newFakeGitSchedulerClock(now)
+	lastAttempt := now.Add(-4*time.Minute - 58*time.Second)
+	statuses := &fakeGitSchedulerStatuses{statuses: map[string]model.GitStatus{
+		"/notes/work": schedulerReadyStatus("work", "/notes/work", lastAttempt),
+	}}
+	queue := &fakeGitSchedulerQueue{calls: make(chan gitcmd.SyncRequest, 1)}
+	cancel := startGitScheduler(t, clock, statuses, &fakeGitSchedulerSnapshots{bases: []gitcmd.ConfiguredBase{schedulerBase("work", "/notes/work", 5)}}, queue)
+	defer cancel()
+
+	clock.Advance(2 * time.Second)
+	assertNoGitSchedulerCall(t, queue.calls)
+	clock.Advance(3 * time.Second)
+	<-queue.calls
+}
+
 func TestGitSchedulerQueuesDueBasesInStableOrder(t *testing.T) {
 	now := schedulerTestNow()
 	clock := newFakeGitSchedulerClock(now)
@@ -150,6 +167,155 @@ func TestGitSchedulerRetriesMetadataAndQueueErrorsAfterThirtySeconds(t *testing.
 	if got := <-queue.calls; got.Snapshot.Name != "work" {
 		t.Fatalf("retry queued %q, want work", got.Snapshot.Name)
 	}
+}
+
+func TestGitSchedulerSourceErrorKeepsPreviousSchedule(t *testing.T) {
+	now := schedulerTestNow()
+	clock := newFakeGitSchedulerClock(now)
+	statuses := &fakeGitSchedulerStatuses{statuses: map[string]model.GitStatus{
+		"/notes/work": schedulerReadyStatus("work", "/notes/work", now),
+	}}
+	snapshots := &fakeGitSchedulerSnapshots{bases: []gitcmd.ConfiguredBase{schedulerBase("work", "/notes/work", 5)}}
+	queue := &fakeGitSchedulerQueue{calls: make(chan gitcmd.SyncRequest, 1)}
+	changes := make(chan struct{}, 1)
+	_, cancel, done := runGitScheduler(clock, statuses, snapshots, changes, queue)
+	defer func() { cancel(); <-done }()
+	clock.waitForReset(t)
+
+	snapshots.setError(errors.New("settings unavailable"))
+	changes <- struct{}{}
+	clock.waitForReset(t)
+	clock.Advance(5 * time.Minute)
+	if got := <-queue.calls; got.Snapshot.Name != "work" {
+		t.Fatalf("scheduled base = %q, want work", got.Snapshot.Name)
+	}
+}
+
+func TestGitSchedulerSourceErrorRetriesAfterThirtySeconds(t *testing.T) {
+	now := schedulerTestNow()
+	clock := newFakeGitSchedulerClock(now)
+	statuses := &fakeGitSchedulerStatuses{statuses: map[string]model.GitStatus{
+		"/notes/work": schedulerReadyStatus("work", "/notes/work", now),
+	}}
+	snapshots := &fakeGitSchedulerSnapshots{bases: []gitcmd.ConfiguredBase{schedulerBase("work", "/notes/work", 5)}}
+	changes := make(chan struct{}, 1)
+	_, cancel, done := runGitScheduler(clock, statuses, snapshots, changes, &fakeGitSchedulerQueue{})
+	defer func() { cancel(); <-done }()
+	clock.waitForReset(t)
+
+	snapshots.setError(errors.New("settings unavailable"))
+	changes <- struct{}{}
+	clock.waitForReset(t)
+	snapshots.setError(nil)
+	clock.Advance(30 * time.Second)
+	clock.waitForReset(t)
+	if got := snapshots.callCount(); got != 3 {
+		t.Fatalf("snapshot reads = %d, want retry after metadata error", got)
+	}
+}
+
+func TestGitSchedulerReconcilesEnablePathDisableAndForget(t *testing.T) {
+	now := schedulerTestNow()
+	clock := newFakeGitSchedulerClock(now)
+	statuses := &fakeGitSchedulerStatuses{statuses: map[string]model.GitStatus{
+		"/notes/work": schedulerReadyStatus("work", "/notes/work", now),
+		"/notes/new":  {Base: "new", RepositoryPath: "/notes/new", State: model.GitStateReady},
+	}}
+	snapshots := &fakeGitSchedulerSnapshots{bases: []gitcmd.ConfiguredBase{{Name: "work", Path: "/notes/work", AutoSync: false, IntervalMinutes: 5}}}
+	queue := &fakeGitSchedulerQueue{calls: make(chan gitcmd.SyncRequest, 2)}
+	changes := make(chan struct{}, 1)
+	_, cancel, done := runGitScheduler(clock, statuses, snapshots, changes, queue)
+	defer func() { cancel(); <-done }()
+	clock.waitForReset(t)
+
+	snapshots.set([]gitcmd.ConfiguredBase{schedulerBase("work", "/notes/work", 5)})
+	changes <- struct{}{}
+	clock.waitForReset(t)
+	clock.Advance(5*time.Minute - time.Second)
+	assertNoGitSchedulerCall(t, queue.calls)
+	clock.Advance(time.Second)
+	<-queue.calls
+	clock.waitForReset(t)
+
+	snapshots.set([]gitcmd.ConfiguredBase{schedulerBase("new", "/notes/new", 5)})
+	changes <- struct{}{}
+	clock.waitForReset(t)
+	clock.Advance(5 * time.Second)
+	if got := <-queue.calls; got.Snapshot.Path != "/notes/new" {
+		t.Fatalf("scheduled path = %q, want /notes/new", got.Snapshot.Path)
+	}
+	clock.waitForReset(t)
+
+	snapshots.set([]gitcmd.ConfiguredBase{{Name: "new", Path: "/notes/new", AutoSync: false, IntervalMinutes: 5}})
+	changes <- struct{}{}
+	clock.waitForReset(t)
+	clock.Advance(time.Hour)
+	assertNoGitSchedulerCall(t, queue.calls)
+
+	snapshots.set(nil)
+	changes <- struct{}{}
+	clock.waitForReset(t)
+	clock.Advance(time.Hour)
+	assertNoGitSchedulerCall(t, queue.calls)
+}
+
+func TestGitSchedulerStatusWakeAnchorsManualAttempt(t *testing.T) {
+	now := schedulerTestNow()
+	clock := newFakeGitSchedulerClock(now)
+	statuses := &fakeGitSchedulerStatuses{statuses: map[string]model.GitStatus{
+		"/notes/work": schedulerReadyStatus("work", "/notes/work", now),
+	}}
+	queue := &fakeGitSchedulerQueue{calls: make(chan gitcmd.SyncRequest, 1)}
+	changes := make(chan struct{})
+	scheduler, cancel, done := runGitScheduler(clock, statuses, &fakeGitSchedulerSnapshots{bases: []gitcmd.ConfiguredBase{schedulerBase("work", "/notes/work", 5)}}, changes, queue)
+	defer func() { cancel(); <-done }()
+	clock.waitForReset(t)
+
+	clock.Advance(2 * time.Minute)
+	statuses.set("/notes/work", schedulerReadyStatus("work", "/notes/work", clock.Now()))
+	scheduler.notifyStatusChanged()
+	clock.waitForReset(t)
+	clock.Advance(4*time.Minute + 59*time.Second)
+	assertNoGitSchedulerCall(t, queue.calls)
+	clock.Advance(time.Second)
+	<-queue.calls
+}
+
+func TestGitSchedulerDeduplicatedAdmissionAdvancesDue(t *testing.T) {
+	now := schedulerTestNow()
+	clock := newFakeGitSchedulerClock(now)
+	statuses := &fakeGitSchedulerStatuses{statuses: map[string]model.GitStatus{
+		"/notes/work": schedulerReadyStatus("work", "/notes/work", now),
+	}}
+	queue := &fakeGitSchedulerQueue{deduplicated: true, calls: make(chan gitcmd.SyncRequest, 2)}
+	cancel := startGitScheduler(t, clock, statuses, &fakeGitSchedulerSnapshots{bases: []gitcmd.ConfiguredBase{schedulerBase("work", "/notes/work", 5)}}, queue)
+	defer cancel()
+
+	clock.Advance(5 * time.Minute)
+	<-queue.calls
+	clock.waitForReset(t)
+	clock.Advance(4*time.Minute + 59*time.Second)
+	assertNoGitSchedulerCall(t, queue.calls)
+	clock.Advance(time.Second)
+	<-queue.calls
+}
+
+func TestGitSchedulerManagerClosedStopsWithoutRetry(t *testing.T) {
+	now := schedulerTestNow()
+	clock := newFakeGitSchedulerClock(now)
+	statuses := &fakeGitSchedulerStatuses{statuses: map[string]model.GitStatus{
+		"/notes/work": schedulerReadyStatus("work", "/notes/work", now),
+	}}
+	queue := &fakeGitSchedulerQueue{err: ErrGitManagerClosed, calls: make(chan gitcmd.SyncRequest, 2)}
+	_, cancel, done := runGitScheduler(clock, statuses, &fakeGitSchedulerSnapshots{bases: []gitcmd.ConfiguredBase{schedulerBase("work", "/notes/work", 5)}}, make(chan struct{}), queue)
+	defer cancel()
+	clock.waitForReset(t)
+
+	clock.Advance(5 * time.Minute)
+	<-queue.calls
+	waitForGitSchedulerDone(t, done)
+	clock.Advance(time.Hour)
+	assertNoGitSchedulerCall(t, queue.calls)
 }
 
 func TestGitSchedulerReconcilesChangesWithoutOverlappingTimers(t *testing.T) {
@@ -223,15 +389,33 @@ func TestGitSchedulerRejectsNilDependencies(t *testing.T) {
 
 func startGitScheduler(t *testing.T, clock *fakeGitSchedulerClock, statuses GitStatusReader, snapshots GitOrderedSnapshots, queue GitSyncQueue) context.CancelFunc {
 	t.Helper()
-	scheduler := newGitScheduler(clock, statuses, snapshots, make(chan struct{}), queue, log.New(io.Discard, "", 0))
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { defer close(done); scheduler.run(ctx) }()
+	_, cancel, done := runGitScheduler(clock, statuses, snapshots, make(chan struct{}), queue)
 	clock.waitForReset(t)
 	return func() {
 		cancel()
 		<-done
 	}
+}
+
+func runGitScheduler(clock *fakeGitSchedulerClock, statuses GitStatusReader, snapshots GitOrderedSnapshots, changes <-chan struct{}, queue GitSyncQueue) (*gitScheduler, context.CancelFunc, <-chan struct{}) {
+	scheduler := newGitScheduler(clock, statuses, snapshots, changes, queue, log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); scheduler.run(ctx) }()
+	return scheduler, cancel, done
+}
+
+func waitForGitSchedulerDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	for attempts := 0; attempts < 10000; attempts++ {
+		select {
+		case <-done:
+			return
+		default:
+			runtime.Gosched()
+		}
+	}
+	t.Fatal("scheduler did not stop")
 }
 
 func schedulerTestNow() time.Time {
@@ -391,15 +575,27 @@ func (s *fakeGitSchedulerStatuses) setError(err error) {
 	s.err = err
 }
 
+func (s *fakeGitSchedulerStatuses) set(path string, status model.GitStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statuses[path] = status
+}
+
 type fakeGitSchedulerSnapshots struct {
 	mu    sync.Mutex
 	bases []gitcmd.ConfiguredBase
+	err   error
+	calls int
 }
 
-func (s *fakeGitSchedulerSnapshots) OrderedGitSnapshots() []gitcmd.ConfiguredBase {
+func (s *fakeGitSchedulerSnapshots) OrderedGitSnapshots() ([]gitcmd.ConfiguredBase, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]gitcmd.ConfiguredBase(nil), s.bases...)
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return append([]gitcmd.ConfiguredBase(nil), s.bases...), nil
 }
 
 func (s *fakeGitSchedulerSnapshots) set(bases []gitcmd.ConfiguredBase) {
@@ -408,10 +604,23 @@ func (s *fakeGitSchedulerSnapshots) set(bases []gitcmd.ConfiguredBase) {
 	s.bases = append([]gitcmd.ConfiguredBase(nil), bases...)
 }
 
+func (s *fakeGitSchedulerSnapshots) setError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
+
+func (s *fakeGitSchedulerSnapshots) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
 type fakeGitSchedulerQueue struct {
-	mu    sync.Mutex
-	err   error
-	calls chan gitcmd.SyncRequest
+	mu           sync.Mutex
+	err          error
+	deduplicated bool
+	calls        chan gitcmd.SyncRequest
 }
 
 func (q *fakeGitSchedulerQueue) QueueSync(_ context.Context, request gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {
@@ -421,5 +630,5 @@ func (q *fakeGitSchedulerQueue) QueueSync(_ context.Context, request gitcmd.Sync
 	if q.calls != nil {
 		q.calls <- request
 	}
-	return gitcmd.Operation{}, false, err
+	return gitcmd.Operation{}, q.deduplicated, err
 }

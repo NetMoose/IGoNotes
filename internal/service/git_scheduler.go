@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sort"
 	"time"
@@ -48,6 +49,7 @@ type gitScheduler struct {
 	statusChanged chan struct{}
 	entries       map[string]gitScheduleEntry
 	startedAt     time.Time
+	metadataRetry time.Time
 }
 
 func newGitScheduler(
@@ -85,9 +87,7 @@ func (s *gitScheduler) notifyStatusChanged() {
 
 func (s *gitScheduler) run(ctx context.Context) {
 	s.startedAt = s.clock.Now()
-	if err := s.reconcile(ctx, true); err != nil {
-		s.logger.Printf("Git autosync scheduler metadata error: %v", err)
-	}
+	s.reconcileAndLog(ctx, true)
 
 	timer := s.clock.NewTimer(gitSchedulerRetryDelay)
 	defer timer.Stop()
@@ -121,13 +121,19 @@ func resetGitSchedulerTimer(timer GitResilienceTimer, delay time.Duration) {
 
 func (s *gitScheduler) reconcileAndLog(ctx context.Context, startup bool) {
 	if err := s.reconcile(ctx, startup); err != nil {
+		s.metadataRetry = s.clock.Now().Add(gitSchedulerRetryDelay)
 		s.logger.Printf("Git autosync scheduler metadata error: %v", err)
+		return
 	}
+	s.metadataRetry = time.Time{}
 }
 
 func (s *gitScheduler) reconcile(ctx context.Context, startup bool) error {
 	now := s.clock.Now()
-	bases := s.snapshots.OrderedGitSnapshots()
+	bases, err := s.snapshots.OrderedGitSnapshots()
+	if err != nil {
+		return err
+	}
 	type scheduledBase struct {
 		snapshot gitcmd.ConfiguredBase
 		status   model.GitStatus
@@ -182,7 +188,7 @@ func (s *gitScheduler) reconcile(ctx context.Context, startup bool) error {
 		}
 		next[path] = gitScheduleEntry{
 			snapshot:    candidate.snapshot,
-			due:         gitScheduleDue(now, slot, candidate.status.LastAttempt, time.Duration(candidate.snapshot.IntervalMinutes)*time.Minute, startup),
+			due:         gitScheduleDue(slot, candidate.status.LastAttempt, time.Duration(candidate.snapshot.IntervalMinutes)*time.Minute),
 			lastAttempt: cloneGitScheduleAttempt(candidate.status.LastAttempt),
 			order:       candidate.order,
 		}
@@ -213,15 +219,15 @@ func gitScheduleBlocked(status model.GitStatus) bool {
 	}
 }
 
-func gitScheduleDue(now, slot time.Time, lastAttempt *time.Time, interval time.Duration, startup bool) time.Time {
+func gitScheduleDue(slot time.Time, lastAttempt *time.Time, interval time.Duration) time.Time {
 	if lastAttempt == nil {
 		return slot
 	}
 	due := lastAttempt.Add(interval)
-	if !due.After(now) && (startup || slot.After(now)) {
-		return slot
+	if due.After(slot) {
+		return due
 	}
-	return due
+	return slot
 }
 
 func equalGitScheduleAttempt(left, right *time.Time) bool {
@@ -246,6 +252,9 @@ func (s *gitScheduler) nextDelay(now time.Time) time.Duration {
 			continue
 		}
 		due = entry.due
+	}
+	if !s.metadataRetry.IsZero() && (due.IsZero() || s.metadataRetry.Before(due)) {
+		due = s.metadataRetry
 	}
 	if due.IsZero() {
 		return gitSchedulerRetryDelay
@@ -277,6 +286,9 @@ func (s *gitScheduler) queueDue(ctx context.Context, now time.Time) bool {
 			return false
 		}
 		_, _, err := s.queue.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: entry.snapshot})
+		if errors.Is(err, ErrGitManagerClosed) {
+			return false
+		}
 		current, found := s.entries[entry.snapshot.Path]
 		if !found {
 			continue

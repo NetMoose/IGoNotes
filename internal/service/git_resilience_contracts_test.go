@@ -125,7 +125,9 @@ func (*fakeGitResilienceStatusReader) List(context.Context) ([]model.GitStatus, 
 
 type fakeGitResilienceSnapshots []gitcmd.ConfiguredBase
 
-func (s fakeGitResilienceSnapshots) OrderedGitSnapshots() []gitcmd.ConfiguredBase { return s }
+func (s fakeGitResilienceSnapshots) OrderedGitSnapshots() ([]gitcmd.ConfiguredBase, error) {
+	return s, nil
+}
 
 type fakeGitResilienceQueue struct{}
 

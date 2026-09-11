@@ -104,7 +104,7 @@ type GitResilienceTimer interface {
 }
 
 type GitOrderedSnapshots interface {
-	OrderedGitSnapshots() []gitcmd.ConfiguredBase
+	OrderedGitSnapshots() ([]gitcmd.ConfiguredBase, error)
 }
 
 type GitSyncQueue interface {
