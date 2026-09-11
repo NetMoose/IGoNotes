@@ -158,6 +158,43 @@ describe('createGitStatusPoller', () => {
     expect(onStatuses).toHaveBeenNthCalledWith(2, ['current'])
   })
 
+  it('keeps an external refresh queued until a pending status callback and new load settle', async () => {
+    const statusesDone = deferred()
+    const current = deferred()
+    const load = vi.fn()
+      .mockResolvedValueOnce({ statuses: ['old'] })
+      .mockReturnValueOnce(current.promise)
+    const onStatuses = vi.fn().mockImplementationOnce(() => statusesDone.promise)
+    const poller = createGitStatusPoller({
+      load,
+      onStatuses,
+      onError: vi.fn(),
+      schedule: vi.fn(),
+    })
+
+    poller.start()
+    await vi.waitFor(() => {
+      expect(onStatuses).toHaveBeenCalledExactlyOnceWith(['old'])
+    })
+
+    const refresh = poller.refresh()
+    let settled = false
+    void refresh.then(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    statusesDone.resolve()
+    await vi.waitFor(() => {
+      expect(load).toHaveBeenCalledTimes(2)
+    })
+    expect(settled).toBe(false)
+
+    current.resolve({ statuses: ['current'] })
+    await expect(refresh).resolves.toEqual(['current'])
+  })
+
   it('invalidates deferred work when stopped', async () => {
     const pending = deferred()
     const schedule = vi.fn()
