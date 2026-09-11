@@ -1400,6 +1400,33 @@ describe('App setup gate', () => {
     expect(screen.getByLabelText('Markdown')).toHaveValue('# Later edit')
   })
 
+  it('retains the submitted manual merge after a repeated note_changed response', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Disk one', revision: 'revision-2' })
+      .mockResolvedValueOnce({ content: '# Disk two', revision: 'revision-3' })
+    vi.mocked(saveNote).mockRejectedValue(changed)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await screen.findByRole('dialog')
+    await user.click(screen.getByRole('button', { name: 'Объединить вручную' }))
+    const merge = screen.getByRole('textbox', { name: 'Итоговый текст' })
+    await user.clear(merge)
+    await user.type(merge, '# Submitted merge')
+    await user.click(screen.getByRole('button', { name: 'Сохранить объединение' }))
+
+    expect(await screen.findByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Submitted merge')
+    expect(screen.getByRole('textbox', { name: 'Версия на диске' })).toHaveValue('# Disk two')
+  })
+
   it('keeps a dirty deleted note in the browser until the explicit close action', async () => {
     const user = userEvent.setup()
     const note = fileNode('deleted.md')
@@ -1550,6 +1577,33 @@ describe('App setup gate', () => {
     expect(switchBase).toHaveBeenCalledWith('work')
     expect(saveNote).not.toHaveBeenCalled()
     expect(await screen.findByTitle('Текущая база заметок')).toHaveTextContent('/srv/work')
+  })
+
+  it('restores a dirty conflict buffer after switching away and back to its base', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
+    vi.mocked(switchBase)
+      .mockResolvedValueOnce(workConfig)
+      .mockResolvedValueOnce(completedConfig)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Retained draft')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }])
+    const conflictTarget = await screen.findByRole('combobox', { name: 'База для переключения' })
+    await user.selectOptions(conflictTarget, 'work')
+    await user.click(screen.getByRole('button', { name: 'Открыть базу' }))
+    await screen.findByText('Выберите заметку')
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    const personal = screen.getByRole('article', { name: 'База personal' })
+    await user.click(within(personal).getByRole('button', { name: 'Открыть' }))
+
+    expect(await screen.findByLabelText('Markdown')).toHaveValue('# Retained draft')
   })
 
   it('cancels a pending debounce when the active base enters a conflict', async () => {

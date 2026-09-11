@@ -47,6 +47,7 @@
   let gitPolling = false
   let changedPathProcessing = Promise.resolve()
   const processedChangedPathBuckets = new Map()
+  const conflictDrafts = new Map()
   const workspaceFlushFailures = new WeakSet()
 
   let currentBase = $derived(activeBase(config))
@@ -102,6 +103,7 @@
 
     config = savedConfig
     basePath = typeof current?.path === 'string' ? current.path : ''
+    if (previous?.name !== current?.name) restoreConflictDraft(current?.name)
     ensureGitPolling()
   }
 
@@ -327,14 +329,14 @@
     }
   }
 
-  async function stageStaleNote(noteId) {
+  async function stageStaleNote(noteId, mine = null) {
     if (stalePending) return
     stalePending = true
     clearSaveTimer()
     try {
       const disk = await fetchDiskNote(noteId)
       if (!mounted || activeNote?.id !== noteId) return
-      staleNote = makeStaleNote({ noteId, mine: markdownContent, disk })
+      staleNote = makeStaleNote({ noteId, mine: mine ?? markdownContent, disk })
       dirty = true
       saveStatus = 'idle'
       transitionError = ''
@@ -378,7 +380,7 @@
       saveStatus = 'saved'
     } catch (error) {
       if (error?.status === 409 && error?.code === 'note_changed') {
-        await stageStaleNote(stale.noteId)
+        await stageStaleNote(stale.noteId, content)
         return
       }
       showSaveError(error)
@@ -549,18 +551,44 @@
   }
 
   async function openBase(name) {
+    const preserveConflictDraft = conflictWorkspaceActive
     await switchBaseSafely({
       name,
       flush: conflictWorkspaceActive ? () => {} : flushPendingSave,
       switchRequest: switchBase,
       commit: (savedConfig) => {
         if (!mounted) return
+        if (preserveConflictDraft) retainConflictDraft(config?.current_base)
         acceptedGitOperation = null
         gitStatuses = []
         applyConfig(savedConfig)
         screen = 'editor'
       },
     })
+  }
+
+  function retainConflictDraft(baseName) {
+    if (!baseName || !activeNote || !dirty) return
+    conflictDrafts.set(baseName, {
+      activeNote,
+      noteRevision,
+      markdownContent,
+      staleNote,
+    })
+  }
+
+  function restoreConflictDraft(baseName) {
+    const draft = conflictDrafts.get(baseName)
+    if (!draft) return
+    conflictDrafts.delete(baseName)
+    activeNote = draft.activeNote
+    noteRevision = draft.noteRevision
+    ignoreNextChange = true
+    markdownContent = draft.markdownContent
+    dirty = true
+    staleNote = draft.staleNote
+    saveStatus = 'idle'
+    transitionError = ''
   }
 
   async function acceptGitOperation(_action, operation) {
