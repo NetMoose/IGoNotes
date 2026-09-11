@@ -78,6 +78,25 @@ describe('TextConflictResolver', () => {
     })
   })
 
+  it('renders and resolves deletion without unrelated draft fields', async () => {
+    const user = userEvent.setup()
+    const props = resolverProps({ conflict: { ...conflict, actions: ['delete'] } })
+    render(TextConflictResolver, props)
+
+    await user.click(screen.getByRole('radio', { name: 'Удалить файл' }))
+    expect(screen.queryByRole('textbox', { name: 'Путь результата' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Итоговый текст' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Применить решение' }))
+
+    expect(props.onResolve).toHaveBeenCalledWith({
+      base: 'work',
+      operation_id: 'operation-1',
+      conflict_id: 'sha256:conflict',
+      path: 'notes/idea.md',
+      action: 'delete',
+    })
+  })
+
   it('preserves the manual draft and selected action after a rejected resolution', async () => {
     const user = userEvent.setup()
     const props = resolverProps({ onResolve: vi.fn().mockRejectedValue(new Error('Не удалось сохранить')) })
