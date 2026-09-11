@@ -94,6 +94,51 @@ describe('StaleNoteDialog', () => {
     expect(merge).toHaveValue('# Объединенная заметка')
   })
 
+  it('resets recovery state for a different stale conflict', async () => {
+    const user = userEvent.setup()
+    const first = {
+      noteId: 'first.md',
+      mine: '# Первая версия',
+      diskContent: '# Первая версия на диске',
+      diskRevision: 'revision-1',
+      diskMissing: false,
+    }
+    const props = dialogProps({
+      stale: first,
+      onManualMerge: vi.fn().mockRejectedValue(new Error('Первая ошибка')),
+    })
+    const result = render(StaleNoteDialog, props)
+
+    await user.click(screen.getByRole('button', { name: 'Объединить вручную' }))
+    const merge = screen.getByRole('textbox', { name: 'Итоговый текст' })
+    await user.clear(merge)
+    await user.type(merge, '# Черновик первой версии')
+    await user.click(screen.getByRole('button', { name: 'Сохранить объединение' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Первая ошибка')
+
+    const second = {
+      noteId: 'second.md',
+      mine: '# Вторая версия',
+      diskContent: '# Вторая версия на диске',
+      diskRevision: 'revision-2',
+      diskMissing: false,
+    }
+    await result.rerender({ ...props, stale: second })
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Вторая версия')
+    expect(screen.queryByRole('textbox', { name: 'Итоговый текст' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Объединить вручную' }))
+    expect(screen.getByRole('textbox', { name: 'Итоговый текст' })).toHaveValue('# Вторая версия')
+
+    await result.rerender({ ...props, stale: { ...second, mine: '# Новая вторая версия' } })
+
+    expect(screen.getByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Новая вторая версия')
+    await user.click(screen.getByRole('button', { name: 'Объединить вручную' }))
+    expect(screen.getByRole('textbox', { name: 'Итоговый текст' })).toHaveValue('# Новая вторая версия')
+  })
+
   it('blocks duplicate actions while a local action is pending', async () => {
     const user = userEvent.setup()
     let resolveLoad

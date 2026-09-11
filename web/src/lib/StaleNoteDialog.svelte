@@ -11,10 +11,30 @@
 
     let mode = $state('compare');
     let mergeContent = $state('');
-    let mergeInitialized = $state(false);
     let localBusy = $state(false);
     let error = $state('');
     let isBusy = $derived(busy || localBusy);
+    let previousStale;
+    let previousNoteId;
+    let previousDiskRevision;
+
+    $effect(() => {
+        const nextStale = stale;
+        const nextNoteId = nextStale?.noteId;
+        const nextDiskRevision = nextStale?.diskRevision;
+        if (
+            nextStale === previousStale
+            && nextNoteId === previousNoteId
+            && nextDiskRevision === previousDiskRevision
+        ) return;
+
+        previousStale = nextStale;
+        previousNoteId = nextNoteId;
+        previousDiskRevision = nextDiskRevision;
+        mode = 'compare';
+        mergeContent = nextStale?.mine ?? '';
+        error = '';
+    });
 
     function showError(reason) {
         error = reason instanceof Error && reason.message
@@ -48,10 +68,6 @@
 
     function showManualMerge() {
         error = '';
-        if (!mergeInitialized) {
-            mergeContent = stale.mine;
-            mergeInitialized = true;
-        }
         mode = 'manual';
     }
 </script>
