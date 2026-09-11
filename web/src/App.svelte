@@ -30,6 +30,7 @@
   let gitBusyBase = $state('')
   let gitActionErrors = $state({})
   let staleNote = $state(null)
+  let stalePending = $state(false)
   let acceptedGitOperation = $state(null)
 
   let saveTimer = null
@@ -142,6 +143,7 @@
     activeNote = null
     noteRevision = ''
     staleNote = null
+    stalePending = false
     ignoreNextChange = true
     markdownContent = ''
     dirty = false
@@ -247,7 +249,7 @@
   }
 
   async function persistCurrentNote() {
-    if (!activeNote || staleNote) return
+    if (!activeNote || staleNote || stalePending) return
     if (savePromise) {
       await savePromise
       if (!mounted || !activeNote || !dirty) return
@@ -270,7 +272,7 @@
           if (mounted && activeNote?.id === noteId) noteRevision = saved.revision
         } catch (error) {
           if (error?.status === 409 && error?.code === 'note_changed') {
-            await stageStaleNote(noteId, content)
+            await stageStaleNote(noteId)
             return
           }
           showSaveError(error)
@@ -304,7 +306,13 @@
   async function flushPendingSave() {
     clearSaveTimer()
     if (savePromise) await savePromise
+    assertNoStaleRecovery()
     if (dirty) await persistCurrentNote()
+    assertNoStaleRecovery()
+  }
+
+  function assertNoStaleRecovery() {
+    if (staleNote || stalePending) throw new Error('Сначала разрешите конфликт изменений заметки')
   }
 
   async function fetchDiskNote(noteId) {
@@ -316,14 +324,20 @@
     }
   }
 
-  async function stageStaleNote(noteId, mine) {
+  async function stageStaleNote(noteId) {
+    if (stalePending) return
+    stalePending = true
     clearSaveTimer()
-    const disk = await fetchDiskNote(noteId)
-    if (!mounted || activeNote?.id !== noteId) return
-    staleNote = makeStaleNote({ noteId, mine, disk })
-    dirty = true
-    saveStatus = 'idle'
-    transitionError = ''
+    try {
+      const disk = await fetchDiskNote(noteId)
+      if (!mounted || activeNote?.id !== noteId) return
+      staleNote = makeStaleNote({ noteId, mine: markdownContent, disk })
+      dirty = true
+      saveStatus = 'idle'
+      transitionError = ''
+    } finally {
+      stalePending = false
+    }
   }
 
   async function loadStaleDisk() {
@@ -344,6 +358,16 @@
       const saved = readSaveResponse(await saveNote(stale.noteId, content, revision))
       if (!mounted || activeNote?.id !== stale.noteId) return
       noteRevision = saved.revision
+      if (markdownContent !== content) {
+        staleNote = makeStaleNote({
+          noteId: stale.noteId,
+          mine: markdownContent,
+          disk: { content, revision: saved.revision },
+        })
+        dirty = true
+        saveStatus = 'idle'
+        return
+      }
       ignoreNextChange = true
       markdownContent = content
       dirty = false
@@ -351,7 +375,7 @@
       saveStatus = 'saved'
     } catch (error) {
       if (error?.status === 409 && error?.code === 'note_changed') {
-        await stageStaleNote(stale.noteId, content)
+        await stageStaleNote(stale.noteId)
         return
       }
       showSaveError(error)
@@ -381,7 +405,7 @@
     const activePaths = batches.flatMap((batch) => batch.paths)
     if (activeNote && noteInChangedPaths(activeNote.id, activePaths)) {
       if (dirty || staleNote) {
-        if (!staleNote) await stageStaleNote(activeNote.id, markdownContent)
+        if (!staleNote) await stageStaleNote(activeNote.id)
       } else {
         const disk = await fetchDiskNote(activeNote.id)
         if (disk === null) resetEditorState()
@@ -483,7 +507,7 @@
   }
 
   async function saveNow() {
-    if (!activeNote || staleNote) return
+    if (!activeNote || staleNote || stalePending) return
     dirty = true
     transitionError = ''
     try {
@@ -537,7 +561,7 @@
       return
     }
 
-    if (currentNote && !staleNote) {
+    if (currentNote && !staleNote && !stalePending) {
       dirty = true
       clearSaveTimer()
       saveTimer = setTimeout(() => {

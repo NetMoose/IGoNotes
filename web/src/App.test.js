@@ -1329,6 +1329,77 @@ describe('App setup gate', () => {
     expect(saveNote).toHaveBeenLastCalledWith(note.id, '# Mine!', 'revision-3')
   })
 
+  it('preserves edits made during a stale disk fetch and blocks navigation and Git sync', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const diskRequest = deferred()
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({ ...base, git_url: `https://example.test/${base.name}.git`, git_branch: 'main' })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockReturnValueOnce(diskRequest.promise)
+    vi.mocked(saveNote).mockRejectedValueOnce(changed)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await gitPollerOptions.onStatuses([{ base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] }])
+    await user.click(screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Mine', 'revision-1'))
+
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Latest during fetch' } })
+    diskRequest.resolve({ content: '# Disk', revision: 'revision-2' })
+
+    expect(await screen.findByRole('dialog')).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Latest during fetch')
+    await fireEvent.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
+    await tick()
+
+    expect(screen.queryByRole('heading', { name: 'Базы заметок' })).not.toBeInTheDocument()
+    expect(syncGit).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Latest during fetch')
+  })
+
+  it('keeps edits made while a stale overwrite is in flight', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const overwriteRequest = deferred()
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Disk', revision: 'revision-2' })
+    vi.mocked(saveNote)
+      .mockRejectedValueOnce(changed)
+      .mockReturnValueOnce(overwriteRequest.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await screen.findByRole('dialog')
+    await user.click(screen.getByRole('button', { name: 'Оставить мою версию' }))
+    await user.click(screen.getByRole('button', { name: 'Подтвердить перезапись' }))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Mine', 'revision-2'))
+
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Later edit' } })
+    overwriteRequest.resolve({ status: 'saved', revision: 'revision-3' })
+
+    expect(await screen.findByRole('dialog')).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Later edit')
+    expect(screen.getByRole('textbox', { name: 'Версия на диске' })).toHaveValue('# Mine')
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Later edit')
+  })
+
   it('keeps a dirty deleted note in the browser until the explicit close action', async () => {
     const user = userEvent.setup()
     const note = fileNode('deleted.md')
