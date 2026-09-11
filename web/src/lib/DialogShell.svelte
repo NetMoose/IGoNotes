@@ -95,11 +95,14 @@
             'input:not([disabled])',
             'select:not([disabled])',
             'textarea:not([disabled])',
-            '[tabindex]:not([tabindex="-1"])'
+            '[contenteditable]:not([contenteditable="false"])',
+            '[tabindex]'
         ].join(',');
         return [...panel.querySelectorAll(selector)].filter((element) => {
             const style = getComputedStyle(element);
-            return !element.hidden
+            const tabindex = element.getAttribute('tabindex');
+            return (tabindex === null || Number(tabindex) >= 0)
+                && !element.hidden
                 && element.getAttribute('aria-hidden') !== 'true'
                 && style.display !== 'none'
                 && style.visibility !== 'hidden';

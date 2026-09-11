@@ -70,6 +70,39 @@ describe('DialogShell', () => {
     }
   })
 
+  it('includes contenteditable elements in the sequential focus trap', async () => {
+    const user = userEvent.setup()
+    render(DialogShellHost, shellProps({ includeContenteditable: true }))
+    const input = screen.getByRole('textbox', { name: 'Значение' })
+    const cancel = screen.getByRole('button', { name: 'Отмена' })
+    const confirm = screen.getByRole('button', { name: 'Подтвердить' })
+    const editor = screen.getByRole('textbox', { name: 'Редактор' })
+
+    await waitFor(() => expect(input).toHaveFocus())
+    await user.tab()
+    expect(cancel).toHaveFocus()
+    await user.tab()
+    expect(confirm).toHaveFocus()
+    await user.tab()
+    expect(editor).toHaveFocus()
+    await user.tab()
+    expect(input).toHaveFocus()
+  })
+
+  it('excludes tabindex minus one controls from focus trap ordering', async () => {
+    render(DialogShellHost, shellProps({ includeTabindexMinusOne: true }))
+    const input = screen.getByRole('textbox', { name: 'Значение' })
+    const confirm = screen.getByRole('button', { name: 'Подтвердить' })
+    const skipped = screen.getByRole('button', { name: 'Пропустить', hidden: true })
+
+    await waitFor(() => expect(input).toHaveFocus())
+    confirm.focus()
+    await fireEvent.keyDown(confirm, { key: 'Tab' })
+
+    expect(input).toHaveFocus()
+    expect(skipped).not.toHaveFocus()
+  })
+
   it('does not cancel with Escape while busy', async () => {
     const props = shellProps({ busy: true })
     const { rerender } = render(DialogShellHost, props)

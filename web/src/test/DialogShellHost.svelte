@@ -8,6 +8,8 @@
         error = '',
         busy = false,
         maxWidth = 'max-w-lg',
+        includeContenteditable = false,
+        includeTabindexMinusOne = false,
         onCancel = () => {}
     } = $props();
 </script>
@@ -27,5 +29,11 @@
     {#snippet actions()}
         <button type="button" onclick={onCancel} disabled={busy}>Отмена</button>
         <button type="button" disabled={busy}>Подтвердить</button>
+        {#if includeTabindexMinusOne}
+            <button type="button" tabindex="-1">Пропустить</button>
+        {/if}
+        {#if includeContenteditable}
+            <div contenteditable="true" role="textbox" aria-label="Редактор">Текст</div>
+        {/if}
     {/snippet}
 </DialogShell>
