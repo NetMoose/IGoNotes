@@ -542,7 +542,7 @@
   async function openBase(name) {
     await switchBaseSafely({
       name,
-      flush: flushPendingSave,
+      flush: conflictWorkspaceActive ? () => {} : flushPendingSave,
       switchRequest: switchBase,
       commit: (savedConfig) => {
         if (!mounted) return

@@ -1491,6 +1491,31 @@ describe('App setup gate', () => {
     expect(await screen.findByTitle('Текущая база заметок')).toHaveTextContent('/srv/work')
   })
 
+  it('switches from an active conflict without flushing the retained dirty editor', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
+    vi.mocked(saveNote).mockRejectedValue(new Error('Не должен вызываться'))
+    vi.mocked(switchBase).mockResolvedValue(workConfig)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Retained draft')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }])
+
+    const target = await screen.findByRole('combobox', { name: 'База для переключения' })
+    await user.selectOptions(target, 'work')
+    await user.click(screen.getByRole('button', { name: 'Открыть базу' }))
+
+    expect(switchBase).toHaveBeenCalledWith('work')
+    expect(saveNote).not.toHaveBeenCalled()
+    expect(await screen.findByTitle('Текущая база заметок')).toHaveTextContent('/srv/work')
+  })
+
   it('cancels a pending debounce when the active base enters a conflict', async () => {
     const initialUser = userEvent.setup()
     const note = fileNode('draft.md')
