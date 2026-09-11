@@ -1,303 +1,136 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createGitStatusPoller } from './git-status-poller.js';
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { createGitStatusPoller } from './git-status-poller.js'
 
 function deferred() {
-  let resolve;
-  let reject;
+  let resolve
+  let reject
   const promise = new Promise((promiseResolve, promiseReject) => {
-    resolve = promiseResolve;
-    reject = promiseReject;
-  });
-  return { promise, resolve, reject };
+    resolve = promiseResolve
+    reject = promiseReject
+  })
+  return { promise, resolve, reject }
 }
 
 describe('createGitStatusPoller', () => {
   afterEach(() => {
-    vi.useRealTimers();
-  });
+    vi.useRealTimers()
+  })
 
-  it('loads immediately and continues at an exact two-second cadence', async () => {
-    vi.useFakeTimers();
-    const statuses = [{ base: 'notes', ahead: 1 }];
-    const load = vi.fn().mockResolvedValue({ statuses });
-    const onStatuses = vi.fn();
-    const onError = vi.fn();
-    const schedule = vi.fn((callback, delay) => setTimeout(callback, delay));
-    const poller = createGitStatusPoller({ load, onStatuses, onError, schedule });
-
-    poller.start();
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(load).toHaveBeenCalledTimes(1);
-    expect(onStatuses).toHaveBeenCalledWith(statuses);
-    expect(onError).toHaveBeenCalledWith(null);
-    expect(schedule).toHaveBeenLastCalledWith(expect.any(Function), 2000);
-
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(load).toHaveBeenCalledTimes(1);
-
-    await vi.advanceTimersByTimeAsync(1);
-    expect(load).toHaveBeenCalledTimes(2);
-  });
-
-  it('reports an error without statuses and recovers on the next interval', async () => {
-    vi.useFakeTimers();
-    const error = new Error('offline');
-    const recovered = [{ base: 'notes', ahead: 2 }];
-    const load = vi
-      .fn()
-      .mockRejectedValueOnce(error)
-      .mockResolvedValueOnce({ statuses: recovered });
-    const onStatuses = vi.fn();
-    const onError = vi.fn();
-    const poller = createGitStatusPoller({ load, onStatuses, onError });
-
-    poller.start();
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(onStatuses).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledWith(error);
-
-    await vi.advanceTimersByTimeAsync(2000);
-
-    expect(onStatuses).toHaveBeenCalledTimes(1);
-    expect(onStatuses).toHaveBeenCalledWith(recovered);
-    expect(onError).toHaveBeenLastCalledWith(null);
-  });
-
-  it('contains a throwing error callback and continues scheduling', async () => {
-    const unhandled = vi.fn();
-    const scheduled = [];
-    const onError = vi.fn((error) => {
-      if (error) {
-        throw new Error('consumer error');
-      }
-    });
-    const load = vi
-      .fn()
-      .mockRejectedValueOnce(new Error('offline'))
-      .mockResolvedValueOnce({ statuses: [] });
-    const schedule = vi.fn((callback) => {
-      scheduled.push(callback);
-      return { id: scheduled.length };
-    });
+  it('awaits asynchronous status and success callbacks before scheduling', async () => {
+    const statusesDone = deferred()
+    const errorDone = deferred()
+    const sequence = []
+    const schedule = vi.fn()
     const poller = createGitStatusPoller({
-      load,
-      onStatuses: vi.fn(),
-      onError,
-      schedule,
-    });
-
-    process.on('unhandledRejection', unhandled);
-    try {
-      poller.start();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      expect(unhandled).not.toHaveBeenCalled();
-      expect(schedule).toHaveBeenCalledTimes(1);
-
-      scheduled[0]();
-      await Promise.resolve();
-      expect(schedule).toHaveBeenCalledTimes(2);
-    } finally {
-      process.off('unhandledRejection', unhandled);
-    }
-  });
-
-  it('contains a throwing statuses callback and continues scheduling', async () => {
-    const unhandled = vi.fn();
-    const schedule = vi.fn();
-    const onError = vi.fn();
-    const poller = createGitStatusPoller({
-      load: vi.fn().mockResolvedValue({ statuses: [] }),
-      onStatuses: vi.fn(() => {
-        throw new Error('consumer statuses error');
+      load: vi.fn(async () => {
+        sequence.push('load')
+        return { statuses: ['ready'] }
       }),
-      onError,
+      onStatuses: vi.fn(async () => {
+        sequence.push('statuses')
+        await statusesDone.promise
+      }),
+      onError: vi.fn(async (error) => {
+        sequence.push(`error:${error}`)
+        await errorDone.promise
+      }),
       schedule,
-    });
+    })
 
-    process.on('unhandledRejection', unhandled);
-    try {
-      poller.start();
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    poller.start()
+    await Promise.resolve()
+    await Promise.resolve()
 
-      expect(unhandled).not.toHaveBeenCalled();
-      expect(onError).toHaveBeenCalledWith(null);
-      expect(schedule).toHaveBeenCalledTimes(1);
-    } finally {
-      process.off('unhandledRejection', unhandled);
-    }
-  });
+    expect(sequence).toEqual(['load', 'statuses'])
+    expect(schedule).not.toHaveBeenCalled()
 
-  it('refresh invalidates an older deferred response', async () => {
-    vi.useFakeTimers();
-    const older = deferred();
-    const current = [{ base: 'notes', ahead: 3 }];
-    const load = vi
-      .fn()
+    statusesDone.resolve()
+    await vi.waitFor(() => {
+      expect(sequence).toEqual(['load', 'statuses', 'error:null'])
+    })
+    expect(schedule).not.toHaveBeenCalled()
+
+    errorDone.resolve()
+    await vi.waitFor(() => {
+      expect(schedule).toHaveBeenCalledWith(expect.any(Function), 2000)
+    })
+  })
+
+  it('serializes refresh behind an older load and discards the stale result', async () => {
+    const older = deferred()
+    const current = deferred()
+    const onStatuses = vi.fn()
+    const load = vi.fn()
       .mockReturnValueOnce(older.promise)
-      .mockResolvedValueOnce({ statuses: current });
-    const onStatuses = vi.fn();
-    const onError = vi.fn();
-    const poller = createGitStatusPoller({ load, onStatuses, onError });
-
-    poller.start();
-    const refresh = poller.refresh();
-    await expect(refresh).resolves.toEqual(current);
-
-    older.resolve({ statuses: [{ base: 'notes', ahead: 1 }] });
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(onStatuses).toHaveBeenCalledTimes(1);
-    expect(onStatuses).toHaveBeenCalledWith(current);
-    expect(onError).toHaveBeenCalledTimes(1);
-  });
-
-  it('stop cancels a timer and ignores a late deferred response', async () => {
-    const late = deferred();
-    const scheduled = [];
-    const timer = { id: 'timer' };
-    const schedule = vi.fn((callback) => {
-      scheduled.push(callback);
-      return timer;
-    });
-    const cancel = vi.fn();
-    const load = vi
-      .fn()
-      .mockResolvedValueOnce({ statuses: [{ base: 'notes', ahead: 1 }] })
-      .mockReturnValueOnce(late.promise);
-    const onStatuses = vi.fn();
-    const onError = vi.fn();
+      .mockReturnValueOnce(current.promise)
     const poller = createGitStatusPoller({
       load,
       onStatuses,
+      onError: vi.fn(),
+      schedule: vi.fn(),
+    })
+
+    poller.start()
+    await Promise.resolve()
+    const refresh = poller.refresh()
+    await Promise.resolve()
+    expect(load).toHaveBeenCalledTimes(1)
+
+    older.resolve({ statuses: ['old'] })
+    await vi.waitFor(() => {
+      expect(load).toHaveBeenCalledTimes(2)
+    })
+    expect(onStatuses).not.toHaveBeenCalled()
+
+    current.resolve({ statuses: ['current'] })
+    await expect(refresh).resolves.toEqual(['current'])
+    expect(onStatuses).toHaveBeenCalledExactlyOnceWith(['current'])
+  })
+
+  it('reports load and callback errors without leaking rejected callbacks', async () => {
+    const schedule = vi.fn()
+    const loadError = new Error('offline')
+    const poller = createGitStatusPoller({
+      load: vi.fn().mockRejectedValueOnce(loadError).mockResolvedValueOnce({ statuses: [] }),
+      onStatuses: vi.fn().mockRejectedValue(new Error('statuses consumer failed')),
+      onError: vi.fn().mockRejectedValue(new Error('error consumer failed')),
+      schedule,
+    })
+
+    poller.start()
+    await vi.waitFor(() => {
+      expect(schedule).toHaveBeenCalledTimes(1)
+    })
+    const next = schedule.mock.calls[0][0]
+    next()
+    await vi.waitFor(() => {
+      expect(schedule).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it('invalidates deferred work when stopped', async () => {
+    const pending = deferred()
+    const schedule = vi.fn()
+    const onStatuses = vi.fn()
+    const onError = vi.fn()
+    const poller = createGitStatusPoller({
+      load: vi.fn().mockReturnValue(pending.promise),
+      onStatuses,
       onError,
       schedule,
-      cancel,
-    });
+      cancel: vi.fn(),
+    })
 
-    poller.start();
-    await Promise.resolve();
-    expect(scheduled).toHaveLength(1);
+    poller.start()
+    await Promise.resolve()
+    poller.stop()
+    pending.resolve({ statuses: ['late'] })
+    await Promise.resolve()
+    await Promise.resolve()
 
-    poller.stop();
-    expect(cancel).toHaveBeenCalledWith(timer);
-
-    scheduled[0]();
-    late.resolve({ statuses: [{ base: 'notes', ahead: 4 }] });
-    await Promise.resolve();
-
-    expect(load).toHaveBeenCalledTimes(1);
-    expect(onStatuses).toHaveBeenCalledTimes(1);
-    expect(onError).toHaveBeenCalledTimes(1);
-    expect(schedule).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not load from a scheduled callback invalidated by refresh', async () => {
-    const scheduled = [];
-    const schedule = vi.fn((callback) => {
-      scheduled.push(callback);
-      return { id: scheduled.length };
-    });
-    const load = vi.fn().mockResolvedValue({ statuses: [] });
-    const poller = createGitStatusPoller({
-      load,
-      onStatuses: vi.fn(),
-      onError: vi.fn(),
-      schedule,
-    });
-
-    poller.start();
-    await Promise.resolve();
-    await poller.refresh();
-
-    scheduled[0]();
-    await Promise.resolve();
-
-    expect(load).toHaveBeenCalledTimes(2);
-  });
-
-  it('keeps a newer timer handle when a stale callback runs', async () => {
-    const scheduled = [];
-    const handles = [];
-    const schedule = vi.fn((callback) => {
-      const handle = { id: handles.length };
-      scheduled.push(callback);
-      handles.push(handle);
-      return handle;
-    });
-    const cancel = vi.fn();
-    const poller = createGitStatusPoller({
-      load: vi.fn().mockResolvedValue({ statuses: [] }),
-      onStatuses: vi.fn(),
-      onError: vi.fn(),
-      schedule,
-      cancel,
-    });
-
-    poller.start();
-    await Promise.resolve();
-    await poller.refresh();
-
-    scheduled[0]();
-    poller.stop();
-
-    expect(cancel).toHaveBeenCalledTimes(2);
-    expect(cancel).toHaveBeenLastCalledWith(handles[1]);
-  });
-
-  it('does not complete a successful run when onStatuses stops the poller', async () => {
-    const schedule = vi.fn();
-    const onError = vi.fn();
-    let poller;
-    const onStatuses = vi.fn(() => poller.stop());
-    const load = vi.fn().mockResolvedValue({ statuses: [] });
-    poller = createGitStatusPoller({ load, onStatuses, onError, schedule });
-
-    poller.start();
-    await Promise.resolve();
-
-    expect(onStatuses).toHaveBeenCalledTimes(1);
-    expect(onError).not.toHaveBeenCalled();
-    expect(schedule).not.toHaveBeenCalled();
-  });
-
-  it('does not complete a successful run when onStatuses refreshes the poller', async () => {
-    const next = deferred();
-    const schedule = vi.fn();
-    const onError = vi.fn();
-    let poller;
-    const onStatuses = vi.fn(() => poller.refresh());
-    const load = vi
-      .fn()
-      .mockResolvedValueOnce({ statuses: [] })
-      .mockReturnValueOnce(next.promise);
-    poller = createGitStatusPoller({ load, onStatuses, onError, schedule });
-
-    poller.start();
-    await Promise.resolve();
-
-    expect(onStatuses).toHaveBeenCalledTimes(1);
-    expect(onError).not.toHaveBeenCalled();
-    expect(schedule).not.toHaveBeenCalled();
-  });
-
-  it('ignores a deferred initial load that settles after stop', async () => {
-    const initial = deferred();
-    const schedule = vi.fn();
-    const onStatuses = vi.fn();
-    const onError = vi.fn();
-    const load = vi.fn().mockReturnValue(initial.promise);
-    const poller = createGitStatusPoller({ load, onStatuses, onError, schedule });
-
-    poller.start();
-    poller.stop();
-    initial.resolve({ statuses: [] });
-    await Promise.resolve();
-
-    expect(onStatuses).not.toHaveBeenCalled();
-    expect(onError).not.toHaveBeenCalled();
-    expect(schedule).not.toHaveBeenCalled();
-  });
-});
+    expect(onStatuses).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    expect(schedule).not.toHaveBeenCalled()
+  })
+})

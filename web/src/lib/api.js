@@ -158,6 +158,47 @@ function validGitOperation(value) {
     && typeof value.deduplicated === 'boolean'
 }
 
+function validGitConflictStage(value) {
+  return isObject(value)
+    && typeof value.path === 'string'
+    && typeof value.oid === 'string'
+    && typeof value.mode === 'string'
+    && Number.isInteger(value.size)
+    && typeof value.preview_truncated === 'boolean'
+    && hasString(value, 'content', { optional: true })
+}
+
+function validGitConflict(value) {
+  return isObject(value)
+    && typeof value.id === 'string'
+    && typeof value.kind === 'string'
+    && typeof value.content_kind === 'string'
+    && typeof value.path === 'string'
+    && Array.isArray(value.actions)
+    && value.actions.every((action) => typeof action === 'string')
+    && hasString(value, 'original_path', { optional: true })
+    && (value.base === undefined || validGitConflictStage(value.base))
+    && (value.local === undefined || validGitConflictStage(value.local))
+    && (value.remote === undefined || validGitConflictStage(value.remote))
+}
+
+function validGitConflictList(value) {
+  return isObject(value)
+    && typeof value.base === 'string'
+    && typeof value.operation_id === 'string'
+    && typeof value.head_oid === 'string'
+    && typeof value.merge_head_oid === 'string'
+    && typeof value.can_complete === 'boolean'
+    && Array.isArray(value.conflicts)
+    && value.conflicts.every(validGitConflict)
+}
+
+function validGitConflictResolve(value) {
+  return isObject(value)
+    && typeof value.resolved_path === 'string'
+    && validGitConflictList(value.remaining)
+}
+
 function validGitProbe(value) {
   const mutations = value?.required_mutations
   const mutationKeys = ['create_repository', 'add_origin', 'replace_origin', 'create_branch', 'merge_histories']
@@ -261,6 +302,31 @@ export function syncGit(base) {
   }, validGitOperation)
 }
 
+export function getGitConflicts(base) {
+  return requestGit(`/api/git/conflicts?base=${encodeURIComponent(base)}`, {
+    method: 'GET',
+  }, validGitConflictList)
+}
+
+export function resolveGitConflict(resolution) {
+  return requestGit('/api/git/conflicts/resolve', {
+    method: 'PUT',
+    body: jsonBody(resolution),
+  }, validGitConflictResolve)
+}
+
+export function completeGitConflict(base) {
+  return requestGit(`/api/git/conflicts/complete?base=${encodeURIComponent(base)}`, {
+    method: 'POST',
+  }, validGitOperation)
+}
+
+export function abortGitConflict(base) {
+  return requestGit(`/api/git/conflicts/abort?base=${encodeURIComponent(base)}`, {
+    method: 'POST',
+  }, validGitOperation)
+}
+
 export function updateConfig(config) {
   return mutateConfig('/api/config', {
     method: 'PUT',
@@ -331,11 +397,14 @@ export function getNote(id) {
   return request(`/api/note?id=${encodeURIComponent(id)}`, { method: 'GET' })
 }
 
-export function saveNote(id, content) {
-  return request('/api/save', {
+export function saveNote(id, content, expectedRevision) {
+  return requestGit('/api/save', {
     method: 'POST',
-    body: jsonBody({ id, content }),
-  })
+    body: jsonBody({ id, content, expected_revision: expectedRevision }),
+  }, (value) => isObject(value)
+    && value.status === 'saved'
+    && typeof value.revision === 'string'
+    && value.revision.length > 0)
 }
 
 export function getNotes() {

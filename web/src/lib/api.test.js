@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   ApiError,
+  abortGitConflict,
+  completeGitConflict,
   completeSetup,
   createBase,
   createNote,
@@ -11,6 +13,7 @@ import {
   disableGit,
   getConfig,
   getGitStatus,
+  getGitConflicts,
   getInfo,
   getNote,
   getNotes,
@@ -21,6 +24,7 @@ import {
   syncNotes,
   syncGit,
   probeGit,
+  resolveGitConflict,
   updateBase,
   updateConfig,
   uploadAsset,
@@ -92,6 +96,23 @@ function gitProbe(base = 'work') {
       merge_histories: false,
     },
     warnings: [],
+  }
+}
+
+function gitConflictList(base = 'work') {
+  return {
+    base,
+    operation_id: 'operation-1',
+    head_oid: 'head-oid',
+    merge_head_oid: 'merge-oid',
+    can_complete: false,
+    conflicts: [{
+      id: 'sha256:conflict',
+      kind: 'content',
+      content_kind: 'text',
+      path: 'topic/note.md',
+      actions: ['local', 'remote', 'manual'],
+    }],
   }
 }
 
@@ -214,6 +235,43 @@ describe('frontend API client', () => {
     })
   })
 
+  it('uses exact Git conflict endpoint methods, bodies, and encoded base names', async () => {
+    const resolution = {
+      base: 'team/name',
+      operation_id: 'operation-1',
+      conflict_id: 'sha256:conflict',
+      path: 'topic/note.md',
+      action: 'local',
+      result_path: 'topic/note.md',
+      local_oid: 'local-oid',
+    }
+    const conflicts = gitConflictList('team/name')
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(conflicts))
+      .mockResolvedValueOnce(jsonResponse({ resolved_path: 'topic/note.md', remaining: conflicts }))
+      .mockResolvedValueOnce(jsonResponse(gitOperation(), 202))
+      .mockResolvedValueOnce(jsonResponse(gitOperation(), 202))
+
+    await expect(getGitConflicts('team/name')).resolves.toEqual(conflicts)
+    await expect(resolveGitConflict(resolution)).resolves.toEqual({ resolved_path: 'topic/note.md', remaining: conflicts })
+    await expect(completeGitConflict('team/name')).resolves.toEqual(gitOperation())
+    await expect(abortGitConflict('team/name')).resolves.toEqual(gitOperation())
+
+    expect(requestAt(fetchMock, 0)).toMatchObject({
+      path: '/api/git/conflicts?base=team%2Fname',
+      options: { method: 'GET' },
+    })
+    expectJSONRequest(fetchMock, 1, '/api/git/conflicts/resolve', 'PUT', resolution)
+    expect(requestAt(fetchMock, 2)).toMatchObject({
+      path: '/api/git/conflicts/complete?base=team%2Fname',
+      options: { method: 'POST' },
+    })
+    expect(requestAt(fetchMock, 3)).toMatchObject({
+      path: '/api/git/conflicts/abort?base=team%2Fname',
+      options: { method: 'POST' },
+    })
+  })
+
   it.each([
     ['probe without all required mutation flags', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), required_mutations: {} }, 200],
     ['probe with an invalid blocking error', () => probeGit({ base: 'work', git_url: 'url' }), { ...gitProbe(), blocking_error: { code: 1, message: 'failure' } }, 200],
@@ -234,6 +292,20 @@ describe('frontend API client', () => {
       status,
       code: 'invalid_response',
       message: 'Приложение вернуло некорректный JSON',
+    })
+  })
+
+  it.each([
+    ['a conflict list without conflicts', () => getGitConflicts('work'), { ...gitConflictList(), conflicts: undefined }, 200],
+    ['a conflict resolve response without remaining', () => resolveGitConflict({}), { resolved_path: 'topic/note.md' }, 200],
+    ['a conflict completion without an operation id', () => completeGitConflict('work'), { ...gitOperation(), operation_id: '' }, 202],
+  ])('rejects a malformed successful Git conflict %s', async (_case, call, payload, status) => {
+    fetchMock.mockResolvedValue(jsonResponse(payload, status))
+
+    await expect(call()).rejects.toMatchObject({
+      name: 'ApiError',
+      status,
+      code: 'invalid_response',
     })
   })
 
@@ -539,7 +611,7 @@ describe('frontend API client', () => {
   })
 
   it('wraps note mutations and decodes their handler responses', async () => {
-    const saved = { status: 'saved' }
+    const saved = { status: 'saved', revision: 'revision-2' }
     const synced = { status: 'ok' }
     const created = {
       id: 'topic/new.md',
@@ -556,7 +628,7 @@ describe('frontend API client', () => {
       .mockResolvedValueOnce(jsonResponse(renamed))
       .mockResolvedValueOnce(response('', 200))
 
-    await expect(saveNote('topic/note.md', '# Updated')).resolves.toEqual(saved)
+    await expect(saveNote('topic/note.md', '# Updated', 'revision-1')).resolves.toEqual(saved)
     await expect(syncNotes()).resolves.toEqual(synced)
     await expect(createNote({ parent_id: 'topic', name: 'new.md', type: 'file' })).resolves.toEqual(created)
     await expect(renameNote('topic/old.md', 'new.md')).resolves.toEqual(renamed)
@@ -565,6 +637,7 @@ describe('frontend API client', () => {
     expectJSONRequest(fetchMock, 0, '/api/save', 'POST', {
       id: 'topic/note.md',
       content: '# Updated',
+      expected_revision: 'revision-1',
     })
     expect(requestAt(fetchMock, 1)).toMatchObject({ path: '/api/sync', options: { method: 'POST' } })
     expect(requestAt(fetchMock, 1).options.body).toBeUndefined()
@@ -582,6 +655,20 @@ describe('frontend API client', () => {
       options: { method: 'DELETE' },
     })
     expect(requestAt(fetchMock, 4).options.body).toBeUndefined()
+  })
+
+  it.each([
+    ['a missing saved status', { revision: 'revision-2' }],
+    ['a non-saved status', { status: 'queued', revision: 'revision-2' }],
+    ['an empty revision', { status: 'saved', revision: '' }],
+  ])('rejects malformed successful save responses with %s', async (_case, payload) => {
+    fetchMock.mockResolvedValue(jsonResponse(payload))
+
+    await expect(saveNote('topic/note.md', '# Updated', 'revision-1')).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 200,
+      code: 'invalid_response',
+    })
   })
 
   it('uploads the same file as multipart data without setting Content-Type', async () => {
