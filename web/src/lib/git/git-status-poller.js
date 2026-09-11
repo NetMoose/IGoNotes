@@ -10,6 +10,7 @@ export function createGitStatusPoller({
   let generation = 0
   let timer = null
   let chain = Promise.resolve()
+  let callbackGeneration = null
 
   function clearTimer() {
     if (timer !== null) {
@@ -18,10 +19,14 @@ export function createGitStatusPoller({
     }
   }
 
-  async function report(error) {
+  async function report(current, error) {
+    callbackGeneration = current
     try {
       await onError(error)
-    } catch {}
+    } catch {
+    } finally {
+      callbackGeneration = null
+    }
   }
 
   async function run(current) {
@@ -35,12 +40,17 @@ export function createGitStatusPoller({
         return null
       }
 
-      await onStatuses(payload.statuses)
+      callbackGeneration = current
+      try {
+        await onStatuses(payload.statuses)
+      } finally {
+        callbackGeneration = null
+      }
       if (!active || current !== generation) {
         return null
       }
 
-      await report(null)
+      await report(current, null)
       if (!active || current !== generation) {
         return null
       }
@@ -48,7 +58,7 @@ export function createGitStatusPoller({
       return payload.statuses
     } catch (error) {
       if (active && current === generation) {
-        await report(error)
+        await report(current, error)
       }
       return null
     } finally {
@@ -88,7 +98,8 @@ export function createGitStatusPoller({
       }
 
       generation += 1
-      return enqueue(generation)
+      const queued = enqueue(generation)
+      return callbackGeneration === null ? queued : Promise.resolve(null)
     },
 
     stop() {

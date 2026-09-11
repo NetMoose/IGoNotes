@@ -1,5 +1,5 @@
 function nonemptyString(value) {
-  return typeof value === 'string' && value.length > 0
+  return typeof value === 'string' && value.trim().length > 0
 }
 
 function required(value, field) {
@@ -34,17 +34,17 @@ export function buildResolution({ base, operationId }, conflict, draft) {
   }
 
   if (action === 'local' || action === 'remote') {
-    resolution.result_path = required(draft.result_path, 'result_path')
+    resolution.result_path = required(draft.resultPath, 'result_path')
     resolution[`${action}_oid`] = required(conflict[action]?.oid, `${action}_oid`)
   } else if (action === 'manual') {
-    resolution.result_path = required(draft.result_path, 'result_path')
+    resolution.result_path = required(draft.resultPath, 'result_path')
     if (typeof draft.content !== 'string') {
       throw new Error('Необходимо поле content')
     }
     resolution.content = draft.content
   } else if (action === 'keep_both') {
-    resolution.local_path = required(draft.local_path, 'local_path')
-    resolution.remote_path = required(draft.remote_path, 'remote_path')
+    resolution.local_path = required(draft.localPath, 'local_path')
+    resolution.remote_path = required(draft.remotePath, 'remote_path')
     if (resolution.local_path === resolution.remote_path) {
       throw new Error('Поля local_path и remote_path должны различаться')
     }

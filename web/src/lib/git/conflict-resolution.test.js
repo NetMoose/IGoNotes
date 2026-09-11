@@ -19,10 +19,10 @@ describe('conflict resolution payloads', () => {
   })
 
   it.each([
-    ['local', { result_path: 'topic/local.md' }, { result_path: 'topic/local.md', local_oid: 'local-oid' }],
-    ['remote', { result_path: 'topic/remote.md' }, { result_path: 'topic/remote.md', remote_oid: 'remote-oid' }],
-    ['manual', { result_path: 'topic/manual.md', content: '# Manual' }, { result_path: 'topic/manual.md', content: '# Manual' }],
-    ['keep_both', { local_path: 'topic/local.md', remote_path: 'topic/remote.md' }, { local_path: 'topic/local.md', remote_path: 'topic/remote.md', local_oid: 'local-oid', remote_oid: 'remote-oid' }],
+    ['local', { resultPath: 'topic/local.md' }, { result_path: 'topic/local.md', local_oid: 'local-oid' }],
+    ['remote', { resultPath: 'topic/remote.md' }, { result_path: 'topic/remote.md', remote_oid: 'remote-oid' }],
+    ['manual', { resultPath: 'topic/manual.md', content: '# Manual' }, { result_path: 'topic/manual.md', content: '# Manual' }],
+    ['keep_both', { localPath: 'topic/local.md', remotePath: 'topic/remote.md' }, { local_path: 'topic/local.md', remote_path: 'topic/remote.md', local_oid: 'local-oid', remote_oid: 'remote-oid' }],
     ['delete', {}, {}],
   ])('builds the %s resolution with only its required fields', (action, draft, expected) => {
     expect(buildResolution(context, conflict, { action, ...draft })).toEqual({
@@ -42,9 +42,17 @@ describe('conflict resolution payloads', () => {
 
   it.each([
     [{ action: 'local' }, /result_path|local_oid/],
-    [{ action: 'manual', result_path: 'topic/manual.md' }, /content/],
-    [{ action: 'keep_both', local_path: 'same.md', remote_path: 'same.md' }, /local_path|remote_path/],
+    [{ action: 'manual', resultPath: 'topic/manual.md' }, /content/],
+    [{ action: 'keep_both', localPath: 'same.md', remotePath: 'same.md' }, /local_path|remote_path/],
   ])('names required fields in Russian validation errors', (draft, fields) => {
     expect(() => buildResolution(context, conflict, draft)).toThrow(fields)
+  })
+
+  it.each([
+    [{ action: 'local', resultPath: '   ' }, conflict, /result_path/],
+    [{ action: 'remote', resultPath: 'topic/remote.md' }, { ...conflict, remote: { oid: '   ' } }, /remote_oid/],
+    [{ action: 'keep_both', localPath: '   ', remotePath: 'topic/remote.md' }, conflict, /local_path/],
+  ])('rejects trim-empty required paths and OIDs', (draft, value, field) => {
+    expect(() => buildResolution(context, value, draft)).toThrow(field)
   })
 })
