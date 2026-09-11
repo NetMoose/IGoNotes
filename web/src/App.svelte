@@ -402,6 +402,15 @@
     }
 
     if (batches.length === 0) return
+    const activeSave = savePromise
+    if (activeSave) {
+      try {
+        await activeSave
+      } catch {
+        return
+      }
+      if (!mounted || staleNote || stalePending) return
+    }
     await notesWorkspace.refreshTree?.()
     if (!mounted || config?.current_base !== baseName) return
 

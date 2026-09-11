@@ -1448,6 +1448,42 @@ describe('App setup gate', () => {
     expect(getNote).toHaveBeenCalledTimes(2)
   })
 
+  it('waits for an active save before reloading a terminal changed path at its fresh revision', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('changed.md')
+    const saveRequest = deferred()
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Fresh disk', revision: 'revision-3' })
+    vi.mocked(saveNote).mockReturnValue(saveRequest.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'changed.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Saving')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Saving', 'revision-1'))
+
+    const changed = gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'ready', repository_path: '/notes/personal', operation_id: 'sync-1',
+      ahead: 0, behind: 0, changed_paths: [note.id],
+    }])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(getNotes).toHaveBeenCalledOnce()
+    expect(getNote).toHaveBeenCalledOnce()
+
+    saveRequest.resolve({ status: 'saved', revision: 'revision-2' })
+    await changed
+
+    expect(getNotes).toHaveBeenCalledTimes(2)
+    expect(getNote).toHaveBeenCalledTimes(2)
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Fresh disk')
+    await user.type(screen.getByLabelText('Markdown'), '!')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    expect(saveNote).toHaveBeenLastCalledWith(note.id, '# Fresh disk!', 'revision-3')
+  })
+
   it.each([
     ['complete', 'Завершить слияние', 'complete-1'],
     ['abort', 'Подтвердить отмену', 'abort-1'],
