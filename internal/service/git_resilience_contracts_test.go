@@ -20,8 +20,8 @@ func TestGitOutcomeClassification(t *testing.T) {
 		{"initialize success resets", GitTerminalOutcome{Operation: gitcmd.OperationInitialize, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStateReady, Failures: GitFailureReset}},
 		{"sync success resets", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStateReady, Failures: GitFailureReset}},
 		{"conflict completion success resets", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStateReady, Failures: GitFailureReset}},
-		{"sync operational failure consumes", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeCommandFailed}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureConsume}},
-		{"conflict completion operational failure consumes", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeTimedOut}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureConsume}},
+		{"sync operational failure increments", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeCommandFailed}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureIncrement}},
+		{"conflict completion operational failure increments", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeTimedOut}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureIncrement}},
 		{"initialize failure preserves", GitTerminalOutcome{Operation: gitcmd.OperationInitialize, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeCommandFailed}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}},
 		{"conflict preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationConflict, ErrorCode: gitcmd.CodeGitConflict}, GitOutcomeClassification{State: model.GitStateConflict, Failures: GitFailurePreserve}},
 		{"abort success preserves", GitTerminalOutcome{Operation: gitcmd.OperationConflictAbort, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStatePaused, Failures: GitFailurePreserve}},
@@ -57,14 +57,16 @@ func TestGitResilienceFifthOperationalFailurePausesAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changed, err := repo.Transition(context.Background(), repository.GitStatusTransition{
-		RepositoryPath: status.RepositoryPath,
-		FromState:      model.GitStateError,
-		ToState:        model.GitStateError,
-		Failures:       repository.GitStatusFailuresIncrement,
-	})
-	if err != nil || !changed {
-		t.Fatalf("Transition() = %v, %v; want changed", changed, err)
+	if err := repo.ApplyTransition(context.Background(), repository.GitStatusTransition{
+		Status: model.GitStatus{
+			Base:           status.Base,
+			RepositoryPath: status.RepositoryPath,
+			State:          model.GitStateError,
+			ChangedPaths:   []string{},
+		},
+		Failures: repository.GitFailureIncrement,
+	}); err != nil {
+		t.Fatalf("ApplyTransition() error = %v", err)
 	}
 	got, found, err := repo.Get(context.Background(), status.RepositoryPath)
 	if err != nil || !found {

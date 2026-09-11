@@ -9,12 +9,12 @@ import (
 	"IGoNotes/internal/repository"
 )
 
-type GitFailureAction string
+type GitFailureAction = repository.GitFailureAction
 
 const (
-	GitFailurePreserve GitFailureAction = "preserve"
-	GitFailureConsume  GitFailureAction = "consume"
-	GitFailureReset    GitFailureAction = "reset"
+	GitFailurePreserve  = repository.GitFailurePreserve
+	GitFailureIncrement = repository.GitFailureIncrement
+	GitFailureReset     = repository.GitFailureReset
 )
 
 // GitTerminalOutcome is the stable input to autosync breaker accounting.
@@ -57,7 +57,7 @@ func ClassifyGitOutcome(outcome GitTerminalOutcome) GitOutcomeClassification {
 	if outcome.State == gitcmd.OperationFailed && gitOperationalFailure(outcome.ErrorCode) {
 		switch outcome.Operation {
 		case gitcmd.OperationSync, gitcmd.OperationConflictComplete:
-			return GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureConsume}
+			return GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureIncrement}
 		}
 	}
 	return GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}
@@ -89,17 +89,6 @@ func gitOperationalFailure(code gitcmd.ErrorCode) bool {
 		return false
 	default:
 		return true
-	}
-}
-
-func (a GitFailureAction) StatusFailureTransition() repository.GitStatusFailureTransition {
-	switch a {
-	case GitFailureConsume:
-		return repository.GitStatusFailuresIncrement
-	case GitFailureReset:
-		return repository.GitStatusFailuresReset
-	default:
-		return repository.GitStatusFailuresPreserve
 	}
 }
 
