@@ -196,7 +196,7 @@
     actionPending = false
     abortDialogOpen = false
     try {
-      await onOperationAccepted(operation.operation_id)
+      await onOperationAccepted(action, operation)
     } catch (cause) {
       error = messageFor(cause, 'Не удалось передать состояние операции')
     }
