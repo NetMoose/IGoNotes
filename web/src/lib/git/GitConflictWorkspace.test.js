@@ -67,8 +67,8 @@ function workspaceProps(overrides = {}) {
     base,
     status,
     bases: [base, otherBase],
-    onBaseSwitch: vi.fn(),
-    onTerminal: vi.fn(),
+    onSwitchBase: vi.fn(),
+    onOperationAccepted: vi.fn(),
     ...overrides,
   }
 }
@@ -115,13 +115,13 @@ describe('GitConflictWorkspace', () => {
     expect(first).toHaveFocus()
   })
 
-  it('submits an exact resolution, reloads conflicts, and focuses the nearest remaining selection', async () => {
+  it('consumes the returned remaining list and focuses Complete after the final resolution', async () => {
     const user = userEvent.setup()
-    const thirdConflict = { ...deleteConflict, id: 'third-conflict', path: 'notes/third.md' }
-    getGitConflicts
-      .mockResolvedValueOnce(conflictList([textConflict, binaryConflict, thirdConflict]))
-      .mockResolvedValueOnce(conflictList([textConflict, thirdConflict]))
-    resolveGitConflict.mockResolvedValue({ resolved_path: 'assets/photo.png', remaining: conflictList([textConflict, thirdConflict]) })
+    getGitConflicts.mockResolvedValueOnce(conflictList([binaryConflict]))
+    resolveGitConflict.mockResolvedValue({
+      resolved_path: 'assets/photo.png',
+      remaining: conflictList([], { can_complete: true }),
+    })
     render(GitConflictWorkspace, workspaceProps())
 
     await screen.findByRole('button', { name: 'assets/photo.png' })
@@ -138,10 +138,27 @@ describe('GitConflictWorkspace', () => {
       result_path: 'assets/photo.png',
       local_oid: 'local',
     }))
+    expect(getGitConflicts).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Завершить слияние' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Завершить слияние' })).toHaveFocus()
+  })
+
+  it('reloads conflicts only after a stale resolution error', async () => {
+    const user = userEvent.setup()
+    const staleError = Object.assign(new Error('Конфликт уже изменился'), { code: 'git_conflict_stale' })
+    getGitConflicts
+      .mockResolvedValueOnce(conflictList([binaryConflict]))
+      .mockResolvedValueOnce(conflictList([textConflict]))
+    resolveGitConflict.mockRejectedValue(staleError)
+    render(GitConflictWorkspace, workspaceProps())
+
+    await screen.findByRole('button', { name: 'assets/photo.png' })
+    await user.click(screen.getByRole('radio', { name: 'Оставить версию на этом устройстве' }))
+    await user.click(screen.getByRole('button', { name: 'Применить решение' }))
+
     await waitFor(() => expect(getGitConflicts).toHaveBeenCalledTimes(2))
-    const nearest = screen.getByRole('button', { name: 'notes/third.md' })
-    expect(nearest).toHaveAttribute('aria-current', 'true')
-    expect(nearest).toHaveFocus()
+    expect(screen.getByRole('button', { name: 'notes/idea.md' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('keeps the selected resolver draft after a failed resolution request', async () => {
@@ -165,7 +182,7 @@ describe('GitConflictWorkspace', () => {
   it('enables completion only when allowed and retains the workspace after an accepted completion', async () => {
     const props = workspaceProps()
     getGitConflicts
-      .mockResolvedValueOnce(conflictList([], { can_complete: false }))
+      .mockResolvedValueOnce(conflictList([textConflict], { can_complete: true }))
       .mockResolvedValueOnce(conflictList([], { can_complete: true, operation_id: 'operation-2' }))
     const workspace = render(GitConflictWorkspace, props)
 
@@ -183,54 +200,77 @@ describe('GitConflictWorkspace', () => {
     const user = userEvent.setup()
     const props = workspaceProps()
     getGitConflicts.mockResolvedValue(conflictList([], { can_complete: true }))
-    completeGitConflict.mockResolvedValue({ operation_id: 'complete-1', status: 'queued', deduplicated: false })
+    const completeOperation = { operation_id: 'complete-1', status: 'queued', deduplicated: false }
+    completeGitConflict.mockResolvedValue(completeOperation)
     const completedWorkspace = render(GitConflictWorkspace, props)
 
-    await user.click(await screen.findByRole('button', { name: 'Завершить слияние' }))
+    const complete = await screen.findByRole('button', { name: 'Завершить слияние' })
+    await waitFor(() => expect(complete).toBeEnabled())
+    await user.click(complete)
     expect(completeGitConflict).toHaveBeenCalledWith('work')
-    expect(props.onTerminal).not.toHaveBeenCalled()
+    expect(props.onOperationAccepted).toHaveBeenCalledWith('complete', completeOperation)
     expect(screen.getByRole('button', { name: 'Отменить слияние' })).toBeDisabled()
     expect(screen.getByText('Ожидание завершения операции Git')).toBeVisible()
+    await completedWorkspace.rerender({ ...props, status: { state: 'needs_reconnect', operation_id: 'complete-1' } })
+    expect(props.onOperationAccepted).toHaveBeenCalledTimes(1)
+    await completedWorkspace.rerender({ ...props, status: { state: 'ready', operation_id: 'another-operation' } })
+    expect(props.onOperationAccepted).toHaveBeenCalledTimes(1)
     await completedWorkspace.rerender({ ...props, status: { state: 'ready', operation_id: 'complete-1' } })
-    await waitFor(() => expect(props.onTerminal).toHaveBeenCalledWith({ state: 'ready', operation_id: 'complete-1' }))
+    expect(screen.getByText('Ожидание завершения операции Git')).toBeVisible()
 
     completedWorkspace.unmount()
 
     getGitConflicts.mockResolvedValue(conflictList())
-    abortGitConflict.mockResolvedValue({ operation_id: 'abort-1', status: 'queued', deduplicated: false })
+    const abortOperation = { operation_id: 'abort-1', status: 'queued', deduplicated: false }
+    abortGitConflict.mockResolvedValue(abortOperation)
     const abortProps = workspaceProps()
     const abortWorkspace = render(GitConflictWorkspace, abortProps)
     await user.click(await screen.findByRole('button', { name: 'Отменить слияние' }))
     await user.click(screen.getByRole('button', { name: 'Подтвердить отмену' }))
     expect(abortGitConflict).toHaveBeenCalledWith('work')
-    expect(abortProps.onTerminal).not.toHaveBeenCalled()
+    expect(abortProps.onOperationAccepted).toHaveBeenCalledWith('abort', abortOperation)
     expect(abortWorkspace.container).toHaveTextContent('Ожидание завершения операции Git')
     await abortWorkspace.rerender({ ...abortProps, status: { state: 'ready', operation_id: 'abort-1' } })
-    await waitFor(() => expect(abortProps.onTerminal).toHaveBeenCalledWith({ state: 'ready', operation_id: 'abort-1' }))
+    expect(abortWorkspace.container).toHaveTextContent('Ожидание завершения операции Git')
   })
 
-  it('delegates base switching without invoking a conflict mutation', async () => {
+  it('retains an explicit base-switch target and error after parent rejection without invoking a conflict mutation', async () => {
     const user = userEvent.setup()
-    const props = workspaceProps()
+    const props = workspaceProps({ onSwitchBase: vi.fn().mockRejectedValue(new Error('База недоступна')) })
     getGitConflicts.mockResolvedValue(conflictList())
     render(GitConflictWorkspace, props)
 
-    await screen.findByRole('combobox', { name: 'База заметок' })
-    await user.selectOptions(screen.getByRole('combobox', { name: 'База заметок' }), 'personal')
-    expect(props.onBaseSwitch).toHaveBeenCalledWith('personal')
+    const target = await screen.findByRole('combobox', { name: 'База для переключения' })
+    expect(screen.queryByRole('option', { name: 'work' })).not.toBeInTheDocument()
+    await user.selectOptions(target, 'personal')
+    expect(props.onSwitchBase).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Открыть базу' }))
+    expect(props.onSwitchBase).toHaveBeenCalledWith('personal')
+    expect(await screen.findByRole('alert')).toHaveTextContent('База недоступна')
+    expect(target).toHaveValue('personal')
     expect(resolveGitConflict).not.toHaveBeenCalled()
     expect(completeGitConflict).not.toHaveBeenCalled()
     expect(abortGitConflict).not.toHaveBeenCalled()
   })
 
-  it('reports load errors and disables competing controls while externally busy', async () => {
-    getGitConflicts.mockRejectedValue(new Error('Не удалось загрузить конфликты'))
-    const { container } = render(GitConflictWorkspace, workspaceProps({ busy: true }))
+  it('retries initial load errors and disables competing controls while externally busy', async () => {
+    const user = userEvent.setup()
+    getGitConflicts
+      .mockRejectedValueOnce(new Error('Не удалось загрузить конфликты'))
+      .mockResolvedValueOnce(conflictList())
+    const props = workspaceProps({ busy: true })
+    const workspace = render(GitConflictWorkspace, props)
+    const { container } = workspace
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось загрузить конфликты')
-    expect(screen.getByRole('combobox', { name: 'База заметок' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'База для переключения' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Завершить слияние' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Отменить слияние' })).toBeDisabled()
     expect(container.querySelector('main')).toHaveClass('lg:grid-cols-[18rem_minmax(0,1fr)]')
+
+    await workspace.rerender({ ...props, busy: false })
+    await user.click(screen.getByRole('button', { name: 'Повторить загрузку' }))
+    await waitFor(() => expect(getGitConflicts).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('radio', { name: 'Оставить версию на этом устройстве' })).toBeVisible()
   })
 })

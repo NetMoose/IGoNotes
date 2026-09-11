@@ -17,6 +17,9 @@ vi.mock('./lib/api.js', async (importOriginal) => {
     ...actual,
     getConfig: vi.fn(),
     getGitStatus: vi.fn(),
+    getGitConflicts: vi.fn(),
+    completeGitConflict: vi.fn(),
+    abortGitConflict: vi.fn(),
     completeSetup: vi.fn(),
     selectDirectory: vi.fn(),
     createBase: vi.fn(),
@@ -45,6 +48,9 @@ import {
   forgetBase,
   getConfig,
   getGitStatus,
+  getGitConflicts,
+  completeGitConflict,
+  abortGitConflict,
   getNote,
   getNotes,
   renameNote,
@@ -92,6 +98,9 @@ const apiMocks = [
   forgetBase,
   getConfig,
   getGitStatus,
+  getGitConflicts,
+  completeGitConflict,
+  abortGitConflict,
   getNote,
   getNotes,
   renameNote,
@@ -143,14 +152,19 @@ describe('App setup gate', () => {
     for (const mock of apiMocks) vi.mocked(mock).mockReset()
     vi.mocked(getConfig).mockResolvedValue(completedConfig)
     vi.mocked(getGitStatus).mockResolvedValue({ statuses: [] })
+    vi.mocked(getGitConflicts).mockResolvedValue({
+      base: 'personal', operation_id: 'conflict-1', head_oid: 'head', merge_head_oid: 'merge', can_complete: true, conflicts: [],
+    })
+    vi.mocked(completeGitConflict).mockResolvedValue({ operation_id: 'complete-1', status: 'queued', deduplicated: false })
+    vi.mocked(abortGitConflict).mockResolvedValue({ operation_id: 'abort-1', status: 'queued', deduplicated: false })
     vi.mocked(completeSetup).mockResolvedValue(completedConfig)
     vi.mocked(selectDirectory).mockResolvedValue(null)
     vi.mocked(createBase).mockResolvedValue(completedConfig)
     vi.mocked(updateBase).mockResolvedValue(completedConfig)
     vi.mocked(forgetBase).mockResolvedValue(completedConfig)
     vi.mocked(switchBase).mockResolvedValue(completedConfig)
-    vi.mocked(getNote).mockResolvedValue({ content: '' })
-    vi.mocked(saveNote).mockResolvedValue(null)
+    vi.mocked(getNote).mockResolvedValue({ content: '', revision: 'revision-1' })
+    vi.mocked(saveNote).mockResolvedValue({ status: 'saved', revision: 'revision-2' })
     vi.mocked(getNotes).mockResolvedValue([])
     vi.mocked(syncNotes).mockResolvedValue(null)
     vi.mocked(syncGit).mockResolvedValue({ operation_id: 'sync-1', status: 'queued', deduplicated: false })
@@ -250,7 +264,8 @@ describe('App setup gate', () => {
     const user = userEvent.setup()
     const note = fileNode('encoded name.md')
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Loaded' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Loaded', revision: 'revision-1' })
+    vi.mocked(saveNote).mockResolvedValue({ status: 'saved', revision: 'revision-2' })
 
     render(App)
     await user.click(await screen.findByRole('button', { name: 'encoded name.md' }))
@@ -262,7 +277,7 @@ describe('App setup gate', () => {
     await user.click(screen.getByRole('button', { name: 'Сохранить' }))
 
     expect(saveNote).toHaveBeenCalledOnce()
-    expect(saveNote).toHaveBeenCalledWith(note.id, '# Loaded')
+    expect(saveNote).toHaveBeenCalledWith(note.id, '# Loaded', 'revision-1')
   })
 
   it('flushes same-note edits without refetching stale content', async () => {
@@ -270,8 +285,8 @@ describe('App setup gate', () => {
     const note = fileNode('a.md')
     vi.mocked(getNotes).mockResolvedValue([note])
     vi.mocked(getNote)
-      .mockResolvedValueOnce({ content: '# A' })
-      .mockResolvedValueOnce({ content: '# Stale A' })
+      .mockResolvedValueOnce({ content: '# A', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Stale A', revision: 'revision-2' })
 
     render(App)
     await user.click(await screen.findByRole('button', { name: 'a.md' }))
@@ -280,7 +295,7 @@ describe('App setup gate', () => {
     await user.type(textarea, '# A latest')
     await user.click(screen.getByRole('button', { name: 'a.md' }))
 
-    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# A latest'))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# A latest', 'revision-1'))
     await tick()
     expect(getNote).toHaveBeenCalledOnce()
     expect(screen.getByLabelText('Markdown')).toHaveValue('# A latest')
@@ -291,7 +306,7 @@ describe('App setup gate', () => {
     const note = fileNode('draft.md')
     const saveRequest = deferred()
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(saveNote).mockReturnValue(saveRequest.promise)
 
     render(App)
@@ -306,10 +321,10 @@ describe('App setup gate', () => {
       await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
 
       expect(saveNote).toHaveBeenCalledOnce()
-      expect(saveNote).toHaveBeenCalledWith(note.id, '# Changed')
+      expect(saveNote).toHaveBeenCalledWith(note.id, '# Changed', 'revision-1')
       expect(screen.queryByRole('heading', { name: 'Базы заметок' })).not.toBeInTheDocument()
 
-      saveRequest.resolve(null)
+      saveRequest.resolve({ status: 'saved', revision: 'revision-2' })
       await saveRequest.promise
       await vi.advanceTimersByTimeAsync(0)
       await tick()
@@ -327,7 +342,7 @@ describe('App setup gate', () => {
     const user = userEvent.setup()
     const note = fileNode('draft.md')
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(saveNote).mockRejectedValue(new Error('Диск недоступен'))
 
     render(App)
@@ -349,7 +364,7 @@ describe('App setup gate', () => {
     const user = userEvent.setup()
     const note = fileNode('draft.md')
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(switchBase).mockResolvedValue(workConfig)
 
     render(App)
@@ -362,7 +377,7 @@ describe('App setup gate', () => {
     await user.click(within(workCard).getByRole('button', { name: 'Открыть' }))
 
     expect(await screen.findByText('Выберите заметку')).toBeVisible()
-    expect(saveNote).toHaveBeenCalledWith(note.id, '# Work in progress')
+    expect(saveNote).toHaveBeenCalledWith(note.id, '# Work in progress', 'revision-1')
     expect(switchBase).toHaveBeenCalledWith('work')
     expect(saveNote.mock.invocationCallOrder[0]).toBeLessThan(switchBase.mock.invocationCallOrder[0])
     expect(screen.queryByLabelText('Markdown')).not.toBeInTheDocument()
@@ -400,7 +415,7 @@ describe('App setup gate', () => {
       ],
     }
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(updateBase).mockResolvedValue(movedConfig)
 
     render(App)
@@ -432,7 +447,7 @@ describe('App setup gate', () => {
     const initialUser = userEvent.setup()
     const note = fileNode('draft.md')
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
 
     render(App)
     await initialUser.click(await screen.findByRole('button', { name: 'draft.md' }))
@@ -449,7 +464,7 @@ describe('App setup gate', () => {
       expect(saveNote).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(1)
       expect(saveNote).toHaveBeenCalledOnce()
-      expect(saveNote).toHaveBeenCalledWith(note.id, '# Debounced')
+      expect(saveNote).toHaveBeenCalledWith(note.id, '# Debounced', 'revision-1')
     } finally {
       vi.clearAllTimers()
       vi.useRealTimers()
@@ -464,7 +479,7 @@ describe('App setup gate', () => {
     let inFlight = 0
     let maxInFlight = 0
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(saveNote).mockImplementation(() => {
       inFlight += 1
       maxInFlight = Math.max(maxInFlight, inFlight)
@@ -487,12 +502,13 @@ describe('App setup gate', () => {
     expect(saveNote).toHaveBeenCalledTimes(1)
     expect(maxInFlight).toBe(1)
 
-    firstSave.resolve(null)
+    firstSave.resolve({ status: 'saved', revision: 'revision-2' })
     await waitFor(() => expect(saveNote).toHaveBeenCalledTimes(2))
-    expect(saveNote).toHaveBeenNthCalledWith(2, note.id, '# Latest')
+    expect(saveNote).toHaveBeenNthCalledWith(1, note.id, '# First', 'revision-1')
+    expect(saveNote).toHaveBeenNthCalledWith(2, note.id, '# Latest', 'revision-2')
     expect(maxInFlight).toBe(1)
 
-    secondSave.resolve(null)
+    secondSave.resolve({ status: 'saved', revision: 'revision-3' })
     await waitFor(() => expect(screen.getByText('Сохранено')).toBeVisible())
     await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
 
@@ -510,11 +526,14 @@ describe('App setup gate', () => {
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
     vi.mocked(getNote).mockImplementation(async (id) => ({
       content: id === noteA.id ? '# A' : '# B',
+      revision: 'revision-1',
     }))
     vi.mocked(saveNote).mockImplementation(() => {
       inFlight += 1
       maxInFlight = Math.max(maxInFlight, inFlight)
-      const request = saveNote.mock.calls.length === 1 ? saveA.promise : Promise.resolve(null)
+      const request = saveNote.mock.calls.length === 1
+        ? saveA.promise
+        : Promise.resolve({ status: 'saved', revision: 'revision-3' })
       return request.finally(() => {
         inFlight -= 1
       })
@@ -530,13 +549,13 @@ describe('App setup gate', () => {
       await user.clear(textarea)
       await user.type(textarea, '# A changed')
       await vi.advanceTimersByTimeAsync(2000)
-      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A changed')
+      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A changed', 'revision-1')
 
       await user.click(screen.getByRole('button', { name: 'b.md' }))
       expect(getNote).not.toHaveBeenCalledWith(noteB.id)
       expect(screen.getByLabelText('Markdown')).toHaveValue('# A changed')
 
-      saveA.resolve(null)
+      saveA.resolve({ status: 'saved', revision: 'revision-2' })
       await saveA.promise
       await vi.advanceTimersByTimeAsync(0)
       await tick()
@@ -547,7 +566,7 @@ describe('App setup gate', () => {
       await user.type(screen.getByLabelText('Markdown'), '# B latest')
       await vi.advanceTimersByTimeAsync(2000)
 
-      expect(saveNote).toHaveBeenNthCalledWith(2, noteB.id, '# B latest')
+      expect(saveNote).toHaveBeenNthCalledWith(2, noteB.id, '# B latest', 'revision-1')
       expect(maxInFlight).toBe(1)
     } finally {
       vi.clearAllTimers()
@@ -562,7 +581,7 @@ describe('App setup gate', () => {
     const loadB = deferred()
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
     vi.mocked(getNote).mockImplementation((id) => (
-      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+      id === noteA.id ? Promise.resolve({ content: '# A', revision: 'revision-1' }) : loadB.promise
     ))
 
     const { container } = render(App)
@@ -576,7 +595,7 @@ describe('App setup gate', () => {
     expect(workspace).toHaveAttribute('aria-busy', 'true')
     expect(screen.getByLabelText('Markdown')).toHaveValue('# A')
 
-    loadB.resolve({ content: '# B' })
+    loadB.resolve({ content: '# B', revision: 'revision-1' })
     await loadB.promise
     await waitFor(() => expect(screen.getByLabelText('Markdown')).toHaveValue('# B'))
 
@@ -592,6 +611,7 @@ describe('App setup gate', () => {
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
     vi.mocked(getNote).mockImplementation(async (id) => ({
       content: id === noteA.id ? '# A' : '# B',
+      revision: 'revision-1',
     }))
     vi.mocked(saveNote).mockReturnValue(saveA.promise)
 
@@ -634,6 +654,7 @@ describe('App setup gate', () => {
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB, noteC])
     vi.mocked(getNote).mockImplementation(async (id) => ({
       content: id === noteA.id ? '# A' : id === noteB.id ? '# B' : '# C',
+      revision: 'revision-1',
     }))
     vi.mocked(saveNote).mockReturnValue(saveA.promise)
 
@@ -652,7 +673,7 @@ describe('App setup gate', () => {
 
       expect(getNote).not.toHaveBeenCalledWith(noteB.id)
       expect(getNote).not.toHaveBeenCalledWith(noteC.id)
-      saveA.resolve(null)
+      saveA.resolve({ status: 'saved', revision: 'revision-2' })
       await saveA.promise
       await vi.advanceTimersByTimeAsync(0)
       await tick()
@@ -674,7 +695,7 @@ describe('App setup gate', () => {
     const saveA = deferred()
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
     vi.mocked(getNote).mockImplementation((id) => (
-      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+      id === noteA.id ? Promise.resolve({ content: '# A', revision: 'revision-1' }) : loadB.promise
     ))
     vi.mocked(saveNote).mockReturnValue(saveA.promise)
 
@@ -691,16 +712,16 @@ describe('App setup gate', () => {
       await user.type(textarea, '# A latest')
       expect(saveNote).not.toHaveBeenCalled()
 
-      loadB.resolve({ content: '# B' })
+      loadB.resolve({ content: '# B', revision: 'revision-1' })
       await loadB.promise
       await vi.advanceTimersByTimeAsync(0)
       await tick()
 
       expect(saveNote).toHaveBeenCalledOnce()
-      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A latest')
+      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A latest', 'revision-1')
       expect(screen.getByLabelText('Markdown')).toHaveValue('# A latest')
 
-      saveA.resolve(null)
+      saveA.resolve({ status: 'saved', revision: 'revision-2' })
       await saveA.promise
       await vi.advanceTimersByTimeAsync(0)
       await tick()
@@ -721,7 +742,7 @@ describe('App setup gate', () => {
     const saveA = deferred()
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
     vi.mocked(getNote).mockImplementation((id) => (
-      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+      id === noteA.id ? Promise.resolve({ content: '# A', revision: 'revision-1' }) : loadB.promise
     ))
     vi.mocked(saveNote).mockReturnValue(saveA.promise)
 
@@ -735,13 +756,13 @@ describe('App setup gate', () => {
       await user.click(screen.getByRole('button', { name: 'b.md' }))
       await user.clear(textarea)
       await user.type(textarea, '# A latest')
-      loadB.resolve({ content: '# B' })
+      loadB.resolve({ content: '# B', revision: 'revision-1' })
       await loadB.promise
       await vi.advanceTimersByTimeAsync(0)
       await tick()
 
       expect(getNote).toHaveBeenCalledWith(noteB.id)
-      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A latest')
+      expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A latest', 'revision-1')
       expect(screen.getByLabelText('Markdown')).toHaveValue('# A latest')
 
       saveA.reject(new Error('Диск недоступен'))
@@ -775,7 +796,7 @@ describe('App setup gate', () => {
     setEditorFlush(flush)
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
     vi.mocked(getNote).mockImplementation((id) => (
-      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+      id === noteA.id ? Promise.resolve({ content: '# A', revision: 'revision-1' }) : loadB.promise
     ))
     vi.mocked(saveNote).mockReturnValue(saveA.promise)
 
@@ -786,17 +807,17 @@ describe('App setup gate', () => {
     await waitFor(() => expect(getNote).toHaveBeenCalledWith(noteB.id))
     expect(flush).toHaveBeenCalledTimes(3)
 
-    loadB.resolve({ content: '# B' })
+    loadB.resolve({ content: '# B', revision: 'revision-1' })
     await loadB.promise
     await waitFor(() => expect(flush).toHaveBeenCalledTimes(4))
     expect(screen.getByLabelText('Markdown')).toHaveValue('# A')
 
     await fireEvent.input(textarea, { target: { value: '# A from upload' } })
     lateUpload.resolve()
-    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A from upload'))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A from upload', 'revision-1'))
     expect(screen.getByLabelText('Markdown')).toHaveValue('# A from upload')
 
-    saveA.resolve(null)
+    saveA.resolve({ status: 'saved', revision: 'revision-2' })
     await saveA.promise
     await waitFor(() => expect(screen.getByLabelText('Markdown')).toHaveValue('# B'))
     expect(saveNote).toHaveBeenCalledOnce()
@@ -817,7 +838,7 @@ describe('App setup gate', () => {
     setEditorFlush(flush)
     vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
     vi.mocked(getNote).mockImplementation((id) => (
-      id === noteA.id ? Promise.resolve({ content: '# A' }) : loadB.promise
+      id === noteA.id ? Promise.resolve({ content: '# A', revision: 'revision-1' }) : loadB.promise
     ))
     vi.mocked(saveNote).mockReturnValue(saveA.promise)
 
@@ -826,13 +847,13 @@ describe('App setup gate', () => {
     const textarea = await screen.findByLabelText('Markdown')
     await user.click(screen.getByRole('button', { name: 'b.md' }))
     await waitFor(() => expect(getNote).toHaveBeenCalledWith(noteB.id))
-    loadB.resolve({ content: '# B' })
+    loadB.resolve({ content: '# B', revision: 'revision-1' })
     await loadB.promise
     await waitFor(() => expect(flush).toHaveBeenCalledTimes(4))
 
     await fireEvent.input(textarea, { target: { value: '# A from upload' } })
     lateUpload.resolve()
-    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A from upload'))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(noteA.id, '# A from upload', 'revision-1'))
     saveA.reject(new Error('Диск недоступен'))
     await saveA.promise.catch(() => {})
 
@@ -848,7 +869,7 @@ describe('App setup gate', () => {
     const note = fileNode('draft.md')
     const renameRequest = deferred()
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(renameNote).mockReturnValue(renameRequest.promise)
 
     render(App)
@@ -863,7 +884,7 @@ describe('App setup gate', () => {
     await user.type(input, 'renamed.md')
     await user.click(within(dialog).getByRole('button', { name: 'Сохранить' }))
 
-    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Renamed draft'))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Renamed draft', 'revision-1'))
     await waitFor(() => expect(renameNote).toHaveBeenCalledWith(note.id, 'renamed.md'))
     expect(saveNote.mock.invocationCallOrder[0]).toBeLessThan(renameNote.mock.invocationCallOrder[0])
     expect(screen.getByLabelText('Markdown')).toHaveValue('# Renamed draft')
@@ -887,7 +908,7 @@ describe('App setup gate', () => {
       .mockReturnValueOnce(undefined)
     setEditorFlush(flush)
     vi.mocked(getNotes).mockResolvedValue([topic])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(saveNote).mockReturnValue(saveRequest.promise)
 
     render(App)
@@ -904,10 +925,10 @@ describe('App setup gate', () => {
 
     await fireEvent.input(textarea, { target: { value: '# Uploaded image' } })
     uploadRequest.resolve()
-    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Uploaded image'))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Uploaded image', 'revision-1'))
     expect(deleteNote).not.toHaveBeenCalled()
 
-    saveRequest.resolve(null)
+    saveRequest.resolve({ status: 'saved', revision: 'revision-2' })
     await saveRequest.promise
     await waitFor(() => expect(deleteNote).toHaveBeenCalledWith(topic.id))
     expect(flush).toHaveBeenCalledTimes(2)
@@ -921,7 +942,7 @@ describe('App setup gate', () => {
     const user = userEvent.setup()
     const note = fileNode('draft.md')
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(saveNote).mockRejectedValue(new Error('Диск недоступен'))
 
     render(App)
@@ -956,7 +977,7 @@ describe('App setup gate', () => {
     const note = fileNode('draft.md')
     const topic = folderNode('topic', [note])
     vi.mocked(getNotes).mockResolvedValue([topic])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
 
     render(App)
     await user.click(await screen.findByRole('button', { name: 'topic' }))
@@ -995,7 +1016,7 @@ describe('App setup gate', () => {
     const flush = vi.fn()
     setEditorFlush(flush)
     vi.mocked(getNotes).mockResolvedValue([topic, archive])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Archive' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Archive', revision: 'revision-1' })
 
     render(App)
     await user.click(await screen.findByRole('button', { name: 'topic-archive' }))
@@ -1030,7 +1051,7 @@ describe('App setup gate', () => {
     const note = fileNode('draft.md')
     const unhandled = vi.fn((event) => event.preventDefault())
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(saveNote).mockRejectedValue(new Error('Нет места'))
     window.addEventListener('unhandledrejection', unhandled)
 
@@ -1041,7 +1062,7 @@ describe('App setup gate', () => {
       await user.click(screen.getByRole('button', { name: 'Сохранить' }))
 
       expect(saveNote).toHaveBeenCalledOnce()
-      expect(saveNote).toHaveBeenCalledWith(note.id, '# Original')
+      expect(saveNote).toHaveBeenCalledWith(note.id, '# Original', 'revision-1')
       expect(await screen.findByRole('alert')).toHaveTextContent(
         /^Не удалось сохранить заметку: Нет места$/,
       )
@@ -1128,7 +1149,7 @@ describe('App setup gate', () => {
     }
     vi.mocked(getConfig).mockResolvedValue(gitConfig)
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
 
     render(App)
     await user.click(await screen.findByRole('button', { name: 'draft.md' }))
@@ -1140,7 +1161,7 @@ describe('App setup gate', () => {
     await user.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
 
     await waitFor(() => expect(syncGit).toHaveBeenCalledWith('personal'))
-    expect(saveNote).toHaveBeenCalledWith(note.id, '# Before sync')
+    expect(saveNote).toHaveBeenCalledWith(note.id, '# Before sync', 'revision-1')
     expect(saveNote.mock.invocationCallOrder[0]).toBeLessThan(syncGit.mock.invocationCallOrder[0])
     expect(gitPoller.refresh).toHaveBeenCalledOnce()
   })
@@ -1160,7 +1181,7 @@ describe('App setup gate', () => {
     }
     vi.mocked(getConfig).mockResolvedValue(gitConfig)
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
 
     const { unmount } = render(App)
     await user.click(await screen.findByRole('button', { name: 'draft.md' }))
@@ -1195,7 +1216,7 @@ describe('App setup gate', () => {
     }
     vi.mocked(getConfig).mockResolvedValue(gitConfig)
     vi.mocked(getNotes).mockResolvedValue([note])
-    vi.mocked(getNote).mockResolvedValue({ content: '# Original' })
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
     vi.mocked(saveNote).mockRejectedValue(new Error('Диск недоступен'))
 
     render(App)
@@ -1272,5 +1293,393 @@ describe('App setup gate', () => {
     expect(syncGit).toHaveBeenCalledWith('work')
     request.resolve({ operation_id: 'sync-1', status: 'queued', deduplicated: false })
     await request.promise
+  })
+
+  it('preserves a 409 draft, then overwrites with the disk revision and advances the revision', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Disk', revision: 'revision-2' })
+    vi.mocked(saveNote)
+      .mockRejectedValueOnce(changed)
+      .mockResolvedValueOnce({ status: 'saved', revision: 'revision-3' })
+      .mockResolvedValueOnce({ status: 'saved', revision: 'revision-4' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+
+    expect(await screen.findByRole('dialog')).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Mine')
+    expect(screen.getByRole('textbox', { name: 'Версия на диске' })).toHaveValue('# Disk')
+    expect(saveNote).toHaveBeenCalledWith(note.id, '# Mine', 'revision-1')
+
+    await user.click(screen.getByRole('button', { name: 'Оставить мою версию' }))
+    await user.click(screen.getByRole('button', { name: 'Подтвердить перезапись' }))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Mine', 'revision-2'))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Markdown'), '!')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    expect(saveNote).toHaveBeenLastCalledWith(note.id, '# Mine!', 'revision-3')
+  })
+
+  it('preserves edits made during a stale disk fetch and blocks navigation and Git sync', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const diskRequest = deferred()
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    const gitConfig = {
+      ...completedConfig,
+      bases: completedConfig.bases.map((base) => ({ ...base, git_url: `https://example.test/${base.name}.git`, git_branch: 'main' })),
+    }
+    vi.mocked(getConfig).mockResolvedValue(gitConfig)
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockReturnValueOnce(diskRequest.promise)
+    vi.mocked(saveNote).mockRejectedValueOnce(changed)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await gitPollerOptions.onStatuses([{ base: 'personal', state: 'ready', ahead: 0, behind: 0, changed_paths: [] }])
+    await user.click(screen.getByRole('button', { name: 'Открыть детали Git: Синхронизировано' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Mine', 'revision-1'))
+
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Latest during fetch' } })
+    diskRequest.resolve({ content: '# Disk', revision: 'revision-2' })
+
+    expect(await screen.findByRole('dialog')).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Latest during fetch')
+    await fireEvent.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Синхронизировать Git' }))
+    await tick()
+
+    expect(screen.queryByRole('heading', { name: 'Базы заметок' })).not.toBeInTheDocument()
+    expect(syncGit).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Latest during fetch')
+  })
+
+  it('keeps edits made while a stale overwrite is in flight', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const overwriteRequest = deferred()
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Disk', revision: 'revision-2' })
+    vi.mocked(saveNote)
+      .mockRejectedValueOnce(changed)
+      .mockReturnValueOnce(overwriteRequest.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await screen.findByRole('dialog')
+    await user.click(screen.getByRole('button', { name: 'Оставить мою версию' }))
+    await user.click(screen.getByRole('button', { name: 'Подтвердить перезапись' }))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Mine', 'revision-2'))
+
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Later edit' } })
+    overwriteRequest.resolve({ status: 'saved', revision: 'revision-3' })
+
+    expect(await screen.findByRole('dialog')).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Later edit')
+    expect(screen.getByRole('textbox', { name: 'Версия на диске' })).toHaveValue('# Mine')
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Later edit')
+  })
+
+  it('retains the submitted manual merge after a repeated note_changed response', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Disk one', revision: 'revision-2' })
+      .mockResolvedValueOnce({ content: '# Disk two', revision: 'revision-3' })
+    vi.mocked(saveNote).mockRejectedValue(changed)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await screen.findByRole('dialog')
+    await user.click(screen.getByRole('button', { name: 'Объединить вручную' }))
+    const merge = screen.getByRole('textbox', { name: 'Итоговый текст' })
+    await user.clear(merge)
+    await user.type(merge, '# Submitted merge')
+    await user.click(screen.getByRole('button', { name: 'Сохранить объединение' }))
+
+    expect(await screen.findByRole('textbox', { name: 'Моя версия' })).toHaveValue('# Submitted merge')
+    expect(screen.getByRole('textbox', { name: 'Версия на диске' })).toHaveValue('# Disk two')
+  })
+
+  it('keeps a dirty deleted note in the browser until the explicit close action', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('deleted.md')
+    const missing = Object.assign(new Error('Не найдено'), { status: 404 })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockRejectedValueOnce(missing)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'deleted.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Browser draft')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'ready', repository_path: '/notes/personal', operation_id: 'sync-1',
+      ahead: 0, behind: 0, changed_paths: [note.id],
+    }])
+
+    expect(await screen.findByRole('button', { name: 'Закрыть заметку' })).toBeVisible()
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Browser draft')
+    await user.click(screen.getByRole('button', { name: 'Закрыть заметку' }))
+    expect(await screen.findByText('Выберите заметку')).toBeVisible()
+  })
+
+  it('refreshes the tree once per terminal changed-path operation and reloads a clean active note', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('changed.md')
+    const status = {
+      base: 'personal', state: 'ready', repository_path: '/notes/personal', operation_id: 'sync-1',
+      ahead: 0, behind: 0, changed_paths: [note.id, note.id],
+    }
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Changed on disk', revision: 'revision-2' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'changed.md' }))
+    await gitPollerOptions.onStatuses([status])
+
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Changed on disk')
+    expect(getNotes).toHaveBeenCalledTimes(2)
+    expect(syncNotes).not.toHaveBeenCalled()
+    await gitPollerOptions.onStatuses([status])
+    expect(getNotes).toHaveBeenCalledTimes(2)
+    expect(getNote).toHaveBeenCalledTimes(2)
+  })
+
+  it('waits for an active save before reloading a terminal changed path at its fresh revision', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('changed.md')
+    const saveRequest = deferred()
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Fresh disk', revision: 'revision-3' })
+    vi.mocked(saveNote).mockReturnValue(saveRequest.promise)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'changed.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Saving')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Saving', 'revision-1'))
+
+    const changed = gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'ready', repository_path: '/notes/personal', operation_id: 'sync-1',
+      ahead: 0, behind: 0, changed_paths: [note.id],
+    }])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(getNotes).toHaveBeenCalledOnce()
+    expect(getNote).toHaveBeenCalledOnce()
+
+    saveRequest.resolve({ status: 'saved', revision: 'revision-2' })
+    await changed
+
+    expect(getNotes).toHaveBeenCalledTimes(2)
+    expect(getNote).toHaveBeenCalledTimes(2)
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Fresh disk')
+    await user.type(screen.getByLabelText('Markdown'), '!')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    expect(saveNote).toHaveBeenLastCalledWith(note.id, '# Fresh disk!', 'revision-3')
+  })
+
+  it.each([
+    ['complete', 'Завершить слияние', 'complete-1'],
+    ['abort', 'Подтвердить отмену', 'abort-1'],
+  ])('keeps the %s conflict workspace until its matching terminal operation arrives', async (action, button, operationId) => {
+    const user = userEvent.setup()
+    const conflict = {
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }
+    render(App)
+    await screen.findByText('Выберите заметку')
+    await gitPollerOptions.onStatuses([conflict])
+    expect(await screen.findByRole('heading', { name: 'Конфликты Git' })).toBeVisible()
+
+    if (action === 'abort') await user.click(screen.getByRole('button', { name: 'Отменить слияние' }))
+    await user.click(screen.getByRole('button', { name: button }))
+    await waitFor(() => expect(action === 'complete' ? completeGitConflict : abortGitConflict).toHaveBeenCalledWith('personal'))
+
+    await gitPollerOptions.onStatuses([{
+      ...conflict, state: 'ready', operation_id: 'other-operation', repository_path: '/notes/personal', changed_paths: [],
+    }])
+    expect(screen.getByRole('heading', { name: 'Конфликты Git' })).toBeVisible()
+    await gitPollerOptions.onStatuses([{
+      ...conflict, state: 'ready', operation_id: operationId, repository_path: '/notes/personal', changed_paths: [],
+    }])
+    expect(await screen.findByText('Выберите заметку')).toBeVisible()
+  })
+
+  it('delegates a conflict workspace base switch to the existing safe base switch', async () => {
+    const user = userEvent.setup()
+    vi.mocked(switchBase).mockResolvedValue(workConfig)
+    render(App)
+    await screen.findByText('Выберите заметку')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }])
+    const target = await screen.findByRole('combobox', { name: 'База для переключения' })
+    await user.selectOptions(target, 'work')
+    await user.click(screen.getByRole('button', { name: 'Открыть базу' }))
+
+    expect(switchBase).toHaveBeenCalledWith('work')
+    expect(await screen.findByTitle('Текущая база заметок')).toHaveTextContent('/srv/work')
+  })
+
+  it('switches from an active conflict without flushing the retained dirty editor', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
+    vi.mocked(saveNote).mockRejectedValue(new Error('Не должен вызываться'))
+    vi.mocked(switchBase).mockResolvedValue(workConfig)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Retained draft')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }])
+
+    const target = await screen.findByRole('combobox', { name: 'База для переключения' })
+    await user.selectOptions(target, 'work')
+    await user.click(screen.getByRole('button', { name: 'Открыть базу' }))
+
+    expect(switchBase).toHaveBeenCalledWith('work')
+    expect(saveNote).not.toHaveBeenCalled()
+    expect(await screen.findByTitle('Текущая база заметок')).toHaveTextContent('/srv/work')
+  })
+
+  it('restores a dirty conflict buffer after switching away and back to its base', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
+    vi.mocked(switchBase)
+      .mockResolvedValueOnce(workConfig)
+      .mockResolvedValueOnce(completedConfig)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Retained draft')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }])
+    const conflictTarget = await screen.findByRole('combobox', { name: 'База для переключения' })
+    await user.selectOptions(conflictTarget, 'work')
+    await user.click(screen.getByRole('button', { name: 'Открыть базу' }))
+    await screen.findByText('Выберите заметку')
+    await user.click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    const personal = screen.getByRole('article', { name: 'База personal' })
+    await user.click(within(personal).getByRole('button', { name: 'Открыть' }))
+
+    expect(await screen.findByLabelText('Markdown')).toHaveValue('# Retained draft')
+  })
+
+  it('cancels a pending debounce when the active base enters a conflict', async () => {
+    const initialUser = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
+
+    render(App)
+    await initialUser.click(await screen.findByRole('button', { name: 'draft.md' }))
+    vi.useFakeTimers()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    try {
+      await user.clear(screen.getByLabelText('Markdown'))
+      await user.type(screen.getByLabelText('Markdown'), '# Pending')
+      await gitPollerOptions.onStatuses([{
+        base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+      }])
+      await vi.advanceTimersByTimeAsync(2000)
+
+      expect(screen.getByRole('heading', { name: 'Конфликты Git' })).toBeVisible()
+      expect(saveNote).not.toHaveBeenCalled()
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not apply a changed-path reload after a newer note selection', async () => {
+    const user = userEvent.setup()
+    const noteA = fileNode('a.md')
+    const noteB = fileNode('b.md')
+    const changedRequest = deferred()
+    vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# A', revision: 'revision-1' })
+      .mockReturnValueOnce(changedRequest.promise)
+      .mockResolvedValueOnce({ content: '# B', revision: 'revision-2' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'a.md' }))
+    const changed = gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'ready', repository_path: '/notes/personal', operation_id: 'sync-1',
+      ahead: 0, behind: 0, changed_paths: [noteA.id],
+    }])
+    await waitFor(() => expect(getNote).toHaveBeenCalledTimes(2))
+    await user.click(screen.getByRole('button', { name: 'b.md' }))
+    expect(await screen.findByLabelText('Markdown')).toHaveValue('# B')
+
+    changedRequest.resolve({ content: '# A changed', revision: 'revision-3' })
+    await changed
+
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# B')
+  })
+
+  it('does not mount stale recovery over the active conflict workspace', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Disk', revision: 'revision-2' })
+    vi.mocked(saveNote).mockRejectedValueOnce(changed)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await screen.findByRole('dialog')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }])
+
+    expect(await screen.findByRole('heading', { name: 'Конфликты Git' })).toBeVisible()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 })
