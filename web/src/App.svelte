@@ -107,6 +107,9 @@
 
   async function applyGitStatuses(statuses) {
     gitStatuses = Array.isArray(statuses) ? statuses : []
+    if (gitStatuses.some((status) => status.base === config?.current_base && status.state === 'conflict')) {
+      clearSaveTimer()
+    }
     settleAcceptedGitOperation()
 
     const snapshot = gitStatuses
@@ -407,9 +410,12 @@
       if (dirty || staleNote) {
         if (!staleNote) await stageStaleNote(activeNote.id)
       } else {
-        const disk = await fetchDiskNote(activeNote.id)
+        const note = activeNote
+        const requestToken = noteRequestToken
+        const disk = await fetchDiskNote(note.id)
+        if (!mounted || noteRequestToken !== requestToken || activeNote?.id !== note.id) return
         if (disk === null) resetEditorState()
-        else if (mounted && activeNote?.id) applyLoadedNote(activeNote, disk)
+        else applyLoadedNote(note, disk)
       }
     }
 
@@ -540,6 +546,8 @@
       switchRequest: switchBase,
       commit: (savedConfig) => {
         if (!mounted) return
+        acceptedGitOperation = null
+        gitStatuses = []
         applyConfig(savedConfig)
         screen = 'editor'
       },
@@ -566,6 +574,7 @@
       clearSaveTimer()
       saveTimer = setTimeout(() => {
         saveTimer = null
+        if (screen !== 'editor' || conflictWorkspaceActive) return
         void persistCurrentNote().catch(showSaveError)
       }, 2000)
     }
@@ -667,10 +676,12 @@
   {/if}
 </div>
 
-<StaleNoteDialog
-  stale={staleNote}
-  busy={saveStatus === 'saving'}
-  onLoadDisk={loadStaleDisk}
-  onOverwrite={saveStaleNote}
-  onManualMerge={saveStaleNote}
-/>
+{#if screen === 'editor' && !conflictWorkspaceActive}
+  <StaleNoteDialog
+    stale={staleNote}
+    busy={saveStatus === 'saving'}
+    onLoadDisk={loadStaleDisk}
+    onOverwrite={saveStaleNote}
+    onManualMerge={saveStaleNote}
+  />
+{/if}

@@ -1490,4 +1490,81 @@ describe('App setup gate', () => {
     expect(switchBase).toHaveBeenCalledWith('work')
     expect(await screen.findByTitle('Текущая база заметок')).toHaveTextContent('/srv/work')
   })
+
+  it('cancels a pending debounce when the active base enters a conflict', async () => {
+    const initialUser = userEvent.setup()
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote).mockResolvedValue({ content: '# Original', revision: 'revision-1' })
+
+    render(App)
+    await initialUser.click(await screen.findByRole('button', { name: 'draft.md' }))
+    vi.useFakeTimers()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    try {
+      await user.clear(screen.getByLabelText('Markdown'))
+      await user.type(screen.getByLabelText('Markdown'), '# Pending')
+      await gitPollerOptions.onStatuses([{
+        base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+      }])
+      await vi.advanceTimersByTimeAsync(2000)
+
+      expect(screen.getByRole('heading', { name: 'Конфликты Git' })).toBeVisible()
+      expect(saveNote).not.toHaveBeenCalled()
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not apply a changed-path reload after a newer note selection', async () => {
+    const user = userEvent.setup()
+    const noteA = fileNode('a.md')
+    const noteB = fileNode('b.md')
+    const changedRequest = deferred()
+    vi.mocked(getNotes).mockResolvedValue([noteA, noteB])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# A', revision: 'revision-1' })
+      .mockReturnValueOnce(changedRequest.promise)
+      .mockResolvedValueOnce({ content: '# B', revision: 'revision-2' })
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'a.md' }))
+    const changed = gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'ready', repository_path: '/notes/personal', operation_id: 'sync-1',
+      ahead: 0, behind: 0, changed_paths: [noteA.id],
+    }])
+    await waitFor(() => expect(getNote).toHaveBeenCalledTimes(2))
+    await user.click(screen.getByRole('button', { name: 'b.md' }))
+    expect(await screen.findByLabelText('Markdown')).toHaveValue('# B')
+
+    changedRequest.resolve({ content: '# A changed', revision: 'revision-3' })
+    await changed
+
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# B')
+  })
+
+  it('does not mount stale recovery over the active conflict workspace', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const changed = Object.assign(new Error('Заметка изменилась'), { status: 409, code: 'note_changed' })
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getNote)
+      .mockResolvedValueOnce({ content: '# Original', revision: 'revision-1' })
+      .mockResolvedValueOnce({ content: '# Disk', revision: 'revision-2' })
+    vi.mocked(saveNote).mockRejectedValueOnce(changed)
+
+    render(App)
+    await user.click(await screen.findByRole('button', { name: 'draft.md' }))
+    await user.clear(screen.getByLabelText('Markdown'))
+    await user.type(screen.getByLabelText('Markdown'), '# Mine')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+    await screen.findByRole('dialog')
+    await gitPollerOptions.onStatuses([{
+      base: 'personal', state: 'conflict', operation_id: 'conflict-1', ahead: 0, behind: 0, changed_paths: [],
+    }])
+
+    expect(await screen.findByRole('heading', { name: 'Конфликты Git' })).toBeVisible()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
 })
