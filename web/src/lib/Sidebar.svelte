@@ -97,6 +97,10 @@
     }
   }
 
+  export function refreshTree() {
+    return loadTree();
+  }
+
   async function syncTree() {
     if (!mounted) return;
     const generation = startRefresh();

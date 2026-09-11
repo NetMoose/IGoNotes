@@ -23,9 +23,14 @@
   } = $props();
 
   let editor = $state();
+  let sidebar = $state();
 
   export function flushPendingUploads() {
     return editor?.flushPendingUploads?.();
+  }
+
+  export function refreshTree() {
+    return sidebar?.refreshTree?.();
   }
 
   function runAfterUploads(callback, ...args) {
@@ -42,6 +47,7 @@
 >
   <div class="flex-1 flex overflow-hidden">
     <Sidebar
+      bind:this={sidebar}
       onSelect={(...args) => runAfterUploads(onSelectNote, ...args)}
       onRename={onRenameNote}
       onDelete={onDeleteNote}

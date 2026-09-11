@@ -2,9 +2,15 @@
   import NotesWorkspace from '../lib/NotesWorkspace.svelte'
 
   let content = $state('# Parent')
+  let notesWorkspace = $state()
+
+  function refreshTree() {
+    notesWorkspace?.refreshTree?.()
+  }
 </script>
 
 <NotesWorkspace
+  bind:this={notesWorkspace}
   activeNote={{ id: 'note.md', name: 'note.md' }}
   bind:content
   saveStatus="idle"
@@ -22,4 +28,5 @@
   onOpenSettings={() => {}}
 />
 
+<button type="button" onclick={refreshTree}>Refresh note tree</button>
 <output aria-label="Parent markdown">{content}</output>

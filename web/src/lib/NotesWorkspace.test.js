@@ -580,6 +580,17 @@ describe('NotesWorkspace', () => {
     expect(screen.getByLabelText('Parent markdown')).toHaveTextContent('# Updated')
   })
 
+  it('refreshes only the note tree through the bound workspace path', async () => {
+    const user = userEvent.setup()
+    render(NotesWorkspaceHost)
+    await waitFor(() => expect(getNotes).toHaveBeenCalledOnce())
+
+    await user.click(screen.getByRole('button', { name: 'Refresh note tree' }))
+
+    await waitFor(() => expect(getNotes).toHaveBeenCalledTimes(2))
+    expect(syncNotes).not.toHaveBeenCalled()
+  })
+
   it('shows the no-note placeholder only without an active note', async () => {
     const { rerender, props } = await renderWorkspace()
 
