@@ -9,6 +9,8 @@ import (
 
 type GitStatusFailureTransition string
 
+const GitStatusPauseFailureThreshold = 5
+
 const (
 	GitStatusFailuresPreserve  GitStatusFailureTransition = "preserve"
 	GitStatusFailuresIncrement GitStatusFailureTransition = "increment"
@@ -40,7 +42,10 @@ func (r *GitStatusRepository) Transition(ctx context.Context, transition GitStat
 
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE git_status
-		SET state = ?,
+		SET state = CASE
+				WHEN ? = 'increment' AND consecutive_failures + 1 >= ? THEN 'paused'
+				ELSE ?
+			END,
 			consecutive_failures = CASE ?
 				WHEN 'increment' THEN consecutive_failures + 1
 				WHEN 'reset' THEN 0
@@ -48,7 +53,8 @@ func (r *GitStatusRepository) Transition(ctx context.Context, transition GitStat
 			END,
 			updated_at_unix_ms = ?
 		WHERE repository_path = ? AND state = ?
-	`, transition.ToState, transition.Failures, r.now().UnixMilli(), transition.RepositoryPath, transition.FromState)
+	`, transition.Failures, GitStatusPauseFailureThreshold, transition.ToState, transition.Failures,
+		r.now().UnixMilli(), transition.RepositoryPath, transition.FromState)
 	if err != nil {
 		return false, err
 	}

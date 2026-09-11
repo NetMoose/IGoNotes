@@ -2,32 +2,36 @@ package service
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
 	gitcmd "IGoNotes/internal/git"
+	"IGoNotes/internal/model"
+	"IGoNotes/internal/repository"
 )
 
 func TestGitOutcomeClassification(t *testing.T) {
 	tests := []struct {
 		name    string
 		outcome GitTerminalOutcome
-		want    GitFailureAction
+		want    GitOutcomeClassification
 	}{
-		{"initialize success resets", GitTerminalOutcome{Operation: gitcmd.OperationInitialize, State: gitcmd.OperationSucceeded}, GitFailureReset},
-		{"sync success resets", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationSucceeded}, GitFailureReset},
-		{"conflict completion success resets", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationSucceeded}, GitFailureReset},
-		{"sync operational failure consumes", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, Failure: GitFailureOperational}, GitFailureConsume},
-		{"conflict completion operational failure consumes", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationFailed, Failure: GitFailureOperational}, GitFailureConsume},
-		{"initialize failure preserves", GitTerminalOutcome{Operation: gitcmd.OperationInitialize, State: gitcmd.OperationFailed, Failure: GitFailureOperational}, GitFailurePreserve},
-		{"sync conflict preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationConflict, Failure: GitFailureConflict}, GitFailurePreserve},
-		{"conflict completion conflict preserves", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationConflict, Failure: GitFailureConflict}, GitFailurePreserve},
-		{"abort success preserves", GitTerminalOutcome{Operation: gitcmd.OperationConflictAbort, State: gitcmd.OperationSucceeded}, GitFailurePreserve},
-		{"abort failure preserves", GitTerminalOutcome{Operation: gitcmd.OperationConflictAbort, State: gitcmd.OperationFailed, Failure: GitFailureOperational}, GitFailurePreserve},
-		{"configuration failure preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, Failure: GitFailureConfiguration}, GitFailurePreserve},
-		{"validation failure preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, Failure: GitFailureValidation}, GitFailurePreserve},
-		{"safety failure preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, Failure: GitFailureSafety}, GitFailurePreserve},
-		{"shutdown preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, Failure: GitFailureShutdown}, GitFailurePreserve},
+		{"initialize success resets", GitTerminalOutcome{Operation: gitcmd.OperationInitialize, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStateReady, Failures: GitFailureReset}},
+		{"sync success resets", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStateReady, Failures: GitFailureReset}},
+		{"conflict completion success resets", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStateReady, Failures: GitFailureReset}},
+		{"sync operational failure consumes", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeCommandFailed}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureConsume}},
+		{"conflict completion operational failure consumes", GitTerminalOutcome{Operation: gitcmd.OperationConflictComplete, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeTimedOut}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureConsume}},
+		{"initialize failure preserves", GitTerminalOutcome{Operation: gitcmd.OperationInitialize, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeCommandFailed}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}},
+		{"conflict preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationConflict, ErrorCode: gitcmd.CodeGitConflict}, GitOutcomeClassification{State: model.GitStateConflict, Failures: GitFailurePreserve}},
+		{"abort success preserves", GitTerminalOutcome{Operation: gitcmd.OperationConflictAbort, State: gitcmd.OperationSucceeded}, GitOutcomeClassification{State: model.GitStatePaused, Failures: GitFailurePreserve}},
+		{"reconnect preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeNeedsReconnect}, GitOutcomeClassification{State: model.GitStateNeedsReconnect, Failures: GitFailurePreserve}},
+		{"branch deletion preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeBranchDeleted}, GitOutcomeClassification{State: model.GitStateNeedsReconnect, Failures: GitFailurePreserve}},
+		{"rewritten history preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeRemoteHistoryRewritten}, GitOutcomeClassification{State: model.GitStateNeedsReconnect, Failures: GitFailurePreserve}},
+		{"configuration preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeIdentityMissing}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}},
+		{"validation preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeInvalidBranch}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}},
+		{"safety preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeOperationInterrupted}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}},
+		{"shutdown preserves", GitTerminalOutcome{Operation: gitcmd.OperationSync, State: gitcmd.OperationFailed, ErrorCode: gitcmd.CodeCanceled}, GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}},
 	}
 
 	for _, test := range tests {
@@ -39,36 +43,88 @@ func TestGitOutcomeClassification(t *testing.T) {
 	}
 }
 
-func TestGitResilienceContracts(t *testing.T) {
-	if gitcmd.ErrGitNotPaused.Code != gitcmd.CodeNotPaused || gitcmd.ErrGitNotPaused.Message != "Git synchronization is not paused" || gitcmd.ErrGitNotPaused.Field != "" {
-		t.Fatalf("ErrGitNotPaused = %#v, want immutable safe error %q", gitcmd.ErrGitNotPaused, gitcmd.CodeNotPaused)
+func TestGitResilienceFifthOperationalFailurePausesAtomically(t *testing.T) {
+	db, err := repository.InitDB(filepath.Join(t.TempDir(), "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := repository.NewGitStatusRepository(db)
+	status := model.GitStatus{RepositoryPath: "/notes/work", Base: "work", State: model.GitStateError, ConsecutiveFailures: 4}
+	if err := repo.Upsert(context.Background(), status); err != nil {
+		t.Fatal(err)
 	}
 
-	scheduler := &fakeGitResilienceScheduler{}
-	var contract GitResilienceScheduler = scheduler
-	want := GitSyncSchedule{RepositoryPath: "/notes/work", Delay: time.Minute}
-	if err := contract.Schedule(context.Background(), want); err != nil {
-		t.Fatalf("Schedule() error = %v", err)
+	changed, err := repo.Transition(context.Background(), repository.GitStatusTransition{
+		RepositoryPath: status.RepositoryPath,
+		FromState:      model.GitStateError,
+		ToState:        model.GitStateError,
+		Failures:       repository.GitStatusFailuresIncrement,
+	})
+	if err != nil || !changed {
+		t.Fatalf("Transition() = %v, %v; want changed", changed, err)
 	}
-	contract.Cancel(want.RepositoryPath)
-	if len(scheduler.scheduled) != 1 || scheduler.scheduled[0] != want {
-		t.Errorf("scheduled = %#v, want %#v", scheduler.scheduled, want)
+	got, found, err := repo.Get(context.Background(), status.RepositoryPath)
+	if err != nil || !found {
+		t.Fatalf("Get() = %#v, %v, %v", got, found, err)
 	}
-	if len(scheduler.canceled) != 1 || scheduler.canceled[0] != want.RepositoryPath {
-		t.Errorf("canceled = %#v, want %q", scheduler.canceled, want.RepositoryPath)
+	if got.State != model.GitStatePaused || got.ConsecutiveFailures != 5 {
+		t.Errorf("transitioned status = %#v, want paused at five failures", got)
 	}
 }
 
-type fakeGitResilienceScheduler struct {
-	scheduled []GitSyncSchedule
-	canceled  []string
+func TestGitResilienceContractsAreFakeable(t *testing.T) {
+	clock := &fakeGitResilienceClock{now: time.Date(2026, time.September, 11, 12, 0, 0, 0, time.UTC)}
+	var clockContract GitResilienceClock = clock
+	if got := clockContract.Now(); !got.Equal(clock.now) {
+		t.Errorf("Now() = %v, want %v", got, clock.now)
+	}
+	if timer := clockContract.NewTimer(time.Minute); timer != clock.timer {
+		t.Errorf("NewTimer() = %T, want fake timer", timer)
+	}
+	var _ GitStatusReader = &fakeGitResilienceStatusReader{}
+	var _ GitOrderedSnapshots = fakeGitResilienceSnapshots{}
+	var _ GitSyncQueue = fakeGitResilienceQueue{}
 }
 
-func (s *fakeGitResilienceScheduler) Schedule(_ context.Context, request GitSyncSchedule) error {
-	s.scheduled = append(s.scheduled, request)
-	return nil
+type fakeGitResilienceClock struct {
+	now   time.Time
+	timer *fakeGitResilienceTimer
 }
 
-func (s *fakeGitResilienceScheduler) Cancel(repositoryPath string) {
-	s.canceled = append(s.canceled, repositoryPath)
+func (c *fakeGitResilienceClock) Now() time.Time { return c.now }
+
+func (c *fakeGitResilienceClock) NewTimer(time.Duration) GitResilienceTimer {
+	if c.timer == nil {
+		c.timer = &fakeGitResilienceTimer{events: make(chan time.Time)}
+	}
+	return c.timer
+}
+
+type fakeGitResilienceTimer struct{ events chan time.Time }
+
+func (t *fakeGitResilienceTimer) C() <-chan time.Time { return t.events }
+func (t *fakeGitResilienceTimer) Stop() bool          { return true }
+func (t *fakeGitResilienceTimer) Reset(time.Duration) bool {
+	return true
+}
+
+type fakeGitResilienceStatusReader struct{}
+
+func (*fakeGitResilienceStatusReader) Get(context.Context, string) (model.GitStatus, bool, error) {
+	return model.GitStatus{}, false, nil
+}
+
+func (*fakeGitResilienceStatusReader) List(context.Context) ([]model.GitStatus, error) {
+	return nil, nil
+}
+
+type fakeGitResilienceSnapshots []gitcmd.ConfiguredBase
+
+func (s fakeGitResilienceSnapshots) OrderedGitSnapshots() []gitcmd.ConfiguredBase { return s }
+
+type fakeGitResilienceQueue struct{}
+
+func (fakeGitResilienceQueue) QueueSync(context.Context, gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {
+	return gitcmd.Operation{}, false, nil
 }

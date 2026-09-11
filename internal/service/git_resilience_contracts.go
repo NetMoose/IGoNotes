@@ -5,6 +5,7 @@ import (
 	"time"
 
 	gitcmd "IGoNotes/internal/git"
+	"IGoNotes/internal/model"
 	"IGoNotes/internal/repository"
 )
 
@@ -16,38 +17,70 @@ const (
 	GitFailureReset    GitFailureAction = "reset"
 )
 
-type GitFailureClass string
-
-const (
-	GitFailureOperational   GitFailureClass = "operational"
-	GitFailureConflict      GitFailureClass = "conflict"
-	GitFailureConfiguration GitFailureClass = "configuration"
-	GitFailureValidation    GitFailureClass = "validation"
-	GitFailureSafety        GitFailureClass = "safety"
-	GitFailureShutdown      GitFailureClass = "shutdown"
-)
-
 // GitTerminalOutcome is the stable input to autosync breaker accounting.
 type GitTerminalOutcome struct {
 	Operation gitcmd.OperationKind
 	State     gitcmd.OperationState
-	Failure   GitFailureClass
+	ErrorCode gitcmd.ErrorCode
 }
 
-func ClassifyGitOutcome(outcome GitTerminalOutcome) GitFailureAction {
+type GitOutcomeClassification struct {
+	State    model.GitState
+	Failures GitFailureAction
+}
+
+func ClassifyGitOutcome(outcome GitTerminalOutcome) GitOutcomeClassification {
 	if outcome.State == gitcmd.OperationSucceeded {
 		switch outcome.Operation {
 		case gitcmd.OperationInitialize, gitcmd.OperationSync, gitcmd.OperationConflictComplete:
-			return GitFailureReset
+			return GitOutcomeClassification{State: model.GitStateReady, Failures: GitFailureReset}
+		case gitcmd.OperationConflictAbort:
+			return GitOutcomeClassification{State: model.GitStatePaused, Failures: GitFailurePreserve}
 		}
 	}
-	if outcome.State == gitcmd.OperationFailed && outcome.Failure == GitFailureOperational {
+	if outcome.State == gitcmd.OperationConflict || outcome.ErrorCode == gitcmd.CodeGitConflict {
+		return GitOutcomeClassification{State: model.GitStateConflict, Failures: GitFailurePreserve}
+	}
+	switch outcome.ErrorCode {
+	case gitcmd.CodeNeedsReconnect, gitcmd.CodeBranchDeleted, gitcmd.CodeRemoteHistoryRewritten:
+		return GitOutcomeClassification{State: model.GitStateNeedsReconnect, Failures: GitFailurePreserve}
+	}
+	if outcome.State == gitcmd.OperationFailed && gitOperationalFailure(outcome.ErrorCode) {
 		switch outcome.Operation {
 		case gitcmd.OperationSync, gitcmd.OperationConflictComplete:
-			return GitFailureConsume
+			return GitOutcomeClassification{State: model.GitStateError, Failures: GitFailureConsume}
 		}
 	}
-	return GitFailurePreserve
+	return GitOutcomeClassification{State: model.GitStateError, Failures: GitFailurePreserve}
+}
+
+func gitOperationalFailure(code gitcmd.ErrorCode) bool {
+	switch code {
+	case gitcmd.CodeGitConflict,
+		gitcmd.CodeConflictNotFound,
+		gitcmd.CodeConflictStale,
+		gitcmd.CodeConflictUnresolved,
+		gitcmd.CodeConflictUnsupported,
+		gitcmd.CodeMergeNotInProgress,
+		gitcmd.CodeRecoveryRequired,
+		gitcmd.CodeOperationInterrupted,
+		gitcmd.CodeRepositoryRoot,
+		gitcmd.CodeBackupMismatch,
+		gitcmd.CodeNeedsReconnect,
+		gitcmd.CodeBranchDeleted,
+		gitcmd.CodeRemoteHistoryRewritten,
+		gitcmd.CodeIdentityMissing,
+		gitcmd.CodeOriginMismatch,
+		gitcmd.CodeNotRepository,
+		gitcmd.CodeInvalidBranch,
+		gitcmd.CodeConfirmationRequired,
+		gitcmd.CodeCanceled,
+		gitcmd.CodePaused,
+		gitcmd.CodeNotPaused:
+		return false
+	default:
+		return true
+	}
 }
 
 func (a GitFailureAction) StatusFailureTransition() repository.GitStatusFailureTransition {
@@ -61,14 +94,23 @@ func (a GitFailureAction) StatusFailureTransition() repository.GitStatusFailureT
 	}
 }
 
-type GitSyncSchedule struct {
-	RepositoryPath string
-	Delay          time.Duration
+type GitResilienceClock interface {
+	Now() time.Time
+	NewTimer(time.Duration) GitResilienceTimer
 }
 
-type GitResilienceScheduler interface {
-	Schedule(context.Context, GitSyncSchedule) error
-	Cancel(repositoryPath string)
+type GitResilienceTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+	Reset(time.Duration) bool
+}
+
+type GitOrderedSnapshots interface {
+	OrderedGitSnapshots() []gitcmd.ConfiguredBase
+}
+
+type GitSyncQueue interface {
+	QueueSync(context.Context, gitcmd.SyncRequest) (gitcmd.Operation, bool, error)
 }
 
 var _ repository.GitStatusTransitioner = (*repository.GitStatusRepository)(nil)
