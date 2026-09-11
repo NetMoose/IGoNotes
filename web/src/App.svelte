@@ -4,6 +4,10 @@
   import { deleteNote, getConfig, getGitStatus, getNote, renameNote, saveNote, switchBase, syncGit } from './lib/api.js'
   import { openSettingsSafely, switchBaseSafely } from './lib/app-transitions.js'
   import { activeBase } from './lib/base-draft.js'
+  import StaleNoteDialog from './lib/StaleNoteDialog.svelte'
+  import { makeStaleNote, readNoteResponse, readSaveResponse } from './lib/stale-note.js'
+  import { changedPathKey, noteInChangedPaths, terminalChangedPaths } from './lib/git/changed-paths.js'
+  import GitConflictWorkspace from './lib/git/GitConflictWorkspace.svelte'
   import { createGitStatusPoller } from './lib/git/git-status-poller.js'
   import NotesWorkspace from './lib/NotesWorkspace.svelte'
   import SettingsWorkspace from './lib/settings/SettingsWorkspace.svelte'
@@ -13,6 +17,7 @@
   let config = $state(null)
   let loadError = $state('')
   let activeNote = $state(null)
+  let noteRevision = $state('')
   let markdownContent = $state('')
   let basePath = $state('')
   let saveStatus = $state('idle')
@@ -24,6 +29,8 @@
   let gitPollError = $state('')
   let gitBusyBase = $state('')
   let gitActionErrors = $state({})
+  let staleNote = $state(null)
+  let acceptedGitOperation = $state(null)
 
   let saveTimer = null
   let statusTimer = null
@@ -37,10 +44,16 @@
   let noteRequestToken = 0
   let gitPoller = null
   let gitPolling = false
+  let changedPathProcessing = Promise.resolve()
+  const processedChangedPathBuckets = new Map()
   const workspaceFlushFailures = new WeakSet()
 
   let currentBase = $derived(activeBase(config))
   let activeGitStatus = $derived(gitStatuses.find((status) => status.base === config?.current_base) ?? null)
+  let conflictWorkspaceActive = $derived(
+    activeGitStatus?.state === 'conflict'
+    || acceptedGitOperation?.base === config?.current_base,
+  )
 
   function errorMessage(error, fallback) {
     return typeof error?.message === 'string' && error.message ? error.message : fallback
@@ -91,8 +104,23 @@
     ensureGitPolling()
   }
 
-  function applyGitStatuses(statuses) {
+  async function applyGitStatuses(statuses) {
     gitStatuses = Array.isArray(statuses) ? statuses : []
+    settleAcceptedGitOperation()
+
+    const snapshot = gitStatuses
+    changedPathProcessing = changedPathProcessing
+      .catch(() => {})
+      .then(() => processChangedPaths(snapshot))
+    return changedPathProcessing
+  }
+
+  function settleAcceptedGitOperation() {
+    const accepted = acceptedGitOperation
+    if (!accepted) return
+    const status = gitStatuses.find((candidate) => candidate.base === accepted.base)
+    if (!status || status.operation_id !== accepted.operationId) return
+    if (['ready', 'error', 'paused'].includes(status.state)) acceptedGitOperation = null
   }
 
   function ensureGitPolling() {
@@ -112,6 +140,8 @@
     clearSaveTimer()
     clearStatusTimer()
     activeNote = null
+    noteRevision = ''
+    staleNote = null
     ignoreNextChange = true
     markdownContent = ''
     dirty = false
@@ -185,17 +215,28 @@
 
       if (!mounted || token !== noteRequestToken) return
 
-      clearSaveTimer()
-      clearStatusTimer()
-      activeNote = node
-      ignoreNextChange = true
-      markdownContent = typeof note?.content === 'string' ? note.content : ''
-      dirty = false
-      saveStatus = 'idle'
-      transitionError = ''
+      applyLoadedNote(node, note)
     } finally {
       endTransition(transition)
     }
+  }
+
+  function readLoadedNote(note) {
+    return readNoteResponse(note)
+  }
+
+  function applyLoadedNote(node, response) {
+    const note = readLoadedNote(response)
+    clearSaveTimer()
+    clearStatusTimer()
+    activeNote = node
+    noteRevision = note.revision
+    ignoreNextChange = true
+    markdownContent = note.content
+    dirty = false
+    staleNote = null
+    saveStatus = 'idle'
+    transitionError = ''
   }
 
   function showSaveError(error) {
@@ -206,7 +247,7 @@
   }
 
   async function persistCurrentNote() {
-    if (!activeNote) return
+    if (!activeNote || staleNote) return
     if (savePromise) {
       await savePromise
       if (!mounted || !activeNote || !dirty) return
@@ -218,14 +259,20 @@
       while (mounted && activeNote?.id === operationNoteId && dirty) {
         const noteId = activeNote.id
         const content = markdownContent
+        const revision = noteRevision
         clearSaveTimer()
         clearStatusTimer()
         saveStatus = 'saving'
         transitionError = ''
 
         try {
-          await saveNote(noteId, content)
+          const saved = readSaveResponse(await saveNote(noteId, content, revision))
+          if (mounted && activeNote?.id === noteId) noteRevision = saved.revision
         } catch (error) {
+          if (error?.status === 409 && error?.code === 'note_changed') {
+            await stageStaleNote(noteId, content)
+            return
+          }
           showSaveError(error)
           throw error
         }
@@ -258,6 +305,102 @@
     clearSaveTimer()
     if (savePromise) await savePromise
     if (dirty) await persistCurrentNote()
+  }
+
+  async function fetchDiskNote(noteId) {
+    try {
+      return readLoadedNote(await getNote(noteId))
+    } catch (error) {
+      if (error?.status === 404) return null
+      throw error
+    }
+  }
+
+  async function stageStaleNote(noteId, mine) {
+    clearSaveTimer()
+    const disk = await fetchDiskNote(noteId)
+    if (!mounted || activeNote?.id !== noteId) return
+    staleNote = makeStaleNote({ noteId, mine, disk })
+    dirty = true
+    saveStatus = 'idle'
+    transitionError = ''
+  }
+
+  async function loadStaleDisk() {
+    const stale = staleNote
+    if (!stale || activeNote?.id !== stale.noteId) return
+    if (stale.diskMissing) {
+      resetEditorState()
+      return
+    }
+    applyLoadedNote(activeNote, { content: stale.diskContent, revision: stale.diskRevision })
+  }
+
+  async function saveStaleNote({ content, revision }) {
+    const stale = staleNote
+    if (!stale || activeNote?.id !== stale.noteId || stale.diskMissing) return
+    saveStatus = 'saving'
+    try {
+      const saved = readSaveResponse(await saveNote(stale.noteId, content, revision))
+      if (!mounted || activeNote?.id !== stale.noteId) return
+      noteRevision = saved.revision
+      ignoreNextChange = true
+      markdownContent = content
+      dirty = false
+      staleNote = null
+      saveStatus = 'saved'
+    } catch (error) {
+      if (error?.status === 409 && error?.code === 'note_changed') {
+        await stageStaleNote(stale.noteId, content)
+        return
+      }
+      showSaveError(error)
+      throw error
+    }
+  }
+
+  async function processChangedPaths(statuses) {
+    if (!mounted || !notesWorkspace) return
+    const baseName = config?.current_base
+    const batches = []
+
+    for (const status of statuses) {
+      if (status?.base !== baseName) continue
+      const paths = terminalChangedPaths(status)
+      if (paths.length === 0) continue
+      const bucket = `${status.repository_path}\0${status.operation_id}`
+      const processed = processedChangedPathBuckets.get(bucket)
+      const pending = paths.filter((path) => !processed?.has(changedPathKey(status, path)))
+      if (pending.length > 0) batches.push({ status, bucket, paths: pending })
+    }
+
+    if (batches.length === 0) return
+    await notesWorkspace.refreshTree?.()
+    if (!mounted || config?.current_base !== baseName) return
+
+    const activePaths = batches.flatMap((batch) => batch.paths)
+    if (activeNote && noteInChangedPaths(activeNote.id, activePaths)) {
+      if (dirty || staleNote) {
+        if (!staleNote) await stageStaleNote(activeNote.id, markdownContent)
+      } else {
+        const disk = await fetchDiskNote(activeNote.id)
+        if (disk === null) resetEditorState()
+        else if (mounted && activeNote?.id) applyLoadedNote(activeNote, disk)
+      }
+    }
+
+    if (!mounted || config?.current_base !== baseName) return
+    for (const batch of batches) {
+      let processed = processedChangedPathBuckets.get(batch.bucket)
+      if (!processed) {
+        processed = new Set()
+        processedChangedPathBuckets.set(batch.bucket, processed)
+      }
+      for (const path of batch.paths) processed.add(changedPathKey(batch.status, path))
+    }
+    while (processedChangedPathBuckets.size > 128) {
+      processedChangedPathBuckets.delete(processedChangedPathBuckets.keys().next().value)
+    }
   }
 
   async function flushEditorUploads() {
@@ -340,7 +483,7 @@
   }
 
   async function saveNow() {
-    if (!activeNote) return
+    if (!activeNote || staleNote) return
     dirty = true
     transitionError = ''
     try {
@@ -379,6 +522,12 @@
     })
   }
 
+  async function acceptGitOperation(_action, operation) {
+    if (!operation?.operation_id || !config?.current_base) return
+    acceptedGitOperation = { base: config.current_base, operationId: operation.operation_id }
+    await refreshGitStatuses()
+  }
+
   $effect(() => {
     const currentContent = markdownContent
     const currentNote = activeNote
@@ -388,7 +537,7 @@
       return
     }
 
-    if (currentNote) {
+    if (currentNote && !staleNote) {
       dirty = true
       clearSaveTimer()
       saveTimer = setTimeout(() => {
@@ -448,25 +597,36 @@
   {:else if screen === 'setup'}
     <SetupWizard {config} onComplete={finishSetup} />
   {:else if screen === 'editor'}
-    <NotesWorkspace
-      bind:this={notesWorkspace}
-      {activeNote}
-      bind:content={markdownContent}
-      {saveStatus}
-      {basePath}
-      gitBase={currentBase}
-      gitStatus={activeGitStatus}
-      gitSyncBusy={gitBusyBase === config?.current_base}
-      gitSyncError={gitActionErrors[config?.current_base] || ''}
-      {transitioning}
-      error={transitionError}
-      onSelectNote={loadNote}
-      onRenameNote={renameNode}
-      onDeleteNote={deleteNode}
-      onSave={saveNow}
-      onOpenSettings={openSettings}
-      onGitSync={runGitSync}
-    />
+    {#if conflictWorkspaceActive}
+      <GitConflictWorkspace
+        base={currentBase}
+        status={activeGitStatus}
+        bases={config?.bases ?? []}
+        busy={transitioning || gitBusyBase === config?.current_base}
+        onSwitchBase={openBase}
+        onOperationAccepted={acceptGitOperation}
+      />
+    {:else}
+      <NotesWorkspace
+        bind:this={notesWorkspace}
+        {activeNote}
+        bind:content={markdownContent}
+        {saveStatus}
+        {basePath}
+        gitBase={currentBase}
+        gitStatus={activeGitStatus}
+        gitSyncBusy={gitBusyBase === config?.current_base}
+        gitSyncError={gitActionErrors[config?.current_base] || ''}
+        {transitioning}
+        error={transitionError}
+        onSelectNote={loadNote}
+        onRenameNote={renameNode}
+        onDeleteNote={deleteNode}
+        onSave={saveNow}
+        onOpenSettings={openSettings}
+        onGitSync={runGitSync}
+      />
+    {/if}
   {:else if screen === 'settings'}
     <SettingsWorkspace
       {config}
@@ -482,3 +642,11 @@
     />
   {/if}
 </div>
+
+<StaleNoteDialog
+  stale={staleNote}
+  busy={saveStatus === 'saving'}
+  onLoadDisk={loadStaleDisk}
+  onOverwrite={saveStaleNote}
+  onManualMerge={saveStaleNote}
+/>
