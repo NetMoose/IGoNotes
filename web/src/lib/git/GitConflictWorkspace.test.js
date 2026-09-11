@@ -67,8 +67,8 @@ function workspaceProps(overrides = {}) {
     base,
     status,
     bases: [base, otherBase],
-    onBaseSwitch: vi.fn(),
-    onTerminal: vi.fn(),
+    onSwitchBase: vi.fn(),
+    onOperationAccepted: vi.fn(),
     ...overrides,
   }
 }
@@ -145,7 +145,7 @@ describe('GitConflictWorkspace', () => {
 
   it('reloads conflicts only after a stale resolution error', async () => {
     const user = userEvent.setup()
-    const staleError = Object.assign(new Error('Конфликт уже изменился'), { code: 'stale_conflict' })
+    const staleError = Object.assign(new Error('Конфликт уже изменился'), { code: 'git_conflict_stale' })
     getGitConflicts
       .mockResolvedValueOnce(conflictList([binaryConflict]))
       .mockResolvedValueOnce(conflictList([textConflict]))
@@ -207,15 +207,15 @@ describe('GitConflictWorkspace', () => {
     await waitFor(() => expect(complete).toBeEnabled())
     await user.click(complete)
     expect(completeGitConflict).toHaveBeenCalledWith('work')
-    expect(props.onTerminal).not.toHaveBeenCalled()
+    expect(props.onOperationAccepted).toHaveBeenCalledWith('complete-1')
     expect(screen.getByRole('button', { name: 'Отменить слияние' })).toBeDisabled()
     expect(screen.getByText('Ожидание завершения операции Git')).toBeVisible()
     await completedWorkspace.rerender({ ...props, status: { state: 'needs_reconnect', operation_id: 'complete-1' } })
-    expect(props.onTerminal).not.toHaveBeenCalled()
+    expect(props.onOperationAccepted).toHaveBeenCalledTimes(1)
     await completedWorkspace.rerender({ ...props, status: { state: 'ready', operation_id: 'another-operation' } })
-    expect(props.onTerminal).not.toHaveBeenCalled()
+    expect(props.onOperationAccepted).toHaveBeenCalledTimes(1)
     await completedWorkspace.rerender({ ...props, status: { state: 'ready', operation_id: 'complete-1' } })
-    await waitFor(() => expect(props.onTerminal).toHaveBeenCalledWith({ state: 'ready', operation_id: 'complete-1' }))
+    expect(screen.getByText('Ожидание завершения операции Git')).toBeVisible()
 
     completedWorkspace.unmount()
 
@@ -226,24 +226,24 @@ describe('GitConflictWorkspace', () => {
     await user.click(await screen.findByRole('button', { name: 'Отменить слияние' }))
     await user.click(screen.getByRole('button', { name: 'Подтвердить отмену' }))
     expect(abortGitConflict).toHaveBeenCalledWith('work')
-    expect(abortProps.onTerminal).not.toHaveBeenCalled()
+    expect(abortProps.onOperationAccepted).toHaveBeenCalledWith('abort-1')
     expect(abortWorkspace.container).toHaveTextContent('Ожидание завершения операции Git')
     await abortWorkspace.rerender({ ...abortProps, status: { state: 'ready', operation_id: 'abort-1' } })
-    await waitFor(() => expect(abortProps.onTerminal).toHaveBeenCalledWith({ state: 'ready', operation_id: 'abort-1' }))
+    expect(abortWorkspace.container).toHaveTextContent('Ожидание завершения операции Git')
   })
 
   it('retains an explicit base-switch target and error after parent rejection without invoking a conflict mutation', async () => {
     const user = userEvent.setup()
-    const props = workspaceProps({ onBaseSwitch: vi.fn().mockRejectedValue(new Error('База недоступна')) })
+    const props = workspaceProps({ onSwitchBase: vi.fn().mockRejectedValue(new Error('База недоступна')) })
     getGitConflicts.mockResolvedValue(conflictList())
     render(GitConflictWorkspace, props)
 
     const target = await screen.findByRole('combobox', { name: 'База для переключения' })
     expect(screen.queryByRole('option', { name: 'work' })).not.toBeInTheDocument()
     await user.selectOptions(target, 'personal')
-    expect(props.onBaseSwitch).not.toHaveBeenCalled()
+    expect(props.onSwitchBase).not.toHaveBeenCalled()
     await user.click(screen.getByRole('button', { name: 'Открыть базу' }))
-    expect(props.onBaseSwitch).toHaveBeenCalledWith('personal')
+    expect(props.onSwitchBase).toHaveBeenCalledWith('personal')
     expect(await screen.findByRole('alert')).toHaveTextContent('База недоступна')
     expect(target).toHaveValue('personal')
     expect(resolveGitConflict).not.toHaveBeenCalled()

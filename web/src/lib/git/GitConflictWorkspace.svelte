@@ -12,15 +12,13 @@
   import DeleteConflictResolver from './DeleteConflictResolver.svelte'
   import TextConflictResolver from './TextConflictResolver.svelte'
 
-  const terminalStates = new Set(['ready', 'error', 'paused'])
-
   let {
     base,
     status,
     bases = [],
     busy = false,
-    onBaseSwitch = () => {},
-    onTerminal = () => {},
+    onSwitchBase = () => {},
+    onOperationAccepted = () => {},
   } = $props()
 
   let workspace = $state(null)
@@ -29,8 +27,6 @@
   let loading = $state(false)
   let actionPending = $state(false)
   let terminalPending = $state(false)
-  let terminalOperationId = $state('')
-  let terminalNotified = $state(false)
   let abortDialogOpen = $state(false)
   let switchTarget = $state('')
   let loadedKey = $state('')
@@ -127,20 +123,6 @@
     switchTarget = ''
   })
 
-  $effect(() => {
-    if (
-      !terminalPending
-      || terminalNotified
-      || !terminalStates.has(status?.state)
-      || status?.operation_id !== terminalOperationId
-    ) return
-
-    terminalNotified = true
-    Promise.resolve(onTerminal(status)).catch((cause) => {
-      error = messageFor(cause, 'Не удалось передать состояние операции')
-    })
-  })
-
   async function selectConflict(id, focus = false) {
     if (controlsDisabled || id === selectedId) return
     selectedId = id
@@ -168,7 +150,7 @@
       const result = await resolveGitConflict(resolution)
       resolved = applyWorkspace(result.remaining)
     } catch (cause) {
-      if (cause?.code !== 'stale_conflict') throw cause
+      if (cause?.code !== 'git_conflict_stale') throw cause
       await loadConflicts()
       resolved = true
     } finally {
@@ -182,7 +164,7 @@
     actionPending = true
     error = ''
     try {
-      await onBaseSwitch(switchTarget)
+      await onSwitchBase(switchTarget)
     } catch (cause) {
       error = messageFor(cause, 'Не удалось переключить базу')
     } finally {
@@ -211,10 +193,13 @@
     }
 
     terminalPending = true
-    terminalOperationId = operation.operation_id
-    terminalNotified = false
     actionPending = false
     abortDialogOpen = false
+    try {
+      await onOperationAccepted(operation.operation_id)
+    } catch (cause) {
+      error = messageFor(cause, 'Не удалось передать состояние операции')
+    }
   }
 
   function resolverKind(conflict) {
