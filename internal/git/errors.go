@@ -39,6 +39,7 @@ const (
 	CodeMergeNotInProgress     ErrorCode = "git_merge_not_in_progress"
 	CodeRecoveryRequired       ErrorCode = "git_recovery_required"
 	CodePaused                 ErrorCode = "git_paused"
+	CodeNotPaused              ErrorCode = "git_not_paused"
 )
 
 var (
@@ -49,6 +50,7 @@ var (
 	ErrMergeNotInProgress     = &SafeError{Code: CodeMergeNotInProgress, Message: "Git merge is not in progress"}
 	ErrRecoveryRequired       = &SafeError{Code: CodeRecoveryRequired, Message: "Git repository requires recovery"}
 	ErrGitPaused              = &SafeError{Code: CodePaused, Message: "Git synchronization is paused"}
+	ErrGitNotPaused           = &SafeError{Code: CodeNotPaused, Message: "Git synchronization is not paused"}
 	ErrConflictStateAmbiguous = ErrRecoveryRequired
 )
 

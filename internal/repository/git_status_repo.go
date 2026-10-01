@@ -20,20 +20,9 @@ func NewGitStatusRepository(db *sql.DB) *GitStatusRepository {
 }
 
 func (r *GitStatusRepository) Upsert(ctx context.Context, status model.GitStatus) error {
-	changedPaths := status.ChangedPaths
-	if changedPaths == nil {
-		changedPaths = []string{}
-	}
-	changedPathsJSON, err := json.Marshal(changedPaths)
+	encoded, err := encodeGitStatus(status)
 	if err != nil {
 		return err
-	}
-
-	var errorCode, errorMessage, errorField string
-	if status.Error != nil {
-		errorCode = status.Error.Code
-		errorMessage = status.Error.Message
-		errorField = status.Error.Field
 	}
 
 	_, err = r.db.ExecContext(ctx, `
@@ -70,14 +59,39 @@ func (r *GitStatusRepository) Upsert(ctx context.Context, status model.GitStatus
 		status.ConsecutiveFailures,
 		unixMilliseconds(status.LastAttempt),
 		unixMilliseconds(status.LastSuccess),
-		string(changedPathsJSON),
+		encoded.changedPathsJSON,
 		status.RemoteOID,
-		errorCode,
-		errorMessage,
-		errorField,
+		encoded.errorCode,
+		encoded.errorMessage,
+		encoded.errorField,
 		r.now().UnixMilli(),
 	)
 	return err
+}
+
+type encodedGitStatus struct {
+	changedPathsJSON string
+	errorCode        string
+	errorMessage     string
+	errorField       string
+}
+
+func encodeGitStatus(status model.GitStatus) (encodedGitStatus, error) {
+	changedPaths := status.ChangedPaths
+	if changedPaths == nil {
+		changedPaths = []string{}
+	}
+	changedPathsJSON, err := json.Marshal(changedPaths)
+	if err != nil {
+		return encodedGitStatus{}, err
+	}
+	encoded := encodedGitStatus{changedPathsJSON: string(changedPathsJSON)}
+	if status.Error != nil {
+		encoded.errorCode = status.Error.Code
+		encoded.errorMessage = status.Error.Message
+		encoded.errorField = status.Error.Field
+	}
+	return encoded, nil
 }
 
 func (r *GitStatusRepository) Get(ctx context.Context, repositoryPath string) (model.GitStatus, bool, error) {

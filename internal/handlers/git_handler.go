@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 
 	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
@@ -33,6 +34,7 @@ type GitOperationConfigurer interface {
 type GitOperations interface {
 	QueueInitialize(context.Context, gitcmd.InitializeRequest) (gitcmd.Operation, bool, error)
 	QueueSync(context.Context, gitcmd.SyncRequest) (gitcmd.Operation, bool, error)
+	Resume(context.Context, string) (gitcmd.Operation, bool, error)
 }
 
 type GitHandler struct {
@@ -137,7 +139,8 @@ func (h *GitHandler) Configure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.Status = statuses.Statuses[0]
-	response.Operation = operationResponse(operation, deduplicated)
+	operationResult := gitOperationResponse(operation, deduplicated)
+	response.Operation = &operationResult
 	writeJSON(w, http.StatusAccepted, response)
 }
 
@@ -189,11 +192,38 @@ func (h *GitHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, operationResponse(operation, deduplicated))
+	writeJSON(w, http.StatusAccepted, gitOperationResponse(operation, deduplicated))
+}
+
+func (h *GitHandler) Resume(w http.ResponseWriter, r *http.Request) {
+	base, ok := readBaseQuery(w, r, true)
+	if !ok {
+		return
+	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		writeMissingField(w, "base")
+		return
+	}
+	if h.operations == nil {
+		writeServiceError(w, errGitOperationsNotInitialized)
+		return
+	}
+	operation, deduplicated, err := h.operations.Resume(r.Context(), base)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, gitOperationResponse(operation, deduplicated))
 }
 
 func operationResponse(operation gitcmd.Operation, deduplicated bool) *model.GitOperationResponse {
-	return &model.GitOperationResponse{
+	response := gitOperationResponse(operation, deduplicated)
+	return &response
+}
+
+func gitOperationResponse(operation gitcmd.Operation, deduplicated bool) model.GitOperationResponse {
+	return model.GitOperationResponse{
 		OperationID:  operation.ID,
 		Status:       string(operation.State),
 		Deduplicated: deduplicated,

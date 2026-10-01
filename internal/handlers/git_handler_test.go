@@ -7,15 +7,121 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
+	"IGoNotes/internal/repository"
 	"IGoNotes/internal/service"
 )
+
+type resumeRESTSettings struct{ config model.Config }
+
+func (s resumeRESTSettings) ReadConfigSnapshot(read func(model.Config) error) error {
+	return read(s.config)
+}
+
+func TestGitResumeRESTLifecycle(t *testing.T) {
+	ctx := context.Background()
+	f := newGitConflictRESTFixture(t)
+	if err := f.manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	oid := f.git(t, f.local, "rev-parse", "HEAD")
+	f.git(t, f.local, "update-ref", "refs/igonotes/remotes/main", oid)
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	op := gitcmd.Operation{ID: strings.Repeat("a", 32), BaseName: f.base.Name, RepoPath: f.base.Path, ConfigFingerprint: f.base.Fingerprint, RemoteFingerprint: f.base.RemoteFingerprint, Branch: "main", Kind: gitcmd.OperationInitialize, State: gitcmd.OperationQueued, Stage: gitcmd.StageQueued, CreatedAt: now, UpdatedAt: now}
+	if err := f.operations.CreateQueued(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	op.State, op.Stage, op.RemoteOID, op.PushOID = gitcmd.OperationSucceeded, gitcmd.StageCompleted, oid, oid
+	if err := f.operations.Finish(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	paused := model.GitStatus{Base: "work", RepositoryPath: f.local, State: model.GitStatePaused, OperationID: op.ID, Stage: "completed", ConsecutiveFailures: 5, LastAttempt: &now, LastSuccess: &now, ChangedPaths: []string{}, RemoteOID: oid, Error: &model.APIError{Code: "remote_unreachable", Message: "Git remote is unreachable"}}
+	if err := f.statuses.Upsert(ctx, paused); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.notes.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	f.db, err = repository.InitDB(filepath.Join(filepath.Dir(f.remote), "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db.SetMaxOpenConns(1)
+	f.statuses, f.operations = repository.NewGitStatusRepository(f.db), repository.NewGitOperationRepository(f.db)
+	f.coordinator = service.NewBaseOperationCoordinator()
+	f.notes = service.NewNoteService(repository.NewNoteRepository(f.db), f.local, f.coordinator)
+	config := model.Config{Bases: []model.Base{{Name: "work", Path: f.local, GitURL: f.remote, GitBranch: "main"}}, CurrentBase: "work"}
+	runner := gitcmd.NewCommandRunner()
+	client := gitcmd.NewClient(runner)
+	prober := service.NewGitProbeService(gitConflictRESTSettings{config}, client)
+	f.manager = service.NewGitManager(gitcmd.NewService(runner, client), f.statuses, f.operations, prober, func(name string) (gitcmd.ConfiguredBase, bool, error) { return f.base, true, nil }, f.notes, f.coordinator)
+	if err := f.manager.RecoverLocal(ctx, []gitcmd.ConfiguredBase{f.base}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewGitHandlerWithOperations(prober, concurrentGitOperationConfigurer{snapshots: map[string]gitcmd.ConfiguredBase{"work": f.base}}, service.NewGitStatusService(resumeRESTSettings{config}, f.statuses), f.manager)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/git/status", handler.Status)
+	mux.HandleFunc("POST /api/git/sync", handler.Sync)
+	mux.HandleFunc("POST /api/git/resume", handler.Resume)
+	request := func(method, path string) *httptest.ResponseRecorder {
+		r := httptest.NewRecorder()
+		mux.ServeHTTP(r, httptest.NewRequest(method, path, nil))
+		return r
+	}
+	var statuses model.GitStatusResponse
+	decodeHandlerJSON(t, request(http.MethodGet, "/api/git/status?base=work"), http.StatusOK, &statuses)
+	if len(statuses.Statuses) != 1 || !reflect.DeepEqual(statuses.Statuses[0], paused) {
+		t.Fatalf("reopened HTTP pause=%+v", statuses)
+	}
+	assertAPIErrorResponse(t, request(http.MethodPost, "/api/git/sync?base=work"), http.StatusConflict, model.APIError{Code: "git_paused", Message: "Git synchronization is paused"})
+	var accepted, duplicate model.GitOperationResponse
+	decodeHandlerJSON(t, request(http.MethodPost, "/api/git/resume?base=work"), http.StatusAccepted, &accepted)
+	decodeHandlerJSON(t, request(http.MethodPost, "/api/git/resume?base=work"), http.StatusAccepted, &duplicate)
+	if accepted.OperationID == "" || accepted.Status != "queued" || accepted.Deduplicated || !duplicate.Deduplicated || duplicate.OperationID != accepted.OperationID {
+		t.Fatalf("resume=%+v duplicate=%+v", accepted, duplicate)
+	}
+	statuses = model.GitStatusResponse{}
+	decodeHandlerJSON(t, request(http.MethodGet, "/api/git/status?base=work"), http.StatusOK, &statuses)
+	if got := statuses.Statuses[0]; got.State != model.GitStateSyncing || got.ConsecutiveFailures != 0 || got.OperationID != accepted.OperationID || got.Error != nil {
+		t.Fatalf("admitted resume=%+v", got)
+	}
+	if err := f.manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		status, _, err := f.statuses.Get(ctx, f.local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.State == model.GitStateReady {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("resume did not complete: %+v", status)
+		}
+		runtime.Gosched()
+	}
+	statuses = model.GitStatusResponse{}
+	decodeHandlerJSON(t, request(http.MethodGet, "/api/git/status?base=work"), http.StatusOK, &statuses)
+	if got := statuses.Statuses[0]; got.State != model.GitStateReady || got.ConsecutiveFailures != 0 || got.Error != nil || got.LastSuccess == nil {
+		t.Fatalf("successful resume=%+v", got)
+	}
+	assertAPIErrorResponse(t, request(http.MethodPost, "/api/git/resume?base=work"), http.StatusConflict, model.APIError{Code: "git_not_paused", Message: "Git synchronization is not paused"})
+}
 
 type gitProberFake struct {
 	calls    int
@@ -114,6 +220,76 @@ type gitOperationsFake struct {
 	syncErr             error
 	syncCalls           int
 	syncRequest         gitcmd.SyncRequest
+	resumeOperation     gitcmd.Operation
+	resumeDuplicate     bool
+	resumeErr           error
+	resumeCalls         int
+	resumeContext       context.Context
+	resumeBase          string
+}
+
+func (f *gitOperationsFake) Resume(ctx context.Context, base string) (gitcmd.Operation, bool, error) {
+	f.resumeCalls++
+	f.resumeContext = ctx
+	f.resumeBase = base
+	return f.resumeOperation, f.resumeDuplicate, f.resumeErr
+}
+
+func TestGitHandlerResumeReturnsExactAcceptedOperationAndForwardsTrimmedBase(t *testing.T) {
+	for _, duplicate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deduplicated=%v", duplicate), func(t *testing.T) {
+			operations := &gitOperationsFake{
+				resumeOperation: gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued},
+				resumeDuplicate: duplicate,
+			}
+			handler := NewGitHandlerWithOperations(&gitProberFake{}, &gitOperationConfigurerFake{}, &gitStatusReaderFake{}, operations)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			request := httptest.NewRequest(http.MethodPost, "/api/git/resume?base=%20work%20", nil).WithContext(ctx)
+			recorder := httptest.NewRecorder()
+
+			handler.Resume(recorder, request)
+
+			var got map[string]any
+			decodeHandlerJSON(t, recorder, http.StatusAccepted, &got)
+			want := map[string]any{"operation_id": operations.resumeOperation.ID, "status": "queued", "deduplicated": duplicate}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("response = %#v, want %#v", got, want)
+			}
+			if operations.resumeCalls != 1 || operations.resumeBase != "work" || operations.resumeContext != ctx {
+				t.Fatalf("Resume calls/base/context = %d/%q/%v", operations.resumeCalls, operations.resumeBase, operations.resumeContext)
+			}
+			if operations.syncCalls != 0 || operations.initializeCalls != 0 {
+				t.Fatal("resume must not queue through sync or initialize")
+			}
+		})
+	}
+}
+
+func TestGitHandlerResumeValidatesBaseBeforeCallingOperations(t *testing.T) {
+	for _, query := range []string{"", "?base=", "?base=%20%09%20"} {
+		t.Run(query, func(t *testing.T) {
+			operations := &gitOperationsFake{}
+			handler := NewGitHandlerWithOperations(&gitProberFake{}, &gitOperationConfigurerFake{}, &gitStatusReaderFake{}, operations)
+			recorder := httptest.NewRecorder()
+			handler.Resume(recorder, httptest.NewRequest(http.MethodPost, "/api/git/resume"+query, nil))
+			assertMissingField(t, recorder, "base")
+			if operations.resumeCalls != 0 {
+				t.Fatalf("Resume calls = %d, want 0", operations.resumeCalls)
+			}
+		})
+	}
+}
+
+func TestGitHandlerResumeDoesNotLeakErrorDetails(t *testing.T) {
+	operations := &gitOperationsFake{resumeErr: fmt.Errorf("resume https://user:secret@example.test/private.git: %w", errors.Join(
+		&gitcmd.SafeError{Code: gitcmd.CodeNotPaused, Message: "private diagnostic", Field: "private_field"},
+		errors.New("private cause"),
+	))}
+	handler := NewGitHandlerWithOperations(&gitProberFake{}, &gitOperationConfigurerFake{}, &gitStatusReaderFake{}, operations)
+	recorder := httptest.NewRecorder()
+	handler.Resume(recorder, httptest.NewRequest(http.MethodPost, "/api/git/resume?base=work", nil))
+	assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "git_not_paused", Message: "Git synchronization is not paused"})
 }
 
 type concurrentGitOperationConfigurer struct {
@@ -148,6 +324,10 @@ type concurrentGitOperations struct {
 
 func (f *concurrentGitOperations) QueueInitialize(context.Context, gitcmd.InitializeRequest) (gitcmd.Operation, bool, error) {
 	return gitcmd.Operation{}, false, errors.New("initialize is not expected")
+}
+
+func (f *concurrentGitOperations) Resume(context.Context, string) (gitcmd.Operation, bool, error) {
+	return gitcmd.Operation{}, false, errors.New("resume is not expected")
 }
 
 func (f *concurrentGitOperations) QueueSync(_ context.Context, request gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {

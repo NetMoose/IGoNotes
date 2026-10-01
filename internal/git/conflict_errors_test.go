@@ -15,6 +15,7 @@ func TestGitConflictSafeErrors(t *testing.T) {
 		{ErrMergeNotInProgress, CodeMergeNotInProgress, "Git merge is not in progress"},
 		{ErrRecoveryRequired, CodeRecoveryRequired, "Git repository requires recovery"},
 		{ErrGitPaused, CodePaused, "Git synchronization is paused"},
+		{ErrGitNotPaused, CodeNotPaused, "Git synchronization is not paused"},
 	}
 	for _, test := range tests {
 		if test.err.Code != test.code || test.err.Message != test.text || test.err.Field != "" {

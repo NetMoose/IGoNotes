@@ -4378,6 +4378,7 @@ func TestSettingsServiceGitRestoreFailureDegradesWithoutLeakingDetails(t *testin
 	if !errors.Is(err, ErrRollbackFailed) || !errors.Is(err, store.saveErr) || !errors.Is(err, restoreErr) {
 		t.Fatalf("ConfigureGit() error = %v, want rollback, operation, and restore errors", err)
 	}
+	assertNoGitConfigChange(t, service)
 	if strings.Contains(logs.String(), "private") || strings.Contains(logs.String(), "secret") || logs.String() == "" {
 		t.Fatalf("rollback log leaked details or was empty: %q", logs.String())
 	}
@@ -4391,6 +4392,381 @@ func TestSettingsServiceGitRestoreFailureDegradesWithoutLeakingDetails(t *testin
 	}
 	if validator.calls != validatorCalls || len(statuses.getCalls)+len(statuses.upsertCalls)+len(statuses.deleteCalls) != statusCalls || store.saveCalls != saveCalls || runtime.persistCalls != persistCalls || len(runtime.transactionCalls) != transactionCalls {
 		t.Fatal("degraded mutation called dependencies")
+	}
+}
+
+func TestSettingsServiceGitSnapshotsOrderedCanonicalAndDetached(t *testing.T) {
+	activePath, otherPath := t.TempDir(), t.TempDir()
+	config := configuredGitTestConfig(activePath, otherPath)
+	config.Bases[0].Name = "z-first"
+	config.CurrentBase = "z-first"
+	config.Bases[1].Name = "a-second"
+	setConfiguredGit(&config.Bases[1])
+	config.Bases[1].AutoSync = false
+	alias := filepath.Join(t.TempDir(), "alias")
+	createSymlinkOrSkip(t, otherPath, alias)
+	config.Bases[1].Path = alias
+	config.Bases = append(config.Bases, model.Base{Name: "legacy", Path: "missing", GitURL: "legacy.git"}, model.Base{Name: "plain", Path: "missing"})
+	service, _, _, _, _ := newGitSettingsServiceForConfig(t, config, activePath)
+	snapshots, err := service.GitSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []gitcmd.ConfiguredBase{configuredBaseAtPath(config.Bases[0], activePath), configuredBaseAtPath(config.Bases[1], otherPath)}
+	if !reflect.DeepEqual(snapshots, want) {
+		t.Fatalf("snapshots = %#v, want %#v", snapshots, want)
+	}
+	for index, snapshot := range snapshots {
+		single, _, err := service.GitSnapshot(snapshot.Name)
+		if err != nil || single != snapshot {
+			t.Fatalf("single snapshot %d = %#v, %v, want %#v", index, single, err, snapshot)
+		}
+	}
+	snapshots[0].Name = "mutated"
+	snapshots[1].URL = "mutated"
+	again, err := service.GitSnapshots()
+	if err != nil || !reflect.DeepEqual(again, want) {
+		t.Fatalf("detached snapshots = %#v, %v", again, err)
+	}
+	service.mu.Lock()
+	service.config.Bases[1].Path = filepath.Join(t.TempDir(), "missing")
+	service.mu.Unlock()
+	if result, err := service.GitSnapshots(); !errors.Is(err, ErrInvalidPath) || result != nil {
+		t.Fatalf("invalid configured path = %#v, %v", result, err)
+	}
+}
+
+func TestSettingsServiceGitConfigChangesBothConstructorsAndCoalescing(t *testing.T) {
+	for _, withGit := range []bool{false, true} {
+		t.Run(strconv.FormatBool(withGit), func(t *testing.T) {
+			path := t.TempDir()
+			config := configuredGitTestConfig(path, t.TempDir())
+			store := &fakeConfigStore{config: ptrConfig(config)}
+			runtime := &fakeBaseRuntime{path: path}
+			var service *SettingsService
+			var err error
+			if withGit {
+				service, err = NewSettingsServiceWithGit(store, runtime, NewBaseOperationCoordinator(), "", nil, nil, nil)
+			} else {
+				service, err = NewSettingsService(store, runtime, NewBaseOperationCoordinator(), "", nil)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			changes := service.GitConfigChanges()
+			if changes == nil || cap(changes) != 1 || changes != service.GitConfigChanges() {
+				t.Fatal("expected stable capacity-one changes channel")
+			}
+			assertNoGitConfigChange(t, service)
+			for range 3 {
+				if _, err := service.SwitchBase("active"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-changes:
+			default:
+				t.Fatal("missing coalesced notification")
+			}
+			assertNoGitConfigChange(t, service)
+		})
+	}
+}
+
+func assertNoGitConfigChange(t *testing.T, service *SettingsService) {
+	t.Helper()
+	select {
+	case <-service.GitConfigChanges():
+		t.Fatal("unexpected Git config change")
+	default:
+	}
+}
+
+func TestSettingsServiceGitAutosyncReconciliationAndPublication(t *testing.T) {
+	operations := []string{"configure-url", "configure-branch", "configure-auto", "configure-interval", "configure-template", "initialize", "rename", "move", "disable", "forget", "replace-rename", "replace-move", "replace-forget", "add", "switch"}
+	for _, operation := range operations {
+		t.Run(operation, func(t *testing.T) {
+			activePath, otherPath, destination := t.TempDir(), t.TempDir(), t.TempDir()
+			config := configuredGitTestConfig(activePath, otherPath)
+			setConfiguredGit(&config.Bases[1])
+			service, _, _, _, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+			original := autosyncStatusForTest("other", otherPath)
+			statuses.statuses[otherPath] = cloneGitStatusForTest(original)
+			for _, path := range []string{otherPath, destination} {
+				if err := os.Mkdir(filepath.Join(path, ".git"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "note.md"), []byte("keep"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := runAutosyncSettingsOperation(service, operation, destination); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-service.GitConfigChanges():
+			default:
+				t.Fatal("successful publication did not notify")
+			}
+			assertNoGitConfigChange(t, service)
+			want := map[string]model.GitStatus{otherPath: original}
+			switch operation {
+			case "configure-url", "configure-branch", "configure-auto", "configure-interval", "configure-template", "initialize":
+				status := needsReconnectGitStatus("other", otherPath)
+				if operation != "configure-url" && operation != "configure-branch" {
+					status.RemoteOID = original.RemoteOID
+				}
+				want[otherPath] = status
+			case "rename", "replace-rename":
+				status := cloneGitStatusForTest(original)
+				status.Base = "renamed"
+				want[otherPath] = status
+			case "move", "replace-move":
+				delete(want, otherPath)
+				want[destination] = needsReconnectGitStatus("other", destination)
+				base := service.GetConfig().Bases[1]
+				if !base.AutoSync || base.AutoSyncIntervalMinutes != 15 || base.GitCommitMessageTemplate != "sync" {
+					t.Fatalf("move lost autosync preferences: %#v", base)
+				}
+			case "disable", "forget", "replace-forget":
+				delete(want, otherPath)
+			}
+			if !reflect.DeepEqual(statuses.statuses, want) {
+				t.Fatalf("statuses = %#v, want %#v", statuses.statuses, want)
+			}
+			for _, path := range []string{otherPath, destination} {
+				assertDirectory(t, filepath.Join(path, ".git"))
+				contents, err := os.ReadFile(filepath.Join(path, "note.md"))
+				if err != nil || string(contents) != "keep" {
+					t.Fatalf("note changed: %q, %v", contents, err)
+				}
+			}
+		})
+	}
+}
+
+func autosyncStatusForTest(name, path string) model.GitStatus {
+	attempt, success := time.Unix(100, 0).UTC(), time.Unix(50, 0).UTC()
+	return model.GitStatus{
+		Base: name, RepositoryPath: path, State: model.GitStatePaused,
+		ConsecutiveFailures: 3, LastAttempt: &attempt, LastSuccess: &success,
+		RemoteOID: "trusted-oid", ChangedPaths: []string{"one.md", "two.md"},
+		Error: &model.APIError{Code: "failed", Message: "previous failure"},
+		Ahead: 2, Behind: 1, OperationID: "previous", Stage: "fetch",
+	}
+}
+
+func runAutosyncSettingsOperation(service *SettingsService, operation, destination string) error {
+	config := service.GetConfig()
+	base := config.Bases[1]
+	request := model.GitConfigRequest{
+		GitURL: base.GitURL, GitBranch: base.GitBranch, AutoSync: base.AutoSync,
+		AutoSyncIntervalMinutes: base.AutoSyncIntervalMinutes, GitCommitMessageTemplate: base.GitCommitMessageTemplate,
+	}
+	var err error
+	switch operation {
+	case "configure-url", "configure-branch", "configure-auto", "configure-interval", "configure-template", "initialize":
+		switch operation {
+		case "configure-url":
+			request.GitURL = "new.git"
+		case "configure-branch":
+			request.GitBranch = "next"
+		case "configure-auto":
+			request.AutoSync = false
+		case "configure-interval":
+			request.AutoSyncIntervalMinutes = 30
+		case "configure-template":
+			request.GitCommitMessageTemplate = "new message"
+		}
+		if operation == "initialize" {
+			_, _, err = service.ConfigureGitForInitialize(context.Background(), "other", request)
+		} else {
+			_, err = service.ConfigureGit(context.Background(), "other", request)
+		}
+	case "rename":
+		_, err = service.UpdateBase("other", model.BaseUpdateRequest{Name: "renamed", Path: base.Path})
+	case "move":
+		_, err = service.UpdateBase("other", model.BaseUpdateRequest{Name: "other", Path: destination})
+	case "disable":
+		_, err = service.DisableGit(context.Background(), "other")
+	case "forget":
+		_, err = service.ForgetBase("other")
+	case "replace-rename", "replace-move", "replace-forget":
+		switch operation {
+		case "replace-rename":
+			config.Bases[1].Name = "renamed"
+		case "replace-move":
+			config.Bases[1].Path = destination
+		case "replace-forget":
+			config.Bases = config.Bases[:1]
+		}
+		_, err = service.ReplaceConfig(config)
+	case "add":
+		_, err = service.AddBase(model.BaseMutationRequest{Mode: "connect", Name: "added", Path: destination})
+	case "switch":
+		_, err = service.SwitchBase("other")
+	default:
+		panic("unknown operation: " + operation)
+	}
+	return err
+}
+
+func TestSettingsServiceGitAutosyncFailedPublicationRestoresExactStatusWithoutEvent(t *testing.T) {
+	for _, operation := range []string{"configure-auto", "initialize", "rename", "move", "disable", "forget", "replace-rename", "replace-move", "replace-forget", "add", "switch"} {
+		for _, failure := range []string{"save", "runtime", "status", "rollback"} {
+			if failure == "runtime" && operation != "switch" || failure == "rollback" && operation != "switch" || failure == "status" && (operation == "add" || operation == "switch") {
+				continue
+			}
+			t.Run(operation+"/"+failure, func(t *testing.T) {
+				activePath, otherPath, destination := t.TempDir(), t.TempDir(), t.TempDir()
+				config := configuredGitTestConfig(activePath, otherPath)
+				setConfiguredGit(&config.Bases[1])
+				service, store, runtime, _, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+				before := map[string]model.GitStatus{
+					otherPath:   autosyncStatusForTest("other", otherPath),
+					destination: autosyncStatusForTest("stale", destination),
+				}
+				statuses.statuses = cloneGitStatusesForTest(before)
+				injected := errors.New("injected failure")
+				switch failure {
+				case "save":
+					store.saveErr = injected
+				case "runtime":
+					runtime.switchErr = injected
+				case "status":
+					if operation == "disable" || operation == "forget" || operation == "replace-forget" {
+						statuses.deleteErrs = []error{injected}
+					} else {
+						statuses.upsertErrs = []error{injected}
+					}
+				case "rollback":
+					store.saveErr = injected
+					runtime.switchErrs = []error{nil, errors.New("rollback failed")}
+				}
+				if err := runAutosyncSettingsOperation(service, operation, destination); !errors.Is(err, injected) {
+					t.Fatalf("error = %v, want injected failure", err)
+				}
+				assertNoGitConfigChange(t, service)
+				if !reflect.DeepEqual(service.GetConfig(), config) || !reflect.DeepEqual(*store.config, config) || runtime.path != activePath {
+					t.Fatal("failed publication changed config/runtime")
+				}
+				if !reflect.DeepEqual(statuses.statuses, before) {
+					t.Fatalf("compensation = %#v, want %#v", statuses.statuses, before)
+				}
+			})
+		}
+	}
+}
+
+func TestSettingsServiceGitConfigChangesSetupAndValidation(t *testing.T) {
+	service, store, _, _ := newIncompleteSettingsService(t)
+	assertNoGitConfigChange(t, service)
+	if _, err := service.CompleteSetup(model.BaseMutationRequest{}); err == nil {
+		t.Fatal("invalid setup accepted")
+	}
+	assertNoGitConfigChange(t, service)
+	request := model.BaseMutationRequest{Mode: "connect", Name: "new", Path: t.TempDir()}
+	store.saveErr = errors.New("save failed")
+	if _, err := service.CompleteSetup(request); err == nil {
+		t.Fatal("failed setup accepted")
+	}
+	assertNoGitConfigChange(t, service)
+	store.saveErr = nil
+	if _, err := service.CompleteSetup(request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-service.GitConfigChanges():
+	default:
+		t.Fatal("setup did not notify")
+	}
+	assertNoGitConfigChange(t, service)
+	gitService, _, _, validator, _, _ := newGitSettingsService(t)
+	validator.err = errors.New("validation failed")
+	if _, err := gitService.ConfigureGit(context.Background(), "work", model.GitConfigRequest{}); !errors.Is(err, validator.err) {
+		t.Fatal(err)
+	}
+	assertNoGitConfigChange(t, gitService)
+}
+
+func TestSettingsServiceGitConfigChangesWaitForPublication(t *testing.T) {
+	for _, saveFails := range []bool{false, true} {
+		t.Run(strconv.FormatBool(saveFails), func(t *testing.T) {
+			activePath, otherPath := t.TempDir(), t.TempDir()
+			config := configuredGitTestConfig(activePath, otherPath)
+			service, store, _, _, _ := newGitSettingsServiceForConfig(t, config, activePath)
+			release := make(chan struct{})
+			store.saveStarted = make(chan struct{})
+			store.saveRelease = release
+			if saveFails {
+				store.saveErr = errors.New("save failed")
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := service.UpdateBase("active", model.BaseUpdateRequest{Name: "published", Path: activePath})
+				done <- err
+			}()
+			<-store.saveStarted
+			assertNoGitConfigChange(t, service)
+			close(release)
+			err := <-done
+			if saveFails {
+				if !errors.Is(err, store.saveErr) {
+					t.Fatal(err)
+				}
+				assertNoGitConfigChange(t, service)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-service.GitConfigChanges():
+			default:
+				t.Fatal("missing publication event")
+			}
+			snapshots, err := service.GitSnapshots()
+			if err != nil || len(snapshots) != 1 || snapshots[0].Name != "published" {
+				t.Fatalf("published snapshots = %#v, %v", snapshots, err)
+			}
+		})
+	}
+}
+
+func TestSettingsServiceGitAutosyncCanonicalAliasRenamePreservesStatus(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(strconv.FormatBool(replace), func(t *testing.T) {
+			activePath, otherPath := t.TempDir(), t.TempDir()
+			alias := filepath.Join(t.TempDir(), "alias")
+			createSymlinkOrSkip(t, otherPath, alias)
+			config := configuredGitTestConfig(activePath, alias)
+			setConfiguredGit(&config.Bases[1])
+			service, _, _, _, statuses := newGitSettingsServiceForConfig(t, config, activePath)
+			before := autosyncStatusForTest("other", otherPath)
+			statuses.statuses[otherPath] = cloneGitStatusForTest(before)
+			var err error
+			if replace {
+				config.Bases[1].Name = "renamed"
+				_, err = service.ReplaceConfig(config)
+			} else {
+				_, err = service.UpdateBase("other", model.BaseUpdateRequest{Name: "renamed", Path: alias})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before.Base = "renamed"
+			if !reflect.DeepEqual(statuses.statuses, map[string]model.GitStatus{otherPath: before}) {
+				t.Fatalf("alias rename lost status: %#v", statuses.statuses)
+			}
+		})
+	}
+}
+
+func TestSettingsServiceGitSnapshotsEmptyWithoutConfiguredBases(t *testing.T) {
+	service, _, _, _, _, _ := newGitSettingsService(t)
+	snapshots, err := service.GitSnapshots()
+	if err != nil || len(snapshots) != 0 {
+		t.Fatalf("unconfigured snapshots = %#v, %v", snapshots, err)
 	}
 }
 

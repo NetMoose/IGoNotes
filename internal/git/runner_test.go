@@ -790,9 +790,17 @@ func TestSafeErrorCodes(t *testing.T) {
 		CodeConfirmationRequired:   "git_confirmation_required",
 		CodeOperationInterrupted:   "operation_interrupted",
 		CodeBackupMismatch:         "backup_mismatch",
+		CodeConflictNotFound:       "git_conflict_not_found",
+		CodeConflictStale:          "git_conflict_stale",
+		CodeConflictUnresolved:     "git_conflict_unresolved",
+		CodeConflictUnsupported:    "git_conflict_unsupported",
+		CodeMergeNotInProgress:     "git_merge_not_in_progress",
+		CodeRecoveryRequired:       "git_recovery_required",
+		CodePaused:                 "git_paused",
+		CodeNotPaused:              "git_not_paused",
 	}
-	if len(want) != 21 {
-		t.Fatalf("error code coverage = %d, want 21", len(want))
+	if len(want) != 29 {
+		t.Fatalf("error code coverage = %d, want 29", len(want))
 	}
 	for code, value := range want {
 		if string(code) != value {

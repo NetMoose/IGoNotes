@@ -95,6 +95,52 @@ func TestGitRoutesRegisterManualSync(t *testing.T) {
 	}
 }
 
+func TestGitRoutesResume(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		method      string
+		origin      string
+		setup       bool
+		status      int
+		wantError   model.APIError
+		setupCalls  int
+		resumeCalls int
+	}{
+		{name: "accepted", method: http.MethodPost, setup: true, status: http.StatusAccepted, setupCalls: 1, resumeCalls: 1},
+		{name: "wrong method", method: http.MethodGet, status: http.StatusMethodNotAllowed, wantError: model.APIError{Code: "method_not_allowed", Message: "Method not allowed"}},
+		{name: "setup required", method: http.MethodPost, status: http.StatusPreconditionRequired, wantError: model.APIError{Code: "setup_required", Message: "setup required"}, setupCalls: 1},
+		{name: "cross origin", method: http.MethodPost, origin: "https://evil.example", status: http.StatusForbidden, wantError: model.APIError{Code: "forbidden_origin", Message: "Forbidden request"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			operations := &gitOperationsFake{resumeOperation: gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued}}
+			state := &gitRouteSetupState{completed: test.setup}
+			mux := http.NewServeMux()
+			RegisterGitRoutes(mux, NewGitHandlerWithOperations(&gitProberFake{}, &gitOperationConfigurerFake{}, &gitStatusReaderFake{}, operations), state)
+			request := newLocalRouterRequest(test.method, "/api/git/resume?base=work", nil)
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, request)
+			if test.wantError.Code != "" {
+				assertAPIErrorResponse(t, recorder, test.status, test.wantError)
+			} else {
+				var got model.GitOperationResponse
+				decodeHandlerJSON(t, recorder, test.status, &got)
+				if got.OperationID != operations.resumeOperation.ID || got.Status != "queued" || got.Deduplicated {
+					t.Fatalf("response = %#v", got)
+				}
+			}
+			if test.status == http.StatusMethodNotAllowed && recorder.Header().Get("Allow") != "POST" {
+				t.Errorf("Allow = %q, want POST", recorder.Header().Get("Allow"))
+			}
+			if state.calls != test.setupCalls || operations.resumeCalls != test.resumeCalls {
+				t.Errorf("setup/resume calls = %d/%d, want %d/%d", state.calls, operations.resumeCalls, test.setupCalls, test.resumeCalls)
+			}
+		})
+	}
+}
+
 func TestGitRoutesRegisterConflictRoutes(t *testing.T) {
 	operation := gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued}
 	tests := []struct {

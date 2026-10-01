@@ -20,6 +20,9 @@ func RegisterGitRoutes(mux *http.ServeMux, handler *GitHandler, state SetupState
 	mux.Handle("/api/git/sync", RequireLocalOrigin(methods(map[string]http.Handler{
 		http.MethodPost: guarded(http.HandlerFunc(handler.Sync)),
 	})))
+	mux.Handle("/api/git/resume", RequireLocalOrigin(methods(map[string]http.Handler{
+		http.MethodPost: guarded(http.HandlerFunc(handler.Resume)),
+	})))
 }
 
 func RegisterGitConflictRoutes(mux *http.ServeMux, handler *GitConflictHandler, state SetupState) {

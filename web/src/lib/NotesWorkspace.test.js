@@ -74,6 +74,48 @@ async function renderWorkspace(overrides = {}) {
 }
 
 describe('NotesWorkspace', () => {
+  const paused = {
+    base: 'work', state: 'paused', ahead: 0, behind: 0, consecutive_failures: 5, changed_paths: [],
+    repository_path: '/notes/work', operation_id: 'persisted-pause-1', stage: 'push',
+    last_attempt: '2026-09-30T12:34:56Z', last_success: '2026-09-29T10:00:00Z',
+    remote_oid: '0123456789abcdef0123456789abcdef0123456789',
+    error: { code: 'git_network', message: 'Сервер недоступен' },
+  }
+
+  it('places pause recovery between header and editor, resumes directly and waits for uploads before settings', async () => {
+    const upload = deferred()
+    const flush = vi.fn(() => upload.promise)
+    setEditorFlush(flush)
+    const onResumeGit = vi.fn()
+    const { props, container } = await renderWorkspace({ activeNote: fileNode('current.md'), gitStatus: paused, onResumeGit })
+    const alert = screen.getByRole('alert', { name: 'Git-синхронизация приостановлена' })
+    expect(within(alert).getByText('Последовательных ошибок: 5.', { exact: true })).toBeVisible()
+    expect(container.querySelector('main').children[1]).toBe(alert)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    expect(onResumeGit).toHaveBeenCalledOnce()
+    expect(flush).not.toHaveBeenCalled()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки Git' }))
+    expect(props.onOpenSettings).not.toHaveBeenCalled()
+    upload.resolve()
+    await waitFor(() => expect(props.onOpenSettings).toHaveBeenCalledOnce())
+  })
+
+  it.each([{ transitioning: true }, { gitSyncBusy: true }])('shares busy state across indicator and recovery: %j', async (busy) => {
+    await renderWorkspace({ ...busy, gitBase: { name: 'work', git_url: 'https://example.test/notes.git' }, gitStatus: paused })
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Открыть настройки Git' })).toBeDisabled()
+    screen.getByRole('button', { name: /Открыть детали Git:/ }).click()
+    await tick()
+    expect(screen.getByRole('button', { name: 'Синхронизировать Git' })).toBeDisabled()
+  })
+
+  it.each([null, 'ready', 'syncing', 'error', 'conflict', 'needs_reconnect', 'initializing', 'unconfigured'])('has no pause alert or recovery actions for nonpaused status %j', async (state) => {
+    await renderWorkspace({ gitStatus: state === null ? null : { ...paused, state } })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Git-синхронизация приостановлена' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Повторить и возобновить' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Открыть настройки Git' })).not.toBeInTheDocument()
+  })
   beforeEach(() => {
     setEditorFlush()
     vi.mocked(getNotes).mockReset().mockResolvedValue([])

@@ -438,3 +438,9 @@ export function uploadAsset(file) {
   body.append('file', file)
   return request('/api/assets', { method: 'POST', body })
 }
+
+export function resumeGit(base) {
+  return requestGit(`/api/git/resume?base=${encodeURIComponent(base)}`, {
+    method: 'POST',
+  }, validGitOperation)
+}

@@ -3,6 +3,22 @@ import userEvent from '@testing-library/user-event'
 import { tick } from 'svelte'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const settingsBoundary = vi.hoisted(() => ({ props: null, workspaceProps: null }))
+vi.mock('./lib/NotesWorkspace.svelte', async (importOriginal) => {
+  const actual = await importOriginal()
+  return { ...actual, default: (anchor, props) => {
+    settingsBoundary.workspaceProps = props
+    return actual.default(anchor, props)
+  } }
+})
+vi.mock('./lib/settings/SettingsWorkspace.svelte', async (importOriginal) => {
+  const actual = await importOriginal()
+  return { ...actual, default: (anchor, props) => {
+    settingsBoundary.props = props
+    return actual.default(anchor, props)
+  } }
+})
+
 vi.mock('./lib/Editor.svelte', async () => ({
   default: (await import('./test/EditorStub.svelte')).default,
 }))
@@ -31,6 +47,7 @@ vi.mock('./lib/api.js', async (importOriginal) => {
     getNotes: vi.fn(),
     syncNotes: vi.fn(),
     syncGit: vi.fn(),
+    resumeGit: vi.fn(),
     createNote: vi.fn(),
     renameNote: vi.fn(),
     deleteNote: vi.fn(),
@@ -59,6 +76,7 @@ import {
   switchBase,
   syncNotes,
   syncGit,
+  resumeGit,
   updateBase,
   uploadAsset,
 } from './lib/api.js'
@@ -109,6 +127,7 @@ const apiMocks = [
   switchBase,
   syncNotes,
   syncGit,
+  resumeGit,
   updateBase,
   uploadAsset,
 ]
@@ -147,6 +166,337 @@ function folderNode(id, children = []) {
 }
 
 describe('App setup gate', () => {
+  const paused = {
+    base: 'personal', state: 'paused', ahead: 0, behind: 0, consecutive_failures: 5, changed_paths: [],
+    repository_path: '/notes/personal', operation_id: 'persisted-pause-1', stage: 'push',
+    last_attempt: '2026-09-30T12:34:56Z', last_success: '2026-09-29T10:00:00Z',
+    remote_oid: '0123456789abcdef0123456789abcdef0123456789',
+    error: { code: 'git_network', message: 'Сервер недоступен' },
+  }
+
+  function expectPausedAlert(status = paused) {
+    const alert = screen.getByRole('alert', { name: 'Git-синхронизация приостановлена' })
+    expect(alert).toHaveAttribute('aria-labelledby', 'git-paused-title')
+    expect(within(alert).getByRole('heading', { name: 'Git-синхронизация приостановлена' })).toHaveAttribute('id', 'git-paused-title')
+    expect(within(alert).getByText(status.error.message, { exact: true })).toBeVisible()
+    expect(within(alert).getByText(`Последовательных ошибок: ${status.consecutive_failures}.`, { exact: true })).toBeVisible()
+    const time = alert.querySelector('time')
+    expect(time).toHaveAttribute('datetime', status.last_attempt)
+    expect(time.textContent).toBe(new Date(status.last_attempt).toLocaleString('ru-RU'))
+    return alert
+  }
+
+  async function openPaused() {
+    vi.mocked(getConfig).mockResolvedValue({ ...completedConfig, bases: completedConfig.bases.map((base) => ({ ...base, git_url: 'https://example.test/notes.git', git_branch: 'main' })) })
+    const result = render(App)
+    await screen.findByText('Выберите заметку')
+    await gitPollerOptions.onStatuses([paused])
+    await tick()
+    expectPausedAlert()
+    return result
+  }
+
+  it('retains a persisted pause through poll failures and resumes only after uploads and save, then refreshes', async () => {
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    await openPaused()
+    gitPollerOptions.onError(new Error('Poll failed'))
+    await tick()
+    expectPausedAlert()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'draft.md' }))
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Dirty' } })
+    const upload = deferred()
+    const flush = vi.fn(() => upload.promise)
+    setEditorFlush(flush)
+    const resume = deferred()
+    vi.mocked(resumeGit).mockReturnValue(resume.promise)
+    await userEvent.setup().dblClick(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    expect(flush).toHaveBeenCalledOnce()
+    expect(resumeGit).not.toHaveBeenCalled()
+    upload.resolve()
+    await waitFor(() => expect(resumeGit).toHaveBeenCalledOnce())
+    expect(resumeGit).toHaveBeenCalledWith('personal')
+    expect(saveNote).toHaveBeenCalledWith(note.id, '# Dirty', 'revision-1')
+    expect(saveNote.mock.invocationCallOrder[0]).toBeLessThan(resumeGit.mock.invocationCallOrder[0])
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    resume.resolve({ operation_id: 'resume-1', status: 'queued', deduplicated: false })
+    await waitFor(() => expect(gitPoller.refresh).toHaveBeenCalledOnce())
+    expect(createGitStatusPoller).toHaveBeenCalledOnce()
+    expect(getGitStatus).not.toHaveBeenCalled()
+  })
+
+  it('shows the complete persisted pause and resume lifecycle', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const strictAPI = await vi.importActual('./lib/api.js')
+    async function publishStatus(status) {
+      const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(
+        JSON.stringify({ statuses: [status] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ))
+      let response
+      try {
+        response = await strictAPI.getGitStatus('personal')
+      } finally {
+        fetch.mockRestore()
+      }
+      await gitPollerOptions.onStatuses(response.statuses)
+      await tick()
+    }
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getConfig).mockResolvedValue({ ...completedConfig, bases: completedConfig.bases.map((base) => ({ ...base, git_url: 'https://example.test/notes.git', git_branch: 'main' })) })
+    render(App)
+    await screen.findByRole('button', { name: 'draft.md' })
+    await publishStatus(paused)
+    // The alert action navigates to the existing settings workspace.
+    await user.click(within(expectPausedAlert()).getByRole('button', { name: 'Открыть настройки Git' }))
+    expect(await screen.findByRole('heading', { name: 'Базы заметок' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Назад к заметкам' }))
+    expectPausedAlert()
+    await user.click(screen.getByRole('button', { name: 'draft.md' }))
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Resume draft' } })
+    const upload = deferred()
+    const save = deferred()
+    const resume = deferred()
+    const flush = vi.fn(() => upload.promise)
+    setEditorFlush(flush)
+    vi.mocked(saveNote).mockReturnValue(save.promise)
+    vi.mocked(resumeGit).mockReturnValue(resume.promise)
+    await user.click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    expect(flush).toHaveBeenCalledOnce()
+    expect(saveNote).not.toHaveBeenCalled()
+    expect(resumeGit).not.toHaveBeenCalled()
+    upload.resolve()
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Resume draft', 'revision-1'))
+    expect(resumeGit).not.toHaveBeenCalled()
+    expectPausedAlert()
+    save.resolve({ status: 'saved', revision: 'revision-2' })
+    await waitFor(() => expect(resumeGit).toHaveBeenCalledWith('personal'))
+    expectPausedAlert()
+    resume.resolve({ operation_id: '44444444444444444444444444444444', status: 'queued', deduplicated: false })
+    await waitFor(() => expect(gitPoller.refresh).toHaveBeenCalledOnce())
+    // Acceptance alone is not proof that the operation succeeded.
+    expectPausedAlert()
+    const { error, ...snapshot } = paused
+    await publishStatus({ ...snapshot, state: 'syncing', consecutive_failures: 0, operation_id: '44444444444444444444444444444444', stage: 'push' })
+    expect(settingsBoundary.workspaceProps.gitStatus.state).toBe('syncing')
+    await publishStatus({ ...snapshot, state: 'ready', consecutive_failures: 0, operation_id: '44444444444444444444444444444444', stage: 'completed', last_success: '2026-10-01T12:00:00Z' })
+    expect(screen.queryByRole('alert', { name: 'Git-синхронизация приостановлена' })).not.toBeInTheDocument()
+    expect(settingsBoundary.workspaceProps.gitStatus.state).toBe('ready')
+    expect(settingsBoundary.workspaceProps.gitStatus.consecutive_failures).toBe(0)
+    expect(createGitStatusPoller).toHaveBeenCalledOnce()
+    expect(resumeGit).toHaveBeenCalledOnce()
+    expect(saveNote).toHaveBeenCalledOnce()
+  })
+
+  it.each(['flush', 'API'])('retains pause and buffer on failed %s with retryable per-base error', async (stage) => {
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    await openPaused()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'draft.md' }))
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Keep' } })
+    if (stage === 'flush') vi.mocked(saveNote).mockRejectedValue(new Error('Save failed'))
+    else vi.mocked(resumeGit).mockRejectedValue(new Error('Resume failed'))
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    const alert = expectPausedAlert()
+    await waitFor(() => expect(within(alert).getByRole('status')).toHaveTextContent(stage === 'flush' ? 'Save failed' : 'Resume failed'))
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Keep')
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    if (stage === 'flush') {
+      expect(resumeGit).not.toHaveBeenCalled()
+      expect(screen.getByText('Ошибка сохранения')).toBeVisible()
+      vi.mocked(saveNote).mockResolvedValue({ status: 'saved', revision: 'revision-2' })
+      await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+      await waitFor(() => expect(resumeGit).toHaveBeenCalledOnce())
+      expect(saveNote).toHaveBeenCalledTimes(2)
+    }
+  })
+
+  it.each(['upload', 'save', 'API'])('classifies primitive %s rejection by the resume stage and preserves the draft', async (stage) => {
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    await openPaused()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'draft.md' }))
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Keep primitive failure' } })
+    if (stage === 'upload') setEditorFlush(() => Promise.reject('upload rejected'))
+    else if (stage === 'save') vi.mocked(saveNote).mockRejectedValue('save rejected')
+    else vi.mocked(resumeGit).mockRejectedValue('resume rejected')
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+
+    const alert = expectPausedAlert()
+    const fallback = stage === 'API'
+      ? 'Не удалось возобновить Git-синхронизацию'
+      : 'Не удалось сохранить рабочую область перед возобновлением Git-синхронизации'
+    await waitFor(() => expect(within(alert).getByRole('status').textContent).toBe(fallback))
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Keep primitive failure')
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeEnabled()
+    if (stage !== 'API') {
+      expect(resumeGit).not.toHaveBeenCalled()
+      expect(screen.getByText('Ошибка сохранения')).toBeVisible()
+      expect(screen.getByText('Не удалось сохранить заметку: Неизвестная ошибка', { exact: true })).toBeVisible()
+    } else {
+      expect(resumeGit).toHaveBeenCalledOnce()
+      expect(screen.queryByText('Ошибка сохранения')).not.toBeInTheDocument()
+    }
+  })
+
+  it('a pending settings-card sync gates workspace resume and rejects its parent callback without another action', async () => {
+    await openPaused()
+    const resume = settingsBoundary.workspaceProps.onResumeGit
+    const workStatus = { ...paused, base: 'work', repository_path: '/srv/work', state: 'ready' }
+    await gitPollerOptions.onStatuses([paused, workStatus])
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    await userEvent.setup().click(screen.getByRole('tab', { name: 'Git-синхронизация' }))
+    const workCard = screen.getByRole('article', { name: 'Git для базы work' })
+    const pending = deferred()
+    vi.mocked(syncGit).mockReturnValue(pending.promise)
+    await userEvent.setup().click(within(workCard).getByRole('button', { name: 'Синхронизировать сейчас' }))
+    await waitFor(() => expect(syncGit).toHaveBeenCalledWith('work'))
+    expect(screen.getByRole('button', { name: 'Назад к заметкам' })).toBeDisabled()
+    await resume()
+    expect(resumeGit).not.toHaveBeenCalled()
+    expect(syncGit).toHaveBeenCalledOnce()
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+
+    // Navigate at the parent boundary to verify the workspace sees the same global lock.
+    settingsBoundary.props.onBack()
+    await tick()
+    expectPausedAlert()
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    expect(resumeGit).not.toHaveBeenCalled()
+    pending.resolve({ operation_id: 'settings-sync-1', status: 'queued', deduplicated: false })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeEnabled())
+    expect(gitPoller.refresh).toHaveBeenCalledOnce()
+  })
+
+  it('a pending resume disables every settings manual-sync card and rejects settings sync callbacks', async () => {
+    await openPaused()
+    const resume = settingsBoundary.workspaceProps.onResumeGit
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    await userEvent.setup().click(screen.getByRole('tab', { name: 'Git-синхронизация' }))
+    await gitPollerOptions.onStatuses([
+      { ...paused, state: 'ready' },
+      { ...paused, base: 'work', repository_path: '/srv/work', state: 'ready' },
+    ])
+    await tick()
+    const cards = completedConfig.bases.map((base) => screen.getByRole('article', { name: `Git для базы ${base.name}` }))
+    for (const card of cards) expect(within(card).getByRole('button', { name: 'Синхронизировать сейчас' })).toBeEnabled()
+    const pending = deferred()
+    vi.mocked(resumeGit).mockReturnValue(pending.promise)
+    const recovery = resume()
+    await waitFor(() => expect(resumeGit).toHaveBeenCalledWith('personal'))
+    for (const card of cards) {
+      expect(card).toHaveAttribute('aria-busy', 'true')
+      const sync = within(card).getByRole('button', { name: 'Синхронизировать сейчас' })
+      expect(sync).toBeDisabled()
+      await userEvent.setup().click(sync)
+    }
+    for (const base of completedConfig.bases) await settingsBoundary.props.onGitSync(base.name)
+    expect(syncGit).not.toHaveBeenCalled()
+    expect(resumeGit).toHaveBeenCalledOnce()
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    pending.resolve({ operation_id: 'resume-1', status: 'queued', deduplicated: false })
+    await recovery
+    await tick()
+    for (const card of cards) expect(within(card).getByRole('button', { name: 'Синхронизировать сейчас' })).toBeEnabled()
+    expect(gitPoller.refresh).toHaveBeenCalledOnce()
+  })
+
+  it.each(['resume', 'manual'])('shares the action lock when %s starts first', async (first) => {
+    await openPaused()
+    if (first === 'manual') {
+      await gitPollerOptions.onStatuses([{ ...paused, state: 'ready' }])
+      await tick()
+    }
+    const operation = deferred()
+    vi.mocked(resumeGit).mockReturnValue(operation.promise)
+    vi.mocked(syncGit).mockReturnValue(operation.promise)
+    await userEvent.setup().click(screen.getByRole('button', { name: /Открыть детали Git:/ }))
+    const manual = screen.getByRole('button', { name: 'Синхронизировать Git' })
+    await userEvent.setup().click(first === 'resume' ? screen.getByRole('button', { name: 'Повторить и возобновить' }) : manual)
+    await waitFor(() => expect(first === 'resume' ? resumeGit : syncGit).toHaveBeenCalledOnce())
+    if (first === 'manual') {
+      await gitPollerOptions.onStatuses([paused])
+      await tick()
+    }
+    const resume = screen.getByRole('button', { name: 'Повторить и возобновить' })
+    expect(resume).toBeDisabled()
+    expect(manual).toBeDisabled()
+    await userEvent.setup().click(first === 'resume' ? manual : resume)
+    expect(first === 'resume' ? syncGit : resumeGit).not.toHaveBeenCalled()
+    operation.resolve({ operation_id: 'op', status: 'queued', deduplicated: false })
+    await waitFor(() => expect(resume).toBeEnabled())
+  })
+
+  it.each(['resolve', 'reject'])('ignores late resume %s after a base change and keeps global actions busy until settlement', async (settlement) => {
+    await openPaused()
+    const pending = deferred()
+    vi.mocked(resumeGit).mockReturnValue(pending.promise)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    await waitFor(() => expect(resumeGit).toHaveBeenCalledOnce())
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    vi.mocked(switchBase).mockResolvedValue({ ...workConfig, bases: workConfig.bases.map((base) => ({ ...base, git_url: 'https://example.test/notes.git', git_branch: 'main' })) })
+    // Exercise a late external transition at the parent boundary; the settings UI remains locked.
+    expect(within(screen.getByRole('article', { name: 'База work' })).getByRole('button', { name: 'Открыть' })).toBeDisabled()
+    await settingsBoundary.props.onSwitch('work')
+    await screen.findByText('Выберите заметку')
+    await gitPollerOptions.onStatuses([{ ...paused, base: 'work', repository_path: '/srv/work' }])
+    await tick()
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
+    if (settlement === 'resolve') pending.resolve({ operation_id: 'op', status: 'queued', deduplicated: false })
+    else pending.reject(new Error('Old base error'))
+    await pending.promise.catch(() => {})
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeEnabled())
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    expect(screen.queryByText('Old base error')).not.toBeInTheDocument()
+  })
+
+  it.each([['flush', 'resolve'], ['flush', 'reject'], ['resume', 'resolve'], ['resume', 'reject']])('ignores %s %s settlement after unmount', async (stage, settlement) => {
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    const { unmount } = await openPaused()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'draft.md' }))
+    const pending = deferred()
+    if (stage === 'flush') setEditorFlush(() => pending.promise)
+    else vi.mocked(resumeGit).mockReturnValue(pending.promise)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    unmount()
+    if (settlement === 'resolve') pending.resolve({ operation_id: 'op', status: 'queued', deduplicated: false })
+    else pending.reject(new Error('Late failure'))
+    await pending.promise.catch(() => {})
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    if (stage === 'flush') expect(resumeGit).not.toHaveBeenCalled()
+  })
+
+  it.each(['resolve', 'reject'])('does not resume or publish an old flush %s after the active base changes', async (settlement) => {
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    await openPaused()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    const switchActive = settingsBoundary.props.onSwitch
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Назад к заметкам' }))
+    await userEvent.setup().click(screen.getByRole('button', { name: 'draft.md' }))
+    const pending = deferred()
+    setEditorFlush(() => pending.promise)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    vi.mocked(switchBase).mockResolvedValue(workConfig)
+    await switchActive('work')
+    await gitPollerOptions.onStatuses([{ ...paused, base: 'work', repository_path: '/srv/work' }])
+    await tick()
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
+    if (settlement === 'resolve') pending.resolve()
+    else pending.reject(new Error('Old upload error'))
+    await pending.promise.catch(() => {})
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeEnabled())
+    expect(resumeGit).not.toHaveBeenCalled()
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    expect(screen.queryByText('Old upload error')).not.toBeInTheDocument()
+    expect(screen.queryByText('Ошибка сохранения')).not.toBeInTheDocument()
+  })
   beforeEach(() => {
     setEditorFlush()
     for (const mock of apiMocks) vi.mocked(mock).mockReset()

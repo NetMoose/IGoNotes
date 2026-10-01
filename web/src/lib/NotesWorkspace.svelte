@@ -2,6 +2,7 @@
   import Sidebar from './Sidebar.svelte';
   import Editor from './Editor.svelte';
   import GitStatusIndicator from './git/GitStatusIndicator.svelte';
+  import GitPausedAlert from './git/GitPausedAlert.svelte';
 
   let {
     activeNote,
@@ -13,6 +14,7 @@
     gitSyncBusy = false,
     gitSyncError = '',
     onGitSync,
+    onResumeGit,
     error = '',
     transitioning = false,
     onSelectNote,
@@ -24,6 +26,7 @@
 
   let editor = $state();
   let sidebar = $state();
+  let gitControlsBusy = $derived(transitioning || gitSyncBusy);
 
   export function flushPendingUploads() {
     return editor?.flushPendingUploads?.();
@@ -100,6 +103,8 @@
         </div>
       </header>
 
+      <GitPausedAlert status={gitStatus} busy={gitControlsBusy} error={gitSyncError} onResume={onResumeGit} onOpenSettings={(...args) => runAfterUploads(onOpenSettings, ...args)} />
+
       <div class="flex-1 overflow-hidden">
         {#if activeNote}
           <Editor bind:this={editor} noteId={activeNote.id} bind:content />
@@ -122,7 +127,7 @@
       {/if}
     </span>
     {#if gitBase}
-      <GitStatusIndicator base={gitBase} status={gitStatus} busy={gitSyncBusy} error={gitSyncError} onSync={onGitSync} />
+      <GitStatusIndicator base={gitBase} status={gitStatus} busy={gitControlsBusy} error={gitSyncError} onSync={onGitSync} />
     {/if}
   </footer>
 </div>
