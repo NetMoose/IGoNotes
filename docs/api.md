@@ -118,6 +118,8 @@ http://localhost:8080/api
 
 Полный пример четвёртой последовательной операционной ошибки (`200 OK`):
 
+При ошибке `stage` сохраняет последнюю достигнутую стадию, например `fetching` или `pushing`, а не становится `completed`. В следующих примерах ошибка произошла при push.
+
 ```json
 {
   "statuses": [{
@@ -125,7 +127,7 @@ http://localhost:8080/api
     "repository_path": "/home/user/notes/work",
     "state": "error",
     "operation_id": "11111111111111111111111111111111",
-    "stage": "completed",
+    "stage": "pushing",
     "ahead": 1,
     "behind": 0,
     "consecutive_failures": 4,
@@ -147,7 +149,7 @@ http://localhost:8080/api
     "repository_path": "/home/user/notes/work",
     "state": "paused",
     "operation_id": "22222222222222222222222222222222",
-    "stage": "completed",
+    "stage": "pushing",
     "ahead": 1,
     "behind": 0,
     "consecutive_failures": 5,
@@ -160,7 +162,7 @@ http://localhost:8080/api
 }
 ```
 
-Успешный conflict abort также публикует явную паузу, сохраняя предыдущий счётчик, например `2`:
+Успешный conflict abort также публикует явную паузу, сохраняя предыдущий счётчик, например `2`. Поля `ahead` и `behind` равны `0`, поле `error` отсутствует; интерфейс использует пояснение по умолчанию: «Автоматическая синхронизация остановлена до явного возобновления.»
 
 ```json
 {
@@ -170,14 +172,13 @@ http://localhost:8080/api
     "state": "paused",
     "operation_id": "33333333333333333333333333333333",
     "stage": "completed",
-    "ahead": 1,
-    "behind": 1,
+    "ahead": 0,
+    "behind": 0,
     "consecutive_failures": 2,
     "last_attempt": "2026-09-01T12:20:00Z",
     "last_success": "2026-09-01T11:00:00Z",
     "changed_paths": ["notes/idea.md"],
-    "remote_oid": "0123456789abcdef0123456789abcdef01234567",
-    "error": {"code": "git_paused", "message": "Git synchronization is paused"}
+    "remote_oid": "0123456789abcdef0123456789abcdef01234567"
   }]
 }
 ```
@@ -200,7 +201,7 @@ Resume для базы вне паузы отвечает `409 Conflict`:
 {"code":"git_not_paused","message":"Git synchronization is not paused"}
 ```
 
-Обычный `POST /api/git/sync?base=work` при `paused` отвечает `409 Conflict`:
+Обычный `POST /api/git/sync?base=work` при `paused` отвечает `409 Conflict`. Ошибка `git_paused` возвращается при отказе принять обычный sync-запрос, а не записывается в статус успешного abort:
 
 ```json
 {"code":"git_paused","message":"Git synchronization is paused"}
