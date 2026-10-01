@@ -51,6 +51,150 @@ type hardeningBarrier struct {
 	release chan struct{}
 }
 
+type hardeningSyncQueueFunc func(context.Context, gitcmd.SyncRequest) (gitcmd.Operation, bool, error)
+
+func (queue hardeningSyncQueueFunc) QueueSync(ctx context.Context, request gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {
+	return queue(ctx, request)
+}
+
+func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
+	ctx := context.Background()
+	root, remote, oid := readyManagerGitPair(t)
+	base := configuredManagerBase("work", root)
+	base.URL, base.AutoSync, base.IntervalMinutes = remote, true, 5
+	fetchEntered, fetchRelease := make(chan struct{}, 1), make(chan struct{}, 1)
+	var fetches, pushes atomic.Int32
+	delegate := gitcmd.NewCommandRunner()
+	runner := managerRunnerFunc(func(ctx context.Context, command gitcmd.Command) (gitcmd.Result, error) {
+		if slices.Contains(command.Args, "fetch") && fetches.Add(1) == 1 {
+			fetchEntered <- struct{}{}
+			select {
+			case <-fetchRelease:
+			case <-ctx.Done():
+				return gitcmd.Result{}, ctx.Err()
+			}
+		}
+		if slices.Contains(command.Args, "push") {
+			pushes.Add(1)
+		}
+		return delegate.Run(ctx, command)
+	})
+	client := gitcmd.NewClient(runner)
+	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, runner, client, client)
+	seedManagerTrust(t, f, base, oid)
+	clock := newFakeGitSchedulerClock(schedulerTestNow())
+	f.manager.now = clock.Now
+	workerReady, workerRelease := make(chan struct{}, 1), make(chan struct{}, 1)
+	// Park the running FIFO worker immediately before operation dequeue using
+	// its existing synchronous-job seam. This is only an admission gate, not a
+	// Git/worktree mutation: temporarily release the coordinator so both real
+	// public QueueSync calls can run, and restore it before the worker resumes.
+	// Lifetime cancellation also opens the gate, keeping failure cleanup bounded.
+	if err := f.manager.enqueueSynchronous(func() {
+		f.coordinator.Unlock()
+		defer f.coordinator.Lock()
+		workerReady <- struct{}{}
+		select {
+		case <-workerRelease:
+		case <-f.manager.lifetimeCtx.Done():
+		}
+	}); err != nil {
+		t.Fatal("cannot install worker admission gate")
+	}
+	if err := f.manager.Start(); err != nil {
+		t.Fatal("cannot start admission worker")
+	}
+	hardeningReceive(t, "running worker admission gate", workerReady)
+	type admission struct {
+		op        gitcmd.Operation
+		duplicate bool
+		err       error
+	}
+	captured, adapterRelease := make(chan admission, 1), make(chan struct{}, 1)
+	queue := hardeningSyncQueueFunc(func(ctx context.Context, request gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {
+		op, duplicate, err := f.manager.QueueSync(ctx, request)
+		// Record the real manager return values before returning to queueDue.
+		// The scheduler request stays open while the manual request races it.
+		captured <- admission{op: op, duplicate: duplicate, err: err}
+		select {
+		case <-adapterRelease:
+		case <-f.manager.lifetimeCtx.Done():
+		}
+		return op, duplicate, err
+	})
+	scheduler := newGitScheduler(clock, f.statuses, f.snapshots, make(chan struct{}, 1), queue, log.New(io.Discard, "", 0))
+	scheduler.startedAt = clock.Now()
+	if err := scheduler.reconcile(ctx, true); err != nil {
+		t.Fatal("cannot reconcile admission scheduler")
+	}
+	clock.Advance(5 * time.Second)
+	tick := make(chan bool, 1)
+	go func() { tick <- scheduler.queueDue(ctx, clock.Now()) }()
+	scheduled := hardeningReceive(t, "scheduler queue result", captured)
+	if scheduled.err != nil || scheduled.duplicate || scheduled.op.ID == "" {
+		t.Fatal("scheduler did not capture a new actual admission")
+	}
+	active, found, err := f.operations.ActiveByPath(ctx, root)
+	if err != nil || !found || active.ID != scheduled.op.ID || active.State != gitcmd.OperationQueued || fetches.Load() != 0 {
+		t.Fatal("scheduler result was not captured at an active durable admission boundary")
+	}
+	manualResult := make(chan admission, 1)
+	go func() {
+		op, duplicate, err := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: base})
+		manualResult <- admission{op, duplicate, err}
+	}()
+	manual := hardeningReceive(t, "same-path manual result", manualResult)
+	if manual.err != nil || !manual.duplicate || manual.op.ID != scheduled.op.ID {
+		t.Fatalf("scheduler/manual admission identity differs: manualDeduplicated=%v sameID=%v", manual.duplicate, manual.op.ID == scheduled.op.ID)
+	}
+	adapterRelease <- struct{}{}
+	if !hardeningReceive(t, "scheduled tick", tick) {
+		t.Fatal("scheduler stopped at admission boundary")
+	}
+	// A later automatic admission while this same operation remains active must
+	// also report deduplication, rather than merely serializing another job.
+	clock.Advance(5 * time.Minute)
+	go func() { tick <- scheduler.queueDue(ctx, clock.Now()) }()
+	again := hardeningReceive(t, "repeat scheduler queue result", captured)
+	if again.err != nil || !again.duplicate || again.op.ID != scheduled.op.ID {
+		t.Fatal("repeat scheduled admission lost active operation identity")
+	}
+	go func() {
+		op, duplicate, err := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: base})
+		manualResult <- admission{op, duplicate, err}
+	}()
+	manual = hardeningReceive(t, "repeat same-path manual result", manualResult)
+	if manual.err != nil || !manual.duplicate || manual.op.ID != again.op.ID {
+		t.Fatal("repeat scheduler/manual admissions returned different operation IDs")
+	}
+	var count int
+	if err := f.db.QueryRow("SELECT COUNT(*) FROM git_operations WHERE repo_path = ? AND kind = ?", root, gitcmd.OperationSync).Scan(&count); err != nil || count != 1 {
+		t.Fatal("deduplicated admissions created more than one durable sync")
+	}
+	f.manager.mu.Lock()
+	inFlight, pending := f.manager.inFlight[root], len(f.manager.queue)
+	f.manager.mu.Unlock()
+	if inFlight.ID != scheduled.op.ID || pending != 1 || fetches.Load() != 0 {
+		t.Fatal("admission identity or FIFO cardinality changed before execution")
+	}
+	adapterRelease <- struct{}{}
+	if !hardeningReceive(t, "repeat scheduled tick", tick) {
+		t.Fatal("repeat scheduler stopped at admission boundary")
+	}
+	workerRelease <- struct{}{}
+	hardeningReceive(t, "admitted operation fetch", fetchEntered)
+	fetchRelease <- struct{}{}
+	hardeningIdle(t, f.manager)
+	completed, found, err := f.operations.ByID(ctx, scheduled.op.ID)
+	if err != nil || !found || completed.State != gitcmd.OperationSucceeded || completed.Stage != gitcmd.StageCompleted || fetches.Load() != 1 || pushes.Load() != 1 {
+		t.Fatal("shared scheduler/manual operation did not execute exactly once")
+	}
+	status, found, err := f.statuses.Get(ctx, root)
+	if err != nil || !found || status.State != model.GitStateReady || status.OperationID != scheduled.op.ID || status.RemoteOID != oid {
+		t.Fatal("completed operation publication lost admission identity")
+	}
+}
+
 func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 	ctx := context.Background()
 	var bases []gitcmd.ConfiguredBase
