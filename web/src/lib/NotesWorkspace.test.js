@@ -74,7 +74,13 @@ async function renderWorkspace(overrides = {}) {
 }
 
 describe('NotesWorkspace', () => {
-  const paused = { base: 'work', state: 'paused', ahead: 0, behind: 0, consecutive_failures: 3, changed_paths: [] }
+  const paused = {
+    base: 'work', state: 'paused', ahead: 0, behind: 0, consecutive_failures: 5, changed_paths: [],
+    repository_path: '/notes/work', operation_id: 'persisted-pause-1', stage: 'push',
+    last_attempt: '2026-09-30T12:34:56Z', last_success: '2026-09-29T10:00:00Z',
+    remote_oid: '0123456789abcdef0123456789abcdef0123456789',
+    error: { code: 'git_network', message: 'Сервер недоступен' },
+  }
 
   it('places pause recovery between header and editor, resumes directly and waits for uploads before settings', async () => {
     const upload = deferred()
@@ -82,7 +88,8 @@ describe('NotesWorkspace', () => {
     setEditorFlush(flush)
     const onResumeGit = vi.fn()
     const { props, container } = await renderWorkspace({ activeNote: fileNode('current.md'), gitStatus: paused, onResumeGit })
-    const alert = screen.getByRole('alert')
+    const alert = screen.getByRole('alert', { name: 'Git-синхронизация приостановлена' })
+    expect(within(alert).getByText('Последовательных ошибок: 5.', { exact: true })).toBeVisible()
     expect(container.querySelector('main').children[1]).toBe(alert)
     await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
     expect(onResumeGit).toHaveBeenCalledOnce()

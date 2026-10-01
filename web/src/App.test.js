@@ -159,7 +159,25 @@ function folderNode(id, children = []) {
 }
 
 describe('App setup gate', () => {
-  const paused = { base: 'personal', state: 'paused', ahead: 0, behind: 0, consecutive_failures: 3, changed_paths: [], error: { code: 'git_network', message: 'Сервер недоступен' } }
+  const paused = {
+    base: 'personal', state: 'paused', ahead: 0, behind: 0, consecutive_failures: 5, changed_paths: [],
+    repository_path: '/notes/personal', operation_id: 'persisted-pause-1', stage: 'push',
+    last_attempt: '2026-09-30T12:34:56Z', last_success: '2026-09-29T10:00:00Z',
+    remote_oid: '0123456789abcdef0123456789abcdef0123456789',
+    error: { code: 'git_network', message: 'Сервер недоступен' },
+  }
+
+  function expectPausedAlert(status = paused) {
+    const alert = screen.getByRole('alert', { name: 'Git-синхронизация приостановлена' })
+    expect(alert).toHaveAttribute('aria-labelledby', 'git-paused-title')
+    expect(within(alert).getByRole('heading', { name: 'Git-синхронизация приостановлена' })).toHaveAttribute('id', 'git-paused-title')
+    expect(within(alert).getByText(status.error.message, { exact: true })).toBeVisible()
+    expect(within(alert).getByText(`Последовательных ошибок: ${status.consecutive_failures}.`, { exact: true })).toBeVisible()
+    const time = alert.querySelector('time')
+    expect(time).toHaveAttribute('datetime', status.last_attempt)
+    expect(time.textContent).toBe(new Date(status.last_attempt).toLocaleString('ru-RU'))
+    return alert
+  }
 
   async function openPaused() {
     vi.mocked(getConfig).mockResolvedValue({ ...completedConfig, bases: completedConfig.bases.map((base) => ({ ...base, git_url: 'https://example.test/notes.git', git_branch: 'main' })) })
@@ -167,6 +185,7 @@ describe('App setup gate', () => {
     await screen.findByText('Выберите заметку')
     await gitPollerOptions.onStatuses([paused])
     await tick()
+    expectPausedAlert()
     return result
   }
 
@@ -176,7 +195,7 @@ describe('App setup gate', () => {
     await openPaused()
     gitPollerOptions.onError(new Error('Poll failed'))
     await tick()
-    expect(screen.getByRole('heading', { name: 'Git-синхронизация приостановлена' })).toBeVisible()
+    expectPausedAlert()
     await userEvent.setup().click(screen.getByRole('button', { name: 'draft.md' }))
     await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Dirty' } })
     const upload = deferred()
@@ -208,7 +227,7 @@ describe('App setup gate', () => {
     if (stage === 'flush') vi.mocked(saveNote).mockRejectedValue(new Error('Save failed'))
     else vi.mocked(resumeGit).mockRejectedValue(new Error('Resume failed'))
     await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
-    const alert = screen.getByRole('heading', { name: 'Git-синхронизация приостановлена' }).closest('[role=alert]')
+    const alert = expectPausedAlert()
     await waitFor(() => expect(within(alert).getByRole('status')).toHaveTextContent(stage === 'flush' ? 'Save failed' : 'Resume failed'))
     expect(screen.getByLabelText('Markdown')).toHaveValue('# Keep')
     expect(gitPoller.refresh).not.toHaveBeenCalled()
@@ -260,7 +279,7 @@ describe('App setup gate', () => {
     expect(within(screen.getByRole('article', { name: 'База work' })).getByRole('button', { name: 'Открыть' })).toBeDisabled()
     await settingsBoundary.props.onSwitch('work')
     await screen.findByText('Выберите заметку')
-    await gitPollerOptions.onStatuses([{ ...paused, base: 'work' }])
+    await gitPollerOptions.onStatuses([{ ...paused, base: 'work', repository_path: '/srv/work' }])
     await tick()
     expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
     if (settlement === 'resolve') pending.resolve({ operation_id: 'op', status: 'queued', deduplicated: false })
@@ -302,7 +321,7 @@ describe('App setup gate', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
     vi.mocked(switchBase).mockResolvedValue(workConfig)
     await switchActive('work')
-    await gitPollerOptions.onStatuses([{ ...paused, base: 'work' }])
+    await gitPollerOptions.onStatuses([{ ...paused, base: 'work', repository_path: '/srv/work' }])
     await tick()
     expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
     if (settlement === 'resolve') pending.resolve()

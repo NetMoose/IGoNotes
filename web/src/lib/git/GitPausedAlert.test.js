@@ -5,7 +5,10 @@ import GitPausedAlert from './GitPausedAlert.svelte'
 
 const paused = {
   base: 'work', state: 'paused', ahead: 0, behind: 0, changed_paths: [],
-  consecutive_failures: 3, last_attempt: '2026-09-30T12:34:56Z',
+  consecutive_failures: 5,
+  repository_path: '/notes/work', operation_id: 'persisted-pause-1', stage: 'push',
+  last_attempt: '2026-09-30T12:34:56Z', last_success: '2026-09-29T10:00:00Z',
+  remote_oid: '0123456789abcdef0123456789abcdef0123456789',
   error: { code: 'git_network', message: 'Сервер недоступен' },
 }
 
@@ -15,17 +18,35 @@ describe('GitPausedAlert', () => {
     const alert = screen.getByRole('alert')
     expect(within(alert).getByRole('heading', { name: 'Git-синхронизация приостановлена' })).toBeVisible()
     expect(alert).toHaveTextContent('Сервер недоступен')
-    expect(alert).toHaveTextContent('Неудачных попыток подряд: 3')
+    expect(within(alert).getByText('Последовательных ошибок: 5.', { exact: true })).toBeVisible()
     const time = alert.querySelector('time')
     expect(time).toHaveAttribute('datetime', paused.last_attempt)
-    expect(time).toHaveTextContent(new Date(paused.last_attempt).toLocaleString())
+    expect(time).toHaveTextContent(new Date(paused.last_attempt).toLocaleString('ru-RU'))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('names the alert by the heading with the specified id', () => {
+    render(GitPausedAlert, { status: paused })
+    const alert = screen.getByRole('alert', { name: 'Git-синхронизация приостановлена' })
+    expect(alert).toHaveAttribute('aria-labelledby', 'git-paused-title')
+    expect(within(alert).getByRole('heading', { name: 'Git-синхронизация приостановлена' })).toHaveAttribute('id', 'git-paused-title')
+  })
+
+  it('formats the last attempt explicitly in Russian regardless of the default locale', () => {
+    const format = vi.spyOn(Date.prototype, 'toLocaleString')
+    try {
+      render(GitPausedAlert, { status: paused })
+      expect(format).toHaveBeenCalledWith('ru-RU')
+      expect(document.querySelector('time')).toHaveTextContent(new Date(paused.last_attempt).toLocaleString('ru-RU'))
+    } finally {
+      format.mockRestore()
+    }
   })
 
   it.each(['', 'invalid'])('uses reason and unknown attempt fallbacks for %j', (last_attempt) => {
     render(GitPausedAlert, { status: { ...paused, error: undefined, last_attempt } })
-    expect(screen.getByRole('alert')).toHaveTextContent('Автоматическая Git-синхронизация приостановлена после повторных ошибок.')
-    expect(screen.getByRole('alert')).toHaveTextContent('Последняя попытка: неизвестно')
+    expect(screen.getByText('Автоматическая синхронизация остановлена до явного возобновления.', { exact: true })).toBeVisible()
+    expect(screen.getByText('Время последней попытки неизвестно', { exact: true })).toBeVisible()
     expect(document.querySelector('time')).toBeNull()
   })
 

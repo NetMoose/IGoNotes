@@ -5,16 +5,16 @@
 </script>
 
 {#if status?.state === 'paused'}
-  <section role="alert" class="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
-    <h2 class="font-semibold">Git-синхронизация приостановлена</h2>
-    <p class="mt-1">{status.error?.message || 'Автоматическая Git-синхронизация приостановлена после повторных ошибок.'}</p>
-    <p class="mt-1">Неудачных попыток подряд: {status.consecutive_failures}</p>
+  <section role="alert" aria-labelledby="git-paused-title" class="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+    <h2 id="git-paused-title" class="font-semibold">Git-синхронизация приостановлена</h2>
+    <p class="mt-1">{status.error?.message || 'Автоматическая синхронизация остановлена до явного возобновления.'}</p>
+    <p class="mt-1">Последовательных ошибок: {status.consecutive_failures}.</p>
     <p>
-      Последняя попытка:
       {#if validAttempt}
-        <time datetime={status.last_attempt}>{attempt.toLocaleString()}</time>
+        Последняя попытка:
+        <time datetime={status.last_attempt}>{attempt.toLocaleString('ru-RU')}</time>
       {:else}
-        неизвестно
+        Время последней попытки неизвестно
       {/if}
     </p>
     {#if error}<p role="status" class="mt-2 text-red-700">{error}</p>{/if}
