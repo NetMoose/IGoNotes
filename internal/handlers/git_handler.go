@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 
 	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
@@ -33,6 +34,7 @@ type GitOperationConfigurer interface {
 type GitOperations interface {
 	QueueInitialize(context.Context, gitcmd.InitializeRequest) (gitcmd.Operation, bool, error)
 	QueueSync(context.Context, gitcmd.SyncRequest) (gitcmd.Operation, bool, error)
+	Resume(context.Context, string) (gitcmd.Operation, bool, error)
 }
 
 type GitHandler struct {
@@ -185,6 +187,28 @@ func (h *GitHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operation, deduplicated, err := h.operations.QueueSync(r.Context(), gitcmd.SyncRequest{Snapshot: snapshot})
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, operationResponse(operation, deduplicated))
+}
+
+func (h *GitHandler) Resume(w http.ResponseWriter, r *http.Request) {
+	base, ok := readBaseQuery(w, r, true)
+	if !ok {
+		return
+	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		writeMissingField(w, "base")
+		return
+	}
+	if h.operations == nil {
+		writeServiceError(w, errGitOperationsNotInitialized)
+		return
+	}
+	operation, deduplicated, err := h.operations.Resume(r.Context(), base)
 	if err != nil {
 		writeServiceError(w, err)
 		return

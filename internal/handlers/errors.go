@@ -64,6 +64,9 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	if errors.As(err, &safeErr) && safeErr != nil {
 		status := 0
 		switch safeErr.Code {
+		case gitcmd.CodeNotPaused:
+			WriteAPIError(w, http.StatusConflict, "git_not_paused", "Git synchronization is not paused", "")
+			return
 		case gitcmd.CodeUnavailable:
 			status = http.StatusServiceUnavailable
 		case gitcmd.CodeUnsupportedVersion, gitcmd.CodeIdentityMissing, gitcmd.CodeInvalidBranch:

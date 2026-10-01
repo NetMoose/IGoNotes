@@ -109,6 +109,20 @@ func TestWriteServiceErrorUsesOnlySafeErrorPublicFields(t *testing.T) {
 	}
 }
 
+func TestWriteServiceErrorGitNotPausedUsesFixedSafeMessage(t *testing.T) {
+	for _, err := range []error{
+		gitcmd.ErrGitNotPaused,
+		fmt.Errorf("resume https://user:secret@example.test/private.git: %w", errors.Join(
+			&gitcmd.SafeError{Code: gitcmd.CodeNotPaused, Message: "private diagnostic", Field: "private_field"},
+			errors.New("private cause"),
+		)),
+	} {
+		recorder := httptest.NewRecorder()
+		writeServiceError(recorder, err)
+		assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "git_not_paused", Message: "Git synchronization is not paused"})
+	}
+}
+
 func TestWriteServiceErrorGitConflict(t *testing.T) {
 	private := "https://user:secret@example.test/private.git"
 	tests := []struct {

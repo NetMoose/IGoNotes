@@ -114,6 +114,76 @@ type gitOperationsFake struct {
 	syncErr             error
 	syncCalls           int
 	syncRequest         gitcmd.SyncRequest
+	resumeOperation     gitcmd.Operation
+	resumeDuplicate     bool
+	resumeErr           error
+	resumeCalls         int
+	resumeContext       context.Context
+	resumeBase          string
+}
+
+func (f *gitOperationsFake) Resume(ctx context.Context, base string) (gitcmd.Operation, bool, error) {
+	f.resumeCalls++
+	f.resumeContext = ctx
+	f.resumeBase = base
+	return f.resumeOperation, f.resumeDuplicate, f.resumeErr
+}
+
+func TestGitHandlerResumeReturnsExactAcceptedOperationAndForwardsTrimmedBase(t *testing.T) {
+	for _, duplicate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deduplicated=%v", duplicate), func(t *testing.T) {
+			operations := &gitOperationsFake{
+				resumeOperation: gitcmd.Operation{ID: "0123456789abcdef0123456789abcdef", State: gitcmd.OperationQueued},
+				resumeDuplicate: duplicate,
+			}
+			handler := NewGitHandlerWithOperations(&gitProberFake{}, &gitOperationConfigurerFake{}, &gitStatusReaderFake{}, operations)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			request := httptest.NewRequest(http.MethodPost, "/api/git/resume?base=%20work%20", nil).WithContext(ctx)
+			recorder := httptest.NewRecorder()
+
+			handler.Resume(recorder, request)
+
+			var got map[string]any
+			decodeHandlerJSON(t, recorder, http.StatusAccepted, &got)
+			want := map[string]any{"operation_id": operations.resumeOperation.ID, "status": "queued", "deduplicated": duplicate}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("response = %#v, want %#v", got, want)
+			}
+			if operations.resumeCalls != 1 || operations.resumeBase != "work" || operations.resumeContext != ctx {
+				t.Fatalf("Resume calls/base/context = %d/%q/%v", operations.resumeCalls, operations.resumeBase, operations.resumeContext)
+			}
+			if operations.syncCalls != 0 || operations.initializeCalls != 0 {
+				t.Fatal("resume must not queue through sync or initialize")
+			}
+		})
+	}
+}
+
+func TestGitHandlerResumeValidatesBaseBeforeCallingOperations(t *testing.T) {
+	for _, query := range []string{"", "?base=", "?base=%20%09%20"} {
+		t.Run(query, func(t *testing.T) {
+			operations := &gitOperationsFake{}
+			handler := NewGitHandlerWithOperations(&gitProberFake{}, &gitOperationConfigurerFake{}, &gitStatusReaderFake{}, operations)
+			recorder := httptest.NewRecorder()
+			handler.Resume(recorder, httptest.NewRequest(http.MethodPost, "/api/git/resume"+query, nil))
+			assertMissingField(t, recorder, "base")
+			if operations.resumeCalls != 0 {
+				t.Fatalf("Resume calls = %d, want 0", operations.resumeCalls)
+			}
+		})
+	}
+}
+
+func TestGitHandlerResumeDoesNotLeakErrorDetails(t *testing.T) {
+	operations := &gitOperationsFake{resumeErr: fmt.Errorf("resume https://user:secret@example.test/private.git: %w", errors.Join(
+		&gitcmd.SafeError{Code: gitcmd.CodeNotPaused, Message: "private diagnostic", Field: "private_field"},
+		errors.New("private cause"),
+	))}
+	handler := NewGitHandlerWithOperations(&gitProberFake{}, &gitOperationConfigurerFake{}, &gitStatusReaderFake{}, operations)
+	recorder := httptest.NewRecorder()
+	handler.Resume(recorder, httptest.NewRequest(http.MethodPost, "/api/git/resume?base=work", nil))
+	assertAPIErrorResponse(t, recorder, http.StatusConflict, model.APIError{Code: "git_not_paused", Message: "Git synchronization is not paused"})
 }
 
 type concurrentGitOperationConfigurer struct {
@@ -148,6 +218,10 @@ type concurrentGitOperations struct {
 
 func (f *concurrentGitOperations) QueueInitialize(context.Context, gitcmd.InitializeRequest) (gitcmd.Operation, bool, error) {
 	return gitcmd.Operation{}, false, errors.New("initialize is not expected")
+}
+
+func (f *concurrentGitOperations) Resume(context.Context, string) (gitcmd.Operation, bool, error) {
+	return gitcmd.Operation{}, false, errors.New("resume is not expected")
 }
 
 func (f *concurrentGitOperations) QueueSync(_ context.Context, request gitcmd.SyncRequest) (gitcmd.Operation, bool, error) {
