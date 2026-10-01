@@ -364,6 +364,8 @@ func (m *GitManager) queueOperationWithResume(ctx context.Context, requested git
 	previous := status
 	if allowPaused {
 		status.State = model.GitStateReady
+		status.OperationID = ""
+		status.Stage = ""
 		status.Error = nil
 		if err := m.applyStatus(ctx, status, GitFailureReset); err != nil {
 			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), managerResumeCompensationTimeout)

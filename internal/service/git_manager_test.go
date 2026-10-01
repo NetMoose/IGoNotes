@@ -44,29 +44,43 @@ func TestGitManagerBreakerFifthFailureAndResume(t *testing.T) {
 	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", runner, client, client)
 	seedManagerTrust(t, f, base, oid)
 	clock := newFakeGitSchedulerClock(time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC))
-	enableManagerAutosyncFixture(t, f, clock)
+	f.manager.now = clock.Now
 	var output bytes.Buffer
 	f.manager.logger = log.New(&output, "", 0)
+	scheduler := newGitScheduler(clock, f.statuses, f.snapshots, make(chan struct{}), f.manager, f.manager.logger)
+	waitForWorker := func() {
+		t.Helper()
+		done := make(chan struct{})
+		if err := f.manager.enqueueSynchronous(func() { close(done) }); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.manager.Start(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not finish the preceding sync")
+		}
+	}
 	for count := 1; count <= 5; count++ {
-		if err := f.manager.scheduler.reconcile(context.Background(), count == 1); err != nil {
+		if err := scheduler.reconcile(context.Background(), count == 1); err != nil {
 			t.Fatal(err)
 		}
 		clock.Advance(15 * time.Minute)
-		if !f.manager.scheduler.queueDue(context.Background(), clock.Now()) {
+		if !scheduler.queueDue(context.Background(), clock.Now()) {
 			t.Fatal("scheduler stopped")
 		}
-		op, duplicate, err := f.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base})
-		if err != nil {
-			t.Fatal(err)
+		if count == 1 {
+			if _, duplicate, err := f.manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: base}); err != nil || !duplicate {
+				t.Fatalf("manual/scheduled dedupe before worker start: duplicate=%v err=%v", duplicate, err)
+			}
 		}
-		if !duplicate {
-			t.Fatal("manual sync did not deduplicate the scheduled job")
+		waitForWorker()
+		op, found, err := f.operations.LatestByPath(context.Background(), base.Path)
+		if err != nil || !found || op.State != gitcmd.OperationFailed || op.Error == nil || op.Error.Code != gitcmd.CodeAuthentication {
+			t.Fatalf("worker journal after failure %d: %+v found=%v err=%v", count, op, found, err)
 		}
-		f.manager.mu.Lock()
-		job := f.manager.queue[0]
-		f.manager.queue = f.manager.queue[1:]
-		f.manager.mu.Unlock()
-		f.manager.runJob(job)
 		status, _, err := f.statuses.Get(context.Background(), base.Path)
 		if err != nil {
 			t.Fatal(err)
@@ -81,6 +95,38 @@ func TestGitManagerBreakerFifthFailureAndResume(t *testing.T) {
 	if strings.Count(output.String(), "breaker") != 1 || strings.Contains(output.String(), base.URL) || strings.Contains(output.String(), "secret") || strings.Contains(output.String(), "password") || strings.Contains(output.String(), "diagnostic") {
 		t.Fatalf("unsafe/repeated log: %s", output.String())
 	}
+	paused, found, err := f.statuses.Get(context.Background(), base.Path)
+	if err != nil || !found {
+		t.Fatalf("paused status found=%v err=%v", found, err)
+	}
+	if err := f.manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.notes.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedDB, err := repository.InitDB(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedDB.SetMaxOpenConns(1)
+	reopenedStatuses := repository.NewGitStatusRepository(reopenedDB)
+	persisted, found, err := reopenedStatuses.Get(context.Background(), base.Path)
+	if err != nil || !found || persisted.State != model.GitStatePaused || persisted.ConsecutiveFailures != 5 || persisted.Error == nil || persisted.Error.Code != string(gitcmd.CodeAuthentication) || !reflect.DeepEqual(persisted, paused) {
+		_ = reopenedDB.Close()
+		t.Fatalf("reopened breaker status=%+v found=%v err=%v, before close=%+v", persisted, found, err, paused)
+	}
+	// Recovery and Resume use fresh repositories and a new manager after restart.
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(repository.NewNoteRepository(reopenedDB), "", coordinator)
+	operations := repository.NewGitOperationRepository(reopenedDB)
+	manager := NewGitManager(f.manager.gitService, reopenedStatuses, operations, f.manager.prober, f.snapshots.get, notes, coordinator)
+	manager.now, manager.logger = clock.Now, f.manager.logger
+	f.db, f.statuses, f.operations, f.notes, f.coordinator, f.manager = reopenedDB, reopenedStatuses, operations, notes, coordinator, manager
+	t.Cleanup(func() { _ = manager.Close(); _ = notes.Close(); _ = reopenedDB.Close() })
 	if err := f.manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{base}); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +141,7 @@ func TestGitManagerBreakerFifthFailureAndResume(t *testing.T) {
 	if err != nil || !duplicate || again.ID != op.ID {
 		t.Fatalf("resume dedupe: %+v %v %v", again, duplicate, err)
 	}
-	f.manager.runJob(f.manager.queue[0])
+	waitForWorker()
 	status, _, _ := f.statuses.Get(context.Background(), base.Path)
 	if status.ConsecutiveFailures != 1 {
 		t.Fatalf("resumed failure: %+v", status)
@@ -428,6 +474,50 @@ func TestGitManagerResumeRollbackExactStatus(t *testing.T) {
 	got, _, _ := f.statuses.Get(context.Background(), base.Path)
 	if !reflect.DeepEqual(previous, got) {
 		t.Fatalf("rollback got=%+v want=%+v", got, previous)
+	}
+}
+
+func TestGitManagerResumePublishesCleanReadyBeforeDurableQueue(t *testing.T) {
+	base := configuredManagerBase("work", t.TempDir())
+	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", nil, nil, nil)
+	seedManagerTrust(t, f, base, managerOID)
+	previous := model.GitStatus{
+		Base: base.Name, RepositoryPath: base.Path, State: model.GitStatePaused,
+		OperationID: "previous-operation", Stage: string(gitcmd.StageFetching),
+		ConsecutiveFailures: 5, RemoteOID: managerOID,
+		Error: &model.APIError{Code: string(gitcmd.CodeAuthentication), Message: "Git authentication failed"},
+	}
+	if err := f.statuses.Upsert(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`CREATE TABLE resume_admission_status (
+		state TEXT, operation_id TEXT, stage TEXT, error_code TEXT, consecutive_failures INTEGER
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	// Capture the reset snapshot at the durable queue boundary, before its
+	// subsequent syncing publication can replace the intermediate ready state.
+	if _, err := f.db.Exec(`CREATE TRIGGER inspect_resume_admission BEFORE INSERT ON git_operations
+		BEGIN INSERT INTO resume_admission_status
+		SELECT state, operation_id, stage, error_code, consecutive_failures FROM git_status
+		WHERE repository_path = NEW.repo_path; END`); err != nil {
+		t.Fatal(err)
+	}
+	op, duplicate, err := f.manager.Resume(context.Background(), base.Name)
+	if err != nil || duplicate {
+		t.Fatalf("resume=%+v duplicate=%v err=%v", op, duplicate, err)
+	}
+	var state, operationID, stage, errorCode string
+	var count int
+	if err := f.db.QueryRow(`SELECT state, operation_id, stage, error_code, consecutive_failures FROM resume_admission_status`).Scan(&state, &operationID, &stage, &errorCode, &count); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(model.GitStateReady) || operationID != "" || stage != "" || errorCode != "" || count != 0 {
+		t.Fatalf("intermediate ready: state=%q operation=%q stage=%q error=%q count=%d", state, operationID, stage, errorCode, count)
+	}
+	queued, _, err := f.statuses.Get(context.Background(), base.Path)
+	if err != nil || queued.State != model.GitStateSyncing || queued.OperationID != op.ID || queued.Stage != string(gitcmd.StageQueued) || queued.ConsecutiveFailures != 0 || queued.Error != nil {
+		t.Fatalf("queued status=%+v err=%v", queued, err)
 	}
 }
 
@@ -811,6 +901,7 @@ func (s *managerSnapshotStore) put(base gitcmd.ConfiguredBase) {
 
 type gitManagerFixture struct {
 	db          *sql.DB
+	dbPath      string
 	statuses    *repository.GitStatusRepository
 	operations  *repository.GitOperationRepository
 	coordinator *BaseOperationCoordinator
@@ -849,7 +940,8 @@ func newGitManagerFixture(
 	probePorcelain GitPorcelain,
 ) *gitManagerFixture {
 	t.Helper()
-	db, err := repository.InitDB(filepath.Join(t.TempDir(), "metadata.db"))
+	dbPath := filepath.Join(t.TempDir(), "metadata.db")
+	db, err := repository.InitDB(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,7 +975,7 @@ func newGitManagerFixture(
 	prober := NewGitProbeService(managerSettings{config: model.Config{Bases: modelBases, CurrentBase: active}}, probePorcelain)
 	manager := NewGitManager(gitcmd.NewService(runner, servicePorcelain), statuses, operations, prober, snapshots.get, notes, coordinator)
 	fixture := &gitManagerFixture{
-		db: db, statuses: statuses, operations: operations, coordinator: coordinator,
+		db: db, dbPath: dbPath, statuses: statuses, operations: operations, coordinator: coordinator,
 		notes: notes, snapshots: snapshots, manager: manager,
 	}
 	t.Cleanup(func() {
