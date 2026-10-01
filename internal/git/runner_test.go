@@ -82,6 +82,25 @@ func TestGitRunnerHelper(t *testing.T) {
 			t.Fatal("large matching credential prefix was not sanitized")
 		}
 		_, _ = io.WriteString(os.Stdout, "bounded redaction passed")
+	case "redact-multivariant-adversarial":
+		size, err := strconv.Atoi(args[1])
+		if err != nil {
+			t.Fatal("invalid adversarial size")
+		}
+		shared := strings.Repeat("a", size)
+		secrets := []string{shared + "b", shared + "d"}
+		near := shared + "c"
+		for _, entry := range []struct{ text, want string }{
+			{near, near},
+			{shared, "[REDACTED_REMOTE]"},
+			{secrets[0] + " " + secrets[1], "[REDACTED_REMOTE] [REDACTED_REMOTE]"},
+			{near + " " + secrets[0], near + " [REDACTED_REMOTE]"},
+		} {
+			if got := redact(entry.text, secrets); got != entry.want {
+				t.Fatal("large multivariant redaction changed security behavior")
+			}
+		}
+		_, _ = io.WriteString(os.Stdout, "bounded multivariant redaction passed")
 	case "fail":
 		_, _ = io.WriteString(os.Stderr, args[1])
 		os.Exit(23)
@@ -515,6 +534,24 @@ func TestRedactAdversarialLargeValuesAreBounded(t *testing.T) {
 	}
 	if err != nil || !strings.HasPrefix(string(output), "bounded redaction passed") {
 		t.Fatal("adversarial redaction failed; helper output is intentionally private")
+	}
+}
+
+func TestRedactMultivariantAdversarialLargeValuesAreBounded(t *testing.T) {
+	for _, size := range []int{32 * 1024, 512 * 1024, 1024 * 1024} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			start := time.Now()
+			output, err := helperCommand(ctx, "redact-multivariant-adversarial", strconv.Itoa(size)).Output()
+			if ctx.Err() != nil {
+				t.Fatal("multivariant adversarial redaction exceeded the 3s bound")
+			}
+			if err != nil || !strings.HasPrefix(string(output), "bounded multivariant redaction passed") {
+				t.Fatal("multivariant redaction failed; helper output is intentionally private")
+			}
+			t.Logf("two-pattern near-match and security checks: %d bytes in %s", size, time.Since(start))
+		})
 	}
 }
 

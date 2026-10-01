@@ -142,10 +142,6 @@ func secretVariants(secrets []string) []string {
 
 func redact(text string, secrets []string) string {
 	ordered := secretVariants(secrets)
-	pairs := make([]string, 0, 2*len(ordered))
-	for _, secret := range ordered {
-		pairs = append(pairs, secret, "[REDACTED_REMOTE]")
-	}
 	// A single pass avoids matching another secret inside a replacement marker.
 	redacted := text
 	if len(ordered) == 1 {
@@ -153,7 +149,7 @@ func redact(text string, secrets []string) string {
 		// repetitive secrets; ReplaceAll has the same single-pass semantics.
 		redacted = strings.ReplaceAll(text, ordered[0], "[REDACTED_REMOTE]")
 	} else if len(ordered) > 1 {
-		redacted = strings.NewReplacer(pairs...).Replace(text)
+		redacted = replaceSecretVariants(text, ordered)
 	}
 	// Capture lookahead can end inside a later credential after earlier full
 	// replacements shrink the output. Protect that tail after full replacements;
@@ -172,6 +168,72 @@ func redact(text string, secrets []string) string {
 	return httpUserinfoPattern.ReplaceAllString(redacted, `${1}[REDACTED]@`)
 }
 
+// replaceSecretVariants scans the original text with KMP for each longest-first
+// pattern: O(len(text) + len(pattern)) per pattern, with O(len(text) + longest
+// pattern) workspace. It records only the longest match at each start, then
+// emits nonoverlapping replacements left to right. Markers are never rescanned.
+func replaceSecretVariants(text string, ordered []string) string {
+	var prefix, longest []int
+	for _, secret := range ordered {
+		if len(secret) > len(text) {
+			continue
+		}
+		if prefix == nil {
+			// Patterns are longest first, so this scratch table can be reused.
+			prefix = make([]int, len(secret))
+		}
+		table := prefix[:len(secret)]
+		fillSecretPrefixTable(secret, table)
+		for i, matched := 0, 0; i < len(text); i++ {
+			for matched > 0 && text[i] != secret[matched] {
+				matched = table[matched-1]
+			}
+			if text[i] == secret[matched] {
+				matched++
+			}
+			if matched == len(secret) {
+				if longest == nil {
+					longest = make([]int, len(text))
+				}
+				start := i + 1 - matched
+				longest[start] = max(longest[start], matched)
+				matched = table[matched-1]
+			}
+		}
+	}
+	if longest == nil {
+		return text
+	}
+	var output strings.Builder
+	output.Grow(len(text))
+	from := 0
+	for i := 0; i < len(text); {
+		if longest[i] == 0 {
+			i++
+			continue
+		}
+		output.WriteString(text[from:i])
+		output.WriteString("[REDACTED_REMOTE]")
+		i += longest[i]
+		from = i
+	}
+	output.WriteString(text[from:])
+	return output.String()
+}
+
+func fillSecretPrefixTable(pattern string, prefix []int) {
+	prefix[0] = 0
+	for i, matched := 1, 0; i < len(pattern); i++ {
+		for matched > 0 && pattern[i] != pattern[matched] {
+			matched = prefix[matched-1]
+		}
+		if pattern[i] == pattern[matched] {
+			matched++
+		}
+		prefix[i] = matched
+	}
+}
+
 // secretPrefixSuffixLength finds the longest proper secret prefix of at least
 // four bytes at the text's tail. KMP avoids repeatedly comparing overlapping
 // suffixes of repetitive input: time and space are linear in the candidate
@@ -183,15 +245,7 @@ func secretPrefixSuffixLength(text, secret string) int {
 	}
 	pattern := secret[:length]
 	prefix := make([]int, length)
-	for i, matched := 1, 0; i < length; i++ {
-		for matched > 0 && pattern[i] != pattern[matched] {
-			matched = prefix[matched-1]
-		}
-		if pattern[i] == pattern[matched] {
-			matched++
-		}
-		prefix[i] = matched
-	}
+	fillSecretPrefixTable(pattern, prefix)
 	matched := 0
 	for i := len(text) - length; i < len(text); i++ {
 		for matched > 0 && (matched == length || text[i] != pattern[matched]) {

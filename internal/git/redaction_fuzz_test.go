@@ -69,6 +69,76 @@ func TestRedactTailPrefixMatchesOriginalSemantics(t *testing.T) {
 	}
 }
 
+func TestRedactMultivariantReplacementMatchesOriginalSemantics(t *testing.T) {
+	texts := []string{"", "credential credential", "abcXYZabcdef", "\x00abcd\xffabcd", "unicode-пример unicode", "aaaaab aaaab aaaaaac"}
+	for size := 1; size <= 7; size++ {
+		for bits := 0; bits < 1<<size; bits++ {
+			text := make([]byte, size)
+			for i := range text {
+				text[i] = 'a' + byte(bits>>i&1)
+			}
+			texts = append(texts, string(text))
+		}
+	}
+	for _, secrets := range [][]string{
+		{"a", "aa", "aaa", "b"},
+		{"ab", "aba", "abab", "baba", "aaab"},
+		{"aaaaab", "aaaab", "aab", "baaaa", "aaaa"},
+		{"credential", "REDACTED_REMOTE", "[RED"},
+		{"abc", "abcXYZ", "XYZabcdef", "abcdef"},
+		{"\x00abcd", "abcd", "unicode-пример", "unicode"},
+	} {
+		ordered := secretVariants(secrets)
+		pairs := make([]string, 0, 2*len(ordered))
+		for _, secret := range ordered {
+			pairs = append(pairs, secret, "[REDACTED_REMOTE]")
+		}
+		for _, text := range texts {
+			want := strings.NewReplacer(pairs...).Replace(text)
+			if !strings.HasSuffix(want, "[REDACTED_REMOTE]") {
+				tail := 0
+				for _, secret := range ordered {
+					for n := min(len(secret)-1, len(want)); n >= 4 && n > tail; n-- {
+						if strings.HasSuffix(want, secret[:n]) {
+							tail = n
+							break
+						}
+					}
+				}
+				if tail > 0 {
+					want = want[:len(want)-tail] + "[REDACTED_REMOTE]"
+				}
+			}
+			if got := redact(text, secrets); got != want {
+				t.Fatal("multivariant matcher changed replacement semantics")
+			}
+		}
+	}
+	// Sequential ReplaceAll calls would process the marker inserted by the
+	// credential replacement. Public output must retain exactly one marker.
+	if got := redact("credential", []string{"credential", "REDACTED_REMOTE"}); got != "[REDACTED_REMOTE]" {
+		t.Fatal("replacement marker was treated as original diagnostic text")
+	}
+}
+
+func TestRedactMultivariantAllocationsAreBounded(t *testing.T) {
+	// Many adjacent matches must not cause a separate allocation per byte or
+	// match. Count allocations only after constructing the diagnostic/secrets.
+	for _, repeats := range []int{1024, 64 * 1024} {
+		text := strings.Repeat("abc|", repeats)
+		secrets := []string{"abc", "bc"}
+		allocations := testing.AllocsPerRun(3, func() {
+			got := redact(text, secrets)
+			if strings.Count(got, "[REDACTED_REMOTE]") != repeats {
+				t.Fatal("adjacent matches changed replacement behavior")
+			}
+		})
+		if allocations > 32 {
+			t.Fatalf("allocation bound exceeded for %d matches: %.0f allocations", repeats, allocations)
+		}
+	}
+}
+
 func FuzzRedactGitDiagnostic(f *testing.F) {
 	f.Add([]byte{0x12, 0xab}, "fatal: Authentication failed", uint16(64))
 	f.Add([]byte("credential"), "Authorization: Basic", uint16(8))
