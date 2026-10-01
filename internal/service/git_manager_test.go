@@ -165,8 +165,12 @@ func TestGitManagerAutosyncCloseBlockedNetworkAndConcurrentCallers(t *testing.T)
 		t.Fatalf("network=%d next=%d", networkCalls.Load(), nextCalls.Load())
 	}
 	status, _, _ = f.statuses.Get(context.Background(), root)
-	if status.ConsecutiveFailures != 3 || status.Error == nil || status.Error.Code != string(gitcmd.CodeCanceled) || status.LastAttempt == nil || !status.LastAttempt.Equal(clock.Now()) {
+	if status.ConsecutiveFailures != 3 || status.State != model.GitStateError || status.Error == nil || status.Error.Code != string(gitcmd.CodeOperationInterrupted) || status.Error.Message != "Git operation was interrupted" || status.LastAttempt == nil || !status.LastAttempt.Equal(clock.Now()) {
 		t.Fatalf("shutdown status=%+v", status)
+	}
+	operation, found, err := f.operations.LatestByPath(context.Background(), root)
+	if err != nil || !found || operation.State != gitcmd.OperationFailed || operation.Error == nil || operation.Error.Code != gitcmd.CodeOperationInterrupted || operation.Error.Message != "Git operation was interrupted" {
+		t.Fatalf("shutdown journal=%+v found=%v err=%v", operation, found, err)
 	}
 	if _, _, err := f.manager.Resume(context.Background(), base.Name); !errors.Is(err, ErrGitManagerClosed) {
 		t.Fatalf("closed resume: %v", err)
@@ -242,7 +246,7 @@ func TestGitManagerTerminalFailureAccounting(t *testing.T) {
 		count int
 	}{
 		{"init", gitcmd.OperationInitialize, gitcmd.CodeCommandFailed, model.GitStateInitializing, model.GitStateError, 3},
-		{"shutdown", gitcmd.OperationSync, gitcmd.CodeCanceled, model.GitStateSyncing, model.GitStateError, 3},
+		{"caller canceled", gitcmd.OperationSync, gitcmd.CodeCanceled, model.GitStateSyncing, model.GitStateError, 3},
 		{"interrupted", gitcmd.OperationSync, gitcmd.CodeOperationInterrupted, model.GitStateSyncing, model.GitStateError, 3},
 		{"branch", gitcmd.OperationSync, gitcmd.CodeBranchDeleted, model.GitStateSyncing, model.GitStatePaused, 3},
 		{"rewrite", gitcmd.OperationSync, gitcmd.CodeRemoteHistoryRewritten, model.GitStateSyncing, model.GitStatePaused, 3},
@@ -424,6 +428,56 @@ func TestGitManagerResumeRollbackExactStatus(t *testing.T) {
 	got, _, _ := f.statuses.Get(context.Background(), base.Path)
 	if !reflect.DeepEqual(previous, got) {
 		t.Fatalf("rollback got=%+v want=%+v", got, previous)
+	}
+}
+
+func TestGitManagerAdmissionTransitionFailureRestoresMissingStatus(t *testing.T) {
+	for _, cancelPublication := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelPublication), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			functionName := fmt.Sprintf("manager_cancel_missing_status_%d", managerSQLiteFunctionID.Add(1))
+			if err := sqlite.RegisterScalarFunction(functionName, 0, func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error) {
+				if cancelPublication {
+					cancel()
+				}
+				return int64(0), nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			base := configuredManagerBase("work", t.TempDir())
+			f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, "", nil, nil, nil)
+			if _, found, err := f.statuses.Get(ctx, base.Path); err != nil || found {
+				t.Fatalf("initial status found=%v err=%v", found, err)
+			}
+			if _, err := f.db.Exec(fmt.Sprintf(`CREATE TRIGGER reject_admission_transition BEFORE UPDATE ON git_status
+				WHEN NEW.state = 'initializing' BEGIN SELECT %s(); SELECT RAISE(FAIL, 'secret transition diagnostic'); END`, functionName)); err != nil {
+				t.Fatal(err)
+			}
+			op, duplicate, err := f.manager.QueueInitialize(ctx, gitcmd.InitializeRequest{Snapshot: base})
+			if err == nil || duplicate || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("failed admission=%+v %v %v", op, duplicate, err)
+			}
+			if cancelPublication && ctx.Err() == nil {
+				t.Fatal("publication did not reach cancellation boundary")
+			}
+			if status, found, err := f.statuses.Get(context.Background(), base.Path); err != nil || found {
+				t.Fatalf("stranded admission status=%+v found=%v err=%v", status, found, err)
+			}
+			stored, found, err := f.operations.ByID(context.Background(), op.ID)
+			if err != nil || !found || stored.State != gitcmd.OperationFailed {
+				t.Fatalf("compensated journal=%+v found=%v err=%v", stored, found, err)
+			}
+			if len(f.manager.queue) != 0 || len(f.manager.inFlight) != 0 {
+				t.Fatal("failed publication retained admitted work")
+			}
+			if _, err := f.db.Exec("DROP TRIGGER reject_admission_transition"); err != nil {
+				t.Fatal(err)
+			}
+			if _, duplicate, err := f.manager.QueueInitialize(context.Background(), gitcmd.InitializeRequest{Snapshot: base}); err != nil || duplicate {
+				t.Fatalf("retry duplicate=%v err=%v", duplicate, err)
+			}
+		})
 	}
 }
 
@@ -2881,8 +2935,12 @@ func TestGitManagerShutdownCancelsCurrentAndStartsNoNextJob(t *testing.T) {
 	}
 	firstOp, _, _ := fixture.operations.LatestByPath(context.Background(), first.Path)
 	secondOp, _, _ := fixture.operations.LatestByPath(context.Background(), second.Path)
-	if firstOp.State != gitcmd.OperationFailed || firstOp.Error == nil || firstOp.Error.Code != gitcmd.CodeCanceled || secondOp.State != gitcmd.OperationQueued {
+	if firstOp.State != gitcmd.OperationFailed || firstOp.Error == nil || firstOp.Error.Code != gitcmd.CodeOperationInterrupted || firstOp.Error.Message != "Git operation was interrupted" || secondOp.State != gitcmd.OperationQueued {
 		t.Fatalf("shutdown operations = %#v / %#v", firstOp, secondOp)
+	}
+	status, found, err := fixture.statuses.Get(context.Background(), first.Path)
+	if err != nil || !found || status.State != model.GitStateError || status.ConsecutiveFailures != 0 || status.Error == nil || status.Error.Code != string(gitcmd.CodeOperationInterrupted) || status.Error.Message != "Git operation was interrupted" {
+		t.Fatalf("shutdown public status=%+v found=%v err=%v", status, found, err)
 	}
 }
 

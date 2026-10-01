@@ -163,6 +163,14 @@ func (m *GitManager) applyStatus(ctx context.Context, status model.GitStatus, ac
 		}
 	}
 	if err := m.statuses.ApplyTransition(ctx, repository.GitStatusTransition{Status: status, Failures: action}); err != nil {
+		if !found {
+			// Seeding and transition publication are separate writes. Restore the
+			// prior absence even when the caller canceled during publication.
+			compensationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), managerAdmissionCompensationTimeout)
+			deleteErr := m.statuses.Delete(compensationCtx, status.RepositoryPath)
+			cancel()
+			return errors.Join(err, deleteErr)
+		}
 		return err
 	}
 	if action == GitFailureIncrement && previous.ConsecutiveFailures == repository.GitStatusPauseFailureThreshold-1 {
@@ -1036,7 +1044,7 @@ func (m *GitManager) runJob(job gitManagerJob) {
 	if operationErr != nil && m.lifetimeCtx.Err() != nil {
 		var conflict *gitcmd.ConflictError
 		if !errors.As(operationErr, &conflict) {
-			operationErr = m.lifetimeCtx.Err()
+			operationErr = &gitcmd.SafeError{Code: gitcmd.CodeOperationInterrupted, Message: "Git operation was interrupted"}
 		}
 	}
 	m.beforeTerminalPublication()
