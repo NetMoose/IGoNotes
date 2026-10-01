@@ -147,18 +147,22 @@ func redact(text string, secrets []string) string {
 		pairs = append(pairs, secret, "[REDACTED_REMOTE]")
 	}
 	// A single pass avoids matching another secret inside a replacement marker.
-	redacted := strings.NewReplacer(pairs...).Replace(text)
+	redacted := text
+	if len(ordered) == 1 {
+		// Single-pattern Replacer preprocessing can itself be quadratic for
+		// repetitive secrets; ReplaceAll has the same single-pass semantics.
+		redacted = strings.ReplaceAll(text, ordered[0], "[REDACTED_REMOTE]")
+	} else if len(ordered) > 1 {
+		redacted = strings.NewReplacer(pairs...).Replace(text)
+	}
 	// Capture lookahead can end inside a later credential after earlier full
 	// replacements shrink the output. Protect that tail after full replacements;
 	// never derive arbitrary words or redact prefixes shorter than four bytes.
 	tail := 0
 	if !strings.HasSuffix(redacted, "[REDACTED_REMOTE]") {
 		for _, secret := range ordered {
-			for n := min(len(secret)-1, len(redacted)); n >= 4 && n > tail; n-- {
-				if strings.HasSuffix(redacted, secret[:n]) {
-					tail = n
-					break
-				}
+			if len(secret)-1 > tail {
+				tail = max(tail, secretPrefixSuffixLength(redacted, secret))
 			}
 		}
 	}
@@ -166,6 +170,41 @@ func redact(text string, secrets []string) string {
 		redacted = redacted[:len(redacted)-tail] + "[REDACTED_REMOTE]"
 	}
 	return httpUserinfoPattern.ReplaceAllString(redacted, `${1}[REDACTED]@`)
+}
+
+// secretPrefixSuffixLength finds the longest proper secret prefix of at least
+// four bytes at the text's tail. KMP avoids repeatedly comparing overlapping
+// suffixes of repetitive input: time and space are linear in the candidate
+// length, bounded by both the secret and the diagnostic length.
+func secretPrefixSuffixLength(text, secret string) int {
+	length := min(len(secret)-1, len(text))
+	if length < 4 {
+		return 0
+	}
+	pattern := secret[:length]
+	prefix := make([]int, length)
+	for i, matched := 1, 0; i < length; i++ {
+		for matched > 0 && pattern[i] != pattern[matched] {
+			matched = prefix[matched-1]
+		}
+		if pattern[i] == pattern[matched] {
+			matched++
+		}
+		prefix[i] = matched
+	}
+	matched := 0
+	for i := len(text) - length; i < len(text); i++ {
+		for matched > 0 && (matched == length || text[i] != pattern[matched]) {
+			matched = prefix[matched-1]
+		}
+		if text[i] == pattern[matched] {
+			matched++
+		}
+	}
+	if matched < 4 {
+		return 0
+	}
+	return matched
 }
 
 func classifyFailure(err error, diagnostic string) *SafeError {

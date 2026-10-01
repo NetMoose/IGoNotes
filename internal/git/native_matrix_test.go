@@ -30,13 +30,64 @@ func requireGit(t *testing.T) *CommandRunner {
 	if err != nil {
 		t.Fatal("native Git version command failed")
 	}
-	version, err := parseGitVersion(string(output))
-	if err != nil || !version.Supported() {
-		t.Fatal("native Git must report a supported version (>=2.28)")
-	}
+	requireNativeGitVersion(t, string(output), os.Getenv("IGONOTES_REQUIRE_GIT_INTEGRATION") == "1")
 	runner := NewCommandRunner()
 	runner.executable = path
 	return runner
+}
+
+type nativeGitVersionReporter interface {
+	Helper()
+	Fatal(...any)
+	Skip(...any)
+}
+
+func requireNativeGitVersion(t nativeGitVersionReporter, output string, required bool) {
+	t.Helper()
+	version, err := parseGitVersion(output)
+	if err != nil {
+		t.Fatal("native Git must report a supported version (>=2.28)")
+		return
+	}
+	if !version.Supported() {
+		if required {
+			t.Fatal("required native Git must be >=2.28")
+		} else {
+			t.Skip("installed native Git is unsupported (requires >=2.28)")
+		}
+	}
+}
+
+type nativeGitVersionObservation struct{ action string }
+
+func (*nativeGitVersionObservation) Helper()        {}
+func (o *nativeGitVersionObservation) Fatal(...any) { o.action = "fail" }
+func (o *nativeGitVersionObservation) Skip(...any)  { o.action = "skip" }
+
+func TestNativeGitVersionRequirementBehavior(t *testing.T) {
+	for _, entry := range []struct{ name, output, optional, required string }{
+		{"minimum supported", "git version 2.28.0", "", ""},
+		{"newer major", "git version 3.0.0", "", ""},
+		{"installed unsupported", "git version 2.27.9", "skip", "fail"},
+		{"installed old major", "git version 1.99.0", "skip", "fail"},
+		{"malformed version", "invalid version", "fail", "fail"},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			for _, required := range []bool{false, true} {
+				t.Run(fmt.Sprintf("required=%t", required), func(t *testing.T) {
+					observation := &nativeGitVersionObservation{}
+					requireNativeGitVersion(observation, entry.output, required)
+					want := entry.optional
+					if required {
+						want = entry.required
+					}
+					if observation.action != want {
+						t.Fatalf("version gate action = %q, want %q", observation.action, want)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestNativeGitVersionIsSupported(t *testing.T) { requireGit(t) }

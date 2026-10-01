@@ -38,6 +38,37 @@ func TestRedactCompleteSecretBeforeOverlappingTailPrefix(t *testing.T) {
 	}
 }
 
+func TestRedactTailPrefixMatchesOriginalSemantics(t *testing.T) {
+	// Exhaustively compare short overlapping/repetitive byte strings with the
+	// previous suffix search. Keep the reference bounded and never print values.
+	words := []string{""}
+	for size := 1; size <= 7; size++ {
+		for bits := 0; bits < 1<<size; bits++ {
+			word := make([]byte, size)
+			for i := range word {
+				word[i] = 'a' + byte(bits>>i&1)
+			}
+			words = append(words, string(word))
+		}
+	}
+	for _, secret := range words[1:] {
+		for _, text := range words {
+			want := strings.ReplaceAll(text, secret, "[REDACTED_REMOTE]")
+			if !strings.HasSuffix(want, "[REDACTED_REMOTE]") {
+				for n := min(len(secret)-1, len(want)); n >= 4; n-- {
+					if strings.HasSuffix(want, secret[:n]) {
+						want = want[:len(want)-n] + "[REDACTED_REMOTE]"
+						break
+					}
+				}
+			}
+			if got := redact(text, []string{secret}); got != want {
+				t.Fatal("tail-prefix matching changed redaction semantics")
+			}
+		}
+	}
+}
+
 func FuzzRedactGitDiagnostic(f *testing.F) {
 	f.Add([]byte{0x12, 0xab}, "fatal: Authentication failed", uint16(64))
 	f.Add([]byte("credential"), "Authorization: Basic", uint16(8))

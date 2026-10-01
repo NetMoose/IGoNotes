@@ -69,6 +69,19 @@ func TestGitRunnerHelper(t *testing.T) {
 		_, _ = io.WriteString(os.Stderr, strings.Repeat("e", stderrSize))
 	case "stderr":
 		_, _ = io.WriteString(os.Stderr, args[1])
+	case "redact-adversarial":
+		const size = 512 * 1024
+		secret := strings.Repeat("a", size) + "b"
+		// Every candidate suffix shares almost its entire prefix, then differs
+		// at the final byte. Repeated HasSuffix comparisons become quadratic.
+		text := strings.Repeat("a", size) + "c"
+		if got := redact(text, []string{secret}); got != text {
+			t.Fatal("large nonmatching diagnostic changed")
+		}
+		if got := redact(strings.Repeat("a", size), []string{secret}); got != "[REDACTED_REMOTE]" {
+			t.Fatal("large matching credential prefix was not sanitized")
+		}
+		_, _ = io.WriteString(os.Stdout, "bounded redaction passed")
 	case "fail":
 		_, _ = io.WriteString(os.Stderr, args[1])
 		os.Exit(23)
@@ -489,6 +502,20 @@ func helperCommand(ctx context.Context, action string, args ...string) *exec.Cmd
 	commandArgs := []string{"-test.run=^TestGitRunnerHelper$", "--", action}
 	commandArgs = append(commandArgs, args...)
 	return exec.CommandContext(ctx, os.Args[0], commandArgs...)
+}
+
+func TestRedactAdversarialLargeValuesAreBounded(t *testing.T) {
+	// Run in a killable subprocess so a quadratic regression cannot stall the
+	// suite. Linear processing of these 512 KiB values has ample headroom at 3s.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	output, err := helperCommand(ctx, "redact-adversarial").Output()
+	if ctx.Err() != nil {
+		t.Fatal("adversarial redaction exceeded the 3s bound")
+	}
+	if err != nil || !strings.HasPrefix(string(output), "bounded redaction passed") {
+		t.Fatal("adversarial redaction failed; helper output is intentionally private")
+	}
 }
 
 func TestCommandRunnerPassesArgumentsWithoutShell(t *testing.T) {
