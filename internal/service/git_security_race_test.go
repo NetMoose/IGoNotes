@@ -46,20 +46,36 @@ func hardeningIdle(t *testing.T, manager *GitManager) {
 }
 
 type hardeningBarrier struct {
+	repo    string
 	stage   string
 	release chan struct{}
 }
 
 func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 	ctx := context.Background()
-	root, remote, oid := readyManagerGitPair(t)
-	peer := t.TempDir()
-	runManagerGit(t, peer, "clone", "--branch", "main", "--", remote, ".")
-	runManagerGit(t, peer, "config", "user.name", "Race Test")
-	runManagerGit(t, peer, "config", "user.email", "race@example.invalid")
-	base := configuredManagerBase("work", root)
-	base.URL, base.AutoSync, base.IntervalMinutes = remote, true, 5
-	entered := make(chan hardeningBarrier, 3)
+	var bases []gitcmd.ConfiguredBase
+	peers, contents, heads := map[string]string{}, map[string]string{}, map[string]string{}
+	for _, name := range []string{"A", "B"} {
+		root, remote, _ := readyManagerGitPair(t)
+		base := configuredManagerBase(name, root)
+		base.URL, base.AutoSync, base.IntervalMinutes = remote, true, 5
+		contents[root] = name + " original\n"
+		for file, data := range map[string]string{"note.md": contents[root], name + "-only.md": name + " destination index\n"} {
+			if err := os.WriteFile(filepath.Join(root, file), []byte(data), 0o600); err != nil {
+				t.Fatal("cannot seed distinct base bytes")
+			}
+		}
+		runManagerGit(t, root, "add", "--all")
+		runManagerGit(t, root, "commit", "-m", "distinct base")
+		runManagerGit(t, root, "push", "--no-verify", "origin", "main")
+		heads[root] = runManagerGit(t, root, "rev-parse", "HEAD")
+		runManagerGit(t, root, "update-ref", "refs/igonotes/remotes/main", heads[root])
+		peers[root] = t.TempDir()
+		runManagerGit(t, peers[root], "clone", "--branch", "main", "--", remote, ".")
+		bases = append(bases, base)
+	}
+	entered := make(chan hardeningBarrier, 1)
+	canceled := make(chan string, 1)
 	var current, maximum, networks atomic.Int32
 	delegate := gitcmd.NewCommandRunner()
 	runner := managerRunnerFunc(func(ctx context.Context, c gitcmd.Command) (gitcmd.Result, error) {
@@ -77,7 +93,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 			networks.Add(1)
 		}
 		if stage != "" {
-			b := hardeningBarrier{stage: stage, release: make(chan struct{}, 1)}
+			b := hardeningBarrier{repo: c.Dir, stage: stage, release: make(chan struct{}, 1)}
 			select {
 			case entered <- b:
 			case <-ctx.Done():
@@ -86,198 +102,377 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 			select {
 			case <-b.release:
 			case <-ctx.Done():
+				canceled <- stage
 				return gitcmd.Result{}, ctx.Err()
 			}
 		}
 		return delegate.Run(ctx, c)
 	})
 	client := gitcmd.NewClient(runner)
-	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, runner, client, client)
-	seedManagerTrust(t, f, base, oid)
-	status, _, err := f.statuses.Get(ctx, root)
+	f := newGitManagerFixture(t, bases, "A", runner, client, client)
+	completed := true
+	store := NewConfigService(filepath.Join(t.TempDir(), "config.json"))
+	config := model.Config{SetupCompleted: &completed, CurrentBase: "A"}
+	for _, base := range bases {
+		config.Bases = append(config.Bases, model.Base{Name: base.Name, Path: base.Path, GitURL: base.URL, GitBranch: base.Branch,
+			AutoSync: true, AutoSyncIntervalMinutes: 5, GitCommitMessageTemplate: DefaultGitCommitMessageTemplate})
+	}
+	if err := store.Save(&config); err != nil {
+		t.Fatal("cannot seed two-base settings")
+	}
+	settings, err := NewSettingsServiceWithGit(store, f.notes, f.coordinator, "", log.New(io.Discard, "", 0), NewGitConfigValidator(client), f.statuses)
 	if err != nil {
-		t.Fatal("cannot read initial failure budget")
+		t.Fatal("cannot construct two-base settings")
 	}
-	status.ConsecutiveFailures = 3
-	if err := f.statuses.Upsert(ctx, status); err != nil {
-		t.Fatal("cannot seed initial failure budget")
-	}
-	clock := newFakeGitSchedulerClock(schedulerTestNow())
-	enableManagerAutosyncFixture(t, f, clock)
-	f.manager.scheduler.startedAt = clock.Now()
-	if err := f.manager.scheduler.reconcile(ctx, true); err != nil {
-		t.Fatal("cannot reconcile scheduler")
-	}
-	clock.Advance(5 * time.Second)
-	if !f.manager.scheduler.queueDue(ctx, clock.Now()) {
-		t.Fatal("scheduler stopped before admission")
-	}
-	scheduled, found, err := f.operations.ActiveByPath(ctx, root)
-	if err != nil || !found {
-		t.Fatal("scheduler did not admit durable work")
-	}
-	// Admission and Resume take the coordinator too; while a job is running
-	// they wait for it. Race queued admissions before starting the worker.
-	op, duplicate, err := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: base})
-	if err != nil || !duplicate || op.ID != scheduled.ID {
-		t.Fatal("manual admission did not deduplicate scheduled work")
-	}
-	for iteration := range 50 {
-		if err := f.notes.SwitchBase(root); err != nil {
-			t.Fatal("cannot bind active base")
-		}
-		before, err := f.notes.GetNote("note.md")
+	for i := range bases {
+		bases[i], _, err = settings.GitSnapshot(bases[i].Name)
 		if err != nil {
-			t.Fatal("cannot read revision")
+			t.Fatal("cannot snapshot configured base")
 		}
-		type admission struct {
-			op        gitcmd.Operation
-			duplicate bool
-			err       error
-		}
-		admissions := make(chan admission, 2)
-		poll := make(chan error, 1)
-		tick := make(chan struct{}, 1)
-		saved, switched := make(chan error, 1), make(chan error, 1)
-		start := make(chan struct{})
-		go func() {
-			<-start
-			op, d, e := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: base})
-			admissions <- admission{op, d, e}
-		}()
-		go func() { <-start; op, d, e := f.manager.Resume(ctx, base.Name); admissions <- admission{op, d, e} }()
-		go func() { <-start; _, _, e := f.statuses.Get(ctx, root); poll <- e }()
-		go func() {
-			<-start
-			clock.Advance(5 * time.Minute)
-			f.manager.scheduler.queueDue(ctx, clock.Now())
-			tick <- struct{}{}
-		}()
-		go func() {
-			<-start
-			_, e := f.notes.SaveNote(model.SaveNoteRequest{ID: "note.md", Content: fmt.Sprintf("editor revision %d\n", iteration), ExpectedRevision: &before.Revision})
-			saved <- e
-		}()
-		go func() { <-start; switched <- f.notes.SwitchBase(root) }()
-		close(start)
-		for range 2 {
-			got := hardeningReceive(t, "same-path admission", admissions)
-			if got.err != nil || !got.duplicate || got.op.ID != op.ID {
-				t.Fatal("manual/resume lost same-path deduplication")
+		f.snapshots.put(bases[i])
+		if i == 1 {
+			// seedManagerTrust deliberately has one fixed fixture ID.
+			if _, err := f.db.Exec("UPDATE git_operations SET operation_id = ?", strings.Repeat("b", 32)); err != nil {
+				t.Fatal("cannot distinguish base journals")
 			}
 		}
-		if hardeningReceive(t, "status poll", poll) != nil {
-			t.Fatal("status poll failed")
+		seedManagerTrust(t, f, bases[i], heads[bases[i].Path])
+	}
+	clock := newFakeGitSchedulerClock(schedulerTestNow())
+	f.manager = NewGitManager(gitcmd.NewService(runner, client), f.statuses, f.operations, NewGitProbeService(settings, client), settings.GitSnapshot, f.notes, f.coordinator)
+	f.manager.now, f.manager.orderedSnapshots = clock.Now, lifecycleGitSnapshots{settings}
+	manager := f.manager
+	t.Cleanup(func() { _ = manager.Close() })
+	// Exercise the real scheduler's reconciliation/admission with an explicitly
+	// driven clock. Only this test goroutine drives scheduler state; the manager's
+	// actual worker is running throughout all fifty iterations.
+	scheduler := newGitScheduler(clock, f.statuses, lifecycleGitSnapshots{settings}, make(chan struct{}, 1), manager, log.New(io.Discard, "", 0))
+	scheduler.startedAt = clock.Now()
+	if err := manager.Start(); err != nil {
+		t.Fatal("cannot start race worker")
+	}
+	f.manager.mu.Lock()
+	started := f.manager.started
+	f.manager.mu.Unlock()
+	configured, err := f.snapshots.OrderedGitSnapshots()
+	if err != nil || !started || len(configured) != 2 {
+		t.Fatal("race fixture requires a running worker and two configured bases")
+	}
+	phases, visits := map[string]int{}, map[string]int{}
+	observe := func(b hardeningBarrier) {
+		t.Helper()
+		if b.stage != []string{"fetch", "add", "push"}[phases[b.repo]] || current.Load() != 1 {
+			t.Fatal("running Git commands overlapped or skipped a barrier")
 		}
-		hardeningReceive(t, "scheduled tick", tick)
-		if hardeningReceive(t, "queued revision save", saved) != nil || hardeningReceive(t, "queued switch", switched) != nil {
-			t.Fatal("queued note mutation failed")
+		phases[b.repo] = (phases[b.repo] + 1) % 3
+		if b.stage == "fetch" {
+			visits[b.repo]++
 		}
 	}
-	before, err := f.notes.GetNote("note.md")
-	if err != nil {
-		t.Fatal("cannot capture pre-transaction revision")
+	type result struct {
+		kind      string
+		op        gitcmd.Operation
+		duplicate bool
+		err       error
 	}
-	// Make the next real merge fast-forward by committing the editor's queued
-	// bytes first, then changing them from the peer. This isolates stale-save
-	// checks from the dirty-snapshot conflict regression.
-	runManagerGit(t, root, "add", "--all")
-	runManagerGit(t, root, "commit", "-m", "queued editor revisions")
-	runManagerGit(t, root, "push", "--no-verify", "origin", "main")
-	runManagerGit(t, peer, "pull", "--ff-only")
-	want := "incoming revision\n"
-	if err := os.WriteFile(filepath.Join(peer, "note.md"), []byte(want), 0o600); err != nil {
-		t.Fatal("cannot edit peer")
+	var interrupted, next gitcmd.Operation
+	destinationIndex := func(base gitcmd.ConfiguredBase) error {
+		nodes, err := repository.NewNoteRepository(f.db).GetAllNodes()
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for _, node := range nodes {
+			ids = append(ids, node.ID)
+		}
+		slices.Sort(ids)
+		if !slices.Equal(ids, []string{base.Name + "-only.md", "note.md"}) {
+			return errors.New("destination index retained source nodes")
+		}
+		return nil
 	}
-	runManagerGit(t, peer, "add", "--all")
-	runManagerGit(t, peer, "commit", "-m", "incoming revision")
-	runManagerGit(t, peer, "push", "--no-verify", "origin", "main")
-	if err := f.manager.Start(); err != nil {
-		t.Fatal("cannot start worker")
+	for iteration := range 50 {
+		source, destination := bases[iteration%2], bases[1-iteration%2]
+		if settings.GetConfig().CurrentBase != source.Name || f.notes.GetBasePath() != source.Path {
+			t.Fatal("iteration did not start on the previous switch destination")
+		}
+		before, err := f.notes.GetNote("note.md")
+		if err != nil || before.Content != contents[source.Path] {
+			t.Fatal("cannot capture source byte revision")
+		}
+		want := fmt.Sprintf("%s incoming revision %d\n", source.Name, iteration)
+		if err := os.WriteFile(filepath.Join(peers[source.Path], "note.md"), []byte(want), 0o600); err != nil {
+			t.Fatal("cannot edit remote source")
+		}
+		runManagerGit(t, peers[source.Path], "add", "--all")
+		runManagerGit(t, peers[source.Path], "commit", "-m", "incoming revision")
+		runManagerGit(t, peers[source.Path], "push", "--no-verify", "origin", "main")
+		contents[source.Path] = want
+		var op gitcmd.Operation
+		if iteration == 49 {
+			if err := scheduler.reconcile(ctx, false); err != nil {
+				t.Fatal("cannot reconcile shutdown scheduler")
+			}
+			status, _, err := f.statuses.Get(ctx, source.Path)
+			if err != nil {
+				t.Fatal("cannot read shutdown budget")
+			}
+			status.ConsecutiveFailures = 3
+			if err := f.statuses.Upsert(ctx, status); err != nil {
+				t.Fatal("cannot seed shutdown budget")
+			}
+			// Atomically admit a real second-base journal/FIFO job behind the last
+			// source job. The worker is already running. Use the existing admission
+			// seam under its documented two locks, so it cannot dequeue between
+			// these two admissions (public admissions are raced below).
+			f.coordinator.Lock()
+			manager.mu.Lock()
+			for _, base := range []gitcmd.ConfiguredBase{source, destination} {
+				status, found, lookupErr := f.statuses.Get(ctx, base.Path)
+				queued, duplicate, queueErr := manager.queueValidatedLocked(ctx, base, gitcmd.OperationSync, model.GitConfirmations{}, status, found)
+				if lookupErr != nil || queueErr != nil || duplicate {
+					manager.mu.Unlock()
+					f.coordinator.Unlock()
+					t.Fatal("cannot admit shutdown pair")
+				}
+				if base.Name == source.Name {
+					op = queued
+				} else {
+					next = queued
+				}
+			}
+			manager.mu.Unlock()
+			f.coordinator.Unlock()
+		} else {
+			var duplicate bool
+			op, duplicate, err = manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: source})
+			if err != nil || duplicate {
+				t.Fatal("cannot admit distinct running iteration")
+			}
+		}
+		fetch := hardeningReceive(t, "running fetch", entered)
+		observe(fetch)
+		stored, found, err := f.operations.ByID(ctx, op.ID)
+		if fetch.repo != source.Path || err != nil || !found || stored.State != gitcmd.OperationRunning || stored.Stage != gitcmd.StageFetching {
+			t.Fatal("iteration did not reach a real running fetch checkpoint")
+		}
+		if iteration != 49 {
+			if err := scheduler.reconcile(ctx, iteration == 0); err != nil {
+				t.Fatal("cannot reconcile live scheduler")
+			}
+		}
+		results, attempted := make(chan result, 6), make(chan struct{}, 6)
+		start := make(chan struct{})
+		worktreeStarted := make(chan struct{})
+		go func() {
+			<-start
+			attempted <- struct{}{}
+			op, duplicate, err := manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: destination})
+			results <- result{kind: "manual", op: op, duplicate: duplicate, err: err}
+		}()
+		go func() {
+			<-start
+			attempted <- struct{}{}
+			op, duplicate, err := manager.Resume(ctx, destination.Name)
+			results <- result{kind: "resume", op: op, duplicate: duplicate, err: err}
+		}()
+		go func() {
+			<-start
+			attempted <- struct{}{}
+			_, _, err := f.statuses.Get(ctx, source.Path)
+			results <- result{kind: "poll", err: err}
+		}()
+		go func() {
+			<-start
+			attempted <- struct{}{}
+			clock.Advance(5 * time.Minute)
+			var err error
+			if !scheduler.queueDue(ctx, clock.Now()) {
+				err = ErrGitManagerClosed
+			}
+			results <- result{kind: "scheduled", err: err}
+		}()
+		go func() {
+			<-start
+			attempted <- struct{}{}
+			// Saves use NoteService's worktree lock, not the coordinator. Start
+			// this stale buffer only after the real mutation owns that lock.
+			<-worktreeStarted
+			_, err := f.notes.SaveNote(model.SaveNoteRequest{ID: "note.md", Content: "stale editor must not overwrite either base\n", ExpectedRevision: &before.Revision})
+			results <- result{kind: "save", err: err}
+		}()
+		go func() {
+			<-start
+			attempted <- struct{}{}
+			_, err := settings.SwitchBase(destination.Name)
+			if err == nil {
+				err = destinationIndex(destination)
+			}
+			results <- result{kind: "switch", err: err}
+		}()
+		close(start)
+		for range 6 {
+			hardeningReceive(t, "running concurrent callers", attempted)
+		}
+		// The poll can return, but switching/admission must stay behind the
+		// coordinator. The save must wait through the active worktree mutation;
+		// after reindex it may reject the old revision while push is still held.
+		remaining := 6
+		checkBlocked := func(worktree, allowSave bool) {
+			t.Helper()
+			if f.coordinator.operations.TryLock() {
+				f.coordinator.Unlock()
+				t.Fatal("running operation released coordinator at barrier")
+			}
+			if worktree && f.notes.baseMu.TryRLock() {
+				f.notes.baseMu.RUnlock()
+				t.Fatal("active worktree transaction did not block note runtime")
+			}
+			for {
+				select {
+				case got := <-results:
+					if !(got.kind == "poll" && got.err == nil || allowSave && got.kind == "save" && errors.Is(got.err, ErrNoteChanged)) {
+						t.Fatal("caller escaped blocked transaction coordination")
+					}
+					remaining--
+				default:
+					return
+				}
+			}
+		}
+		checkBlocked(false, false)
+		fetch.release <- struct{}{}
+		worktree := hardeningReceive(t, "running worktree", entered)
+		observe(worktree)
+		if worktree.repo != source.Path || worktree.stage != "add" {
+			t.Fatal("source did not enter active worktree transaction")
+		}
+		close(worktreeStarted)
+		checkBlocked(true, false)
+		worktree.release <- struct{}{}
+		push := hardeningReceive(t, "running push", entered)
+		observe(push)
+		if push.repo != source.Path || push.stage != "push" {
+			t.Fatal("source did not reach push")
+		}
+		checkBlocked(false, true)
+		if iteration == 49 {
+			closed := make(chan error, 1)
+			go func() { closed <- manager.Close() }()
+			if hardeningReceive(t, "Close during final network", closed) != nil || hardeningReceive(t, "network cancellation", canceled) != "push" {
+				t.Fatal("Close did not cancel running push")
+			}
+			interrupted = op
+		} else {
+			push.release <- struct{}{}
+		}
+		// Admission also uses the coordinator. Drive any jobs admitted after the
+		// primary operation releases it, rather than assuming a queued-only race
+		// or depending on mutex wakeup order between worker and API callers.
+		var fence <-chan struct{}
+		for remaining > 0 || fence != nil {
+			select {
+			case b := <-entered:
+				if iteration == 49 {
+					t.Fatal("Close started the next configured base")
+				}
+				observe(b)
+				b.release <- struct{}{}
+			case got := <-results:
+				remaining--
+				switch got.kind {
+				case "save":
+					if !errors.Is(got.err, ErrNoteChanged) {
+						t.Fatal("revision save overwrote a source or destination note")
+					}
+				case "manual", "resume":
+					if iteration == 49 {
+						if !errors.Is(got.err, ErrGitManagerClosed) {
+							t.Fatal("Close admitted waiting mutation request")
+						}
+					} else if got.err != nil {
+						if got.kind != "resume" || !errors.Is(got.err, gitcmd.ErrGitNotPaused) {
+							t.Fatal("live admission failed unexpectedly")
+						}
+					} else {
+						journal, found, err := f.operations.ByID(ctx, got.op.ID)
+						if err != nil || !found || journal.RepoPath != destination.Path || got.op.RepoPath != destination.Path || got.kind == "resume" && !got.duplicate {
+							t.Fatal("same-path admission lost durable operation identity")
+						}
+					}
+				case "scheduled":
+					if iteration == 49 && !errors.Is(got.err, ErrGitManagerClosed) || iteration != 49 && got.err != nil {
+						t.Fatal("scheduled admission ignored manager lifetime")
+					}
+				default:
+					if got.err != nil {
+						t.Fatal("switch or status poll failed")
+					}
+				}
+				if remaining == 0 && iteration != 49 {
+					done := make(chan struct{}, 1)
+					if err := manager.enqueueSynchronous(func() { done <- struct{}{} }); err != nil {
+						t.Fatal("cannot fence live jobs")
+					}
+					fence = done
+				}
+			case <-fence:
+				fence = nil
+			case <-time.After(5 * time.Second):
+				t.Fatal("live race did not finish all callers and jobs")
+			}
+		}
+		if settings.GetConfig().CurrentBase != destination.Name || f.notes.GetBasePath() != destination.Path {
+			t.Fatal("switch did not publish distinct destination path")
+		}
+		if err := destinationIndex(destination); err != nil {
+			t.Fatal("switch retained source nodes instead of replacing destination index")
+		}
+		for _, base := range bases {
+			data, err := os.ReadFile(filepath.Join(base.Path, "note.md"))
+			if err != nil || string(data) != contents[base.Path] {
+				t.Fatal("concurrent save or switch lost exact base bytes")
+			}
+		}
+		f.snapshots.mu.Lock()
+		f.snapshots.active = destination.Name
+		f.snapshots.mu.Unlock()
+		stored, found, err = f.operations.ByID(ctx, op.ID)
+		if iteration != 49 && (err != nil || !found || stored.State != gitcmd.OperationSucceeded) {
+			t.Fatal("running iteration did not succeed")
+		}
 	}
-	fetch := hardeningReceive(t, "fetch barrier", entered)
-	if fetch.stage != "fetch" {
-		t.Fatal("unexpected fetch boundary")
-	}
-	fetch.release <- struct{}{}
-	worktree := hardeningReceive(t, "worktree barrier", entered)
-	if worktree.stage != "add" {
-		t.Fatal("unexpected worktree boundary")
-	}
-	saved, switched := make(chan error, 1), make(chan error, 1)
-	attempted := make(chan struct{}, 2)
-	go func() {
-		attempted <- struct{}{}
-		_, e := f.notes.SaveNote(model.SaveNoteRequest{ID: "note.md", Content: "stale editor bytes\n", ExpectedRevision: &before.Revision})
-		saved <- e
-	}()
-	go func() { attempted <- struct{}{}; switched <- f.notes.SwitchBase(root) }()
-	for range 2 {
-		hardeningReceive(t, "mutation callers", attempted)
-	}
-	select {
-	case <-saved:
-		t.Fatal("save escaped the worktree coordinator")
-	default:
-	}
-	select {
-	case <-switched:
-		t.Fatal("switch escaped the worktree coordinator")
-	default:
-	}
-	worktree.release <- struct{}{}
-	push := hardeningReceive(t, "push barrier", entered)
-	if push.stage != "push" {
-		t.Fatal("unexpected push boundary")
-	}
-	// Both note callers remain behind the whole-operation coordinator until
-	// Close cancels push; they must observe the reindexed incoming revision.
-	var next atomic.Int32
-	if err := f.manager.enqueueSynchronous(func() { next.Add(1) }); err != nil {
-		t.Fatal("cannot queue shutdown sentinel")
-	}
-	closed := make(chan error, 1)
-	go func() { closed <- f.manager.Close() }()
-	if hardeningReceive(t, "Close cancellation", closed) != nil || next.Load() != 0 {
-		t.Fatal("Close started queued work or failed")
-	}
-	if !errors.Is(hardeningReceive(t, "revision save", saved), ErrNoteChanged) {
-		t.Fatal("stale save overwrote incoming bytes")
-	}
-	if hardeningReceive(t, "switch and reindex", switched) != nil {
-		t.Fatal("switch failed after transaction")
-	}
-	got, err := f.notes.GetNote("note.md")
-	if err != nil || got.Content != want {
-		t.Fatal("note runtime lost incoming bytes")
-	}
-	clock.Advance(time.Hour)
-	stored, found, err := f.operations.ByID(ctx, op.ID)
+	stored, found, err := f.operations.ByID(ctx, interrupted.ID)
 	if err != nil || !found || stored.State != gitcmd.OperationFailed || stored.Error == nil || stored.Error.Code != gitcmd.CodeOperationInterrupted {
-		t.Fatal("Close did not persist interrupted network operation")
+		t.Fatal("Close did not persist interrupted push")
 	}
-	status, _, err = f.statuses.Get(ctx, root)
+	queued, found, err := f.operations.ByID(ctx, next.ID)
+	if err != nil || !found || queued.State != gitcmd.OperationQueued {
+		t.Fatal("Close started queued second-base operation")
+	}
+	status, _, err := f.statuses.Get(ctx, interrupted.RepoPath)
 	if err != nil || status.ConsecutiveFailures != 3 || status.Error == nil || status.Error.Code != string(gitcmd.CodeOperationInterrupted) {
 		t.Fatal("Close changed failure budget or lost cancellation")
 	}
-	remoteOID := runManagerGit(t, remote, "rev-parse", "refs/heads/main")
-	if remoteOID != runManagerGit(t, peer, "rev-parse", "HEAD") {
-		t.Fatal("Close performed an unexpected push")
-	}
 	beforeNetwork := networks.Load()
 	hardeningRestart(t, f, runner, client)
-	if err := f.manager.RecoverLocal(ctx, []gitcmd.ConfiguredBase{base}); err != nil {
+	if err := f.manager.RecoverLocal(ctx, bases); err != nil {
 		t.Fatal("cannot recover after Close")
 	}
 	if networks.Load() != beforeNetwork {
 		t.Fatal("local recovery performed network work")
 	}
-	persisted, _, err := f.operations.ByID(ctx, op.ID)
+	persisted, _, err := f.operations.ByID(ctx, interrupted.ID)
 	if err != nil || persisted.State != gitcmd.OperationFailed || persisted.Error == nil || persisted.Error.Code != gitcmd.CodeOperationInterrupted {
 		t.Fatal("restart lost persisted interruption")
 	}
 	if maximum.Load() != 1 {
 		t.Fatal("manager overlapped Git commands")
+	}
+	for _, base := range bases {
+		if phases[base.Path] != 0 || visits[base.Path] < 25 || runManagerGit(t, base.Path, "rev-parse", "HEAD") != runManagerGit(t, peers[base.Path], "rev-parse", "HEAD") {
+			t.Fatal("live barrier loop failed to exercise or preserve both base histories")
+		}
 	}
 }
 
@@ -603,16 +798,44 @@ func TestGitSecretsNeverReachPublicOrPersistentSinks(t *testing.T) {
 	if _, err := f.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		t.Fatal("cannot checkpoint persistent sinks")
 	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal("cannot close SQLite before scanning persistent sinks")
+	}
+	if err := f.db.Ping(); err == nil {
+		t.Fatal("persistent sink fixture must close SQLite before scanning")
+	}
 	for sink, path := range map[string]string{"config file": configPath, "SQLite": f.dbPath, "SQLite WAL": f.dbPath + "-wal", "SQLite SHM": f.dbPath + "-shm"} {
 		data, e := os.ReadFile(path)
-		if e != nil && !errors.Is(e, os.ErrNotExist) {
+		optional := sink == "SQLite WAL" || sink == "SQLite SHM"
+		if e != nil && !(optional && errors.Is(e, os.ErrNotExist)) {
 			t.Fatal("cannot inspect persistent sink")
+		}
+		if !optional && len(data) == 0 {
+			t.Fatal("persistent sink fixture must contain durable bytes")
+		}
+		if sink == "SQLite" && !bytes.HasPrefix(data, []byte("SQLite format 3\x00")) {
+			t.Fatal("persistent sink fixture did not read a closed SQLite database")
 		}
 		hardeningSecretFree(t, sink, data, secrets)
 	}
-	bodies, err := delegate.Run(ctx, gitcmd.Command{Dir: root, Args: []string{"log", "--all", "--format=%B"}, ReadOnly: true})
-	if err != nil || bodies.StdoutTruncated {
+	bodies, err := delegate.Run(ctx, gitcmd.Command{Dir: root, Args: []string{"log", "--all", "--format=%B%x00"}, ReadOnly: true})
+	if err != nil || bodies.StdoutTruncated || bodies.StderrTruncated {
 		t.Fatal("cannot inspect commit bodies")
 	}
+	if !strings.Contains(bodies.Stdout, "\x00") {
+		t.Fatal("commit sink fixture requires NUL-delimited bodies")
+	}
+	// Scan every byte including separators, and every body without trimming its
+	// whitespace. Git inserts a newline after each explicit %x00 terminator.
 	hardeningSecretFree(t, "commit bodies", []byte(bodies.Stdout), secrets)
+	parts := strings.Split(bodies.Stdout, "\x00")
+	if parts[len(parts)-1] != "\n" {
+		t.Fatal("commit sink fixture has an unterminated record")
+	}
+	for _, body := range parts[:len(parts)-1] {
+		if body == "" {
+			t.Fatal("commit sink fixture omitted a body")
+		}
+		hardeningSecretFree(t, "commit body record", []byte(body), secrets)
+	}
 }
