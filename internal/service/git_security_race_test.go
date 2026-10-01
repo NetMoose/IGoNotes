@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +46,177 @@ func hardeningIdle(t *testing.T, manager *GitManager) {
 	hardeningReceive(t, "worker fence", done)
 }
 
+func hardeningWaitForSignal(ctx context.Context, signal <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-signal:
+		return ctx.Err() // Cancellation wins over a simultaneously opened gate.
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type hardeningCallers struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	stopWorker func()
+}
+
+func newHardeningCallers(t *testing.T, f *gitManagerFixture) *hardeningCallers {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	callers := &hardeningCallers{ctx: ctx, cancel: cancel, stopWorker: func() { f.manager.lifetimeCancel() }}
+	// Register after fixture/manager cleanup so cancellation and caller joins
+	// run first. Signalling worker cancellation releases non-context-aware
+	// coordinator/worktree locks; Close and SQLite teardown happen only later.
+	t.Cleanup(func() { callers.stopAndJoin(t) })
+	return callers
+}
+
+func (callers *hardeningCallers) goCall(run func()) {
+	callers.wg.Add(1)
+	go func() { defer callers.wg.Done(); run() }()
+}
+
+func (callers *hardeningCallers) join(t *testing.T) {
+	t.Helper()
+	done := make(chan struct{}, 1)
+	go func() { callers.wg.Wait(); done <- struct{}{} }()
+	// Cleanup must still join when t.Context and the caller context are already
+	// cancelled. This independent bound does not prolong any caller's context.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(callers.ctx), 5*time.Second)
+	defer cancel()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("cancelled test callers did not join before resource teardown")
+	}
+}
+
+func (callers *hardeningCallers) stopAndJoin(t *testing.T) {
+	t.Helper()
+	callers.cancel()
+	callers.stopWorker()
+	callers.join(t)
+}
+
+func TestGitManagerRaceCancellationBeforeWorktree(t *testing.T) {
+	root, remote, _ := readyManagerGitPair(t)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	runner := gitcmd.NewCommandRunner()
+	client := gitcmd.NewClient(runner)
+	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, runner, client, client)
+	callers := newHardeningCallers(t, f)
+	ctx := callers.ctx
+	worktreeStarted := make(chan struct{})
+	entered, result := make(chan struct{}, 1), make(chan error, 1)
+	var release sync.Once
+	t.Cleanup(func() {
+		callers.cancel()
+		release.Do(func() { close(worktreeStarted) })
+		callers.join(t)
+	})
+	callers.goCall(func() {
+		entered <- struct{}{}
+		if err := hardeningWaitForSignal(ctx, worktreeStarted); err != nil {
+			result <- err
+			return
+		}
+		_, err := f.notes.SaveNote(model.SaveNoteRequest{ID: "note.md", Content: "late save after failure\n"})
+		result <- err
+	})
+	hardeningReceive(t, "waiting worktree caller", entered)
+	callers.cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Error("worktree waiter did not return caller cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("cancelled caller remained stranded before worktreeStarted")
+		// RED/failure recovery must itself join the old, uncancellable waiter.
+		release.Do(func() { close(worktreeStarted) })
+		hardeningReceive(t, "failed fixture worktree drain", result)
+	}
+	callers.join(t)
+	data, err := os.ReadFile(filepath.Join(root, "note.md"))
+	if err != nil || string(data) != "note\n" {
+		t.Error("cancelled worktree waiter performed a late real save")
+	}
+	release.Do(func() { close(worktreeStarted) })
+	if !errors.Is(hardeningWaitForSignal(ctx, worktreeStarted), context.Canceled) {
+		t.Error("opened worktree gate defeated prior caller cancellation")
+	}
+}
+
+func TestGitManagerRaceCancellationJoinsQueuedConflictCallers(t *testing.T) {
+	root, remote, oid := readyManagerGitPair(t)
+	base := configuredManagerBase("work", root)
+	base.URL = remote
+	var commands atomic.Int32
+	delegate := gitcmd.NewCommandRunner()
+	runner := managerRunnerFunc(func(ctx context.Context, command gitcmd.Command) (gitcmd.Result, error) {
+		commands.Add(1)
+		return delegate.Run(ctx, command)
+	})
+	client := gitcmd.NewClient(runner)
+	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, runner, client, client)
+	seedManagerTrust(t, f, base, oid)
+	callers := newHardeningCallers(t, f)
+	ctx := callers.ctx
+	if _, bounded := ctx.Deadline(); !bounded {
+		t.Fatal("queued conflict callers require a bounded shared context")
+	}
+	results := make(chan error, 2)
+	// Leave the worker unstarted: both public calls must really enter its FIFO,
+	// and only caller cancellation can return them (Close doesn't deliver their
+	// private queued result channels). No synthetic handler/error responses.
+	callers.goCall(func() { _, err := f.manager.ListConflicts(ctx, base.Name); results <- err })
+	callers.goCall(func() {
+		_, err := f.manager.ResolveConflict(ctx, model.GitConflictResolveRequest{Base: base.Name, OperationID: strings.Repeat("a", 32), ConflictID: "queued", Path: "note.md"})
+		results <- err
+	})
+	queuedCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for {
+		f.manager.mu.Lock()
+		queued := len(f.manager.queue)
+		f.manager.mu.Unlock()
+		if queued == 2 {
+			break
+		}
+		select {
+		case <-queuedCtx.Done():
+			t.Fatal("conflict callers did not enter real FIFO")
+		default:
+			runtime.Gosched()
+		}
+	}
+	callers.cancel()
+	// Join before even cancelling the manager lifetime. This specifically proves
+	// queued ListConflicts/ResolveConflict do not depend on teardown waking them.
+	callers.join(t)
+	for range 2 {
+		if !errors.Is(hardeningReceive(t, "cancelled queued conflict caller", results), context.Canceled) {
+			t.Fatal("queued conflict call did not return caller cancellation")
+		}
+	}
+	if f.manager.lifetimeCtx.Err() != nil || commands.Load() != 0 {
+		t.Fatal("queued caller cancellation depended on manager shutdown or Git execution")
+	}
+	if err := f.db.Ping(); err != nil {
+		t.Fatal("SQLite closed before caller join")
+	}
+	note, err := f.notes.GetNote("note.md")
+	if err != nil || note.Content != "note\n" {
+		t.Fatal("cancelled queued calls mutated or closed the note runtime")
+	}
+}
+
 type hardeningBarrier struct {
 	repo    string
 	stage   string
@@ -58,7 +230,6 @@ func (queue hardeningSyncQueueFunc) QueueSync(ctx context.Context, request gitcm
 }
 
 func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
-	ctx := context.Background()
 	root, remote, oid := readyManagerGitPair(t)
 	base := configuredManagerBase("work", root)
 	base.URL, base.AutoSync, base.IntervalMinutes = remote, true, 5
@@ -81,6 +252,8 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 	})
 	client := gitcmd.NewClient(runner)
 	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, runner, client, client)
+	callers := newHardeningCallers(t, f)
+	ctx := callers.ctx
 	seedManagerTrust(t, f, base, oid)
 	clock := newFakeGitSchedulerClock(schedulerTestNow())
 	f.manager.now = clock.Now
@@ -96,6 +269,7 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 		workerReady <- struct{}{}
 		select {
 		case <-workerRelease:
+		case <-ctx.Done():
 		case <-f.manager.lifetimeCtx.Done():
 		}
 	}); err != nil {
@@ -115,10 +289,13 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 		op, duplicate, err := f.manager.QueueSync(ctx, request)
 		// Record the real manager return values before returning to queueDue.
 		// The scheduler request stays open while the manual request races it.
-		captured <- admission{op: op, duplicate: duplicate, err: err}
 		select {
-		case <-adapterRelease:
-		case <-f.manager.lifetimeCtx.Done():
+		case captured <- admission{op: op, duplicate: duplicate, err: err}:
+		case <-ctx.Done():
+			return op, duplicate, ctx.Err()
+		}
+		if waitErr := hardeningWaitForSignal(ctx, adapterRelease); waitErr != nil {
+			return op, duplicate, waitErr
 		}
 		return op, duplicate, err
 	})
@@ -129,7 +306,7 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 	}
 	clock.Advance(5 * time.Second)
 	tick := make(chan bool, 1)
-	go func() { tick <- scheduler.queueDue(ctx, clock.Now()) }()
+	callers.goCall(func() { tick <- scheduler.queueDue(ctx, clock.Now()) })
 	scheduled := hardeningReceive(t, "scheduler queue result", captured)
 	if scheduled.err != nil || scheduled.duplicate || scheduled.op.ID == "" {
 		t.Fatal("scheduler did not capture a new actual admission")
@@ -139,10 +316,10 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 		t.Fatal("scheduler result was not captured at an active durable admission boundary")
 	}
 	manualResult := make(chan admission, 1)
-	go func() {
+	callers.goCall(func() {
 		op, duplicate, err := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: base})
 		manualResult <- admission{op, duplicate, err}
-	}()
+	})
 	manual := hardeningReceive(t, "same-path manual result", manualResult)
 	if manual.err != nil || !manual.duplicate || manual.op.ID != scheduled.op.ID {
 		t.Fatalf("scheduler/manual admission identity differs: manualDeduplicated=%v sameID=%v", manual.duplicate, manual.op.ID == scheduled.op.ID)
@@ -154,15 +331,15 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 	// A later automatic admission while this same operation remains active must
 	// also report deduplication, rather than merely serializing another job.
 	clock.Advance(5 * time.Minute)
-	go func() { tick <- scheduler.queueDue(ctx, clock.Now()) }()
+	callers.goCall(func() { tick <- scheduler.queueDue(ctx, clock.Now()) })
 	again := hardeningReceive(t, "repeat scheduler queue result", captured)
 	if again.err != nil || !again.duplicate || again.op.ID != scheduled.op.ID {
 		t.Fatal("repeat scheduled admission lost active operation identity")
 	}
-	go func() {
+	callers.goCall(func() {
 		op, duplicate, err := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: base})
 		manualResult <- admission{op, duplicate, err}
-	}()
+	})
 	manual = hardeningReceive(t, "repeat same-path manual result", manualResult)
 	if manual.err != nil || !manual.duplicate || manual.op.ID != again.op.ID {
 		t.Fatal("repeat scheduler/manual admissions returned different operation IDs")
@@ -185,6 +362,7 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 	hardeningReceive(t, "admitted operation fetch", fetchEntered)
 	fetchRelease <- struct{}{}
 	hardeningIdle(t, f.manager)
+	callers.join(t)
 	completed, found, err := f.operations.ByID(ctx, scheduled.op.ID)
 	if err != nil || !found || completed.State != gitcmd.OperationSucceeded || completed.Stage != gitcmd.StageCompleted || fetches.Load() != 1 || pushes.Load() != 1 {
 		t.Fatal("shared scheduler/manual operation did not execute exactly once")
@@ -196,7 +374,7 @@ func TestGitManagerRaceScheduledManualAdmissionIdentity(t *testing.T) {
 }
 
 func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	var bases []gitcmd.ConfiguredBase
 	peers, contents, heads := map[string]string{}, map[string]string{}, map[string]string{}
 	for _, name := range []string{"A", "B"} {
@@ -287,6 +465,8 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 	f.manager.now, f.manager.orderedSnapshots = clock.Now, lifecycleGitSnapshots{settings}
 	manager := f.manager
 	t.Cleanup(func() { _ = manager.Close() })
+	callers := newHardeningCallers(t, f)
+	ctx = callers.ctx
 	// Exercise the real scheduler's reconciliation/admission with an explicitly
 	// driven clock. Only this test goroutine drives scheduler state; the manager's
 	// actual worker is running throughout all fifty iterations.
@@ -408,26 +588,38 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 		results, attempted := make(chan result, 6), make(chan struct{}, 6)
 		start := make(chan struct{})
 		worktreeStarted := make(chan struct{})
-		go func() {
-			<-start
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- result{kind: "manual", err: err}
+				return
+			}
 			attempted <- struct{}{}
 			op, duplicate, err := manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: destination})
 			results <- result{kind: "manual", op: op, duplicate: duplicate, err: err}
-		}()
-		go func() {
-			<-start
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- result{kind: "resume", err: err}
+				return
+			}
 			attempted <- struct{}{}
 			op, duplicate, err := manager.Resume(ctx, destination.Name)
 			results <- result{kind: "resume", op: op, duplicate: duplicate, err: err}
-		}()
-		go func() {
-			<-start
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- result{kind: "poll", err: err}
+				return
+			}
 			attempted <- struct{}{}
 			_, _, err := f.statuses.Get(ctx, source.Path)
 			results <- result{kind: "poll", err: err}
-		}()
-		go func() {
-			<-start
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- result{kind: "scheduled", err: err}
+				return
+			}
 			attempted <- struct{}{}
 			clock.Advance(5 * time.Minute)
 			var err error
@@ -435,25 +627,34 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 				err = ErrGitManagerClosed
 			}
 			results <- result{kind: "scheduled", err: err}
-		}()
-		go func() {
-			<-start
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- result{kind: "save", err: err}
+				return
+			}
 			attempted <- struct{}{}
 			// Saves use NoteService's worktree lock, not the coordinator. Start
 			// this stale buffer only after the real mutation owns that lock.
-			<-worktreeStarted
+			if err := hardeningWaitForSignal(ctx, worktreeStarted); err != nil {
+				results <- result{kind: "save", err: err}
+				return
+			}
 			_, err := f.notes.SaveNote(model.SaveNoteRequest{ID: "note.md", Content: "stale editor must not overwrite either base\n", ExpectedRevision: &before.Revision})
 			results <- result{kind: "save", err: err}
-		}()
-		go func() {
-			<-start
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- result{kind: "switch", err: err}
+				return
+			}
 			attempted <- struct{}{}
 			_, err := settings.SwitchBase(destination.Name)
 			if err == nil {
 				err = destinationIndex(destination)
 			}
 			results <- result{kind: "switch", err: err}
-		}()
+		})
 		close(start)
 		for range 6 {
 			hardeningReceive(t, "running concurrent callers", attempted)
@@ -502,7 +703,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 		checkBlocked(false, true)
 		if iteration == 49 {
 			closed := make(chan error, 1)
-			go func() { closed <- manager.Close() }()
+			callers.goCall(func() { closed <- manager.Close() })
 			if hardeningReceive(t, "Close during final network", closed) != nil || hardeningReceive(t, "network cancellation", canceled) != "push" {
 				t.Fatal("Close did not cancel running push")
 			}
@@ -599,7 +800,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 		t.Fatal("Close changed failure budget or lost cancellation")
 	}
 	beforeNetwork := networks.Load()
-	hardeningRestart(t, f, runner, client)
+	hardeningRestart(t, f, runner, client, callers)
 	if err := f.manager.RecoverLocal(ctx, bases); err != nil {
 		t.Fatal("cannot recover after Close")
 	}
@@ -620,8 +821,9 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 	}
 }
 
-func hardeningRestart(t *testing.T, f *gitManagerFixture, runner gitcmd.Runner, client *gitcmd.Client) {
+func hardeningRestart(t *testing.T, f *gitManagerFixture, runner gitcmd.Runner, client *gitcmd.Client, callers *hardeningCallers) {
 	t.Helper()
+	callers.join(t)
 	if err := f.manager.Close(); err != nil {
 		t.Fatal("cannot close manager")
 	}
@@ -641,7 +843,7 @@ func hardeningRestart(t *testing.T, f *gitManagerFixture, runner gitcmd.Runner, 
 	f.notes = NewNoteService(repository.NewNoteRepository(db), firstManagerPathMust(f), f.coordinator)
 	f.manager = NewGitManager(gitcmd.NewService(runner, client), f.statuses, f.operations, f.manager.prober, f.snapshots.get, f.notes, f.coordinator)
 	manager, notes := f.manager, f.notes
-	t.Cleanup(func() { _ = manager.Close(); _ = notes.Close(); _ = db.Close() })
+	t.Cleanup(func() { callers.stopAndJoin(t); _ = manager.Close(); _ = notes.Close(); _ = db.Close() })
 }
 
 func firstManagerPathMust(f *gitManagerFixture) string {
@@ -651,7 +853,7 @@ func firstManagerPathMust(f *gitManagerFixture) string {
 }
 
 func TestGitManagerRaceConflictResolvePollAndRestart(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	root, remote, oid := readyManagerGitPair(t)
 	peer := t.TempDir()
 	runManagerGit(t, peer, "clone", "--branch", "main", "--", remote, ".")
@@ -702,6 +904,8 @@ func TestGitManagerRaceConflictResolvePollAndRestart(t *testing.T) {
 	}
 	clock := newFakeGitSchedulerClock(schedulerTestNow())
 	enableManagerAutosyncFixture(t, f, clock)
+	callers := newHardeningCallers(t, f)
+	ctx = callers.ctx
 	op, _, err := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: base})
 	if err != nil {
 		t.Fatal("cannot admit conflicting sync")
@@ -724,34 +928,57 @@ func TestGitManagerRaceConflictResolvePollAndRestart(t *testing.T) {
 		}
 		results := make(chan error, 5)
 		start := make(chan struct{})
-		go func() { <-start; _, e := f.manager.ListConflicts(ctx, base.Name); results <- e }()
-		go func() { <-start; _, _, e := f.statuses.Get(ctx, root); results <- e }()
-		go func() {
-			<-start
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- err
+				return
+			}
+			_, e := f.manager.ListConflicts(ctx, base.Name)
+			results <- e
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- err
+				return
+			}
+			_, _, e := f.statuses.Get(ctx, root)
+			results <- e
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- err
+				return
+			}
 			_, e := f.notes.SaveNote(model.SaveNoteRequest{ID: "note.md", Content: "must not overwrite"})
 			if !errors.Is(e, ErrGitConflictPending) {
 				results <- errors.New("conflict mutation gate failed")
 			} else {
 				results <- nil
 			}
-		}()
-		go func() {
-			<-start
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- err
+				return
+			}
 			_, _, e := f.manager.Resume(ctx, base.Name)
 			if e == nil {
 				results <- errors.New("conflict admitted resume")
 			} else {
 				results <- nil
 			}
-		}()
-		go func() {
-			<-start
+		})
+		callers.goCall(func() {
+			if err := hardeningWaitForSignal(ctx, start); err != nil {
+				results <- err
+				return
+			}
 			response, e := f.manager.ResolveConflict(ctx, model.GitConflictResolveRequest{Base: base.Name, OperationID: op.ID, ConflictID: conflict.ID, Path: conflict.Path, Action: model.GitConflictManual, ResultPath: conflict.Path, Content: &merged})
 			if e == nil && (response.Remaining.OperationID != op.ID || response.Remaining.CanComplete || len(response.Remaining.Conflicts) != 50-iteration) {
 				e = errors.New("resolution lost original conflict identity")
 			}
 			results <- e
-		}()
+		})
 		close(start)
 		for range 5 {
 			if hardeningReceive(t, "conflict race", results) != nil {
@@ -765,7 +992,7 @@ func TestGitManagerRaceConflictResolvePollAndRestart(t *testing.T) {
 	if err != nil || status.State != model.GitStateConflict || status.ConsecutiveFailures != 3 || network.Load() != beforeNetwork {
 		t.Fatal("conflict consumed failure budget or performed network work")
 	}
-	hardeningRestart(t, f, runner, client)
+	hardeningRestart(t, f, runner, client, callers)
 	if err := f.manager.RecoverLocal(ctx, []gitcmd.ConfiguredBase{base}); err != nil {
 		t.Fatal("cannot recover resolved conflict")
 	}
@@ -803,7 +1030,7 @@ func TestGitSecretsNeverReachPublicOrPersistentSinks(t *testing.T) {
 		_, _ = io.WriteString(os.Stderr, os.Getenv("IGONOTES_HARDENING_DIAGNOSTIC"))
 		os.Exit(23)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 	secret := strings.Repeat("IGONOTES_SECRET_32", 7)
 	unsafe := "https://user:" + secret + "@example.invalid/repo.git?token=" + secret
 	basic := base64.StdEncoding.EncodeToString([]byte("user:" + secret))
@@ -857,6 +1084,8 @@ func TestGitSecretsNeverReachPublicOrPersistentSinks(t *testing.T) {
 	})
 	client := gitcmd.NewClient(runner)
 	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{base}, base.Name, runner, client, client)
+	callers := newHardeningCallers(t, f)
+	ctx = callers.ctx
 	var logs bytes.Buffer
 	logger := log.New(&logs, "", 0)
 	configPath := filepath.Join(t.TempDir(), "config.json")
@@ -936,6 +1165,7 @@ func TestGitSecretsNeverReachPublicOrPersistentSinks(t *testing.T) {
 		hardeningSecretFree(t, sink, data, secrets)
 	}
 	hardeningSecretFree(t, "logger", logs.Bytes(), secrets)
+	callers.stopAndJoin(t)
 	if err := f.manager.Close(); err != nil {
 		t.Fatal("cannot close sink manager")
 	}
@@ -962,7 +1192,9 @@ func TestGitSecretsNeverReachPublicOrPersistentSinks(t *testing.T) {
 		}
 		hardeningSecretFree(t, sink, data, secrets)
 	}
-	bodies, err := delegate.Run(ctx, gitcmd.Command{Dir: root, Args: []string{"log", "--all", "--format=%B%x00"}, ReadOnly: true})
+	auditCtx, auditCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer auditCancel()
+	bodies, err := delegate.Run(auditCtx, gitcmd.Command{Dir: root, Args: []string{"log", "--all", "--format=%B%x00"}, ReadOnly: true})
 	if err != nil || bodies.StdoutTruncated || bodies.StderrTruncated {
 		t.Fatal("cannot inspect commit bodies")
 	}
