@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -23,6 +24,98 @@ import (
 )
 
 var twoDeviceOperationID atomic.Uint64
+
+// A fatal helper rejection must be observable without failing the parent test.
+type e2eHelperRejection struct{}
+type e2eHelperReporter struct{}
+
+func (e2eHelperReporter) Helper()      {}
+func (e2eHelperReporter) Fatal(...any) { panic(e2eHelperRejection{}) }
+
+func e2eRejected(call func()) (rejected bool) {
+	defer func() {
+		if value := recover(); value != nil {
+			if _, ok := value.(e2eHelperRejection); !ok {
+				panic(value)
+			}
+			rejected = true
+		}
+	}()
+	call()
+	return false
+}
+
+func TestTwoDeviceRelativeNameRequiresCleanSlashPath(t *testing.T) {
+	for _, name := range []string{"note.md", "folder/renamed [two].md", "assets/images/проба.bin", "space \tname.md"} {
+		if got := e2eRelativeName(t, name); got != filepath.FromSlash(name) {
+			t.Fatal("relative name bytes changed")
+		}
+	}
+	for _, name := range []string{"", ".", "/absolute.md", "../escape.md", "folder/../note.md",
+		"./note.md", "folder//note.md", "folder/./note.md", "folder/", ".git/config", "folder/.GIT/config", "folder\\note.md"} {
+		t.Run(fmt.Sprintf("invalid_%q", name), func(t *testing.T) {
+			if !e2eRejected(func() { e2eRelativeName(e2eHelperReporter{}, name) }) {
+				t.Fatal("invalid relative name was accepted")
+			}
+		})
+	}
+}
+
+func TestTwoDeviceSyncResultPreservesTrustedOIDUnlessSuccessfulAndValid(t *testing.T) {
+	old := strings.Repeat("a", 40)
+	for _, entry := range []struct {
+		name, oid string
+		err       error
+		accept    bool
+	}{
+		{name: "successful SHA1", oid: strings.Repeat("b", 40), accept: true},
+		{name: "successful SHA256", oid: strings.Repeat("c", 64), accept: true},
+		{name: "empty successful result"},
+		{name: "malformed successful result", oid: "not-an-oid"},
+		{name: "short successful result", oid: strings.Repeat("d", 39)},
+		{name: "failed result with valid OID", oid: strings.Repeat("e", 40), err: errors.New("sync failed")},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			d := &twoDevice{trustedRemoteOID: old}
+			d.rememberSyncResult(OperationResult{RemoteOID: entry.oid}, entry.err)
+			want := old
+			if entry.accept {
+				want = entry.oid
+			}
+			if d.trustedRemoteOID != want {
+				t.Fatal("sync result incorrectly advanced or cleared trusted OID")
+			}
+		})
+	}
+}
+
+func TestTwoDeviceNULFieldsPreservesBytesAndRejectsMalformedRecords(t *testing.T) {
+	want := []string{" space \tname\n.md", "проба\xff.md"}
+	if got := e2eNULFields(t, strings.Join(want, "\x00")+"\x00"); !reflect.DeepEqual(got, want) {
+		t.Fatal("NUL records did not preserve exact bytes")
+	}
+	if got := e2eNULFields(t, ""); len(got) != 0 {
+		t.Fatal("empty output must represent zero records")
+	}
+	for _, output := range []string{"unterminated", "\x00", "one\x00\x00", "one\x00\x00two\x00"} {
+		if !e2eRejected(func() { e2eNULFields(e2eHelperReporter{}, output) }) {
+			t.Fatal("malformed NUL records were accepted")
+		}
+	}
+}
+
+func TestTwoDeviceSnapshotsFingerprintExplicitDefaultTemplate(t *testing.T) {
+	f := newTwoDeviceFixture(t)
+	for _, d := range []*twoDevice{f.one, f.two} {
+		if d.snapshot.CommitTemplate != defaultSyncCommitTemplate {
+			t.Fatal("device snapshot must explicitly select the default commit template")
+		}
+		s := d.snapshot
+		if s.Fingerprint == twoDeviceFingerprint(s.Name, s.Path, s.URL, s.Branch, "false", "0", "") {
+			t.Fatal("device fingerprint omitted the explicit commit template")
+		}
+	}
+}
 
 type twoDeviceFixture struct {
 	runner         *CommandRunner
@@ -77,7 +170,8 @@ func (f *twoDeviceFixture) device(t *testing.T, name string) *twoDevice {
 		t.Fatal("cannot open device root")
 	}
 	t.Cleanup(func() { root.Close() })
-	s := ConfiguredBase{Name: name, Path: canonical, URL: f.remote, Branch: "main"}
+	s := ConfiguredBase{Name: name, Path: canonical, URL: f.remote, Branch: "main",
+		CommitTemplate: defaultSyncCommitTemplate}
 	s.Fingerprint = twoDeviceFingerprint(s.Name, s.Path, s.URL, s.Branch,
 		strconv.FormatBool(s.AutoSync), strconv.Itoa(s.IntervalMinutes), s.CommitTemplate)
 	s.RemoteFingerprint = twoDeviceFingerprint(s.Path, s.URL, s.Branch)
@@ -133,7 +227,8 @@ func (f *twoDeviceFixture) initialize(t *testing.T, d *twoDevice, emptyRemote bo
 	}
 	d.begin(OperationInitialize)
 	probe := model.GitProbeResponse{Base: d.snapshot.Name, EmptyRemote: emptyRemote,
-		IdentityConfigured: true, CanConfigure: true, WorkingTreeClean: local.WorkingTreeClean,
+		RepositoryRootMatches: true,
+		IdentityConfigured:    true, CanConfigure: true, WorkingTreeClean: local.WorkingTreeClean,
 		RequiredMutations: model.GitRequiredMutations{CreateRepository: true, AddOrigin: true, CreateBranch: emptyRemote}}
 	if !emptyRemote {
 		probe.RemoteBranches = []string{"main"}
@@ -151,10 +246,14 @@ func (f *twoDeviceFixture) syncAttempt(d *twoDevice) (OperationResult, error) {
 	d.begin(OperationSync)
 	result, err := f.service.Sync(context.Background(), SyncOptions{
 		Snapshot: d.snapshot, Operation: d.operation, LastRemoteOID: d.trustedRemoteOID}, d.worktree, d.progress)
-	if err == nil {
+	d.rememberSyncResult(result, err)
+	return result, err
+}
+
+func (d *twoDevice) rememberSyncResult(result OperationResult, err error) {
+	if err == nil && result.RemoteOID != "" && validObjectID(result.RemoteOID) {
 		d.trustedRemoteOID = result.RemoteOID
 	}
-	return result, err
 }
 
 func (f *twoDeviceFixture) sync(t *testing.T, d *twoDevice) {
@@ -189,9 +288,12 @@ func (f *twoDeviceFixture) git(t *testing.T, dir string, args ...string) string 
 	return result.Stdout
 }
 
-func e2eRelativeName(t *testing.T, name string) string {
+func e2eRelativeName(t interface {
+	Helper()
+	Fatal(...any)
+}, name string) string {
 	t.Helper()
-	if !filepath.IsLocal(name) || strings.Contains(name, "\\") {
+	if !filepath.IsLocal(name) || strings.Contains(name, "\\") || name == "." || path.Clean(name) != name {
 		t.Fatal("device file name must stay inside its root")
 	}
 	for _, part := range strings.Split(filepath.ToSlash(name), "/") {
@@ -236,7 +338,10 @@ func (d *twoDevice) assertContents(t *testing.T, name string, want []byte) {
 }
 
 // Git's NUL records are byte strings: do not trim whitespace or normalize names.
-func e2eNULFields(t *testing.T, output string) []string {
+func e2eNULFields(t interface {
+	Helper()
+	Fatal(...any)
+}, output string) []string {
 	t.Helper()
 	if output == "" {
 		return nil

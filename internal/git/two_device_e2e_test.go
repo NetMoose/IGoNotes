@@ -2,7 +2,7 @@ package git
 
 import "testing"
 
-func TestTwoDeviceGitConvergence(t *testing.T) {
+func TestTwoDeviceEndToEndConvergesCreateEditRenameDeleteAndAssets(t *testing.T) {
 	f := newTwoDeviceFixture(t)
 	one, two := f.one, f.two
 	initial := map[string][]byte{
