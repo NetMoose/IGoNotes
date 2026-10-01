@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -124,11 +125,46 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 		runErr = newSafeProcessError("prepare Git process tree", runErr)
 	} else {
 		defer tree.Close()
-		cmd.Cancel = func() error { return tree.Terminate(cmd) }
+		// exec's watcher ends when the parent is reaped, before Wait drains
+		// inherited pipes. Share one termination attempt with a full-Wait
+		// context callback, and disable it before Close to avoid late PID reuse.
+		var terminationMu sync.Mutex
+		terminationActive, terminated := true, false
+		var terminationErr error
+		terminate := func() error {
+			terminationMu.Lock()
+			defer terminationMu.Unlock()
+			if !terminationActive {
+				return os.ErrProcessDone
+			}
+			if !terminated {
+				terminationErr = tree.Terminate(cmd)
+				terminated = true
+			}
+			return terminationErr
+		}
+		cmd.Cancel = terminate
 		cmd.WaitDelay = processWaitDelay
 		runErr = tree.Start(cmd)
 		if runErr == nil {
+			// Register only after Start succeeds: failed post-create setup owns
+			// its own kill/Wait, and Windows cancellation must obey its launch gate.
+			callbackDone := make(chan struct{})
+			stopCancellation := context.AfterFunc(commandContext, func() {
+				defer close(callbackDone)
+				_ = terminate()
+			})
 			runErr = cmd.Wait()
+			terminationMu.Lock()
+			terminationActive = false
+			terminationMu.Unlock()
+			if !stopCancellation() {
+				<-callbackDone
+			}
+		} else {
+			terminationMu.Lock()
+			terminationActive = false
+			terminationMu.Unlock()
 		}
 	}
 	// Cancellation wins even if the process exited successfully at the same time.

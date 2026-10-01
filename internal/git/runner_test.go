@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -234,6 +236,161 @@ func TestCommandRunnerContextWinsSuccessfulExitRace(t *testing.T) {
 	}
 	if _, err := runner.Run(ctx, Command{Dir: t.TempDir()}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want canceled despite successful exit", err)
+	}
+}
+
+func TestCommandRunnerCancelsDescendantWhileDrainingPipes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "exited parent live child PIDs.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	nativeTree, err := newProcessTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nativeTree.Close()
+	started := make(chan *exec.Cmd, 1)
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			return helperCommand(ctx, "tree-parent-exit", path)
+		})
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start: func(cmd *exec.Cmd) error {
+				err := nativeTree.Start(cmd)
+				if err == nil {
+					started <- cmd
+				}
+				return err
+			},
+			terminate: nativeTree.Terminate,
+			close:     nativeTree.Close,
+		}, nil
+	}
+	done := make(chan error, 1)
+	dir := t.TempDir()
+	go func() { _, err := runner.Run(ctx, Command{Dir: dir}); done <- err }()
+	returned := false
+	defer func() {
+		cancel()
+		// Even the red regression must not leave a live orphan or blocked Run.
+		data, err := os.ReadFile(path)
+		var pids helperPIDs
+		if err == nil && json.Unmarshal(data, &pids) == nil {
+			for _, pid := range []int{pids.Child, pids.Parent} {
+				if pid > 0 && !helperStopped(pid) {
+					process, err := os.FindProcess(pid)
+					if err == nil {
+						_ = process.Kill()
+						_ = process.Release()
+					}
+				}
+			}
+		}
+		if !returned {
+			select {
+			case <-done:
+			case <-time.After(helperTimeout):
+				t.Error("runner did not finish cleanup")
+			}
+		}
+	}()
+	var cmd *exec.Cmd
+	select {
+	case cmd = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper did not start")
+	}
+	pids := waitForHelperPIDs(t, path)
+	// Process.Signal uses os.Process's synchronized state. Unix Wait marks it
+	// done; Windows Wait releases its handle (Signal then returns EINVAL).
+	// Neither requires racing on cmd.ProcessState while Wait drains the pipes.
+	parentReaped := func() bool {
+		err := cmd.Process.Signal(syscall.Signal(0))
+		return errors.Is(err, os.ErrProcessDone) || runtime.GOOS == "windows" && errors.Is(err, syscall.EINVAL)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if parentReaped() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !parentReaped() {
+		t.Fatal("parent was not reaped")
+	}
+	if helperStopped(pids.Child) {
+		t.Fatal("child stopped before cancellation")
+	}
+	select {
+	case <-done:
+		returned = true
+		t.Fatal("Run returned before draining descendant pipes")
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		returned = true
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation waited for the 5s pipe-drain timeout")
+	}
+	assertHelpersStopped(t, pids)
+}
+
+func TestCommandRunnerProcessTreeCancellationLifetime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan *exec.Cmd, 1)
+	var terminated atomic.Int32
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd { return helperCommand(ctx, "wait") })
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start: func(cmd *exec.Cmd) error {
+				err := cmd.Start()
+				if err == nil {
+					started <- cmd
+				}
+				return err
+			},
+			terminate: func(cmd *exec.Cmd) error { terminated.Add(1); return cmd.Process.Kill() },
+			close: func() error {
+				if terminated.Load() != 1 {
+					t.Errorf("Terminate calls at Close = %d, want 1", terminated.Load())
+				}
+				return nil
+			},
+		}, nil
+	}
+	dir := t.TempDir()
+	done := make(chan error, 1)
+	go func() { _, err := runner.Run(ctx, Command{Dir: dir}); done <- err }()
+	var cmd *exec.Cmd
+	select {
+	case cmd = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper did not start")
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not finish")
+	}
+	// A retained cancellation function must not signal a reused PID/group after
+	// Wait/Close, and overlapping exec/runner cancellation must terminate once.
+	if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("late Cancel = %v", err)
+	}
+	if terminated.Load() != 1 {
+		t.Fatalf("Terminate calls = %d, want 1", terminated.Load())
 	}
 }
 
