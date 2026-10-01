@@ -495,22 +495,23 @@
 
     gitBusyBase = baseName
     gitActionErrors = { ...gitActionErrors, [baseName]: '' }
+    let flushComplete = false
 
     try {
       await flushWorkspace()
+      flushComplete = true
       if (!mounted || config?.current_base !== baseName) return
       await resumeGit(baseName)
       if (!mounted || config?.current_base !== baseName) return
       await refreshGitStatuses()
     } catch (error) {
       if (!mounted || config?.current_base !== baseName) return
-      const flushError = Boolean(error && typeof error === 'object' && workspaceFlushFailures.has(error))
-      if (flushError && saveStatus !== 'error') showSaveError(error)
+      if (!flushComplete && saveStatus !== 'error') showSaveError(error)
       gitActionErrors = {
         ...gitActionErrors,
-        [baseName]: errorMessage(error, flushError
-          ? 'Не удалось сохранить рабочую область перед Git-синхронизацией'
-          : 'Не удалось возобновить Git-синхронизацию'),
+        [baseName]: errorMessage(error, flushComplete
+          ? 'Не удалось возобновить Git-синхронизацию'
+          : 'Не удалось сохранить рабочую область перед возобновлением Git-синхронизации'),
       }
     } finally {
       if (gitBusyBase === baseName) gitBusyBase = ''

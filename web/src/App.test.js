@@ -3,7 +3,14 @@ import userEvent from '@testing-library/user-event'
 import { tick } from 'svelte'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const settingsBoundary = vi.hoisted(() => ({ props: null }))
+const settingsBoundary = vi.hoisted(() => ({ props: null, workspaceProps: null }))
+vi.mock('./lib/NotesWorkspace.svelte', async (importOriginal) => {
+  const actual = await importOriginal()
+  return { ...actual, default: (anchor, props) => {
+    settingsBoundary.workspaceProps = props
+    return actual.default(anchor, props)
+  } }
+})
 vi.mock('./lib/settings/SettingsWorkspace.svelte', async (importOriginal) => {
   const actual = await importOriginal()
   return { ...actual, default: (anchor, props) => {
@@ -239,6 +246,99 @@ describe('App setup gate', () => {
       await waitFor(() => expect(resumeGit).toHaveBeenCalledOnce())
       expect(saveNote).toHaveBeenCalledTimes(2)
     }
+  })
+
+  it.each(['upload', 'save', 'API'])('classifies primitive %s rejection by the resume stage and preserves the draft', async (stage) => {
+    const note = fileNode('draft.md')
+    vi.mocked(getNotes).mockResolvedValue([note])
+    await openPaused()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'draft.md' }))
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Keep primitive failure' } })
+    if (stage === 'upload') setEditorFlush(() => Promise.reject('upload rejected'))
+    else if (stage === 'save') vi.mocked(saveNote).mockRejectedValue('save rejected')
+    else vi.mocked(resumeGit).mockRejectedValue('resume rejected')
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+
+    const alert = expectPausedAlert()
+    const fallback = stage === 'API'
+      ? 'Не удалось возобновить Git-синхронизацию'
+      : 'Не удалось сохранить рабочую область перед возобновлением Git-синхронизации'
+    await waitFor(() => expect(within(alert).getByRole('status').textContent).toBe(fallback))
+    expect(screen.getByLabelText('Markdown')).toHaveValue('# Keep primitive failure')
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeEnabled()
+    if (stage !== 'API') {
+      expect(resumeGit).not.toHaveBeenCalled()
+      expect(screen.getByText('Ошибка сохранения')).toBeVisible()
+      expect(screen.getByText('Не удалось сохранить заметку: Неизвестная ошибка', { exact: true })).toBeVisible()
+    } else {
+      expect(resumeGit).toHaveBeenCalledOnce()
+      expect(screen.queryByText('Ошибка сохранения')).not.toBeInTheDocument()
+    }
+  })
+
+  it('a pending settings-card sync gates workspace resume and rejects its parent callback without another action', async () => {
+    await openPaused()
+    const resume = settingsBoundary.workspaceProps.onResumeGit
+    const workStatus = { ...paused, base: 'work', repository_path: '/srv/work', state: 'ready' }
+    await gitPollerOptions.onStatuses([paused, workStatus])
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    await userEvent.setup().click(screen.getByRole('tab', { name: 'Git-синхронизация' }))
+    const workCard = screen.getByRole('article', { name: 'Git для базы work' })
+    const pending = deferred()
+    vi.mocked(syncGit).mockReturnValue(pending.promise)
+    await userEvent.setup().click(within(workCard).getByRole('button', { name: 'Синхронизировать сейчас' }))
+    await waitFor(() => expect(syncGit).toHaveBeenCalledWith('work'))
+    expect(screen.getByRole('button', { name: 'Назад к заметкам' })).toBeDisabled()
+    await resume()
+    expect(resumeGit).not.toHaveBeenCalled()
+    expect(syncGit).toHaveBeenCalledOnce()
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+
+    // Navigate at the parent boundary to verify the workspace sees the same global lock.
+    settingsBoundary.props.onBack()
+    await tick()
+    expectPausedAlert()
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    expect(resumeGit).not.toHaveBeenCalled()
+    pending.resolve({ operation_id: 'settings-sync-1', status: 'queued', deduplicated: false })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeEnabled())
+    expect(gitPoller.refresh).toHaveBeenCalledOnce()
+  })
+
+  it('a pending resume disables every settings manual-sync card and rejects settings sync callbacks', async () => {
+    await openPaused()
+    const resume = settingsBoundary.workspaceProps.onResumeGit
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки' }))
+    await userEvent.setup().click(screen.getByRole('tab', { name: 'Git-синхронизация' }))
+    await gitPollerOptions.onStatuses([
+      { ...paused, state: 'ready' },
+      { ...paused, base: 'work', repository_path: '/srv/work', state: 'ready' },
+    ])
+    await tick()
+    const cards = completedConfig.bases.map((base) => screen.getByRole('article', { name: `Git для базы ${base.name}` }))
+    for (const card of cards) expect(within(card).getByRole('button', { name: 'Синхронизировать сейчас' })).toBeEnabled()
+    const pending = deferred()
+    vi.mocked(resumeGit).mockReturnValue(pending.promise)
+    const recovery = resume()
+    await waitFor(() => expect(resumeGit).toHaveBeenCalledWith('personal'))
+    for (const card of cards) {
+      expect(card).toHaveAttribute('aria-busy', 'true')
+      const sync = within(card).getByRole('button', { name: 'Синхронизировать сейчас' })
+      expect(sync).toBeDisabled()
+      await userEvent.setup().click(sync)
+    }
+    for (const base of completedConfig.bases) await settingsBoundary.props.onGitSync(base.name)
+    expect(syncGit).not.toHaveBeenCalled()
+    expect(resumeGit).toHaveBeenCalledOnce()
+    expect(gitPoller.refresh).not.toHaveBeenCalled()
+    pending.resolve({ operation_id: 'resume-1', status: 'queued', deduplicated: false })
+    await recovery
+    await tick()
+    for (const card of cards) expect(within(card).getByRole('button', { name: 'Синхронизировать сейчас' })).toBeEnabled()
+    expect(gitPoller.refresh).toHaveBeenCalledOnce()
   })
 
   it.each(['resume', 'manual'])('shares the action lock when %s starts first', async (first) => {

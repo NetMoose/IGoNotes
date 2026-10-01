@@ -108,6 +108,14 @@ describe('NotesWorkspace', () => {
     await tick()
     expect(screen.getByRole('button', { name: 'Синхронизировать Git' })).toBeDisabled()
   })
+
+  it.each([null, 'ready', 'syncing', 'error', 'conflict', 'needs_reconnect', 'initializing', 'unconfigured'])('has no pause alert or recovery actions for nonpaused status %j', async (state) => {
+    await renderWorkspace({ gitStatus: state === null ? null : { ...paused, state } })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Git-синхронизация приостановлена' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Повторить и возобновить' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Открыть настройки Git' })).not.toBeInTheDocument()
+  })
   beforeEach(() => {
     setEditorFlush()
     vi.mocked(getNotes).mockReset().mockResolvedValue([])
