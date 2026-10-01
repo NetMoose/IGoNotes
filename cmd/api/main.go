@@ -78,7 +78,7 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("закрыть БД метаданных: %w", err))
+			returnErr = errors.Join(returnErr, gitLifecycleError("закрыть БД метаданных", err))
 		}
 	}()
 
@@ -87,7 +87,7 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	noteService := service.NewNoteService(noteRepo, basePath, coordinator)
 	defer func() {
 		if err := noteService.Close(); err != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("закрыть базу заметок: %w", err))
+			returnErr = errors.Join(returnErr, gitLifecycleError("закрыть базу заметок", err))
 		}
 	}()
 
@@ -103,18 +103,28 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	gitStatusService := service.NewGitStatusService(settingsService, gitStatusRepo)
 	gitOperations := repository.NewGitOperationRepository(db)
 	gitService := gitcmd.NewService(gitRunner, gitClient)
-	gitManager := service.NewGitManager(gitService, gitStatusRepo, gitOperations, gitProbeService, settingsService.GitSnapshot, noteService, coordinator)
+	gitManager := service.NewGitManagerWithAutosync(
+		gitService, gitStatusRepo, gitOperations, gitProbeService,
+		settingsService.GitSnapshot, noteService, coordinator,
+		gitSnapshotSource(settingsService.GitSnapshots), settingsService.GitConfigChanges(), log.Default(),
+	)
 	defer func() {
 		if err := gitManager.Close(); err != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("закрыть менеджер Git: %w", err))
+			returnErr = errors.Join(returnErr, gitLifecycleError("закрыть менеджер Git", err))
 		}
 	}()
-	if err := gitManager.RecoverLocal(ctx, configuredGitSnapshots(settingsService)); err != nil {
-		return fmt.Errorf("восстановить локальные репозитории Git: %w", err)
+	configuredSnapshots, err := configuredGitSnapshots(settingsService)
+	if err != nil {
+		return gitLifecycleError("получить настройки локальных репозиториев Git", err)
+	}
+	if err := gitManager.RecoverLocal(ctx, configuredSnapshots); err != nil {
+		return gitLifecycleError("восстановить локальные репозитории Git", err)
 	}
 	if err := gitManager.Start(); err != nil {
-		return fmt.Errorf("запустить менеджер Git: %w", err)
+		return gitLifecycleError("запустить менеджер Git", err)
 	}
+	stopGitClose := watchGitShutdown(ctx, gitManager)
+	defer stopGitClose()
 	gitHandler := handlers.NewGitHandlerWithOperations(gitProbeService, settingsService, gitStatusService, gitManager)
 
 	go func() {
@@ -156,20 +166,33 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	}, gracefulShutdownTimeout)
 }
 
-func configuredGitSnapshots(settings *service.SettingsService) []gitcmd.ConfiguredBase {
-	config := settings.GetConfig()
-	snapshots := make([]gitcmd.ConfiguredBase, 0, len(config.Bases))
-	for _, base := range config.Bases {
-		if !base.GitConfigured() {
-			continue
-		}
-		snapshot, _, err := settings.GitSnapshot(base.Name)
-		if err != nil {
-			continue
-		}
-		snapshots = append(snapshots, snapshot)
-	}
-	return snapshots
+type gitSnapshotSource func() ([]gitcmd.ConfiguredBase, error)
+
+func (source gitSnapshotSource) OrderedGitSnapshots() ([]gitcmd.ConfiguredBase, error) {
+	return source()
+}
+
+// Close cancels the manager immediately, even while HTTP shutdown is draining.
+// The owner's deferred Close still waits for both worker and scheduler before
+// closing their note service and database dependencies.
+func watchGitShutdown(ctx context.Context, manager interface{ Close() error }) func() bool {
+	return context.AfterFunc(ctx, func() { _ = manager.Close() })
+}
+
+type safeGitLifecycleError struct {
+	message string
+	cause   error
+}
+
+func (err *safeGitLifecycleError) Error() string { return err.message }
+func (err *safeGitLifecycleError) Unwrap() error { return err.cause }
+
+func gitLifecycleError(message string, cause error) error {
+	return &safeGitLifecycleError{message: message, cause: cause}
+}
+
+func configuredGitSnapshots(settings *service.SettingsService) ([]gitcmd.ConfiguredBase, error) {
+	return settings.GitSnapshots()
 }
 
 func runMain() error {
