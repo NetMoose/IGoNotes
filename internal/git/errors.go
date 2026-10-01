@@ -3,8 +3,12 @@ package git
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -72,6 +76,16 @@ func (e *SafeError) Error() string {
 	return e.Message
 }
 
+// Format keeps even Go-syntax formatting from inspecting private diagnostics
+// or invoking a private cause's Error or Format methods.
+func (e *SafeError) Format(state fmt.State, verb rune) {
+	message := e.Message
+	if verb == 'q' {
+		message = strconv.Quote(message)
+	}
+	_, _ = io.WriteString(state, message)
+}
+
 func (e *SafeError) Unwrap() error {
 	return e.cause
 }
@@ -85,17 +99,71 @@ var (
 	truncatedHTTPAuthorityPattern = regexp.MustCompile(`(?i)(https?://)[^/\s@]*$`)
 )
 
-func redact(text string, secrets []string) string {
-	orderedSecrets := append([]string(nil), secrets...)
-	sort.SliceStable(orderedSecrets, func(i, j int) bool {
-		return len(orderedSecrets[i]) > len(orderedSecrets[j])
-	})
-
-	redacted := text
-	for _, secret := range orderedSecrets {
-		if secret != "" {
-			redacted = strings.ReplaceAll(redacted, secret, "[REDACTED_REMOTE]")
+// secretVariants is local to each redaction: credentials are never retained on
+// a runner or error. Only explicit secrets and their HTTP userinfo are used.
+func secretVariants(secrets []string) []string {
+	unique := make(map[string]struct{})
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
 		}
+		unique[secret] = struct{}{}
+		parsed, err := url.Parse(secret)
+		if err != nil || parsed.User == nil || !(strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) {
+			continue
+		}
+		password, _ := parsed.User.Password()
+		_, authority, _ := strings.Cut(secret, "://")
+		if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+			authority = authority[:end]
+		}
+		rawUserinfo := ""
+		if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+			rawUserinfo = authority[:at]
+		}
+		for _, variant := range []string{rawUserinfo, parsed.User.String(), parsed.User.Username(), password} {
+			if len(variant) >= 4 {
+				unique[variant] = struct{}{}
+			}
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for variant := range unique {
+		ordered = append(ordered, variant)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if len(ordered[i]) != len(ordered[j]) {
+			return len(ordered[i]) > len(ordered[j])
+		}
+		return ordered[i] < ordered[j]
+	})
+	return ordered
+}
+
+func redact(text string, secrets []string) string {
+	ordered := secretVariants(secrets)
+	pairs := make([]string, 0, 2*len(ordered))
+	for _, secret := range ordered {
+		pairs = append(pairs, secret, "[REDACTED_REMOTE]")
+	}
+	// A single pass avoids matching another secret inside a replacement marker.
+	redacted := strings.NewReplacer(pairs...).Replace(text)
+	// Capture lookahead can end inside a later credential after earlier full
+	// replacements shrink the output. Protect that tail after full replacements;
+	// never derive arbitrary words or redact prefixes shorter than four bytes.
+	tail := 0
+	if !strings.HasSuffix(redacted, "[REDACTED_REMOTE]") {
+		for _, secret := range ordered {
+			for n := min(len(secret)-1, len(redacted)); n >= 4 && n > tail; n-- {
+				if strings.HasSuffix(redacted, secret[:n]) {
+					tail = n
+					break
+				}
+			}
+		}
+	}
+	if tail > 0 {
+		redacted = redacted[:len(redacted)-tail] + "[REDACTED_REMOTE]"
 	}
 	return httpUserinfoPattern.ReplaceAllString(redacted, `${1}[REDACTED]@`)
 }

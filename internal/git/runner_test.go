@@ -752,6 +752,184 @@ func TestCommandRunnerRedactsSuccessAndHTTPUserinfo(t *testing.T) {
 	}
 }
 
+func assertNoSecretLeak(t testing.TB, public string, secrets []string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if secret != "" && strings.Contains(public, secret) {
+			t.Fatal("public output contains a complete secret")
+		}
+		for n := 4; n <= len(secret); n++ {
+			if strings.HasSuffix(public, secret[:n]) {
+				t.Fatal("public output ends in a secret prefix")
+			}
+		}
+	}
+}
+
+func TestCommandRunnerSecretVariantMatrix(t *testing.T) {
+	const remote = "https://matrixUser:matrixPassword@example.invalid/private.git"
+	variants := []string{remote, "matrixUser:matrixPassword", "matrixUser", "matrixPassword"}
+	corpus := []struct{ name, diagnostic, secret string }{
+		{"full URL", remote, remote},
+		{"authentication trailing slash", "fatal: Authentication failed for '" + remote + "/'", remote},
+		{"userinfo token", "token=matrixUser:matrixPassword", remote},
+		{"username token", "token=matrixUser", remote},
+		{"password token", "token=matrixPassword", remote},
+		{"authorization Basic", "Authorization: Basic matrixPassword", remote},
+		{"scp path", "git@example.invalid:private/scpSecret.git", "scpSecret"},
+	}
+	for _, entry := range corpus {
+		t.Run(entry.name, func(t *testing.T) {
+			for _, action := range []string{"stderr", "fail"} {
+				t.Run(action, func(t *testing.T) {
+					for _, limit := range []int{64, 4096} {
+						t.Run(strconv.Itoa(limit), func(t *testing.T) {
+							// Place a complete credential across the diagnostic boundary.
+							diagnostic := entry.diagnostic
+							if limit == 64 {
+								diagnostic = strings.Repeat("~", limit-8) + diagnostic
+							}
+							runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
+								func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+									return helperCommand(ctx, action, diagnostic)
+								})
+							result, err := runner.Run(context.Background(), Command{Dir: t.TempDir(), Secrets: []string{entry.secret}})
+							resultJSON, marshalErr := json.Marshal(result)
+							if marshalErr != nil {
+								t.Fatal(marshalErr)
+							}
+							public := []string{result.Stderr, fmt.Sprintf("%+v", result), fmt.Sprintf("%#v", result), string(resultJSON)}
+							if action == "fail" {
+								var safe *SafeError
+								if !errors.As(err, &safe) || result != (Result{}) || safe.ExitCode != 23 {
+									t.Fatal("failure did not preserve SafeError/result contract")
+								}
+								if entry.name == "authentication trailing slash" && limit == 4096 && safe.Code != CodeAuthentication {
+									t.Fatal("authentication classification changed")
+								}
+								public = append(public, safe.Error(), safe.Diagnostic(), fmt.Sprint(safe), fmt.Sprintf("%v", safe), fmt.Sprintf("%+v", safe), fmt.Sprintf("%#v", safe), fmt.Sprintf("%q", safe))
+								encoded, marshalErr := json.Marshal(safe)
+								if marshalErr != nil {
+									t.Fatal(marshalErr)
+								}
+								public = append(public, string(encoded))
+								if len(safe.Diagnostic()) > limit {
+									t.Fatal("diagnostic exceeds limit")
+								}
+							} else if err != nil || len(result.Stderr) > limit {
+								t.Fatal("success stderr contract changed")
+							}
+							for _, output := range public {
+								assertNoSecretLeak(t, output, append(variants, entry.secret, "scpSecret"))
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+type unformattableCause struct{ calls *int }
+
+func (c unformattableCause) Error() string          { *c.calls++; return "private cause" }
+func (c unformattableCause) Format(fmt.State, rune) { *c.calls++ }
+
+func TestSafeErrorNeverFormatsCause(t *testing.T) {
+	calls := 0
+	cause := unformattableCause{calls: &calls}
+	safe := &SafeError{Code: CodeCommandFailed, Message: "Git command failed", diagnostic: "private diagnostic", cause: cause}
+	for _, verb := range []string{"%s", "%v", "%+v", "%#v", "%q"} {
+		output := fmt.Sprintf(verb, safe)
+		if strings.Contains(output, "private") {
+			t.Fatal("format exposes private state")
+		}
+	}
+	if _, err := json.Marshal(safe); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatal("public formatting invoked private cause")
+	}
+	if safe.Unwrap() != cause {
+		t.Fatal("cause contract changed")
+	}
+}
+
+func TestRedactKeepsUnrelatedShortWords(t *testing.T) {
+	text := "an at to on user password"
+	if got := redact(text, []string{"https://an:to@example.invalid/repo"}); got != text {
+		t.Fatal("redaction changed unrelated words")
+	}
+	if got := redact("https://an:to@example.invalid/repo", nil); strings.Contains(got, "an:to") {
+		t.Fatal("HTTP userinfo stripping was lost")
+	}
+}
+
+func TestCommandRunnerRedactsCaptureTailAfterEarlierReplacement(t *testing.T) {
+	const password = "matrixPasswordLongCredential"
+	const remote = "https://matrixUser:" + password + "@host/r"
+	const limit = 64
+	// Earlier replacements shrink the output, bringing a partially captured
+	// credential back inside the public diagnostic limit.
+	text := remote + " " + remote + " " + password
+	for _, action := range []string{"stderr", "fail"} {
+		t.Run(action, func(t *testing.T) {
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					return helperCommand(ctx, action, text)
+				})
+			result, err := runner.Run(context.Background(), Command{Dir: t.TempDir(), Secrets: []string{remote}})
+			output := result.Stderr
+			if action == "fail" {
+				var safe *SafeError
+				if !errors.As(err, &safe) {
+					t.Fatal("missing SafeError")
+				}
+				output = safe.Diagnostic()
+			} else if err != nil {
+				t.Fatal("unexpected failure")
+			}
+			assertNoSecretLeak(t, output, []string{remote, "matrixUser:" + password, "matrixUser", password})
+		})
+	}
+}
+
+func TestCommandRunnerVariantMarkerCrossesDiagnosticLimit(t *testing.T) {
+	const remote = "https://matrixUser:matrixPassword@example.invalid/private.git"
+	for _, variant := range []string{remote, "matrixUser:matrixPassword", "matrixUser", "matrixPassword"} {
+		t.Run(variant, func(t *testing.T) {
+			for _, action := range []string{"stderr", "fail"} {
+				t.Run(action, func(t *testing.T) {
+					const limit = 64
+					const prefix = limit - 6
+					text := strings.Repeat("~", prefix) + variant + " trailing bytes"
+					runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
+						func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+							return helperCommand(ctx, action, text)
+						})
+					result, err := runner.Run(context.Background(), Command{Dir: t.TempDir(), Secrets: []string{remote}})
+					output := result.Stderr
+					if action == "fail" {
+						var safe *SafeError
+						if !errors.As(err, &safe) {
+							t.Fatal("missing SafeError")
+						}
+						output = safe.Diagnostic()
+					} else if err != nil {
+						t.Fatal("unexpected failure")
+					}
+					want := strings.Repeat("~", prefix) + "[REDAC"
+					if output != want {
+						t.Fatal("complete variant was not redacted before marker truncation")
+					}
+					assertNoSecretLeak(t, output, []string{variant})
+				})
+			}
+		})
+	}
+}
+
 func TestCommandRunnerRedactsBeforeDiagnosticTruncation(t *testing.T) {
 	const limit = 64
 	const secret = "qZ9-very-secret-token"
