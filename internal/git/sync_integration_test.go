@@ -356,6 +356,54 @@ func TestSyncRechecksRemoteOIDImmediatelyBeforePush(t *testing.T) {
 	}
 }
 
+func TestSyncConflictCheckpointsCommittedLocalOIDAndRecoversOriginalOperation(t *testing.T) {
+	fixture, options := preparedSyncFixture(t)
+	before := fixture.git(fixture.root, "rev-parse", "HEAD")
+	fixture.write("remote.md", "local conflict\n")
+	remote := seedRemoteAdvance(t, fixture, "remote.md", "remote conflict\n")
+	operation := options.Operation
+	var merging []Checkpoint
+	_, err := runSync(t, fixture, nil, options, nil, func(_ context.Context, checkpoint Checkpoint) error {
+		applyCheckpoint(&operation, checkpoint)
+		if checkpoint.Stage == StageMerging {
+			merging = append(merging, checkpoint)
+		}
+		return nil
+	})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || !reflect.DeepEqual(conflict.Paths, []string{"remote.md"}) {
+		t.Fatalf("Sync() error = %v, want actual remote.md conflict", err)
+	}
+	local := fixture.git(fixture.root, "rev-parse", "HEAD")
+	if local == before || fixture.git(fixture.root, "show", local+":remote.md") != "local conflict" {
+		t.Fatal("sync did not commit the uncommitted local side")
+	}
+	if operation.LocalOID != local {
+		t.Errorf("operation.LocalOID = %s, want committed local side %s (pre-autocommit %s)", operation.LocalOID, local, before)
+	}
+	if len(merging) == 0 {
+		t.Fatal("sync did not checkpoint before merge")
+	}
+	for _, checkpoint := range merging {
+		if checkpoint.LocalOID != local || checkpoint.CandidateOID != remote || checkpoint.RemoteOID != remote {
+			t.Errorf("merging checkpoint did not freeze committed sides: %#v", checkpoint)
+		}
+	}
+	// Keep the exact checkpointed identity; only apply the terminal conflict state.
+	operation.State = OperationConflict
+	fixture.git(fixture.root, "update-ref", "FETCH_HEAD", before)
+	recovered, err := runRecovery(t, fixture, nil, recoveryOptions(options, &operation))
+	if !errors.As(err, &conflict) || !recovered.Blocking || recovered.ConflictState != RecoveryConflict ||
+		recovered.HeadOID != local || recovered.MergeHeadOID != remote || recovered.RemoteOID != remote {
+		t.Fatalf("RecoverLocal(original operation) = %#v, %v", recovered, err)
+	}
+	runner := NewCommandRunner()
+	snapshot, err := NewService(runner, NewClient(runner)).Conflicts(context.Background(), options.Snapshot, operation)
+	if err != nil || snapshot.HeadOID != local || snapshot.MergeHeadOID != remote || len(snapshot.Conflicts) != 1 {
+		t.Fatalf("Conflicts(original operation) = %#v, %v", snapshot, err)
+	}
+}
+
 func TestSyncConflictReindexesAndSkipsPush(t *testing.T) {
 	fixture, options := preparedSyncFixture(t)
 	fixture.write("remote.md", "local conflict\n")

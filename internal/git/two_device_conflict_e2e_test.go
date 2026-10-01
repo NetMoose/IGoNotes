@@ -36,7 +36,7 @@ func TestTwoDeviceEndToEndConflictSurvivesRestartAndLosesNoData(t *testing.T) {
 		t.Fatal("sync did not return the exact sorted conflict paths")
 	}
 	original := two.operation
-	original.State = OperationFailed
+	original.State = OperationConflict
 	headOID := strings.TrimSpace(f.git(t, two.snapshot.Path, "rev-parse", "HEAD"))
 	twoOID := original.LocalOID
 	assertNoPush := func() {
