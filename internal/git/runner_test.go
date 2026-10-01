@@ -72,6 +72,39 @@ func TestGitRunnerHelper(t *testing.T) {
 		os.Exit(23)
 	case "wait":
 		time.Sleep(30 * time.Second)
+	case "tree-parent", "tree-parent-exit":
+		child := helperCommand(context.Background(), "tree-child", args[1]+".child")
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if args[0] == "tree-parent" {
+			defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+		}
+		pids, _ := json.Marshal(helperPIDs{Parent: os.Getpid(), Child: child.Process.Pid})
+		if err := os.WriteFile(args[1], pids, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if args[0] == "tree-parent-exit" {
+			return
+		}
+		time.Sleep(30 * time.Second)
+	case "tree-child":
+		if err := os.WriteFile(args[1], []byte("running"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(30 * time.Second)
+	case "stdin-env":
+		contents, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(struct {
+			Env   []string
+			Stdin string
+		}{os.Environ(), string(contents)}); err != nil {
+			t.Fatal(err)
+		}
 	case "stdin-sha256":
 		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
@@ -80,6 +113,196 @@ func TestGitRunnerHelper(t *testing.T) {
 		_, _ = fmt.Fprintf(os.Stdout, "%x", sha256.Sum256(contents))
 	default:
 		t.Fatalf("unknown helper action %q", args[0])
+	}
+}
+
+type helperPIDs struct {
+	Parent int
+	Child  int
+}
+
+func waitForHelperPIDs(t *testing.T, path string) helperPIDs {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		var pids helperPIDs
+		if err == nil && json.Unmarshal(data, &pids) == nil && pids.Parent > 0 && pids.Child > 0 {
+			return pids
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("helper did not publish parent and child PIDs within 5s")
+	return helperPIDs{}
+}
+
+func TestCommandRunnerStdinEOFAndEnvironment(t *testing.T) {
+	for _, payload := range []string{"", "explicit payload"} {
+		t.Run(payload, func(t *testing.T) {
+			var captured *exec.Cmd
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, 64*1024,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					captured = helperCommand(ctx, "stdin-env")
+					return captured
+				})
+			command := Command{Dir: t.TempDir(), ReadOnly: true}
+			if payload != "" {
+				command.Stdin = strings.NewReader(payload)
+			}
+			result, err := runner.Run(context.Background(), command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if captured.Stdin != command.Stdin {
+				t.Fatal("stdin was replaced")
+			}
+			var observation struct {
+				Env   []string
+				Stdin string
+			}
+			if err := json.NewDecoder(strings.NewReader(result.Stdout)).Decode(&observation); err != nil {
+				t.Fatal(err)
+			}
+			if observation.Stdin != payload {
+				t.Fatalf("stdin = %q", observation.Stdin)
+			}
+			assertEnvValues(t, observation.Env, "GIT_TERMINAL_PROMPT", []string{"0"})
+			assertEnvValues(t, observation.Env, "LC_ALL", []string{"C"})
+			assertEnvValues(t, observation.Env, "GIT_OPTIONAL_LOCKS", []string{"0"})
+		})
+	}
+}
+
+type testProcessTree struct {
+	start     func(*exec.Cmd) error
+	terminate func(*exec.Cmd) error
+	close     func() error
+}
+
+func (tree *testProcessTree) Start(cmd *exec.Cmd) error     { return tree.start(cmd) }
+func (tree *testProcessTree) Terminate(cmd *exec.Cmd) error { return tree.terminate(cmd) }
+func (tree *testProcessTree) Close() error                  { return tree.close() }
+
+func TestCommandRunnerProcessTreeLifecycle(t *testing.T) {
+	var cmd *exec.Cmd
+	closed := 0
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			cmd = helperCommand(ctx, "success")
+			return cmd
+		})
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start: func(cmd *exec.Cmd) error {
+				if cmd.Cancel == nil || cmd.WaitDelay != 5*time.Second {
+					t.Error("missing tree cancellation or 5s WaitDelay")
+				}
+				return cmd.Start()
+			},
+			terminate: func(cmd *exec.Cmd) error { return cmd.Process.Kill() },
+			close: func() error {
+				closed++
+				if cmd.ProcessState == nil {
+					t.Error("Close before Wait")
+				}
+				return nil
+			},
+		}, nil
+	}
+	if _, err := runner.Run(context.Background(), Command{Dir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if closed != 1 {
+		t.Fatalf("Close calls = %d", closed)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("runner did not reap command")
+	}
+}
+
+func TestCommandRunnerContextWinsSuccessfulExitRace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd { return helperCommand(ctx, "success") })
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start:     func(cmd *exec.Cmd) error { err := cmd.Start(); cancel(); return err },
+			terminate: func(*exec.Cmd) error { return os.ErrProcessDone },
+			close:     func() error { return nil },
+		}, nil
+	}
+	if _, err := runner.Run(ctx, Command{Dir: t.TempDir()}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want canceled despite successful exit", err)
+	}
+}
+
+func TestCommandRunnerSafeProcessErrors(t *testing.T) {
+	sentinel := errors.New("sentinel https://user:password@example.invalid PID 12345")
+	for _, stage := range []string{"prepare", "attach", "attach after create"} {
+		t.Run(stage, func(t *testing.T) {
+			closed := 0
+			var cmd *exec.Cmd
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					cmd = helperCommand(ctx, "success")
+					return cmd
+				})
+			runner.newProcessTree = func() (processTree, error) {
+				if stage == "prepare" {
+					return nil, sentinel
+				}
+				return &testProcessTree{
+					start: func(cmd *exec.Cmd) error {
+						if stage == "attach after create" {
+							if err := cmd.Start(); err != nil {
+								return err
+							}
+							if err := cmd.Wait(); err != nil {
+								return err
+							}
+						}
+						return newSafeProcessError("attach Git process tree", sentinel)
+					},
+					terminate: func(*exec.Cmd) error { t.Error("Terminate on failed Start"); return nil },
+					close:     func() error { closed++; return nil },
+				}, nil
+			}
+			_, err := runner.Run(context.Background(), Command{Dir: t.TempDir()})
+			assertSafeProcessError(t, err, sentinel)
+			if stage != "prepare" && closed != 1 {
+				t.Fatalf("Close calls = %d", closed)
+			}
+			if stage == "attach after create" {
+				if cmd.ProcessState == nil {
+					t.Fatal("failed Start did not reap process")
+				}
+			} else if cmd.ProcessState != nil {
+				t.Fatal("unexpected ProcessState after failed Start")
+			}
+		})
+	}
+}
+
+func assertSafeProcessError(t *testing.T, err, cause error) {
+	t.Helper()
+	var safe *SafeError
+	if !errors.As(err, &safe) || safe.Code != CodeCommandFailed || safe.Message != "Git command failed" {
+		t.Fatalf("error = %v, want fixed command failed SafeError", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("private cause was lost")
+	}
+	encoded, marshalErr := json.Marshal(err)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	for _, public := range []string{err.Error(), fmt.Sprintf("%+v", err), string(encoded), safe.Diagnostic()} {
+		for _, private := range []string{"sentinel", "https://", "password", "12345"} {
+			if strings.Contains(public, private) {
+				t.Fatalf("private data leaked: %q", public)
+			}
+		}
 	}
 }
 
@@ -568,7 +791,7 @@ func TestCommandRunnerRejectsInvalidDirectory(t *testing.T) {
 func TestCommandRunnerDefaults(t *testing.T) {
 	runner := NewCommandRunner()
 	if runner.executable != "git" || runner.localTimeout != DefaultLocalTimeout ||
-		runner.networkTimeout != DefaultNetworkTimeout || runner.outputLimit != DefaultOutputLimit || runner.command == nil {
+		runner.networkTimeout != DefaultNetworkTimeout || runner.outputLimit != DefaultOutputLimit || runner.command == nil || runner.newProcessTree == nil {
 		t.Fatalf("NewCommandRunner() = %#v, want documented defaults", runner)
 	}
 	if AllowedGitProtocols != "file:http:https:ssh:git" {
