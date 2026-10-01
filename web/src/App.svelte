@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte'
 
-  import { deleteNote, getConfig, getGitStatus, getNote, renameNote, saveNote, switchBase, syncGit } from './lib/api.js'
+  import { deleteNote, getConfig, getGitStatus, getNote, renameNote, resumeGit, saveNote, switchBase, syncGit } from './lib/api.js'
   import { openSettingsSafely, switchBaseSafely } from './lib/app-transitions.js'
   import { activeBase } from './lib/base-draft.js'
   import StaleNoteDialog from './lib/StaleNoteDialog.svelte'
@@ -489,6 +489,34 @@
     }
   }
 
+  async function resumeGitSync() {
+    const baseName = config?.current_base
+    if (!mounted || !baseName || gitBusyBase !== '') return
+
+    gitBusyBase = baseName
+    gitActionErrors = { ...gitActionErrors, [baseName]: '' }
+
+    try {
+      await flushWorkspace()
+      if (!mounted || config?.current_base !== baseName) return
+      await resumeGit(baseName)
+      if (!mounted || config?.current_base !== baseName) return
+      await refreshGitStatuses()
+    } catch (error) {
+      if (!mounted || config?.current_base !== baseName) return
+      const flushError = Boolean(error && typeof error === 'object' && workspaceFlushFailures.has(error))
+      if (flushError && saveStatus !== 'error') showSaveError(error)
+      gitActionErrors = {
+        ...gitActionErrors,
+        [baseName]: errorMessage(error, flushError
+          ? 'Не удалось сохранить рабочую область перед Git-синхронизацией'
+          : 'Не удалось возобновить Git-синхронизацию'),
+      }
+    } finally {
+      if (gitBusyBase === baseName) gitBusyBase = ''
+    }
+  }
+
   function affectsActiveNote(id) {
     const activeId = activeNote?.id
     return activeId === id || activeId?.startsWith(`${id}/`)
@@ -685,7 +713,7 @@
         {basePath}
         gitBase={currentBase}
         gitStatus={activeGitStatus}
-        gitSyncBusy={gitBusyBase === config?.current_base}
+        gitSyncBusy={gitBusyBase !== ''}
         gitSyncError={gitActionErrors[config?.current_base] || ''}
         {transitioning}
         error={transitionError}
@@ -695,6 +723,7 @@
         onSave={saveNow}
         onOpenSettings={openSettings}
         onGitSync={runGitSync}
+        onResumeGit={resumeGitSync}
       />
     {/if}
   {:else if screen === 'settings'}

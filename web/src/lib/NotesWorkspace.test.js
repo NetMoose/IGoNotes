@@ -74,6 +74,33 @@ async function renderWorkspace(overrides = {}) {
 }
 
 describe('NotesWorkspace', () => {
+  const paused = { base: 'work', state: 'paused', ahead: 0, behind: 0, consecutive_failures: 3, changed_paths: [] }
+
+  it('places pause recovery between header and editor, resumes directly and waits for uploads before settings', async () => {
+    const upload = deferred()
+    const flush = vi.fn(() => upload.promise)
+    setEditorFlush(flush)
+    const onResumeGit = vi.fn()
+    const { props, container } = await renderWorkspace({ activeNote: fileNode('current.md'), gitStatus: paused, onResumeGit })
+    const alert = screen.getByRole('alert')
+    expect(container.querySelector('main').children[1]).toBe(alert)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    expect(onResumeGit).toHaveBeenCalledOnce()
+    expect(flush).not.toHaveBeenCalled()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Открыть настройки Git' }))
+    expect(props.onOpenSettings).not.toHaveBeenCalled()
+    upload.resolve()
+    await waitFor(() => expect(props.onOpenSettings).toHaveBeenCalledOnce())
+  })
+
+  it.each([{ transitioning: true }, { gitSyncBusy: true }])('shares busy state across indicator and recovery: %j', async (busy) => {
+    await renderWorkspace({ ...busy, gitBase: { name: 'work', git_url: 'https://example.test/notes.git' }, gitStatus: paused })
+    expect(screen.getByRole('button', { name: 'Повторить и возобновить' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Открыть настройки Git' })).toBeDisabled()
+    screen.getByRole('button', { name: /Открыть детали Git:/ }).click()
+    await tick()
+    expect(screen.getByRole('button', { name: 'Синхронизировать Git' })).toBeDisabled()
+  })
   beforeEach(() => {
     setEditorFlush()
     vi.mocked(getNotes).mockReset().mockResolvedValue([])

@@ -23,6 +23,7 @@ import {
   switchBase,
   syncNotes,
   syncGit,
+  resumeGit,
   probeGit,
   resolveGitConflict,
   updateBase,
@@ -151,6 +152,21 @@ describe('frontend API client', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+  })
+
+  it('resumes the encoded base with a bodyless POST and accepts a complete 202 operation', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(gitOperation(), 202))
+    await expect(resumeGit('work & личное')).resolves.toEqual(gitOperation())
+    const { path, options } = requestAt(fetchMock)
+    expect(path).toBe(`/api/git/resume?base=${encodeURIComponent('work & личное')}`)
+    expect(options.method).toBe('POST')
+    expect(options).not.toHaveProperty('body')
+    expect(options.headers.has('Content-Type')).toBe(false)
+  })
+
+  it.each([null, {}, [], { ...gitOperation(), operation_id: '' }, { ...gitOperation(), deduplicated: 'false' }, { ...gitOperation(), status: null }])('rejects malformed resume operations: %j', async (payload) => {
+    fetchMock.mockResolvedValue(jsonResponse(payload, 202))
+    await expect(resumeGit('work')).rejects.toMatchObject({ status: 202, code: 'invalid_response' })
   })
 
   it('constructs ApiError with stable defaults', () => {
