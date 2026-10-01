@@ -50,15 +50,16 @@ type BaseRuntime interface {
 type SettingsService struct {
 	// Lock ordering: coordinator -> SettingsService.mu -> future NoteService.baseMu
 	// -> repository/SQLite. Dependencies must not call back into an earlier layer.
-	mu           sync.RWMutex
-	store        ConfigStore
-	notes        BaseRuntime
-	coordinator  *BaseOperationCoordinator
-	logger       *log.Logger
-	gitValidator GitConfigValidator
-	gitStatuses  GitStatusStore
-	config       model.Config
-	degraded     error
+	mu               sync.RWMutex
+	store            ConfigStore
+	notes            BaseRuntime
+	coordinator      *BaseOperationCoordinator
+	logger           *log.Logger
+	gitValidator     GitConfigValidator
+	gitStatuses      GitStatusStore
+	gitConfigChanged chan struct{}
+	config           model.Config
+	degraded         error
 }
 
 func NewSettingsService(
@@ -145,13 +146,14 @@ func NewSettingsServiceWithGit(
 	}
 
 	return &SettingsService{
-		store:        store,
-		notes:        notes,
-		coordinator:  coordinator,
-		logger:       logger,
-		gitValidator: gitValidator,
-		gitStatuses:  gitStatuses,
-		config:       cloneConfig(config),
+		store:            store,
+		notes:            notes,
+		coordinator:      coordinator,
+		logger:           logger,
+		gitValidator:     gitValidator,
+		gitStatuses:      gitStatuses,
+		gitConfigChanged: make(chan struct{}, 1),
+		config:           cloneConfig(config),
 	}, nil
 }
 
@@ -408,6 +410,20 @@ func (s *SettingsService) publishConfigLocked(next model.Config, conflicts confl
 	s.config = cloneConfig(next)
 	for _, entry := range conflicts.entriesToClear {
 		s.coordinator.clearConflictForIdentity(entry.path, entry.info)
+	}
+	s.notifyGitConfigChangedLocked()
+}
+
+// GitConfigChanges coalesces successful settings publications. Consumers should
+// read a fresh snapshot rather than infer individual mutations from events.
+func (s *SettingsService) GitConfigChanges() <-chan struct{} {
+	return s.gitConfigChanged
+}
+
+func (s *SettingsService) notifyGitConfigChangedLocked() {
+	select {
+	case s.gitConfigChanged <- struct{}{}:
+	default:
 	}
 }
 
@@ -792,6 +808,26 @@ func (s *SettingsService) GitSnapshot(name string) (gitcmd.ConfiguredBase, bool,
 		return gitcmd.ConfiguredBase{}, false, err
 	}
 	return snapshot, s.config.CurrentBase == name, nil
+}
+
+// GitSnapshots returns detached configured bases in configuration order,
+// including bases whose automatic synchronization is disabled.
+func (s *SettingsService) GitSnapshots() ([]gitcmd.ConfiguredBase, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snapshots := make([]gitcmd.ConfiguredBase, 0, len(s.config.Bases))
+	for _, base := range s.config.Bases {
+		if !base.GitConfigured() {
+			continue
+		}
+		snapshot, err := configuredBase(base)
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots, nil
 }
 
 func configuredBase(base model.Base) (gitcmd.ConfiguredBase, error) {
