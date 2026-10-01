@@ -225,6 +225,70 @@ describe('App setup gate', () => {
     expect(getGitStatus).not.toHaveBeenCalled()
   })
 
+  it('shows the complete persisted pause and resume lifecycle', async () => {
+    const user = userEvent.setup()
+    const note = fileNode('draft.md')
+    const strictAPI = await vi.importActual('./lib/api.js')
+    async function publishStatus(status) {
+      const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(
+        JSON.stringify({ statuses: [status] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ))
+      let response
+      try {
+        response = await strictAPI.getGitStatus('personal')
+      } finally {
+        fetch.mockRestore()
+      }
+      await gitPollerOptions.onStatuses(response.statuses)
+      await tick()
+    }
+    vi.mocked(getNotes).mockResolvedValue([note])
+    vi.mocked(getConfig).mockResolvedValue({ ...completedConfig, bases: completedConfig.bases.map((base) => ({ ...base, git_url: 'https://example.test/notes.git', git_branch: 'main' })) })
+    render(App)
+    await screen.findByRole('button', { name: 'draft.md' })
+    await publishStatus(paused)
+    // The alert action navigates to the existing settings workspace.
+    await user.click(within(expectPausedAlert()).getByRole('button', { name: 'Открыть настройки Git' }))
+    expect(await screen.findByRole('heading', { name: 'Базы заметок' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Назад к заметкам' }))
+    expectPausedAlert()
+    await user.click(screen.getByRole('button', { name: 'draft.md' }))
+    await fireEvent.input(screen.getByLabelText('Markdown'), { target: { value: '# Resume draft' } })
+    const upload = deferred()
+    const save = deferred()
+    const resume = deferred()
+    const flush = vi.fn(() => upload.promise)
+    setEditorFlush(flush)
+    vi.mocked(saveNote).mockReturnValue(save.promise)
+    vi.mocked(resumeGit).mockReturnValue(resume.promise)
+    await user.click(screen.getByRole('button', { name: 'Повторить и возобновить' }))
+    expect(flush).toHaveBeenCalledOnce()
+    expect(saveNote).not.toHaveBeenCalled()
+    expect(resumeGit).not.toHaveBeenCalled()
+    upload.resolve()
+    await waitFor(() => expect(saveNote).toHaveBeenCalledWith(note.id, '# Resume draft', 'revision-1'))
+    expect(resumeGit).not.toHaveBeenCalled()
+    expectPausedAlert()
+    save.resolve({ status: 'saved', revision: 'revision-2' })
+    await waitFor(() => expect(resumeGit).toHaveBeenCalledWith('personal'))
+    expectPausedAlert()
+    resume.resolve({ operation_id: '44444444444444444444444444444444', status: 'queued', deduplicated: false })
+    await waitFor(() => expect(gitPoller.refresh).toHaveBeenCalledOnce())
+    // Acceptance alone is not proof that the operation succeeded.
+    expectPausedAlert()
+    const { error, ...snapshot } = paused
+    await publishStatus({ ...snapshot, state: 'syncing', consecutive_failures: 0, operation_id: '44444444444444444444444444444444', stage: 'push' })
+    expect(settingsBoundary.workspaceProps.gitStatus.state).toBe('syncing')
+    await publishStatus({ ...snapshot, state: 'ready', consecutive_failures: 0, operation_id: '44444444444444444444444444444444', stage: 'completed', last_success: '2026-10-01T12:00:00Z' })
+    expect(screen.queryByRole('alert', { name: 'Git-синхронизация приостановлена' })).not.toBeInTheDocument()
+    expect(settingsBoundary.workspaceProps.gitStatus.state).toBe('ready')
+    expect(settingsBoundary.workspaceProps.gitStatus.consecutive_failures).toBe(0)
+    expect(createGitStatusPoller).toHaveBeenCalledOnce()
+    expect(resumeGit).toHaveBeenCalledOnce()
+    expect(saveNote).toHaveBeenCalledOnce()
+  })
+
   it.each(['flush', 'API'])('retains pause and buffer on failed %s with retryable per-base error', async (stage) => {
     const note = fileNode('draft.md')
     vi.mocked(getNotes).mockResolvedValue([note])

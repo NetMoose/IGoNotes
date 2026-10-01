@@ -172,6 +172,10 @@ func TestGitShutdownCancelsBeforeHTTPDrainAndWaitsBeforeDependencies(t *testing.
 		<-releaseGit
 		return gitcmd.Result{}, context.Canceled
 	}, true, runtimeGitBase(t, "queued"))
+	heads := make(map[string]string, len(snapshots))
+	for _, snapshot := range snapshots {
+		heads[snapshot.Path] = runtimeGitCommand(t, snapshot.Path, "rev-parse", "HEAD")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	drain, releaseHTTP, dependenciesClosed, runtimeDone := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -260,6 +264,11 @@ func TestGitShutdownCancelsBeforeHTTPDrainAndWaitsBeforeDependencies(t *testing.
 	awaitRuntime(t, runtimeDone, "runtime deferred cleanup")
 	if networkCalls.Load() != 1 {
 		t.Fatalf("network calls = %d, want 1 (no final sync)", networkCalls.Load())
+	}
+	for _, snapshot := range snapshots {
+		if got := runtimeGitCommand(t, snapshot.Path, "rev-parse", "HEAD"); got != heads[snapshot.Path] {
+			t.Fatalf("shutdown created a hidden commit for %s: %s != %s", snapshot.Name, got, heads[snapshot.Path])
+		}
 	}
 	if _, _, err := manager.QueueSync(context.Background(), gitcmd.SyncRequest{Snapshot: snapshots[0]}); !errors.Is(err, service.ErrGitManagerClosed) {
 		t.Fatalf("closed manager admission: %v", err)

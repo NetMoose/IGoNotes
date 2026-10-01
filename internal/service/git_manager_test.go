@@ -29,6 +29,269 @@ import (
 
 const managerOID = "1111111111111111111111111111111111111111"
 
+type lifecycleGitSnapshots struct{ settings *SettingsService }
+
+func (s lifecycleGitSnapshots) OrderedGitSnapshots() ([]gitcmd.ConfiguredBase, error) {
+	return s.settings.GitSnapshots()
+}
+
+func awaitGitLifecycle(t *testing.T, boundary string, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for !ready() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out at %s", boundary)
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestGitAutosyncResilienceLifecycle(t *testing.T) {
+	ctx := context.Background()
+	aRoot, aRemote, aOID := readyManagerGitPair(t)
+	bRoot, bRemote, bOID := readyManagerGitPair(t)
+	completed := true
+	store := &fakeConfigStore{config: &model.Config{SetupCompleted: &completed, CurrentBase: "A", Bases: []model.Base{
+		{Name: "A", Path: aRoot, GitURL: aRemote, GitBranch: "main", AutoSync: true, AutoSyncIntervalMinutes: 5, GitCommitMessageTemplate: DefaultGitCommitMessageTemplate},
+		{Name: "B", Path: bRoot, GitURL: bRemote, GitBranch: "main", AutoSync: true, AutoSyncIntervalMinutes: 15, GitCommitMessageTemplate: DefaultGitCommitMessageTemplate},
+	}}}
+	var failA atomic.Bool
+	failA.Store(true)
+	var concurrent, maximum atomic.Int32
+	delegate := gitcmd.NewCommandRunner()
+	runner := managerRunnerFunc(func(ctx context.Context, command gitcmd.Command) (gitcmd.Result, error) {
+		n := concurrent.Add(1)
+		defer concurrent.Add(-1)
+		for old := maximum.Load(); n > old && !maximum.CompareAndSwap(old, n); old = maximum.Load() {
+		}
+		if command.Dir == aRoot && command.Scope == gitcmd.NetworkOperation && failA.Load() {
+			return gitcmd.Result{}, &gitcmd.SafeError{Code: gitcmd.CodeRemoteUnreachable, Message: "Git remote is unreachable"}
+		}
+		return delegate.Run(ctx, command)
+	})
+	client := gitcmd.NewClient(runner)
+	f := newGitManagerFixture(t, nil, "", runner, client, client)
+	clock := newFakeGitSchedulerClock(schedulerTestNow())
+	var settings *SettingsService
+	open := func() {
+		t.Helper()
+		var err error
+		settings, err = NewSettingsServiceWithGit(store, f.notes, f.coordinator, "", log.Default(), NewGitConfigValidator(client), f.statuses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.manager = newGitManagerWithAutosync(gitcmd.NewService(runner, client), f.statuses, f.operations, NewGitProbeService(settings, client), settings.GitSnapshot, f.notes, f.coordinator, lifecycleGitSnapshots{settings}, settings.GitConfigChanges(), log.Default(), clock)
+		t.Cleanup(func() { _ = f.manager.Close() })
+	}
+	// Bind the real active note runtime before constructing settings.
+	if err := f.notes.SwitchBase(aRoot); err != nil {
+		t.Fatal(err)
+	}
+	open()
+	a, _, err := settings.GitSnapshot("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := settings.GitSnapshot("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedManagerTrust(t, f, a, aOID)
+	// Each initialized base has its own durable journal identity.
+	if _, err := f.db.Exec("UPDATE git_operations SET operation_id = ?", strings.Repeat("b", 32)); err != nil {
+		t.Fatal(err)
+	}
+	seedManagerTrust(t, f, b, bOID)
+	assertStatus := func(path string, state model.GitState, count int) model.GitStatus {
+		t.Helper()
+		got, found, err := f.statuses.Get(ctx, path)
+		if err != nil || !found || got.State != state || got.ConsecutiveFailures != count {
+			t.Fatalf("status=%+v found=%v err=%v; want %s/%d", got, found, err, state, count)
+		}
+		return got
+	}
+	waitStatus := func(path string, state model.GitState, count int) {
+		t.Helper()
+		defer func() {
+			if t.Failed() {
+				s, _, _ := f.statuses.Get(ctx, path)
+				op, _, _ := f.operations.LatestByPath(ctx, path)
+				t.Logf("terminal status=%+v journal=%+v clock=%s", s, op, clock.Now())
+			}
+		}()
+		awaitGitLifecycle(t, fmt.Sprintf("terminal %s %s/%d", path, state, count), func() bool {
+			clock.Advance(0)
+			s, found, err := f.statuses.Get(ctx, path)
+			return err == nil && found && s.State == state && s.ConsecutiveFailures == count && s.LastAttempt != nil && s.LastAttempt.Equal(clock.Now())
+		})
+	}
+	waitTimer := func(due time.Time) {
+		t.Helper()
+		awaitGitLifecycle(t, "scheduler timer reconciliation", func() bool {
+			clock.mu.Lock()
+			defer clock.mu.Unlock()
+			for timer := range clock.timers {
+				if timer.armed && timer.deadline.Equal(due) {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	if err := f.manager.RecoverLocal(ctx, []gitcmd.ConfiguredBase{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	// Recovery notifications precede scheduler startup; consume them before
+	// advancing its first fake-clock boundary.
+	for len(f.manager.scheduler.statusChanged) > 0 {
+		<-f.manager.scheduler.statusChanged
+	}
+	for len(settings.GitConfigChanges()) > 0 {
+		<-settings.GitConfigChanges()
+	}
+	if err := f.manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitTimer(clock.Now().Add(5 * time.Second))
+	clock.Advance(5 * time.Second)
+	waitStatus(aRoot, model.GitStateError, 1)
+	assertStatus(bRoot, model.GitStateReady, 0)
+	waitTimer(clock.Now().Add(5 * time.Second))
+	clock.Advance(5 * time.Second)
+	waitStatus(bRoot, model.GitStateReady, 0)
+	for count := 2; count <= 5; count++ {
+		last := assertStatus(aRoot, model.GitStateError, count-1)
+		due := last.LastAttempt.Add(5 * time.Minute)
+		waitTimer(due)
+		clock.Advance(due.Sub(clock.Now()))
+		state := model.GitStateError
+		if count == 5 {
+			state = model.GitStatePaused
+		}
+		waitStatus(aRoot, state, count)
+		if count == 4 {
+			// B's independent fifteen-minute timer fires between A's fourth
+			// and fifth failures; it never inherits A's failure sequence.
+			lastB := assertStatus(bRoot, model.GitStateReady, 0)
+			dueB := lastB.LastAttempt.Add(15 * time.Minute)
+			waitTimer(dueB)
+			clock.Advance(dueB.Sub(clock.Now()))
+			waitStatus(bRoot, model.GitStateReady, 0)
+		}
+	}
+	paused := assertStatus(aRoot, model.GitStatePaused, 5)
+	lastB := assertStatus(bRoot, model.GitStateReady, 0)
+	nextB := lastB.LastAttempt.Add(15 * time.Minute)
+	waitTimer(nextB)
+	clock.Advance(nextB.Sub(clock.Now()))
+	waitStatus(bRoot, model.GitStateReady, 0)
+	if got := assertStatus(aRoot, model.GitStatePaused, 5); !reflect.DeepEqual(got, paused) {
+		t.Fatalf("breaker allowed another automatic attempt: %+v", got)
+	}
+	if err := f.manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.notes.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.db, err = repository.InitDB(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.db.SetMaxOpenConns(1)
+	f.statuses, f.operations = repository.NewGitStatusRepository(f.db), repository.NewGitOperationRepository(f.db)
+	f.coordinator = NewBaseOperationCoordinator()
+	f.notes = NewNoteService(repository.NewNoteRepository(f.db), aRoot, f.coordinator)
+	t.Cleanup(func() { _ = f.notes.Close(); _ = f.db.Close() })
+	open()
+	if err := f.manager.RecoverLocal(ctx, []gitcmd.ConfiguredBase{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	if got := assertStatus(aRoot, model.GitStatePaused, 5); !reflect.DeepEqual(got, paused) {
+		t.Fatalf("restart changed pause: %+v", got)
+	}
+	assertStatus(bRoot, model.GitStateReady, 0)
+	failA.Store(false)
+	op, duplicate, err := f.manager.Resume(ctx, "A")
+	if err != nil || duplicate {
+		t.Fatalf("resume=%+v %v %v", op, duplicate, err)
+	}
+	if again, duplicate, err := f.manager.Resume(ctx, "A"); err != nil || !duplicate || again.ID != op.ID {
+		t.Fatalf("dedupe=%+v %v %v", again, duplicate, err)
+	}
+	if err := f.manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(aRoot, model.GitStateReady, 0)
+	beforeRename := assertStatus(bRoot, model.GitStateReady, 0)
+	if _, err := settings.UpdateBase("B", model.BaseUpdateRequest{Name: "renamed", Path: bRoot}); err != nil {
+		t.Fatal(err)
+	}
+	renamed := assertStatus(bRoot, model.GitStateReady, 0)
+	beforeRename.Base = "renamed"
+	if !reflect.DeepEqual(renamed, beforeRename) {
+		t.Fatalf("rename changed path-owned status: %+v", renamed)
+	}
+	_, disabled, err := settings.ConfigureGitForInitialize(ctx, "A", model.GitConfigRequest{GitURL: aRemote, GitBranch: "main", AutoSync: false, AutoSyncIntervalMinutes: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(aRoot, model.GitStateNeedsReconnect, 0)
+	if _, _, err := f.manager.QueueInitialize(ctx, gitcmd.InitializeRequest{Snapshot: disabled}); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(aRoot, model.GitStateReady, 0)
+	disabledStatus := assertStatus(aRoot, model.GitStateReady, 0)
+	bDue := renamed.LastAttempt.Add(15 * time.Minute)
+	waitTimer(bDue)
+	clock.Advance(bDue.Sub(clock.Now()))
+	waitStatus(bRoot, model.GitStateReady, 0)
+	if got := assertStatus(aRoot, model.GitStateReady, 0); !reflect.DeepEqual(got, disabledStatus) {
+		t.Fatalf("disabled autosync ran again: %+v", got)
+	}
+	if got := assertStatus(bRoot, model.GitStateReady, 0); got.Base != "renamed" {
+		t.Fatalf("scheduled work retained old name: %+v", got)
+	}
+	newPath := t.TempDir()
+	if _, err := settings.UpdateBase("renamed", model.BaseUpdateRequest{Name: "renamed", Path: newPath}); err != nil {
+		t.Fatal(err)
+	}
+	if s, found, err := f.statuses.Get(ctx, bRoot); err != nil || found {
+		t.Fatalf("old path row=%+v %v %v", s, found, err)
+	}
+	assertStatus(newPath, model.GitStateNeedsReconnect, 0)
+	if _, err := settings.SwitchBase("renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.ForgetBase("A"); err != nil {
+		t.Fatal(err)
+	}
+	if s, found, err := f.statuses.Get(ctx, aRoot); err != nil || found {
+		t.Fatalf("forgotten row=%+v %v %v", s, found, err)
+	}
+	waitTimer(clock.Now().Add(gitSchedulerRetryDelay))
+	clock.Advance(time.Hour)
+	waitTimer(clock.Now().Add(gitSchedulerRetryDelay))
+	rows, err := f.statuses.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].RepositoryPath != newPath {
+		t.Fatalf("reconciled rows=%+v %v", rows, err)
+	}
+	for _, root := range []string{aRoot, bRoot} {
+		if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+			t.Fatal(err)
+		}
+		if content, err := os.ReadFile(filepath.Join(root, "note.md")); err != nil || string(content) != "note\n" {
+			t.Fatalf("settings reconciliation changed user files: %q %v", content, err)
+		}
+	}
+	if maximum.Load() != 1 {
+		t.Fatalf("overlapping Git commands: %d", maximum.Load())
+	}
+}
+
 func TestGitManagerBreakerFifthFailureAndResume(t *testing.T) {
 	root, remote, oid := readyManagerGitPair(t)
 	base := configuredManagerBase("work", root)
@@ -145,6 +408,143 @@ func TestGitManagerBreakerFifthFailureAndResume(t *testing.T) {
 	status, _, _ := f.statuses.Get(context.Background(), base.Path)
 	if status.ConsecutiveFailures != 1 {
 		t.Fatalf("resumed failure: %+v", status)
+	}
+}
+
+func TestGitAutosyncShutdownDuringScheduledPush(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root, remote, oid := readyManagerGitPair(t)
+	nextRoot, nextRemote, nextOID := readyManagerGitPair(t)
+	a, b := configuredManagerBase("A", root), configuredManagerBase("B", nextRoot)
+	a.URL, a.AutoSync, a.IntervalMinutes = remote, true, 5
+	b.URL, b.AutoSync = nextRemote, true
+	entered, canceled := make(chan struct{}), make(chan struct{})
+	var pushes, network atomic.Int32
+	delegate := gitcmd.NewCommandRunner()
+	runner := managerRunnerFunc(func(ctx context.Context, command gitcmd.Command) (gitcmd.Result, error) {
+		if command.Scope == gitcmd.NetworkOperation {
+			network.Add(1)
+			if slices.Contains(command.Args, "push") {
+				pushes.Add(1)
+				close(entered)
+				<-ctx.Done()
+				close(canceled)
+				return gitcmd.Result{}, ctx.Err()
+			}
+		}
+		return delegate.Run(ctx, command)
+	})
+	client := gitcmd.NewClient(runner)
+	f := newGitManagerFixture(t, []gitcmd.ConfiguredBase{a, b}, "", runner, client, client)
+	seedManagerTrust(t, f, a, oid)
+	if _, err := f.db.Exec("UPDATE git_operations SET operation_id = ?", strings.Repeat("b", 32)); err != nil {
+		t.Fatal(err)
+	}
+	seedManagerTrust(t, f, b, nextOID)
+	status, _, _ := f.statuses.Get(ctx, root)
+	status.ConsecutiveFailures = 3
+	if err := f.statuses.Upsert(ctx, status); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "note.md"), []byte("scheduled draft\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeGitSchedulerClock(schedulerTestNow())
+	enableManagerAutosyncFixture(t, f, clock)
+	if err := f.manager.RecoverLocal(ctx, []gitcmd.ConfiguredBase{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	for len(f.manager.scheduler.statusChanged) > 0 {
+		<-f.manager.scheduler.statusChanged
+	}
+	f.manager.scheduler.startedAt = clock.Now()
+	if err := f.manager.scheduler.reconcile(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(5 * time.Second)
+	if !f.manager.scheduler.queueDue(ctx, clock.Now()) {
+		t.Fatal("scheduler stopped before submission")
+	}
+	if _, _, err := f.manager.QueueSync(ctx, gitcmd.SyncRequest{Snapshot: b}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("scheduled operation did not reach push")
+	}
+	committed := runManagerGit(t, root, "rev-parse", "HEAD")
+	if committed == oid {
+		t.Fatal("scheduled sync did not checkpoint the draft before push")
+	}
+	closed := make(chan error, 1)
+	go func() { <-ctx.Done(); closed <- f.manager.Close() }()
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(15 * time.Second):
+		t.Fatal("application cancellation did not reach push")
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Hour)
+	status, _, err := f.statuses.Get(context.Background(), root)
+	if err != nil || status.State != model.GitStateError || status.ConsecutiveFailures != 3 || status.Error == nil || status.Error.Code != string(gitcmd.CodeOperationInterrupted) {
+		t.Fatalf("shutdown status=%+v %v", status, err)
+	}
+	queued, found, err := f.operations.ActiveByPath(context.Background(), nextRoot)
+	if err != nil || !found || queued.State != gitcmd.OperationQueued {
+		t.Fatalf("next operation started: %+v %v %v", queued, found, err)
+	}
+	if pushes.Load() != 1 {
+		t.Fatalf("push calls=%d", pushes.Load())
+	}
+	interrupted, found, err := f.operations.LatestByPath(context.Background(), root)
+	if err != nil || !found || interrupted.State != gitcmd.OperationFailed || interrupted.Error == nil || interrupted.Error.Code != gitcmd.CodeOperationInterrupted {
+		t.Fatalf("shutdown journal=%+v found=%v err=%v", interrupted, found, err)
+	}
+	networkBefore := network.Load()
+	if err := f.notes.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := repository.InitDB(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	statuses, operations := repository.NewGitStatusRepository(db), repository.NewGitOperationRepository(db)
+	coordinator := NewBaseOperationCoordinator()
+	notes := NewNoteService(repository.NewNoteRepository(db), "", coordinator)
+	defer notes.Close()
+	manager := NewGitManager(gitcmd.NewService(runner, client), statuses, operations, NewGitProbeService(managerSettings{model.Config{Bases: []model.Base{{Name: a.Name, Path: a.Path, GitURL: a.URL, GitBranch: a.Branch}, {Name: b.Name, Path: b.Path, GitURL: b.URL, GitBranch: b.Branch}}}}, client), f.snapshots.get, notes, coordinator)
+	defer manager.Close()
+	if err := manager.RecoverLocal(context.Background(), []gitcmd.ConfiguredBase{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	if network.Load() != networkBefore || pushes.Load() != 1 {
+		t.Fatal("local recovery performed network work")
+	}
+	if got := runManagerGit(t, root, "rev-parse", "HEAD"); got != committed {
+		t.Fatalf("hidden shutdown/recovery commit: %s != %s", got, committed)
+	}
+	if got := runManagerGit(t, remote, "rev-parse", "refs/heads/main"); got != oid {
+		t.Fatalf("hidden push: %s != %s", got, oid)
+	}
+	if got := runManagerGit(t, nextRoot, "rev-parse", "HEAD"); got != nextOID {
+		t.Fatal("queued base committed during shutdown/recovery")
+	}
+	recovered, found, err := statuses.Get(context.Background(), root)
+	if err != nil || !found || recovered.ConsecutiveFailures != 3 {
+		t.Fatalf("recovered budget=%+v %v %v", recovered, found, err)
 	}
 }
 
