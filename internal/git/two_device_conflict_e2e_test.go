@@ -93,7 +93,13 @@ func TestTwoDeviceEndToEndConflictSurvivesRestartAndLosesNoData(t *testing.T) {
 	}
 	assertNoPush()
 	// FETCH_HEAD is mutable and is deliberately made unrelated to the frozen remote.
-	f.git(t, two.snapshot.Path, "update-ref", "FETCH_HEAD", baseOID)
+	// Use fetch rather than update-ref, which newer Git rejects for pseudorefs.
+	f.git(t, two.snapshot.Path, "fetch", "--no-tags", ".", baseOID)
+	if strings.TrimSpace(f.git(t, two.snapshot.Path, "rev-parse", "FETCH_HEAD")) != baseOID ||
+		strings.TrimSpace(f.git(t, two.snapshot.Path, "rev-parse", "HEAD")) != twoOID ||
+		strings.TrimSpace(f.git(t, two.snapshot.Path, "rev-parse", "MERGE_HEAD")) != oneOID {
+		t.Fatal("local fetch did not change FETCH_HEAD independently of the conflict parents")
+	}
 	runner := NewCommandRunner()
 	audit = &interceptRunner{delegate: runner}
 	client := NewClient(audit)

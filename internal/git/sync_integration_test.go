@@ -391,7 +391,14 @@ func TestSyncConflictCheckpointsCommittedLocalOIDAndRecoversOriginalOperation(t 
 	}
 	// Keep the exact checkpointed identity; only apply the terminal conflict state.
 	operation.State = OperationConflict
-	fixture.git(fixture.root, "update-ref", "FETCH_HEAD", before)
+	// FETCH_HEAD is a pseudoref: newer Git versions reject update-ref for it.
+	// A local fetch changes it without changing the frozen merge parents.
+	fixture.git(fixture.root, "fetch", "--no-tags", ".", before)
+	if fixture.git(fixture.root, "rev-parse", "FETCH_HEAD") != before ||
+		fixture.git(fixture.root, "rev-parse", "HEAD") != local ||
+		fixture.git(fixture.root, "rev-parse", "MERGE_HEAD") != remote {
+		t.Fatal("local fetch did not change FETCH_HEAD independently of the conflict parents")
+	}
 	recovered, err := runRecovery(t, fixture, nil, recoveryOptions(options, &operation))
 	if !errors.As(err, &conflict) || !recovered.Blocking || recovered.ConflictState != RecoveryConflict ||
 		recovered.HeadOID != local || recovered.MergeHeadOID != remote || recovered.RemoteOID != remote {
