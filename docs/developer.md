@@ -16,6 +16,7 @@ Git-синхронизация реализована через системн�
 - `internal/service/`: настройка, управление базами и заметками, синхронизация файловой системы.
 - `internal/repository/`: SQLite-репозиторий метаданных.
 - `internal/model/`: API, конфигурационные и доменные структуры.
+- `internal/git/`: runner системного Git, porcelain, операции одного репозитория, конфликты и локальное восстановление.
 - `web/src/`: Svelte-приложение, компоненты, API wrappers и Vitest-тесты.
 - `web/dist/`: результат сборки Vite.
 - `web/embed.go`: пакет `web` встраивает `web/dist/` директивой `//go:embed all:dist` и предоставляет `fs.FS` серверу.
@@ -76,9 +77,9 @@ Vitest 4, jsdom и Testing Library запускаются в Node.js 24 и пр�
 |:---|:---|:---|
 | GET | `/api/notes` | Получить дерево заметок |
 | POST | `/api/notes` | Создать заметку или папку |
-| GET | `/api/note?id=...` | Получить содержимое заметки |
+| GET | `/api/note?id=...` | Получить `content` и `revision` |
 | DELETE | `/api/note?id=...` | Удалить заметку или папку |
-| POST | `/api/save` | Сохранить содержимое заметки |
+| POST | `/api/save` | Сохранить с `expected_revision`, получить новую `revision` |
 | PUT | `/api/rename` | Переименовать заметку или папку |
 | POST | `/api/sync` | Синхронизировать файловую систему и метаданные |
 | GET | `/api/info` | Получить путь текущей базы |
@@ -89,20 +90,50 @@ Vitest 4, jsdom и Testing Library запускаются в Node.js 24 и пр�
 | POST/PUT/DELETE | `/api/bases` | Добавить, изменить или забыть базу |
 | POST | `/api/bases/switch` | Переключить активную базу |
 | POST | `/api/system/select-directory` | Открыть системный выбор каталога |
-| GET | `/api/git/status` | Получить статусы Git-баз |
-| POST | `/api/git/sync` | Запустить синхронизацию Git-базы |
-| GET | `/api/git/conflicts` | Получить конфликты текущей Git-операции |
+| POST | `/api/git/probe` | Проверить репозиторий без изменений |
+| PUT/DELETE | `/api/git/config?base=...` | Сохранить настройки и поставить initialize в очередь / отключить Git |
+| GET | `/api/git/status?base=...` | Получить статус одной базы; без `base` — всех баз |
+| POST | `/api/git/sync?base=...` | Поставить синхронизацию Git-базы в очередь |
+| POST | `/api/git/resume?base=...` | Явно снять паузу и поставить sync в очередь |
+| GET | `/api/git/conflicts?base=...` | Получить конфликты текущей Git-операции |
 | PUT | `/api/git/conflicts/resolve` | Применить решение конфликта |
-| POST | `/api/git/conflicts/complete` | Завершить слияние после разрешения |
-| POST | `/api/git/conflicts/abort` | Отменить незавершенное слияние |
+| POST | `/api/git/conflicts/complete?base=...` | Поставить завершение слияния в очередь |
+| POST | `/api/git/conflicts/abort?base=...` | Поставить отмену слияния в очередь и приостановить sync |
 
 Note API, кроме `/api/info`, закрыт setup guard до завершения мастера. API принимает только запросы с допустимым локальным origin.
+
+Полный контракт, включая `/api/git/probe`, PUT/DELETE `/api/git/config` и `/api/git/resume`, приведен в [спецификации API](api.md). GET заметки возвращает `content` и `revision`; POST save передает `expected_revision` и получает новую `revision`. Несовпадение возвращает `409 note_changed` без перезаписи. Клиент перечитывает диск и сохраняет восстановленный текст с новой ревизией после явного подтверждения пользователя.
+
+## Архитектура Git-интеграции
+
+### Запуск системного Git
+
+`internal/git` — единственная граница запуска системного Git в приложении.
+
+`internal/git/CommandRunner` запускает executable `git` с отдельным массивом `argv` через `exec.CommandContext`, никогда через shell. Рабочий каталог канонизируется; локальные и сетевые команды имеют отдельные таймауты (15 и 60 секунд), ограниченный вывод и безопасные ошибки с редактированием секретов. `Command.Stdin == nil` дает EOF, а не наследование терминала. Окружение всегда содержит `GIT_TERMINAL_PROMPT=0`; авторизация должна заранее работать через SSH-agent, credential helper или Git config пользователя.
+
+В Linux и macOS команда получает собственную process group; отмена завершает группу, включая дочерние процессы. В Windows процесс создается с `CREATE_SUSPENDED`, присоединяется к Job Object с `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` **до** вызова `ResumeThread` для единственного начального потока. Ошибка присоединения или resume завершает и собирает приостановленный процесс; отмена ожидает завершения launch gate. После успешного старта runner выполняет один `Wait`, синхронизирует callback отмены и закрывает объект дерева процессов.
+
+Git hooks создания коммитов (commit hooks) и настроенная подпись коммитов остаются активны. Push использует `--no-verify`, поэтому локальный `pre-push` пропускается. Сбой hook или подписи может завершить операцию ошибкой; приложение не обещает отключения всех hooks.
+
+### Владельцы состояния
+
+- `internal/git/Service` выполняет одну операцию одного репозитория: initialize, sync, conflict complete/abort либо recovery. Он получает неизменяемый снимок конфигурации, callback долговечного checkpoint и транзакцию рабочего дерева; не владеет общей очередью или расписанием.
+- `internal/service/GitManager` владеет единственным последовательным FIFO worker, дедупликацией по канонической идентичности репозитория, долговечной очередью и терминальными статусами в SQLite. Его autosync scheduler обслуживает все настроенные базы, включая неактивные, и сверяет расписание с опубликованными изменениями конфигурации. Перед выполнением worker повторно проверяет снимок и fingerprint.
+- `internal/service/SettingsService` — владелец Git-конфигурации: валидирует и сохраняет URL, ветку, интервал и шаблон, предоставляет Git snapshots и публикует изменения для manager/scheduler. Общий PUT `/api/config` не меняет Git-поля; Git-настройки проходят через `/api/git/config`. Сохранение настроек предшествует постановке initialize в очередь, поэтому отказ очереди не означает откат конфигурации.
+- `NoteService` владеет доступом к активной базе и атомарной транзакцией изменения файловой системы с переиндексацией; `BaseOperationCoordinator` согласует операции Git и жизненный цикл баз. Конфликтный snapshot запрещает обычные записи в конфликтное дерево без повторного захвата coordinator.
+
+Порядок блокировок фиксирован: `coordinator -> SettingsService.mu -> NoteService.baseMu -> repository/SQLite`. Callback нижнего уровня не должен захватывать coordinator или вызывать верхний слой. Сетевой fetch выполняется **до** write lock заметок; snapshot/commit, переключение и merge выполняются в транзакции рабочего дерева, затем reindex и освобождение note write lock; сетевой push выполняется **после** reindex/unlock. Это не удерживает блокировку чтения и сохранения заметок на время сети. Операция базы при этом остается сериализованной coordinator.
+
+Git сохраняет все неигнорируемые файлы базы (`git add -A`), включая assets. Перед переключением или слиянием защищаемый локальный снимок сохраняется через `refs/igonotes/backups/...`; это Git ref, не копия каталога. При merge conflict обычные записи блокируются до явного resolve/complete/abort. Перезапуск восстанавливает состояние локальными проверками, не удаляет Git lock/state файлы и не возобновляет паузу автоматически. Shutdown отменяет текущую операцию, записывает `operation_interrupted` и не запускает заключительный commit/push.
 
 ## Хранение данных
 
 - Markdown-файлы и `assets/images/` находятся внутри каталогов баз, указанных в конфигурации.
 - SQLite с метаданными находится в `~/.igonotes/metadata.db`.
 - Конфигурация находится в `<os.UserConfigDir()>/igonotes/config.json`, если каталог не переопределен флагом `--config`.
+
+SQLite (дерево, Git-очередь, checkpoints и статусы) и конфигурация приложения находятся вне каталогов баз и не входят в Git-коммиты базы.
 
 ## Тестирование
 
@@ -114,13 +145,27 @@ npm test
 npm run test:watch
 ```
 
-Полная проверка и сборка из корня проекта:
+Проверки перед merge из корня проекта (Go 1.26+, Node.js 24):
 
 ```bash
-go test -race ./...
-go vet ./...
+npm --prefix web run verify
+make test
+make test-git
+make test-race
+make vet
+make verify
 make all
 ```
+
+`npm --prefix web run verify` запускает frontend-тесты и сборку. `make test`, `make test-git`, `make test-race` и `make vet` сначала собирают embedded frontend; `make verify` объединяет frontend-тесты/сборку, полный Go suite, race detector и vet. `make all` собирает бинарник.
+
+Для обычного `go test ./...` Git-интеграционные тесты опциональны: при недоступном executable либо Git старее **2.28** они пропускаются. `make test-git` включает `IGONOTES_REQUIRE_GIT_INTEGRATION=1`: native Git обязателен, отсутствие или неподдерживаемая версия приводят к ошибке. Этот режим применим и к полному suite:
+
+```bash
+IGONOTES_REQUIRE_GIT_INTEGRATION=1 go test ./... -count=1
+```
+
+Интеграционные тесты используют реальный системный Git, изолированное окружение, временные локальные bare remotes и рабочие каталоги. Внешняя сеть и пользовательские credentials не нужны; `go-git` не используется. Тесты `internal/docs` читают документацию относительно исходного файла через `runtime.Caller`, не зависят от CWD, Git или обязательного integration env; проверяют текущие контракты и точные зеркала API/user/developer после нормализации CRLF. Jekyll-страница содержит только frontmatter `layout: default` и точные байты исходника, включая raw wrappers вокруг шаблонных переменных.
 
 ## Добавление функции
 
@@ -130,8 +175,12 @@ make all
 4. Добавьте Go-тесты и Vitest component/module tests рядом с измененным кодом.
 5. Запустите команды полной проверки.
 
-Git API использует системный Git, поэтому для настройки и синхронизации он должен быть доступен в `PATH` процесса IGoNotes.
+Git API использует системный Git 2.28+, поэтому для настройки и синхронизации он должен быть доступен в `PATH` процесса IGoNotes. Для обычной локальной работы Git необязателен.
 
 ## Работа с Git
 
-Проект использует ветки `develop` для разработки, `master` для стабильной версии и `pages` для Jekyll-документации. GitHub Actions собирает архивы для Linux, Windows и macOS на amd64 и arm64 и публикует release при отправке тега вида `v*`.
+Проект использует ветки `develop` для разработки, `master` для стабильной версии и `pages` для Jekyll-документации.
+
+CI выполняет native Git integration на трех ОС: Linux, macOS и Windows, с обязательным `IGONOTES_REQUIRE_GIT_INTEGRATION=1`, полным Go suite и повторными process-tree/two-device тестами. Отдельная Linux job запускает race/vet/build и шесть cross-build комбинаций Linux/Windows/macOS × amd64/arm64 (`CGO_ENABLED=0`). Кросс-компиляция проверяет сборку, а native jobs — выполнение платформенного кода.
+
+Release запускается тегом `v*`. Job `build` имеет только `contents: read`, выполняет frontend/Go/race/vet проверки и собирает шесть архивов с checksums. Только job `publish` имеет `contents: write`: получает уже проверенные artifacts, проверяет точные шесть архивов и checksums и публикует release. В `publish` нет checkout или сборки исходного кода.
