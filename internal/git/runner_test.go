@@ -610,12 +610,13 @@ func helperCommand(ctx context.Context, action string, args ...string) *exec.Cmd
 
 func TestRedactAdversarialLargeValuesAreBounded(t *testing.T) {
 	// Run in a killable subprocess so a quadratic regression cannot stall the
-	// suite. Linear processing of these 512 KiB values has ample headroom at 3s.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// suite. Use the normal helper deadline to include process startup and race
+	// detector shutdown on hosted runners, not just the redaction itself.
+	ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
 	defer cancel()
 	output, err := helperCommand(ctx, "redact-adversarial").Output()
 	if ctx.Err() != nil {
-		t.Fatal("adversarial redaction exceeded the 3s bound")
+		t.Fatalf("adversarial redaction exceeded the %s helper deadline", helperTimeout)
 	}
 	if err != nil || !strings.HasPrefix(string(output), "bounded redaction passed") {
 		t.Fatal("adversarial redaction failed; helper output is intentionally private")
@@ -625,12 +626,13 @@ func TestRedactAdversarialLargeValuesAreBounded(t *testing.T) {
 func TestRedactMultivariantAdversarialLargeValuesAreBounded(t *testing.T) {
 	for _, size := range []int{32 * 1024, 512 * 1024, 1024 * 1024} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			// This bounds the entire subprocess, including race-detector overhead.
+			ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
 			defer cancel()
 			start := time.Now()
 			output, err := helperCommand(ctx, "redact-multivariant-adversarial", strconv.Itoa(size)).Output()
 			if ctx.Err() != nil {
-				t.Fatal("multivariant adversarial redaction exceeded the 3s bound")
+				t.Fatalf("multivariant adversarial redaction exceeded the %s helper deadline", helperTimeout)
 			}
 			if err != nil || !strings.HasPrefix(string(output), "bounded multivariant redaction passed") {
 				t.Fatal("multivariant redaction failed; helper output is intentionally private")
