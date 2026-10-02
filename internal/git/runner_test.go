@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -67,11 +69,79 @@ func TestGitRunnerHelper(t *testing.T) {
 		_, _ = io.WriteString(os.Stderr, strings.Repeat("e", stderrSize))
 	case "stderr":
 		_, _ = io.WriteString(os.Stderr, args[1])
+	case "redact-adversarial":
+		const size = 512 * 1024
+		secret := strings.Repeat("a", size) + "b"
+		// Every candidate suffix shares almost its entire prefix, then differs
+		// at the final byte. Repeated HasSuffix comparisons become quadratic.
+		text := strings.Repeat("a", size) + "c"
+		if got := redact(text, []string{secret}); got != text {
+			t.Fatal("large nonmatching diagnostic changed")
+		}
+		if got := redact(strings.Repeat("a", size), []string{secret}); got != "[REDACTED_REMOTE]" {
+			t.Fatal("large matching credential prefix was not sanitized")
+		}
+		_, _ = io.WriteString(os.Stdout, "bounded redaction passed")
+	case "redact-multivariant-adversarial":
+		size, err := strconv.Atoi(args[1])
+		if err != nil {
+			t.Fatal("invalid adversarial size")
+		}
+		shared := strings.Repeat("a", size)
+		secrets := []string{shared + "b", shared + "d"}
+		near := shared + "c"
+		for _, entry := range []struct{ text, want string }{
+			{near, near},
+			{shared, "[REDACTED_REMOTE]"},
+			{secrets[0] + " " + secrets[1], "[REDACTED_REMOTE] [REDACTED_REMOTE]"},
+			{near + " " + secrets[0], near + " [REDACTED_REMOTE]"},
+		} {
+			if got := redact(entry.text, secrets); got != entry.want {
+				t.Fatal("large multivariant redaction changed security behavior")
+			}
+		}
+		_, _ = io.WriteString(os.Stdout, "bounded multivariant redaction passed")
 	case "fail":
 		_, _ = io.WriteString(os.Stderr, args[1])
 		os.Exit(23)
 	case "wait":
 		time.Sleep(30 * time.Second)
+	case "tree-parent", "tree-parent-exit", "tree-parent-exit-fail":
+		child := helperCommand(context.Background(), "tree-child", args[1]+".child")
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if args[0] == "tree-parent" {
+			defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+		}
+		pids, _ := json.Marshal(helperPIDs{Parent: os.Getpid(), Child: child.Process.Pid})
+		if err := os.WriteFile(args[1], pids, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if args[0] == "tree-parent-exit" {
+			return
+		}
+		if args[0] == "tree-parent-exit-fail" {
+			os.Exit(23)
+		}
+		time.Sleep(30 * time.Second)
+	case "tree-child":
+		if err := os.WriteFile(args[1], []byte("running"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(30 * time.Second)
+	case "stdin-env":
+		contents, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(struct {
+			Env   []string
+			Stdin string
+		}{os.Environ(), string(contents)}); err != nil {
+			t.Fatal(err)
+		}
 	case "stdin-sha256":
 		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
@@ -80,6 +150,433 @@ func TestGitRunnerHelper(t *testing.T) {
 		_, _ = fmt.Fprintf(os.Stdout, "%x", sha256.Sum256(contents))
 	default:
 		t.Fatalf("unknown helper action %q", args[0])
+	}
+}
+
+type helperPIDs struct {
+	Parent int
+	Child  int
+}
+
+func waitForHelperPIDs(t *testing.T, path string) helperPIDs {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		var pids helperPIDs
+		if err == nil && json.Unmarshal(data, &pids) == nil && pids.Parent > 0 && pids.Child > 0 {
+			return pids
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("helper did not publish parent and child PIDs within 5s")
+	return helperPIDs{}
+}
+
+func TestCommandRunnerStdinEOFAndEnvironment(t *testing.T) {
+	for _, payload := range []string{"", "explicit payload"} {
+		t.Run(payload, func(t *testing.T) {
+			var captured *exec.Cmd
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, 64*1024,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					captured = helperCommand(ctx, "stdin-env")
+					return captured
+				})
+			command := Command{Dir: t.TempDir(), ReadOnly: true}
+			if payload != "" {
+				command.Stdin = strings.NewReader(payload)
+			}
+			result, err := runner.Run(context.Background(), command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if captured.Stdin != command.Stdin {
+				t.Fatal("stdin was replaced")
+			}
+			var observation struct {
+				Env   []string
+				Stdin string
+			}
+			if err := json.NewDecoder(strings.NewReader(result.Stdout)).Decode(&observation); err != nil {
+				t.Fatal(err)
+			}
+			if observation.Stdin != payload {
+				t.Fatalf("stdin = %q", observation.Stdin)
+			}
+			assertEnvValues(t, observation.Env, "GIT_TERMINAL_PROMPT", []string{"0"})
+			assertEnvValues(t, observation.Env, "LC_ALL", []string{"C"})
+			assertEnvValues(t, observation.Env, "GIT_OPTIONAL_LOCKS", []string{"0"})
+		})
+	}
+}
+
+type testProcessTree struct {
+	start     func(*exec.Cmd) error
+	terminate func(*exec.Cmd) error
+	close     func() error
+}
+
+func (tree *testProcessTree) Start(cmd *exec.Cmd) error     { return tree.start(cmd) }
+func (tree *testProcessTree) Terminate(cmd *exec.Cmd) error { return tree.terminate(cmd) }
+func (tree *testProcessTree) Close() error                  { return tree.close() }
+
+func TestCommandRunnerProcessTreeLifecycle(t *testing.T) {
+	var cmd *exec.Cmd
+	closed := 0
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			cmd = helperCommand(ctx, "success")
+			return cmd
+		})
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start: func(cmd *exec.Cmd) error {
+				if cmd.Cancel == nil || cmd.WaitDelay != 5*time.Second {
+					t.Error("missing tree cancellation or 5s WaitDelay")
+				}
+				return cmd.Start()
+			},
+			terminate: func(cmd *exec.Cmd) error { return cmd.Process.Kill() },
+			close: func() error {
+				closed++
+				if cmd.ProcessState == nil {
+					t.Error("Close before Wait")
+				}
+				return nil
+			},
+		}, nil
+	}
+	if _, err := runner.Run(context.Background(), Command{Dir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if closed != 1 {
+		t.Fatalf("Close calls = %d", closed)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("runner did not reap command")
+	}
+}
+
+func TestCommandRunnerContextWinsSuccessfulExitRace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd { return helperCommand(ctx, "success") })
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start:     func(cmd *exec.Cmd) error { err := cmd.Start(); cancel(); return err },
+			terminate: func(*exec.Cmd) error { return os.ErrProcessDone },
+			close:     func() error { return nil },
+		}, nil
+	}
+	if _, err := runner.Run(ctx, Command{Dir: t.TempDir()}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want canceled despite successful exit", err)
+	}
+}
+
+func TestCommandRunnerCancelsDescendantWhileDrainingPipes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "exited parent live child PIDs.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	nativeTree, err := newProcessTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nativeTree.Close()
+	started := make(chan *exec.Cmd, 1)
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			return helperCommand(ctx, "tree-parent-exit", path)
+		})
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start: func(cmd *exec.Cmd) error {
+				err := nativeTree.Start(cmd)
+				if err == nil {
+					started <- cmd
+				}
+				return err
+			},
+			terminate: nativeTree.Terminate,
+			close:     nativeTree.Close,
+		}, nil
+	}
+	done := make(chan error, 1)
+	dir := t.TempDir()
+	go func() { _, err := runner.Run(ctx, Command{Dir: dir}); done <- err }()
+	returned := false
+	defer func() {
+		cancel()
+		// Even the red regression must not leave a live orphan or blocked Run.
+		data, err := os.ReadFile(path)
+		var pids helperPIDs
+		if err == nil && json.Unmarshal(data, &pids) == nil {
+			for _, pid := range []int{pids.Child, pids.Parent} {
+				if pid > 0 && !helperStopped(pid) {
+					process, err := os.FindProcess(pid)
+					if err == nil {
+						_ = process.Kill()
+						_ = process.Release()
+					}
+				}
+			}
+		}
+		if !returned {
+			select {
+			case <-done:
+			case <-time.After(helperTimeout):
+				t.Error("runner did not finish cleanup")
+			}
+		}
+	}()
+	var cmd *exec.Cmd
+	select {
+	case cmd = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper did not start")
+	}
+	pids := waitForHelperPIDs(t, path)
+	// Process.Signal uses os.Process's synchronized state. Unix Wait marks it
+	// done; Windows Wait releases its handle (Signal then returns EINVAL).
+	// Neither requires racing on cmd.ProcessState while Wait drains the pipes.
+	parentReaped := func() bool {
+		err := cmd.Process.Signal(syscall.Signal(0))
+		return errors.Is(err, os.ErrProcessDone) || runtime.GOOS == "windows" && errors.Is(err, syscall.EINVAL)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if parentReaped() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !parentReaped() {
+		t.Fatal("parent was not reaped")
+	}
+	if helperStopped(pids.Child) {
+		t.Fatal("child stopped before cancellation")
+	}
+	select {
+	case <-done:
+		returned = true
+		t.Fatal("Run returned before draining descendant pipes")
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		returned = true
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation waited for the 5s pipe-drain timeout")
+	}
+	assertHelpersStopped(t, pids)
+}
+
+func TestCommandRunnerProcessTreeCancellationLifetime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan *exec.Cmd, 1)
+	var terminated atomic.Int32
+	runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+		func(ctx context.Context, _ string, _ ...string) *exec.Cmd { return helperCommand(ctx, "wait") })
+	runner.newProcessTree = func() (processTree, error) {
+		return &testProcessTree{
+			start: func(cmd *exec.Cmd) error {
+				err := cmd.Start()
+				if err == nil {
+					started <- cmd
+				}
+				return err
+			},
+			terminate: func(cmd *exec.Cmd) error { terminated.Add(1); return cmd.Process.Kill() },
+			close: func() error {
+				if terminated.Load() != 1 {
+					t.Errorf("Terminate calls at Close = %d, want 1", terminated.Load())
+				}
+				return nil
+			},
+		}, nil
+	}
+	dir := t.TempDir()
+	done := make(chan error, 1)
+	go func() { _, err := runner.Run(ctx, Command{Dir: dir}); done <- err }()
+	var cmd *exec.Cmd
+	select {
+	case cmd = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper did not start")
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not finish")
+	}
+	// A retained cancellation function must not signal a reused PID/group after
+	// Wait/Close, and overlapping exec/runner cancellation must terminate once.
+	if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("late Cancel = %v", err)
+	}
+	if terminated.Load() != 1 {
+		t.Fatalf("Terminate calls = %d, want 1", terminated.Load())
+	}
+}
+
+func TestCommandRunnerCleansDescendantsAfterPipeWaitDelay(t *testing.T) {
+	for _, action := range []string{"tree-parent-exit", "tree-parent-exit-fail"} {
+		t.Run(action, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "exited parent live child PIDs.json")
+			t.Cleanup(func() {
+				data, err := os.ReadFile(path)
+				var pids helperPIDs
+				if err == nil && json.Unmarshal(data, &pids) == nil && pids.Child > 0 && !helperStopped(pids.Child) {
+					process, err := os.FindProcess(pids.Child)
+					if err == nil {
+						_ = process.Kill()
+						_ = process.Release()
+					}
+				}
+			})
+			nativeTree, err := newProcessTree()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nativeTree.Close()
+			var cmd *exec.Cmd
+			terminated := 0
+			checkedBeforeReturn := false
+			runner := newCommandRunner("git", 20*time.Second, 20*time.Second, 1024,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					cmd = helperCommand(ctx, action, path)
+					return cmd
+				})
+			runner.newProcessTree = func() (processTree, error) {
+				return &testProcessTree{
+					start:     nativeTree.Start,
+					terminate: func(cmd *exec.Cmd) error { terminated++; return nativeTree.Terminate(cmd) },
+					close: func() error {
+						// This runs inside Run, before releasing the controller. Poll
+						// only for signal delivery; never kill from the assertion.
+						pids := waitForHelperPIDs(t, path)
+						deadline := time.Now().Add(time.Second)
+						for time.Now().Before(deadline) && !helperStopped(pids.Child) {
+							time.Sleep(time.Millisecond)
+						}
+						if !helperStopped(pids.Child) {
+							t.Error("live descendant at controller release, before Run returns")
+						}
+						if cmd.ProcessState == nil {
+							t.Error("main process was not reaped")
+						}
+						checkedBeforeReturn = true
+						return nativeTree.Close()
+					},
+				}, nil
+			}
+			begin := time.Now()
+			result, err := runner.Run(context.Background(), Command{Dir: t.TempDir()})
+			if time.Since(begin) < processWaitDelay {
+				t.Error("Run did not wait for pipe WaitDelay")
+			}
+			var safe *SafeError
+			if !errors.As(err, &safe) || safe.Code != CodeCommandFailed || safe.Message != "Git command failed" {
+				t.Fatalf("Run error = %v", err)
+			}
+			if action == "tree-parent-exit-fail" && safe.ExitCode != 23 {
+				t.Errorf("ExitCode = %d, want 23", safe.ExitCode)
+			}
+			if result != (Result{}) {
+				t.Errorf("result = %#v, want zero failure result", result)
+			}
+			if !checkedBeforeReturn {
+				t.Fatal("did not check descendant before Run returned")
+			}
+			if terminated != 1 {
+				t.Errorf("Terminate calls = %d, want 1", terminated)
+			}
+			if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
+				t.Errorf("late Cancel = %v", err)
+			}
+			if terminated != 1 {
+				t.Error("late Cancel signaled a retired process group")
+			}
+		})
+	}
+}
+
+func TestCommandRunnerSafeProcessErrors(t *testing.T) {
+	sentinel := errors.New("sentinel https://user:password@example.invalid PID 12345")
+	for _, stage := range []string{"prepare", "attach", "attach after create"} {
+		t.Run(stage, func(t *testing.T) {
+			closed := 0
+			var cmd *exec.Cmd
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, 1024,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					cmd = helperCommand(ctx, "success")
+					return cmd
+				})
+			runner.newProcessTree = func() (processTree, error) {
+				if stage == "prepare" {
+					return nil, sentinel
+				}
+				return &testProcessTree{
+					start: func(cmd *exec.Cmd) error {
+						if stage == "attach after create" {
+							if err := cmd.Start(); err != nil {
+								return err
+							}
+							if err := cmd.Wait(); err != nil {
+								return err
+							}
+						}
+						return newSafeProcessError("attach Git process tree", sentinel)
+					},
+					terminate: func(*exec.Cmd) error { t.Error("Terminate on failed Start"); return nil },
+					close:     func() error { closed++; return nil },
+				}, nil
+			}
+			_, err := runner.Run(context.Background(), Command{Dir: t.TempDir()})
+			assertSafeProcessError(t, err, sentinel)
+			if stage != "prepare" && closed != 1 {
+				t.Fatalf("Close calls = %d", closed)
+			}
+			if stage == "attach after create" {
+				if cmd.ProcessState == nil {
+					t.Fatal("failed Start did not reap process")
+				}
+			} else if cmd.ProcessState != nil {
+				t.Fatal("unexpected ProcessState after failed Start")
+			}
+		})
+	}
+}
+
+func assertSafeProcessError(t *testing.T, err, cause error) {
+	t.Helper()
+	var safe *SafeError
+	if !errors.As(err, &safe) || safe.Code != CodeCommandFailed || safe.Message != "Git command failed" {
+		t.Fatalf("error = %v, want fixed command failed SafeError", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("private cause was lost")
+	}
+	encoded, marshalErr := json.Marshal(err)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	for _, public := range []string{err.Error(), fmt.Sprintf("%+v", err), string(encoded), safe.Diagnostic()} {
+		for _, private := range []string{"sentinel", "https://", "password", "12345"} {
+			if strings.Contains(public, private) {
+				t.Fatalf("private data leaked: %q", public)
+			}
+		}
 	}
 }
 
@@ -109,6 +606,40 @@ func helperCommand(ctx context.Context, action string, args ...string) *exec.Cmd
 	commandArgs := []string{"-test.run=^TestGitRunnerHelper$", "--", action}
 	commandArgs = append(commandArgs, args...)
 	return exec.CommandContext(ctx, os.Args[0], commandArgs...)
+}
+
+func TestRedactAdversarialLargeValuesAreBounded(t *testing.T) {
+	// Run in a killable subprocess so a quadratic regression cannot stall the
+	// suite. Use the normal helper deadline to include process startup and race
+	// detector shutdown on hosted runners, not just the redaction itself.
+	ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
+	defer cancel()
+	output, err := helperCommand(ctx, "redact-adversarial").Output()
+	if ctx.Err() != nil {
+		t.Fatalf("adversarial redaction exceeded the %s helper deadline", helperTimeout)
+	}
+	if err != nil || !strings.HasPrefix(string(output), "bounded redaction passed") {
+		t.Fatal("adversarial redaction failed; helper output is intentionally private")
+	}
+}
+
+func TestRedactMultivariantAdversarialLargeValuesAreBounded(t *testing.T) {
+	for _, size := range []int{32 * 1024, 512 * 1024, 1024 * 1024} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			// This bounds the entire subprocess, including race-detector overhead.
+			ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
+			defer cancel()
+			start := time.Now()
+			output, err := helperCommand(ctx, "redact-multivariant-adversarial", strconv.Itoa(size)).Output()
+			if ctx.Err() != nil {
+				t.Fatalf("multivariant adversarial redaction exceeded the %s helper deadline", helperTimeout)
+			}
+			if err != nil || !strings.HasPrefix(string(output), "bounded multivariant redaction passed") {
+				t.Fatal("multivariant redaction failed; helper output is intentionally private")
+			}
+			t.Logf("two-pattern near-match and security checks: %d bytes in %s", size, time.Since(start))
+		})
+	}
 }
 
 func TestCommandRunnerPassesArgumentsWithoutShell(t *testing.T) {
@@ -372,6 +903,184 @@ func TestCommandRunnerRedactsSuccessAndHTTPUserinfo(t *testing.T) {
 	}
 }
 
+func assertNoSecretLeak(t testing.TB, public string, secrets []string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if secret != "" && strings.Contains(public, secret) {
+			t.Fatal("public output contains a complete secret")
+		}
+		for n := 4; n <= len(secret); n++ {
+			if strings.HasSuffix(public, secret[:n]) {
+				t.Fatal("public output ends in a secret prefix")
+			}
+		}
+	}
+}
+
+func TestCommandRunnerSecretVariantMatrix(t *testing.T) {
+	const remote = "https://matrixUser:matrixPassword@example.invalid/private.git"
+	variants := []string{remote, "matrixUser:matrixPassword", "matrixUser", "matrixPassword"}
+	corpus := []struct{ name, diagnostic, secret string }{
+		{"full URL", remote, remote},
+		{"authentication trailing slash", "fatal: Authentication failed for '" + remote + "/'", remote},
+		{"userinfo token", "token=matrixUser:matrixPassword", remote},
+		{"username token", "token=matrixUser", remote},
+		{"password token", "token=matrixPassword", remote},
+		{"authorization Basic", "Authorization: Basic matrixPassword", remote},
+		{"scp path", "git@example.invalid:private/scpSecret.git", "scpSecret"},
+	}
+	for _, entry := range corpus {
+		t.Run(entry.name, func(t *testing.T) {
+			for _, action := range []string{"stderr", "fail"} {
+				t.Run(action, func(t *testing.T) {
+					for _, limit := range []int{64, 4096} {
+						t.Run(strconv.Itoa(limit), func(t *testing.T) {
+							// Place a complete credential across the diagnostic boundary.
+							diagnostic := entry.diagnostic
+							if limit == 64 {
+								diagnostic = strings.Repeat("~", limit-8) + diagnostic
+							}
+							runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
+								func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+									return helperCommand(ctx, action, diagnostic)
+								})
+							result, err := runner.Run(context.Background(), Command{Dir: t.TempDir(), Secrets: []string{entry.secret}})
+							resultJSON, marshalErr := json.Marshal(result)
+							if marshalErr != nil {
+								t.Fatal(marshalErr)
+							}
+							public := []string{result.Stderr, fmt.Sprintf("%+v", result), fmt.Sprintf("%#v", result), string(resultJSON)}
+							if action == "fail" {
+								var safe *SafeError
+								if !errors.As(err, &safe) || result != (Result{}) || safe.ExitCode != 23 {
+									t.Fatal("failure did not preserve SafeError/result contract")
+								}
+								if entry.name == "authentication trailing slash" && limit == 4096 && safe.Code != CodeAuthentication {
+									t.Fatal("authentication classification changed")
+								}
+								public = append(public, safe.Error(), safe.Diagnostic(), fmt.Sprint(safe), fmt.Sprintf("%v", safe), fmt.Sprintf("%+v", safe), fmt.Sprintf("%#v", safe), fmt.Sprintf("%q", safe))
+								encoded, marshalErr := json.Marshal(safe)
+								if marshalErr != nil {
+									t.Fatal(marshalErr)
+								}
+								public = append(public, string(encoded))
+								if len(safe.Diagnostic()) > limit {
+									t.Fatal("diagnostic exceeds limit")
+								}
+							} else if err != nil || len(result.Stderr) > limit {
+								t.Fatal("success stderr contract changed")
+							}
+							for _, output := range public {
+								assertNoSecretLeak(t, output, append(variants, entry.secret, "scpSecret"))
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+type unformattableCause struct{ calls *int }
+
+func (c unformattableCause) Error() string          { *c.calls++; return "private cause" }
+func (c unformattableCause) Format(fmt.State, rune) { *c.calls++ }
+
+func TestSafeErrorNeverFormatsCause(t *testing.T) {
+	calls := 0
+	cause := unformattableCause{calls: &calls}
+	safe := &SafeError{Code: CodeCommandFailed, Message: "Git command failed", diagnostic: "private diagnostic", cause: cause}
+	for _, verb := range []string{"%s", "%v", "%+v", "%#v", "%q"} {
+		output := fmt.Sprintf(verb, safe)
+		if strings.Contains(output, "private") {
+			t.Fatal("format exposes private state")
+		}
+	}
+	if _, err := json.Marshal(safe); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatal("public formatting invoked private cause")
+	}
+	if safe.Unwrap() != cause {
+		t.Fatal("cause contract changed")
+	}
+}
+
+func TestRedactKeepsUnrelatedShortWords(t *testing.T) {
+	text := "an at to on user password"
+	if got := redact(text, []string{"https://an:to@example.invalid/repo"}); got != text {
+		t.Fatal("redaction changed unrelated words")
+	}
+	if got := redact("https://an:to@example.invalid/repo", nil); strings.Contains(got, "an:to") {
+		t.Fatal("HTTP userinfo stripping was lost")
+	}
+}
+
+func TestCommandRunnerRedactsCaptureTailAfterEarlierReplacement(t *testing.T) {
+	const password = "matrixPasswordLongCredential"
+	const remote = "https://matrixUser:" + password + "@host/r"
+	const limit = 64
+	// Earlier replacements shrink the output, bringing a partially captured
+	// credential back inside the public diagnostic limit.
+	text := remote + " " + remote + " " + password
+	for _, action := range []string{"stderr", "fail"} {
+		t.Run(action, func(t *testing.T) {
+			runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					return helperCommand(ctx, action, text)
+				})
+			result, err := runner.Run(context.Background(), Command{Dir: t.TempDir(), Secrets: []string{remote}})
+			output := result.Stderr
+			if action == "fail" {
+				var safe *SafeError
+				if !errors.As(err, &safe) {
+					t.Fatal("missing SafeError")
+				}
+				output = safe.Diagnostic()
+			} else if err != nil {
+				t.Fatal("unexpected failure")
+			}
+			assertNoSecretLeak(t, output, []string{remote, "matrixUser:" + password, "matrixUser", password})
+		})
+	}
+}
+
+func TestCommandRunnerVariantMarkerCrossesDiagnosticLimit(t *testing.T) {
+	const remote = "https://matrixUser:matrixPassword@example.invalid/private.git"
+	for _, variant := range []string{remote, "matrixUser:matrixPassword", "matrixUser", "matrixPassword"} {
+		t.Run(variant, func(t *testing.T) {
+			for _, action := range []string{"stderr", "fail"} {
+				t.Run(action, func(t *testing.T) {
+					const limit = 64
+					const prefix = limit - 6
+					text := strings.Repeat("~", prefix) + variant + " trailing bytes"
+					runner := newCommandRunner("git", helperTimeout, helperTimeout, limit,
+						func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+							return helperCommand(ctx, action, text)
+						})
+					result, err := runner.Run(context.Background(), Command{Dir: t.TempDir(), Secrets: []string{remote}})
+					output := result.Stderr
+					if action == "fail" {
+						var safe *SafeError
+						if !errors.As(err, &safe) {
+							t.Fatal("missing SafeError")
+						}
+						output = safe.Diagnostic()
+					} else if err != nil {
+						t.Fatal("unexpected failure")
+					}
+					want := strings.Repeat("~", prefix) + "[REDAC"
+					if output != want {
+						t.Fatal("complete variant was not redacted before marker truncation")
+					}
+					assertNoSecretLeak(t, output, []string{variant})
+				})
+			}
+		})
+	}
+}
+
 func TestCommandRunnerRedactsBeforeDiagnosticTruncation(t *testing.T) {
 	const limit = 64
 	const secret = "qZ9-very-secret-token"
@@ -568,7 +1277,7 @@ func TestCommandRunnerRejectsInvalidDirectory(t *testing.T) {
 func TestCommandRunnerDefaults(t *testing.T) {
 	runner := NewCommandRunner()
 	if runner.executable != "git" || runner.localTimeout != DefaultLocalTimeout ||
-		runner.networkTimeout != DefaultNetworkTimeout || runner.outputLimit != DefaultOutputLimit || runner.command == nil {
+		runner.networkTimeout != DefaultNetworkTimeout || runner.outputLimit != DefaultOutputLimit || runner.command == nil || runner.newProcessTree == nil {
 		t.Fatalf("NewCommandRunner() = %#v, want documented defaults", runner)
 	}
 	if AllowedGitProtocols != "file:http:https:ssh:git" {

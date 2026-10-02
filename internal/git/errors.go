@@ -3,8 +3,12 @@ package git
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -72,6 +76,16 @@ func (e *SafeError) Error() string {
 	return e.Message
 }
 
+// Format keeps even Go-syntax formatting from inspecting private diagnostics
+// or invoking a private cause's Error or Format methods.
+func (e *SafeError) Format(state fmt.State, verb rune) {
+	message := e.Message
+	if verb == 'q' {
+		message = strconv.Quote(message)
+	}
+	_, _ = io.WriteString(state, message)
+}
+
 func (e *SafeError) Unwrap() error {
 	return e.cause
 }
@@ -85,19 +99,166 @@ var (
 	truncatedHTTPAuthorityPattern = regexp.MustCompile(`(?i)(https?://)[^/\s@]*$`)
 )
 
-func redact(text string, secrets []string) string {
-	orderedSecrets := append([]string(nil), secrets...)
-	sort.SliceStable(orderedSecrets, func(i, j int) bool {
-		return len(orderedSecrets[i]) > len(orderedSecrets[j])
-	})
-
-	redacted := text
-	for _, secret := range orderedSecrets {
-		if secret != "" {
-			redacted = strings.ReplaceAll(redacted, secret, "[REDACTED_REMOTE]")
+// secretVariants is local to each redaction: credentials are never retained on
+// a runner or error. Only explicit secrets and their HTTP userinfo are used.
+func secretVariants(secrets []string) []string {
+	unique := make(map[string]struct{})
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		unique[secret] = struct{}{}
+		parsed, err := url.Parse(secret)
+		if err != nil || parsed.User == nil || !(strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) {
+			continue
+		}
+		password, _ := parsed.User.Password()
+		_, authority, _ := strings.Cut(secret, "://")
+		if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+			authority = authority[:end]
+		}
+		rawUserinfo := ""
+		if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+			rawUserinfo = authority[:at]
+		}
+		for _, variant := range []string{rawUserinfo, parsed.User.String(), parsed.User.Username(), password} {
+			if len(variant) >= 4 {
+				unique[variant] = struct{}{}
+			}
 		}
 	}
+	ordered := make([]string, 0, len(unique))
+	for variant := range unique {
+		ordered = append(ordered, variant)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if len(ordered[i]) != len(ordered[j]) {
+			return len(ordered[i]) > len(ordered[j])
+		}
+		return ordered[i] < ordered[j]
+	})
+	return ordered
+}
+
+func redact(text string, secrets []string) string {
+	ordered := secretVariants(secrets)
+	// A single pass avoids matching another secret inside a replacement marker.
+	redacted := text
+	if len(ordered) == 1 {
+		// Single-pattern Replacer preprocessing can itself be quadratic for
+		// repetitive secrets; ReplaceAll has the same single-pass semantics.
+		redacted = strings.ReplaceAll(text, ordered[0], "[REDACTED_REMOTE]")
+	} else if len(ordered) > 1 {
+		redacted = replaceSecretVariants(text, ordered)
+	}
+	// Capture lookahead can end inside a later credential after earlier full
+	// replacements shrink the output. Protect that tail after full replacements;
+	// never derive arbitrary words or redact prefixes shorter than four bytes.
+	tail := 0
+	if !strings.HasSuffix(redacted, "[REDACTED_REMOTE]") {
+		for _, secret := range ordered {
+			if len(secret)-1 > tail {
+				tail = max(tail, secretPrefixSuffixLength(redacted, secret))
+			}
+		}
+	}
+	if tail > 0 {
+		redacted = redacted[:len(redacted)-tail] + "[REDACTED_REMOTE]"
+	}
 	return httpUserinfoPattern.ReplaceAllString(redacted, `${1}[REDACTED]@`)
+}
+
+// replaceSecretVariants scans the original text with KMP for each longest-first
+// pattern: O(len(text) + len(pattern)) per pattern, with O(len(text) + longest
+// pattern) workspace. It records only the longest match at each start, then
+// emits nonoverlapping replacements left to right. Markers are never rescanned.
+func replaceSecretVariants(text string, ordered []string) string {
+	var prefix, longest []int
+	for _, secret := range ordered {
+		if len(secret) > len(text) {
+			continue
+		}
+		if prefix == nil {
+			// Patterns are longest first, so this scratch table can be reused.
+			prefix = make([]int, len(secret))
+		}
+		table := prefix[:len(secret)]
+		fillSecretPrefixTable(secret, table)
+		for i, matched := 0, 0; i < len(text); i++ {
+			for matched > 0 && text[i] != secret[matched] {
+				matched = table[matched-1]
+			}
+			if text[i] == secret[matched] {
+				matched++
+			}
+			if matched == len(secret) {
+				if longest == nil {
+					longest = make([]int, len(text))
+				}
+				start := i + 1 - matched
+				longest[start] = max(longest[start], matched)
+				matched = table[matched-1]
+			}
+		}
+	}
+	if longest == nil {
+		return text
+	}
+	var output strings.Builder
+	output.Grow(len(text))
+	from := 0
+	for i := 0; i < len(text); {
+		if longest[i] == 0 {
+			i++
+			continue
+		}
+		output.WriteString(text[from:i])
+		output.WriteString("[REDACTED_REMOTE]")
+		i += longest[i]
+		from = i
+	}
+	output.WriteString(text[from:])
+	return output.String()
+}
+
+func fillSecretPrefixTable(pattern string, prefix []int) {
+	prefix[0] = 0
+	for i, matched := 1, 0; i < len(pattern); i++ {
+		for matched > 0 && pattern[i] != pattern[matched] {
+			matched = prefix[matched-1]
+		}
+		if pattern[i] == pattern[matched] {
+			matched++
+		}
+		prefix[i] = matched
+	}
+}
+
+// secretPrefixSuffixLength finds the longest proper secret prefix of at least
+// four bytes at the text's tail. KMP avoids repeatedly comparing overlapping
+// suffixes of repetitive input: time and space are linear in the candidate
+// length, bounded by both the secret and the diagnostic length.
+func secretPrefixSuffixLength(text, secret string) int {
+	length := min(len(secret)-1, len(text))
+	if length < 4 {
+		return 0
+	}
+	pattern := secret[:length]
+	prefix := make([]int, length)
+	fillSecretPrefixTable(pattern, prefix)
+	matched := 0
+	for i := len(text) - length; i < len(text); i++ {
+		for matched > 0 && (matched == length || text[i] != pattern[matched]) {
+			matched = prefix[matched-1]
+		}
+		if text[i] == pattern[matched] {
+			matched++
+		}
+	}
+	if matched < 4 {
+		return 0
+	}
+	return matched
 }
 
 func classifyFailure(err error, diagnostic string) *SafeError {
