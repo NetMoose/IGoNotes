@@ -106,7 +106,7 @@ func TestGitRunnerHelper(t *testing.T) {
 		os.Exit(23)
 	case "wait":
 		time.Sleep(30 * time.Second)
-	case "tree-parent", "tree-parent-exit":
+	case "tree-parent", "tree-parent-exit", "tree-parent-exit-fail":
 		child := helperCommand(context.Background(), "tree-child", args[1]+".child")
 		child.Stdout, child.Stderr = os.Stdout, os.Stderr
 		if err := child.Start(); err != nil {
@@ -121,6 +121,9 @@ func TestGitRunnerHelper(t *testing.T) {
 		}
 		if args[0] == "tree-parent-exit" {
 			return
+		}
+		if args[0] == "tree-parent-exit-fail" {
+			os.Exit(23)
 		}
 		time.Sleep(30 * time.Second)
 	case "tree-child":
@@ -423,6 +426,88 @@ func TestCommandRunnerProcessTreeCancellationLifetime(t *testing.T) {
 	}
 	if terminated.Load() != 1 {
 		t.Fatalf("Terminate calls = %d, want 1", terminated.Load())
+	}
+}
+
+func TestCommandRunnerCleansDescendantsAfterPipeWaitDelay(t *testing.T) {
+	for _, action := range []string{"tree-parent-exit", "tree-parent-exit-fail"} {
+		t.Run(action, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "exited parent live child PIDs.json")
+			t.Cleanup(func() {
+				data, err := os.ReadFile(path)
+				var pids helperPIDs
+				if err == nil && json.Unmarshal(data, &pids) == nil && pids.Child > 0 && !helperStopped(pids.Child) {
+					process, err := os.FindProcess(pids.Child)
+					if err == nil {
+						_ = process.Kill()
+						_ = process.Release()
+					}
+				}
+			})
+			nativeTree, err := newProcessTree()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nativeTree.Close()
+			var cmd *exec.Cmd
+			terminated := 0
+			checkedBeforeReturn := false
+			runner := newCommandRunner("git", 20*time.Second, 20*time.Second, 1024,
+				func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					cmd = helperCommand(ctx, action, path)
+					return cmd
+				})
+			runner.newProcessTree = func() (processTree, error) {
+				return &testProcessTree{
+					start:     nativeTree.Start,
+					terminate: func(cmd *exec.Cmd) error { terminated++; return nativeTree.Terminate(cmd) },
+					close: func() error {
+						// This runs inside Run, before releasing the controller. Poll
+						// only for signal delivery; never kill from the assertion.
+						pids := waitForHelperPIDs(t, path)
+						deadline := time.Now().Add(time.Second)
+						for time.Now().Before(deadline) && !helperStopped(pids.Child) {
+							time.Sleep(time.Millisecond)
+						}
+						if !helperStopped(pids.Child) {
+							t.Error("live descendant at controller release, before Run returns")
+						}
+						if cmd.ProcessState == nil {
+							t.Error("main process was not reaped")
+						}
+						checkedBeforeReturn = true
+						return nativeTree.Close()
+					},
+				}, nil
+			}
+			begin := time.Now()
+			result, err := runner.Run(context.Background(), Command{Dir: t.TempDir()})
+			if time.Since(begin) < processWaitDelay {
+				t.Error("Run did not wait for pipe WaitDelay")
+			}
+			var safe *SafeError
+			if !errors.As(err, &safe) || safe.Code != CodeCommandFailed || safe.Message != "Git command failed" {
+				t.Fatalf("Run error = %v", err)
+			}
+			if action == "tree-parent-exit-fail" && safe.ExitCode != 23 {
+				t.Errorf("ExitCode = %d, want 23", safe.ExitCode)
+			}
+			if result != (Result{}) {
+				t.Errorf("result = %#v, want zero failure result", result)
+			}
+			if !checkedBeforeReturn {
+				t.Fatal("did not check descendant before Run returned")
+			}
+			if terminated != 1 {
+				t.Errorf("Terminate calls = %d, want 1", terminated)
+			}
+			if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
+				t.Errorf("late Cancel = %v", err)
+			}
+			if terminated != 1 {
+				t.Error("late Cancel signaled a retired process group")
+			}
+		})
 	}
 }
 

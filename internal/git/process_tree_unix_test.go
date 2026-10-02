@@ -133,3 +133,61 @@ func TestUnixProcessTreePreservesAttributes(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestUnixProcessTreeOnlyTerminatesOwnedGroup(t *testing.T) {
+	for _, stage := range []string{"foreign command", "retired command"} {
+		t.Run(stage, func(t *testing.T) {
+			tree, err := newProcessTree()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tree.Close()
+			cmd := helperCommand(context.Background(), "wait")
+			if err := tree.Start(cmd); err != nil {
+				t.Fatal(err)
+			}
+			originalProcess := cmd.Process
+			reaped := false
+			defer func() {
+				cmd.Process = originalProcess
+				_ = originalProcess.Kill()
+				if !reaped {
+					_ = cmd.Wait()
+				}
+			}()
+			otherTree, err := newProcessTree()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer otherTree.Close()
+			other := helperCommand(context.Background(), "wait")
+			if err := otherTree.Start(other); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = other.Process.Kill(); _ = other.Wait() }()
+			target := other
+			if stage == "retired command" {
+				if err := tree.Terminate(cmd); err != nil {
+					t.Fatal(err)
+				}
+				_ = cmd.Wait()
+				reaped = true
+				if err := tree.Close(); err != nil {
+					t.Fatal(err)
+				}
+				// Simulate a stale command carrying a replacement process/PID.
+				cmd.Process = other.Process
+				target = cmd
+			}
+			if err := tree.Terminate(target); !errors.Is(err, os.ErrProcessDone) {
+				t.Errorf("Terminate unowned group = %v", err)
+			}
+			if err := other.Process.Signal(syscall.Signal(0)); err != nil {
+				t.Errorf("unrelated process was signaled: %v", err)
+			}
+			if helperStopped(other.Process.Pid) {
+				t.Error("unrelated group was killed")
+			}
+		})
+	}
+}

@@ -155,6 +155,15 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 				_ = terminate()
 			})
 			runErr = cmd.Wait()
+			// WaitDelay closes inherited pipes, not their owning descendants.
+			// An ExitError can also mask ErrWaitDelay. Clean up failed waits
+			// while termination is still active, before releasing the base lock
+			// to the caller. Start failures own their separate kill/reap path.
+			if runErr != nil || commandContext.Err() != nil {
+				if err := terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					runErr = errors.Join(runErr, err)
+				}
+			}
 			terminationMu.Lock()
 			terminationActive = false
 			terminationMu.Unlock()
