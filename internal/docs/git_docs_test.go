@@ -2,6 +2,7 @@ package docs
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,13 +11,64 @@ import (
 	"testing"
 )
 
+// Resolve once during package initialization, before any test can change CWD.
+// These values are read-only throughout the test run.
+var documentationRoot, documentationRootErr = discoverDocumentationRoot()
+
+func discoverDocumentationRoot() (string, error) {
+	_, sourceFile, _, _ := runtime.Caller(0)
+	initialDirectory, err := os.Getwd()
+	if err != nil {
+		// An absolute source path can still identify a validated checkout.
+		initialDirectory = ""
+	}
+	return resolveDocumentationRoot(sourceFile, initialDirectory)
+}
+
+func resolveDocumentationRoot(sourceFile, initialDirectory string) (string, error) {
+	if filepath.IsAbs(sourceFile) {
+		root := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
+		if validDocumentationRoot(root) {
+			return root, nil
+		}
+	}
+	// A -trimpath module-relative filename is not a filesystem location.
+	// Walk only the initial absolute directory, never a later test's CWD.
+	if filepath.IsAbs(initialDirectory) {
+		for directory := filepath.Clean(initialDirectory); ; {
+			if validDocumentationRoot(directory) {
+				return directory, nil
+			}
+			parent := filepath.Dir(directory)
+			if parent == directory {
+				break
+			}
+			directory = parent
+		}
+	}
+	return "", fmt.Errorf("cannot locate IGoNotes documentation checkout from source %q or initial directory %q; start a relocated -trimpath test executable inside the checkout", sourceFile, initialDirectory)
+}
+
+func validDocumentationRoot(root string) bool {
+	module, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil || !regexp.MustCompile(`(?m)^module[\t ]+IGoNotes[\t ]*\r?$`).Match(module) {
+		return false
+	}
+	for _, path := range []string{"docs/api.md", "docs/user.md", "docs/developer.md", "site/docs/developer.md"} {
+		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(path)))
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
+
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot locate documentation test source")
+	if documentationRootErr != nil {
+		t.Fatal(documentationRootErr)
 	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	return documentationRoot
 }
 
 func readDocument(t *testing.T, root, path string) []byte {
@@ -35,6 +87,66 @@ func requireTokens(t *testing.T, data []byte, tokens ...string) {
 			t.Errorf("missing documentation token %q", token)
 		}
 	}
+}
+
+func TestRepositoryRootSurvivesWorkingDirectoryChange(t *testing.T) {
+	// Resolve for the first time in this test only after leaving the checkout.
+	// With -trimpath, runtime.Caller returns a module-relative source path.
+	t.Chdir(t.TempDir())
+	root := repositoryRoot(t)
+	if !filepath.IsAbs(root) {
+		t.Fatalf("repository root must remain absolute after chdir: %q", root)
+	}
+	requireTokens(t, readDocument(t, root, "go.mod"), "module IGoNotes")
+	requireTokens(t, readDocument(t, root, "docs/developer.md"), "# Руководство разработчика IGoNotes")
+	if got := repositoryRoot(t); got != root {
+		t.Fatalf("repository root changed: %q -> %q", root, got)
+	}
+}
+
+func TestDocumentationRootDiscovery(t *testing.T) {
+	checkout := documentationCheckoutFixture(t, "IGoNotes")
+	otherCheckout := documentationCheckoutFixture(t, "IGoNotes")
+	wrongModule := documentationCheckoutFixture(t, "OtherModule")
+	missingDocs := documentationCheckoutFixture(t, "IGoNotes")
+	if err := os.Remove(filepath.Join(missingDocs, "docs", "api.md")); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, sourceRoot, initialRoot, want string
+	}{
+		{"absolute source takes priority", checkout, otherCheckout, checkout},
+		{"trimmed source uses initial checkout", "IGoNotes", checkout, checkout},
+		{"wrong source module falls back", wrongModule, checkout, checkout},
+		{"incomplete source falls back", missingDocs, checkout, checkout},
+		{"wrong initial module is rejected", "IGoNotes", wrongModule, ""},
+		{"incomplete initial checkout is rejected", "IGoNotes", missingDocs, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, err := resolveDocumentationRoot(filepath.Join(test.sourceRoot, "internal", "docs", "git_docs_test.go"), filepath.Join(test.initialRoot, "docs"))
+			if root != test.want || (err != nil) != (test.want == "") {
+				t.Fatalf("resolve root = %q, %v; want %q", root, err, test.want)
+			}
+		})
+	}
+}
+
+func documentationCheckoutFixture(t *testing.T, module string) string {
+	t.Helper()
+	root := t.TempDir()
+	for path, content := range map[string]string{
+		"go.mod": "module " + module + "\n", "docs/api.md": "API\n", "docs/user.md": "User\n",
+		"docs/developer.md": "Developer\n", "site/docs/developer.md": "Published developer\n",
+	} {
+		file := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
 }
 
 func TestSiteDocumentationExactlyMirrorsSources(t *testing.T) {
