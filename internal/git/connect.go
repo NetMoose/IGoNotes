@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"IGoNotes/internal/fileidentity"
 )
 
 const (
@@ -420,7 +422,7 @@ func requireCallbackPath(expected, callbackPath string) error {
 }
 
 func pinConnectBase(ctx context.Context, path string) (context.Context, error) {
-	info, err := os.Stat(path)
+	info, err := fileidentity.Stat(path)
 	if err != nil {
 		return nil, &SafeError{Code: CodeNeedsReconnect, Message: "Git base directory must be reconnected", cause: err}
 	}

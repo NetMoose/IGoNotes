@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -278,6 +279,9 @@ func TestResolutionDestination(t *testing.T) {
 	})
 
 	t.Run("uses pathspec-looking output literally", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows filenames cannot contain colon or asterisk")
+		}
 		root := newRoot(t)
 		pathspecWrite := write
 		pathspecWrite.Path = ":(glob)*.md"
@@ -420,7 +424,7 @@ func TestWriteConflictEntry(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o755 {
+		if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o755) {
 			t.Fatalf("entry mode = %v, want regular 0755", info.Mode())
 		}
 		contents, err := root.ReadFile("nested/entry")
@@ -495,8 +499,11 @@ func TestWriteConflictEntry(t *testing.T) {
 			t.Fatalf("writeConflictEntry() retry error = %v", err)
 		}
 		info, err := root.Lstat("retry")
-		if err != nil || info.Mode().Perm() != 0o755 {
-			t.Fatalf("retry mode = %v, %v", info.Mode(), err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o755) {
+			t.Fatalf("retry mode = %v", info.Mode())
 		}
 	})
 }
@@ -531,8 +538,11 @@ func TestWriteConflictEntryStreamsExistingComparison(t *testing.T) {
 		t.Fatalf("writeConflictEntry() error = %v", err)
 	}
 	info, err := root.Lstat("existing")
-	if err != nil || info.Mode().Perm() != 0o755 {
-		t.Fatalf("existing mode = %v, %v", info.Mode(), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o755) {
+		t.Fatalf("existing mode = %v", info.Mode())
 	}
 }
 

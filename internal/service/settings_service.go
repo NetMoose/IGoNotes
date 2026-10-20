@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"IGoNotes/internal/fileidentity"
 	gitcmd "IGoNotes/internal/git"
 	"IGoNotes/internal/model"
 )
@@ -438,7 +439,7 @@ func resolveConflictPathIdentity(path string) conflictPathResolution {
 		return conflictPathResolution{path: cleanedPath}
 	}
 	canonicalPath = filepath.Clean(canonicalPath)
-	info, err := os.Stat(canonicalPath)
+	info, err := fileidentity.Stat(canonicalPath)
 	if err != nil {
 		return conflictPathResolution{path: cleanedPath}
 	}
