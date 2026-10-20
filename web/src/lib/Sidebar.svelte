@@ -3,7 +3,7 @@
   import Modal from './Modal.svelte';
   import { getNotes, syncNotes, createNote } from './api.js';
 
-  let { onSelect, onRename, onDelete } = $props();
+  let { onSelect, onRename, onDelete, onOpenSettings, settingsDisabled = false } = $props();
 
   let nodes = $state([]);
   let activeId = $state(null);
@@ -285,6 +285,9 @@
       </button>
       <button onclick={openDeleteModal} disabled={!activeId} aria-label="Удалить выбранное" class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:hover:text-red-500 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Удалить выбранное">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+      </button>
+      <button type="button" onclick={onOpenSettings} disabled={settingsDisabled} aria-label="Открыть настройки" class="flex-1 flex justify-center items-center bg-white border border-gray-300 rounded p-1.5 text-gray-600 hover:text-blue-600 hover:bg-blue-50 disabled:opacity-50 disabled:hover:text-gray-600 disabled:hover:bg-white transition-colors shadow-sm cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600" title="Настройки">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.4 15a1.7 1.7 0 00.34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 00-1.88-.34 1.7 1.7 0 00-1.03 1.56V21h-4v-.08A1.7 1.7 0 008.97 19.4a1.7 1.7 0 00-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 004.6 15a1.7 1.7 0 00-1.52-1H3v-4h.08A1.7 1.7 0 004.6 8.97a1.7 1.7 0 00-.34-1.88l-.06-.06L7.03 4.2l.06.06A1.7 1.7 0 008.97 4.6 1.7 1.7 0 0010 3.08V3h4v.08a1.7 1.7 0 001.03 1.52 1.7 1.7 0 001.88-.34l.06-.06 2.83 2.83-.06.06a1.7 1.7 0 00-.34 1.88A1.7 1.7 0 0020.92 10H21v4h-.08A1.7 1.7 0 0019.4 15z"></path></svg>
       </button>
     </div>
     {#if activeFolderId || activeId}

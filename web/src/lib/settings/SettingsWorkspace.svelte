@@ -6,6 +6,7 @@
   import BaseForm from '../setup/BaseForm.svelte'
   import BaseCard from './BaseCard.svelte'
   import GitSettingsSection from './GitSettingsSection.svelte'
+  import AboutSection from './AboutSection.svelte'
 
   let {
     config,
@@ -69,7 +70,7 @@
 
   async function navigateTabs(event, tab) {
     if (workspaceBusy) return
-    const tabs = ['bases', 'git']
+    const tabs = ['bases', 'git', 'about']
     const current = tabs.indexOf(tab)
     let next = -1
     if (event.key === 'Home') next = 0
@@ -312,6 +313,20 @@
         >
           Git-синхронизация
         </button>
+        <button
+          id="settings-about-tab"
+          type="button"
+          role="tab"
+          aria-selected={selectedTab === 'about'}
+          aria-controls="settings-about-panel"
+          tabindex={selectedTab === 'about' ? 0 : -1}
+          onclick={() => selectTab('about')}
+          onkeydown={(event) => navigateTabs(event, 'about')}
+          disabled={workspaceBusy}
+          class={`shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50 md:w-full ${selectedTab === 'about' ? 'bg-blue-50 text-blue-700' : 'text-slate-600 hover:bg-slate-50'}`}
+        >
+          О программе
+        </button>
       </div>
     </nav>
 
@@ -427,6 +442,17 @@
         onRefresh={onGitRefresh}
         onBusyChange={(busy) => gitSectionBusy = busy}
       />
+    </div>
+    <div
+      id="settings-about-panel"
+      role="tabpanel"
+      aria-labelledby="settings-about-tab"
+      hidden={selectedTab !== 'about'}
+      class="min-w-0 p-4 sm:p-6 lg:p-8"
+    >
+      {#if selectedTab === 'about'}
+        <AboutSection />
+      {/if}
     </div>
   </main>
 

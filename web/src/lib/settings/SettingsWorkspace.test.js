@@ -7,12 +7,13 @@ vi.mock('../api.js', async (importOriginal) => {
   return {
     ...actual,
     createBase: vi.fn(),
+    getInfo: vi.fn(),
     updateBase: vi.fn(),
     forgetBase: vi.fn(),
   }
 })
 
-import { ApiError, createBase, forgetBase, updateBase } from '../api.js'
+import { ApiError, createBase, forgetBase, getInfo, updateBase } from '../api.js'
 import BaseCard from './BaseCard.svelte'
 import SettingsWorkspace from './SettingsWorkspace.svelte'
 
@@ -97,6 +98,7 @@ describe('SettingsWorkspace', () => {
     vi.mocked(createBase).mockReset()
     vi.mocked(updateBase).mockReset()
     vi.mocked(forgetBase).mockReset()
+    vi.mocked(getInfo).mockReset().mockResolvedValue({ app_name: 'IGoNotes', app_version: 'v0.0.1-alpha.99' })
   })
 
   it('renders the bases tab, paths, current state, and only an eligible Forget action', () => {
@@ -151,6 +153,7 @@ describe('SettingsWorkspace', () => {
       const tablist = screen.getByRole('tablist', { name: 'Разделы настроек' })
       const basesTab = screen.getByRole('tab', { name: 'Базы заметок' })
       const gitTab = screen.getByRole('tab', { name: 'Git-синхронизация' })
+      const aboutTab = screen.getByRole('tab', { name: 'О программе' })
       expect(tablist).toHaveAttribute('aria-orientation', 'horizontal')
 
       basesTab.focus()
@@ -159,13 +162,26 @@ describe('SettingsWorkspace', () => {
       expect(gitTab).toHaveAttribute('aria-selected', 'true')
       expect(screen.getByRole('tabpanel', { name: 'Git-синхронизация' })).not.toHaveAttribute('hidden')
 
+      await user.keyboard('{ArrowRight}')
+      expect(aboutTab).toHaveFocus()
+      const aboutPanel = screen.getByRole('tabpanel', { name: 'О программе' })
+      expect(aboutTab).toHaveAttribute('aria-controls', aboutPanel.id)
+      expect(aboutPanel).toHaveAttribute('aria-labelledby', aboutTab.id)
+      expect(await within(aboutPanel).findByText('v0.0.1-alpha.99')).toBeVisible()
+      await user.keyboard('{ArrowRight}')
+      expect(basesTab).toHaveFocus()
+
       listeners[0]({ matches: true })
       await waitFor(() => expect(tablist).toHaveAttribute('aria-orientation', 'vertical'))
+      await user.keyboard('{ArrowUp}')
+      expect(aboutTab).toHaveFocus()
+      await user.keyboard('{ArrowUp}')
+      expect(gitTab).toHaveFocus()
       await user.keyboard('{ArrowUp}')
       expect(basesTab).toHaveFocus()
       expect(basesTab).toHaveAttribute('aria-selected', 'true')
       await user.keyboard('{End}')
-      expect(gitTab).toHaveFocus()
+      expect(aboutTab).toHaveFocus()
       await user.keyboard('{Home}')
       expect(basesTab).toHaveFocus()
     } finally {

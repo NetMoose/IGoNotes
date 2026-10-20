@@ -17,6 +17,7 @@ Git-синхронизация реализована через системн�
 
 - `cmd/api/`: точка входа, CLI, запуск локального сервера и регистрация системных маршрутов.
 - `internal/handlers/`: REST-обработчики, guards и SPA handler.
+- `internal/appinfo/`: название приложения и версия запущенной сборки.
 - `internal/service/`: настройка, управление базами и заметками, синхронизация файловой системы.
 - `internal/repository/`: SQLite-репозиторий метаданных.
 - `internal/model/`: API, конфигурационные и доменные структуры.
@@ -51,6 +52,16 @@ go run ./cmd/api --port 8080
 make all
 ```
 
+### Версия сборки
+
+`internal/appinfo.Version` по умолчанию равна `dev`. Release workflow передаёт полный тег в каждую платформенную сборку через `-ldflags="-s -w -X IGoNotes/internal/appinfo.Version=${VERSION}"`, где `VERSION` — `github.ref_name`. Для ручной сборки с версией сначала соберите frontend, затем выполните, например:
+
+```bash
+go build -trimpath -ldflags="-X IGoNotes/internal/appinfo.Version=v0.0.1-alpha.6" -o builds/igonotes ./cmd/api
+```
+
+`GET /api/info` отдаёт `app_name` и `app_version` вместе с `base_path`. Вкладка «О программе» получает версию от бэкенда; `dev` отображается как «Сборка разработки».
+
 ## Архитектура frontend
 
 `web/src/App.svelte` управляет состояниями экрана без client-side router:
@@ -59,7 +70,7 @@ make all
 - `error`: ошибка загрузки и повторный запрос;
 - `setup`: обязательный трехшаговый мастер;
 - `editor`: дерево заметок и редактор либо полноэкранная рабочая область Git-конфликтов;
-- `settings`: полноэкранное управление базами.
+- `settings`: полноэкранные настройки баз, Git-синхронизации и раздел «О программе».
 
 Редактор не отображается, пока `setup_completed` не станет истинным. `web/src/lib/setup/SetupWizard.svelte` проводит пользователя через создание или подключение первой базы, ввод имени и каталога, проверку и завершение. `BaseForm.svelte` и `DirectoryField.svelte` переиспользуются в мастере и настройках, включая системный выбор каталога с ручным вводом как запасным вариантом.
 
@@ -86,7 +97,7 @@ Vitest 4, jsdom и Testing Library запускаются в Node.js 24 и пр�
 | POST | `/api/save` | Сохранить с `expected_revision`, получить новую `revision` |
 | PUT | `/api/rename` | Переименовать заметку или папку |
 | POST | `/api/sync` | Синхронизировать файловую систему и метаданные |
-| GET | `/api/info` | Получить путь текущей базы |
+| GET | `/api/info` | Получить путь текущей базы, название и версию приложения |
 | GET | `/api/raw?path=...` | Получить файл из текущей базы |
 | POST | `/api/assets` | Загрузить изображение |
 | GET/PUT | `/api/config` | Получить/сохранить конфигурацию |
