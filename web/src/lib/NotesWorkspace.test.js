@@ -127,13 +127,15 @@ describe('NotesWorkspace', () => {
 
   it('shows the empty workspace, base path, and available settings action', async () => {
     const user = userEvent.setup()
-    const { props } = await renderWorkspace()
+    const { props, container } = await renderWorkspace()
 
     expect(screen.getByText('Выберите заметку')).toBeVisible()
     const basePath = screen.getByTitle('Текущая база заметок')
     expect(basePath).toHaveTextContent('/notes/work')
     expect(screen.queryByRole('button', { name: /Открыть детали Git:/ })).not.toBeInTheDocument()
-    const settings = screen.getByRole('button', { name: 'Открыть настройки' })
+    const settings = within(screen.getByRole('complementary')).getByRole('button', { name: 'Открыть настройки' })
+    expect(settings.parentElement.lastElementChild).toBe(settings)
+    expect(within(container.querySelector('main header')).queryByRole('button', { name: 'Открыть настройки' })).not.toBeInTheDocument()
     expect(settings).toHaveAttribute('title', 'Настройки')
     expect(settings).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Сохранить' })).toBeDisabled()
