@@ -1,5 +1,10 @@
 # Git Integration Hardening Implementation Plan
 
+> **Status: completed (Plan 8), including Task 10, accepted 2026-10-20 on `30662c0`.**
+> [Final acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> Tasks 1–9 retain their original procedural recipe; those checkboxes are not a
+> remaining backlog. Task 10 below records the final acceptance execution.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finish the approved Git synchronization work with native cross-platform process safety, two-device end-to-end coverage, race and secret-leak verification, reproducible developer commands, branch/PR and release CI gates, and complete synchronized documentation.
@@ -1924,7 +1929,7 @@ git commit -m "docs: describe git integration architecture"
 - Verify all files from Tasks 1-9.
 - Do not create a release tag or modify application behavior during this task.
 
-- [ ] **Step 1: Confirm intended integrated file ownership**
+- [x] **Step 1: Confirm intended integrated file ownership**
 
 Run:
 
@@ -1936,7 +1941,7 @@ git log --oneline -12
 
 Expected: no unstaged implementation changes, no whitespace errors, and the lane commits are present. Existing unrelated user files may remain untracked, but they must not be staged or modified.
 
-- [ ] **Step 2: Run frontend and documentation verification**
+- [x] **Step 2: Run frontend and documentation verification**
 
 Run:
 
@@ -1949,7 +1954,7 @@ go test ./internal/docs -count=1 -v
 
 Expected: all commands exit `0`, Vitest reports no failed tests, Vite produces `web/dist`, audit has no high/critical finding, and docs contain no stale claim.
 
-- [ ] **Step 3: Run complete backend and native Git verification**
+- [x] **Step 3: Run complete backend and native Git verification**
 
 Run:
 
@@ -1961,7 +1966,7 @@ IGONOTES_REQUIRE_GIT_INTEGRATION=1 go test ./internal/git -run 'Test(CommandRunn
 
 Expected: all packages pass, native Git is not skipped, process-tree tests pass ten times, both two-device scenarios pass ten times, and no raw stderr/secret appears.
 
-- [ ] **Step 4: Run full race and repeated manager stress serially**
+- [x] **Step 4: Run full race and repeated manager stress serially**
 
 Run:
 
@@ -1972,7 +1977,7 @@ go test -race ./internal/service -run '^TestGitManagerRace' -count=20 -v
 
 Expected: exit `0`; no `DATA RACE`, deadlock, five-second test timeout, leaked goroutine, duplicate operation, or stale overwrite.
 
-- [ ] **Step 5: Run finite fuzz campaigns serially**
+- [x] **Step 5: Run finite fuzz campaigns serially**
 
 Run each command separately:
 
@@ -1983,7 +1988,7 @@ go test ./internal/git -run '^$' -fuzz=FuzzConflictParsers -fuzztime=15s
 
 Expected: both known Git fuzz campaigns exit `0` without panic, hang, malformed-path escape, or secret assertion.
 
-- [ ] **Step 6: Run static and production build verification**
+- [x] **Step 6: Run static and production build verification**
 
 Run:
 
@@ -1996,7 +2001,7 @@ test -x builds/igonotes
 
 Expected: vet exits `0`, clean rebuild succeeds from `npm ci`, and the production binary exists.
 
-- [ ] **Step 7: Cross-compile all release targets**
+- [x] **Step 7: Cross-compile all release targets**
 
 Run:
 
@@ -2015,7 +2020,7 @@ test "$(find "$tmp" -maxdepth 1 -type f | wc -l)" -eq 6
 
 Expected: all six binaries compile and exactly six files exist in the temporary directory.
 
-- [ ] **Step 8: Validate workflow hardening and changed-file boundary**
+- [x] **Step 8: Validate workflow hardening and changed-file boundary**
 
 Run:
 
@@ -2028,7 +2033,7 @@ git status --short
 
 Expected: exactly one `contents: write` match, in the release `publish` job; native Git is required by CI and release verification; only intentional uncommitted files, if any, are the pre-existing unrelated files excluded from this plan.
 
-- [ ] **Step 9: Execute the final acceptance matrix**
+- [x] **Step 9: Execute the final acceptance matrix**
 
 | Acceptance criterion | Evidence | Expected result |
 |---|---|---|
@@ -2050,7 +2055,7 @@ Expected: exactly one `contents: write` match, in the release `publish` job; nat
 | Release | six cross-builds and split workflow checks | Six binaries; write permission only in publish. |
 | Documentation | `go test ./internal/docs` | Exact routes/commands and mirrored site docs pass. |
 
-- [ ] **Step 10: Self-review against the approved specification**
+- [x] **Step 10: Self-review against the approved specification**
 
 Read `docs/superpowers/specs/2026-09-01-git-synchronization-design.md` from top to bottom and check each readiness criterion at lines 476-488 against the matrix above. Then run:
 
@@ -2071,7 +2076,10 @@ git diff --check
 
 Expected: both commands exit `0`; the negated `git grep` has no output and `git diff --check` reports no whitespace errors. Confirm all names used by tests match the landed Plan 1-7 types and methods, especially `ConfiguredBase`, `Operation`, `RecoveryResult`, `ConflictSnapshot`, conflict actions, scheduler clock seam, and public status values.
 
-- [ ] **Step 11: Commit only serial verification fixes, when present**
+- [x] **Step 11: Commit only serial verification fixes, when present**
+
+Final acceptance required no correction; the conditional implementation commit
+was skipped. Results are recorded in the linked acceptance report.
 
 When Steps 1-10 required an owned-lane correction, stage only that correction after repeating its focused and final checks:
 

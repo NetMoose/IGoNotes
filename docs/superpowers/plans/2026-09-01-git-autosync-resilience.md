@@ -1,5 +1,10 @@
 # Git Synchronization Plan 7: Autosync Resilience Implementation Plan
 
+> **Status: completed (Plan 7), accepted 2026-10-20 on `30662c0`.**
+> [Final acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> The procedural checkboxes below retain the original implementation recipe,
+> not an outstanding task list.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add deterministic all-base automatic Git synchronization, an atomic persisted five-failure circuit breaker, explicit resume behavior, a persistent paused alert, and cancellation-safe startup/shutdown lifecycle integration.

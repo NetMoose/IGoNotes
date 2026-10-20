@@ -1,5 +1,10 @@
 # Git Manual Synchronization Implementation Plan
 
+> **Status: completed (Plan 3), accepted 2026-10-20 on `30662c0`.**
+> [Final acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> The procedural checkboxes below retain the original implementation recipe,
+> not an outstanding task list.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add crash-recoverable initial Git connection and manual synchronization for configured note bases, with exact-OID safety, a persistent operation journal, a globally sequential deduplicating manager queue, conflict detection/mutation blocking, and startup recovery.

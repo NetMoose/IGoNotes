@@ -1,5 +1,10 @@
 # Git Worktree Safety Implementation Plan
 
+> **Status: completed (Plan 2), accepted 2026-10-20 on `30662c0`.**
+> [Final acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> The procedural checkboxes below retain the original implementation recipe,
+> not an outstanding task list.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add the coordination, active-worktree transaction, conflict mutation policy, and note revision safeguards required before Git can safely change a notes base.
