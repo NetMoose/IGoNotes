@@ -1,5 +1,10 @@
 # Git Synchronization Plan 6: Conflict Frontend Implementation Plan
 
+> **Status: completed (Plan 6), accepted 2026-10-20 on `30662c0`.**
+> [Final acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> The procedural checkboxes below retain the original implementation recipe,
+> not an outstanding task list.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add revision-safe note editing, incoming Git change handling, stale-note recovery, and a complete accessible conflict-resolution workspace without losing browser buffers or silently choosing a Git side.

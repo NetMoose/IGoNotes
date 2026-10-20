@@ -1,5 +1,10 @@
 # Git Settings Frontend Implementation Plan
 
+> **Status: completed (Plan 5), accepted 2026-10-20 on `30662c0`.**
+> [Final acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> The procedural checkboxes below retain the original implementation recipe,
+> not an outstanding task list.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an accessible Git settings experience for every notes base, four-step probe/configuration flow, live status polling, and flush-safe manual synchronization from settings and the editor footer.

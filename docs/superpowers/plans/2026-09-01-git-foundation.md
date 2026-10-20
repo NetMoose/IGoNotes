@@ -1,5 +1,10 @@
 # Git Synchronization Foundation Implementation Plan
 
+> **Status: completed (Plan 1), accepted 2026-10-20 on `30662c0`.**
+> [Final acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> The procedural checkboxes below retain the original implementation recipe,
+> not an outstanding task list.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add the non-mutating and persistence foundation for optional per-base Git integration: backward-compatible contracts, a safe system-Git runner and porcelain client, validation and read-only probing, ordered SQLite migrations and persisted status, dedicated SettingsService Git ownership, REST routes, and startup wiring that never invokes Git unless a Git API or Git-settings command is called.

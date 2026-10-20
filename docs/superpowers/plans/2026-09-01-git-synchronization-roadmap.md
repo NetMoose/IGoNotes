@@ -1,5 +1,22 @@
 # Git Synchronization Implementation Roadmap
 
+> **Status: completed and accepted, 2026-10-20.** All eight plans are integrated
+> in `develop`; final serial acceptance passed on `30662c0`.
+> [Acceptance report](../reports/2026-10-20-git-synchronization-acceptance.md).
+> The execution waves below retain the original procedural recipe, including
+> workspace/delegation recommendations; their checkboxes are not a remaining backlog.
+
+## Final Plan Status
+
+- [x] Plan 1: Foundation.
+- [x] Plan 2: Worktree safety and note revisions.
+- [x] Plan 3: Initial connect and manual sync.
+- [x] Plan 4: Conflict backend.
+- [x] Plan 5: Settings/status frontend.
+- [x] Plan 6: Stale-note and conflict frontend.
+- [x] Plan 7: Autosync and circuit breaker.
+- [x] Plan 8: Integration, cross-platform, CI, documentation, and final serial acceptance.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this roadmap plan-by-plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver the approved Git synchronization design through eight independently reviewable implementation plans with explicit dependency gates and safe parallel subagent waves.
