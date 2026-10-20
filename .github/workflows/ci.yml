@@ -57,7 +57,9 @@ jobs:
       - name: Native Git version
         run: git --version
       - name: Full Go suite with mandatory native Git
-        run: go test ./... -count=1 -timeout=20m
+        # Windows runs thousands of native Git processes; retain per-operation
+        # progress bounds while allowing the complete package suite to finish.
+        run: go test ./... -count=1 -timeout=30m
       - name: Repeat native, process-tree, and two-device integration
         run: >-
           go test ./internal/git -count=3 -timeout=15m

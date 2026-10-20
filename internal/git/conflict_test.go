@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -73,6 +74,10 @@ func TestConflictServiceReadsContentConflictWithoutWritingBase(t *testing.T) {
 		if !strings.Contains(strings.Join(command.Args, "\x00"), "checkout-index") {
 			continue
 		}
+		if len(command.Args) != 12 || !reflect.DeepEqual(command.Args[2:6], []string{"-c", "core.autocrlf=false", "-c", "core.eol=lf"}) {
+			t.Fatalf("checkout line-ending arguments = %#v", command.Args)
+		}
+		command.Args = append(append([]string(nil), command.Args[:2]...), command.Args[6:]...)
 		if len(command.Args) != 8 || !strings.HasPrefix(command.Args[0], "--git-dir=") || !strings.HasPrefix(command.Args[1], "--work-tree=") ||
 			strings.Join(command.Args[2:], "\x00") != "--literal-pathspecs\x00checkout-index\x00--temp\x00--stage="+command.Args[5][len("--stage="):]+"\x00-z\x00--stdin" {
 			t.Fatalf("checkout arguments = %#v", command.Args)

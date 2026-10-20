@@ -247,7 +247,10 @@ func TestGitSecretAcceptanceRealHTTPResponses(t *testing.T) {
 	failValidation.Store(false)
 	waitOperation := func(id string, state gitcmd.OperationState) {
 		t.Helper()
-		deadline := time.NewTimer(5 * time.Second)
+		// This waits for a whole native Git operation and its durable status,
+		// including initialization's many subprocesses on Windows CI.
+		const operationCompletionTimeout = time.Minute
+		deadline := time.NewTimer(operationCompletionTimeout)
 		defer deadline.Stop()
 		ticker := time.NewTicker(time.Millisecond)
 		defer ticker.Stop()

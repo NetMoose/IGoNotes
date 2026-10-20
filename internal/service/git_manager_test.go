@@ -3550,6 +3550,7 @@ func newManagerGitPair(t *testing.T) (string, string) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	runManagerGit(t, rootDir, "config", "--global", "user.name", "IGoNotes Test")
 	runManagerGit(t, rootDir, "config", "--global", "user.email", "igonotes@example.invalid")
+	runManagerGit(t, rootDir, "config", "--global", "core.autocrlf", "false")
 	remote := filepath.Join(rootDir, "remote.git")
 	runManagerGit(t, rootDir, "init", "--bare", "--initial-branch", "main", remote)
 	root := filepath.Join(rootDir, "notes")

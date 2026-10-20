@@ -42,6 +42,7 @@ func newConnectFixtureWithObjectFormat(t *testing.T, objectFormat string) *conne
 	}
 	fixture.git(root, "config", "--global", "user.name", "IGoNotes Test")
 	fixture.git(root, "config", "--global", "user.email", "igonotes@example.invalid")
+	fixture.git(root, "config", "--global", "core.autocrlf", "false")
 	args := []string{"init", "--bare", "--initial-branch", "main"}
 	if objectFormat != "" {
 		args = append(args, "--object-format="+objectFormat)

@@ -34,7 +34,7 @@ func TestCheckoutConflictStage(t *testing.T) {
 	}
 	command := runner.calls[0]
 	if command.Dir != temp || command.Scope != LocalOperation || !command.ReadOnly ||
-		!reflect.DeepEqual(command.Args, []string{"--git-dir=" + gitDir, "--work-tree=" + temp, "--literal-pathspecs", "checkout-index", "--temp", "--stage=2", "-z", "--stdin"}) {
+		!reflect.DeepEqual(command.Args, []string{"--git-dir=" + gitDir, "--work-tree=" + temp, "-c", "core.autocrlf=false", "-c", "core.eol=lf", "--literal-pathspecs", "checkout-index", "--temp", "--stage=2", "-z", "--stdin"}) {
 		t.Fatalf("checkout command = %#v", command)
 	}
 	if input := runner.checkoutInputs[0]; string(input) != "note.md\x00" {

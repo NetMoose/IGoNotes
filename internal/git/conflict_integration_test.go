@@ -22,6 +22,22 @@ func TestResolveRemoteIntegration(t *testing.T) {
 	resolveContentConflictIntegration(t, model.GitConflictUseRemote, "remote\n")
 }
 
+func TestResolveSelectedStageWithAutomaticCRLF(t *testing.T) {
+	for _, test := range []struct {
+		action model.GitConflictAction
+		want   string
+	}{
+		{model.GitConflictUseLocal, "local\n"},
+		{model.GitConflictUseRemote, "remote\n"},
+	} {
+		t.Run(string(test.action), func(t *testing.T) {
+			resolveContentConflictIntegration(t, test.action, test.want, func(fixture *conflictFixture) {
+				runConflictGit(t, fixture.Local, "config", "core.autocrlf", "true")
+			})
+		})
+	}
+}
+
 func TestResolveManualIntegration(t *testing.T) {
 	resolveContentConflictIntegration(t, model.GitConflictManual, "manual\n")
 }
@@ -618,9 +634,12 @@ func TestConflictRestartIntegration(t *testing.T) {
 	})
 }
 
-func resolveContentConflictIntegration(t *testing.T, action model.GitConflictAction, want string) {
+func resolveContentConflictIntegration(t *testing.T, action model.GitConflictAction, want string, configure ...func(*conflictFixture)) {
 	t.Helper()
 	fixture := newConflictFixture(t)
+	for _, apply := range configure {
+		apply(fixture)
+	}
 	writeConflictFile(t, fixture.Local, "victim.md", []byte("local\n"))
 	writeConflictFile(t, fixture.Local, "other.md", []byte("local other\n"))
 	conflictCommit(t, fixture.Local, "local conflicts")
@@ -724,6 +743,9 @@ func newConflictFixture(t *testing.T) *conflictFixture {
 		Other:  filepath.Join(root, "other"),
 		Branch: "main",
 	}
+	// Fixtures compare exact bytes; do not inherit Git for Windows' system
+	// core.autocrlf=true through the production runner's clean environment.
+	runConflictGit(t, root, "config", "--global", "core.autocrlf", "false")
 
 	runConflictGit(t, root, []string{"init", "--bare", "--initial-branch", fixture.Branch, fixture.Remote}...)
 	seed := filepath.Join(root, "seed")

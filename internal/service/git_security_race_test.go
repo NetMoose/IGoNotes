@@ -24,7 +24,7 @@ import (
 	"IGoNotes/internal/repository"
 )
 
-// All asynchronous boundaries have a buffered result and a five-second bound.
+// Concurrency barriers have a buffered result and a five-second progress bound.
 func hardeningReceive[T any](t *testing.T, sink string, results <-chan T) T {
 	t.Helper()
 	select {
@@ -39,11 +39,19 @@ func hardeningReceive[T any](t *testing.T, sink string, results <-chan T) T {
 
 func hardeningIdle(t *testing.T, manager *GitManager) {
 	t.Helper()
+	// A FIFO fence waits for whole native Git operations, not just a signal.
+	// In particular, creating 51 real conflicts can exceed five seconds on
+	// Windows CI. Keep this completion budget separate from race barriers.
+	const operationCompletionTimeout = time.Minute
 	done := make(chan struct{}, 1)
 	if err := manager.enqueueSynchronous(func() { done <- struct{}{} }); err != nil {
 		t.Fatal("cannot queue worker fence")
 	}
-	hardeningReceive(t, "worker fence", done)
+	select {
+	case <-done:
+	case <-time.After(operationCompletionTimeout):
+		t.Fatal("timeout at worker fence")
+	}
 }
 
 func hardeningWaitForSignal(ctx context.Context, signal <-chan struct{}) error {
@@ -67,7 +75,15 @@ type hardeningCallers struct {
 
 func newHardeningCallers(t *testing.T, f *gitManagerFixture) *hardeningCallers {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	// Native Git process startup varies substantially across CI platforms. Keep
+	// caller lifetime tied to the test; each asynchronous boundary and cleanup
+	// join has its own five-second progress bound. Retain a finite fallback for
+	// invocations with go test -timeout=0.
+	deadline, bounded := t.Deadline()
+	if !bounded {
+		deadline = time.Now().Add(20 * time.Minute)
+	}
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
 	callers := &hardeningCallers{ctx: ctx, cancel: cancel, stopWorker: func() { f.manager.lifetimeCancel() }}
 	// Register after fixture/manager cleanup so cancellation and caller joins
 	// run first. Signalling worker cancellation releases non-context-aware
@@ -737,7 +753,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 						}
 					} else if got.err != nil {
 						if got.kind != "resume" || !errors.Is(got.err, gitcmd.ErrGitNotPaused) {
-							t.Fatal("live admission failed unexpectedly")
+							t.Fatalf("live admission failed at iteration %d (%s): %v (caller context: %v)", iteration, got.kind, got.err, ctx.Err())
 						}
 					} else {
 						journal, found, err := f.operations.ByID(ctx, got.op.ID)

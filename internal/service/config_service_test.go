@@ -157,12 +157,9 @@ func TestConfigServiceNeedsInitialization(t *testing.T) {
 	})
 
 	t.Run("stat error", func(t *testing.T) {
-		dir := t.TempDir()
-		notDirectory := filepath.Join(dir, "not-a-directory")
-		if err := os.WriteFile(notDirectory, nil, 0644); err != nil {
-			t.Fatalf("os.WriteFile() error = %v, want nil", err)
-		}
-		service := NewConfigService(filepath.Join(notDirectory, "config.json"))
+		// A child of a regular file is reported as not-exist on Windows.
+		// An embedded NUL reliably exercises the other stat-error branch.
+		service := NewConfigService(filepath.Join(t.TempDir(), "config\x00.json"))
 
 		got, err := service.NeedsInitialization()
 		if err == nil {

@@ -374,6 +374,7 @@ func newGitConflictRESTFixture(t *testing.T) *gitConflictRESTFixture {
 		local:  filepath.Join(root, "local"),
 		other:  filepath.Join(root, "other"),
 	}
+	fixture.git(t, root, "config", "--global", "core.autocrlf", "false")
 	fixture.git(t, root, "init", "--bare", "--initial-branch", "main", fixture.remote)
 	seed := filepath.Join(root, "seed")
 	fixture.git(t, root, "init", "--initial-branch", "main", seed)
