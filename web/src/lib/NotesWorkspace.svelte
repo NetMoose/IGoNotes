@@ -54,6 +54,8 @@
       onSelect={(...args) => runAfterUploads(onSelectNote, ...args)}
       onRename={onRenameNote}
       onDelete={onDeleteNote}
+      onOpenSettings={(...args) => runAfterUploads(onOpenSettings, ...args)}
+      settingsDisabled={saveStatus === 'saving'}
     />
 
     <main class="flex-1 flex flex-col h-full overflow-hidden min-w-0">
@@ -80,17 +82,6 @@
           {:else if saveStatus === 'error'}
             <span class="text-sm text-red-500 font-medium">Ошибка сохранения</span>
           {/if}
-
-          <button
-            type="button"
-            onclick={(...args) => runAfterUploads(onOpenSettings, ...args)}
-            disabled={saveStatus === 'saving'}
-            aria-label="Открыть настройки"
-            title="Настройки"
-            class="rounded-md p-2 text-gray-500 transition-colors hover:bg-gray-100 hover:text-blue-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:opacity-50"
-          >
-            <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.4 15a1.7 1.7 0 00.34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 00-1.88-.34 1.7 1.7 0 00-1.03 1.56V21h-4v-.08A1.7 1.7 0 008.97 19.4a1.7 1.7 0 00-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 004.6 15a1.7 1.7 0 00-1.52-1H3v-4h.08A1.7 1.7 0 004.6 8.97a1.7 1.7 0 00-.34-1.88l-.06-.06L7.03 4.2l.06.06A1.7 1.7 0 008.97 4.6 1.7 1.7 0 0010 3.08V3h4v.08a1.7 1.7 0 001.03 1.52 1.7 1.7 0 001.88-.34l.06-.06 2.83 2.83-.06.06a1.7 1.7 0 00-.34 1.88A1.7 1.7 0 0020.92 10H21v4h-.08A1.7 1.7 0 0019.4 15z"></path></svg>
-          </button>
 
           <button
             type="button"

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 
+	"IGoNotes/internal/appinfo"
 	"IGoNotes/internal/model"
 	"IGoNotes/internal/service"
 )
@@ -25,7 +26,9 @@ func NewNoteHandler(noteService *service.NoteService) *NoteHandler {
 // GetInfo обрабатывает GET /api/info
 func (h *NoteHandler) GetInfo(w http.ResponseWriter, r *http.Request) {
 	info := map[string]string{
-		"base_path": h.NoteService.GetBasePath(),
+		"base_path":   h.NoteService.GetBasePath(),
+		"app_name":    appinfo.Name,
+		"app_version": appinfo.Version,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)

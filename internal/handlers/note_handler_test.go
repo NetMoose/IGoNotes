@@ -44,6 +44,35 @@ func (r *failingInitialSyncRepository) BeginReplaceAll([]model.NoteNode) (func()
 }
 func (r *failingInitialSyncRepository) DeleteNode(string) error { return nil }
 
+func TestNoteHandlerGetInfoIncludesApplication(t *testing.T) {
+	handler := newFilesystemNoteHandler(t)
+	recorder := httptest.NewRecorder()
+	handler.GetInfo(recorder, httptest.NewRequest(http.MethodGet, "/api/info", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	var info map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	wantVersion := os.Getenv("IGONOTES_TEST_VERSION")
+	if wantVersion == "" {
+		wantVersion = "dev"
+	}
+	for key, want := range map[string]string{
+		"base_path":   handler.NoteService.GetBasePath(),
+		"app_name":    "IGoNotes",
+		"app_version": wantVersion,
+	} {
+		if got := info[key]; got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 	t.Run("bad JSON", func(t *testing.T) {
 		handler := NewNoteHandler(nil)
