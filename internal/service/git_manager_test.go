@@ -37,7 +37,12 @@ func (s lifecycleGitSnapshots) OrderedGitSnapshots() ([]gitcmd.ConfiguredBase, e
 
 func awaitGitLifecycle(t *testing.T, boundary string, ready func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	awaitGitLifecycleWithin(t, boundary, ready, 15*time.Second)
+}
+
+func awaitGitLifecycleWithin(t *testing.T, boundary string, ready func() bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for !ready() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out at %s", boundary)
@@ -119,11 +124,11 @@ func TestGitAutosyncResilienceLifecycle(t *testing.T) {
 				t.Logf("terminal status=%+v journal=%+v clock=%s", s, op, clock.Now())
 			}
 		}()
-		awaitGitLifecycle(t, fmt.Sprintf("terminal %s %s/%d", path, state, count), func() bool {
+		awaitGitLifecycleWithin(t, fmt.Sprintf("terminal %s %s/%d", path, state, count), func() bool {
 			clock.Advance(0)
 			s, found, err := f.statuses.Get(ctx, path)
 			return err == nil && found && s.State == state && s.ConsecutiveFailures == count && s.LastAttempt != nil && s.LastAttempt.Equal(clock.Now())
-		})
+		}, time.Minute)
 	}
 	waitTimer := func(due time.Time) {
 		t.Helper()

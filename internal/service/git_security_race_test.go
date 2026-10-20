@@ -27,10 +27,24 @@ import (
 // Concurrency barriers have a buffered result and a five-second progress bound.
 func hardeningReceive[T any](t *testing.T, sink string, results <-chan T) T {
 	t.Helper()
+	return hardeningReceiveWithin(t, sink, results, 5*time.Second)
+}
+
+const hardeningGitCompletionTimeout = time.Minute
+
+// A Git phase can run multiple native commands before emitting its next event.
+// Its completion budget is separate from pure synchronization/cancellation.
+func hardeningGitReceive[T any](t *testing.T, sink string, results <-chan T) T {
+	t.Helper()
+	return hardeningReceiveWithin(t, sink, results, hardeningGitCompletionTimeout)
+}
+
+func hardeningReceiveWithin[T any](t *testing.T, sink string, results <-chan T, timeout time.Duration) T {
+	t.Helper()
 	select {
 	case result := <-results:
 		return result
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		t.Fatalf("timeout at %s", sink)
 		var zero T
 		return zero
@@ -42,14 +56,13 @@ func hardeningIdle(t *testing.T, manager *GitManager) {
 	// A FIFO fence waits for whole native Git operations, not just a signal.
 	// In particular, creating 51 real conflicts can exceed five seconds on
 	// Windows CI. Keep this completion budget separate from race barriers.
-	const operationCompletionTimeout = time.Minute
 	done := make(chan struct{}, 1)
 	if err := manager.enqueueSynchronous(func() { done <- struct{}{} }); err != nil {
 		t.Fatal("cannot queue worker fence")
 	}
 	select {
 	case <-done:
-	case <-time.After(operationCompletionTimeout):
+	case <-time.After(hardeningGitCompletionTimeout):
 		t.Fatal("timeout at worker fence")
 	}
 }
@@ -590,7 +603,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 				t.Fatal("cannot admit distinct running iteration")
 			}
 		}
-		fetch := hardeningReceive(t, "running fetch", entered)
+		fetch := hardeningGitReceive(t, "running fetch", entered)
 		observe(fetch)
 		stored, found, err := f.operations.ByID(ctx, op.ID)
 		if fetch.repo != source.Path || err != nil || !found || stored.State != gitcmd.OperationRunning || stored.Stage != gitcmd.StageFetching {
@@ -703,7 +716,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 		}
 		checkBlocked(false, false)
 		fetch.release <- struct{}{}
-		worktree := hardeningReceive(t, "running worktree", entered)
+		worktree := hardeningGitReceive(t, "running worktree", entered)
 		observe(worktree)
 		if worktree.repo != source.Path || worktree.stage != "add" {
 			t.Fatal("source did not enter active worktree transaction")
@@ -711,7 +724,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 		close(worktreeStarted)
 		checkBlocked(true, false)
 		worktree.release <- struct{}{}
-		push := hardeningReceive(t, "running push", entered)
+		push := hardeningGitReceive(t, "running push", entered)
 		observe(push)
 		if push.repo != source.Path || push.stage != "push" {
 			t.Fatal("source did not reach push")
@@ -779,7 +792,7 @@ func TestGitManagerRaceManualScheduledResumeSwitchSaveAndClose(t *testing.T) {
 				}
 			case <-fence:
 				fence = nil
-			case <-time.After(5 * time.Second):
+			case <-time.After(hardeningGitCompletionTimeout):
 				t.Fatal("live race did not finish all callers and jobs")
 			}
 		}
@@ -997,7 +1010,7 @@ func TestGitManagerRaceConflictResolvePollAndRestart(t *testing.T) {
 		})
 		close(start)
 		for range 5 {
-			if hardeningReceive(t, "conflict race", results) != nil {
+			if hardeningGitReceive(t, "conflict race", results) != nil {
 				t.Fatal("conflict race contract failed")
 			}
 		}
