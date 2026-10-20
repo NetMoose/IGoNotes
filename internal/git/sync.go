@@ -496,6 +496,8 @@ func (s *Service) mergeSyncCandidate(
 	if err != nil {
 		return err
 	}
+	// Freeze the committed local side, including the snapshot or a prior retry's merge.
+	checkpoint.value.LocalOID = head
 	ancestor, err := s.isAncestor(ctx, path, candidate, head)
 	if err != nil || ancestor {
 		return err

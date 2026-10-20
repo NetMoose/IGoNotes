@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"IGoNotes/internal/fileidentity"
 )
 
 func TestBaseOperationCoordinatorZeroValueSupportsConflictPolicy(t *testing.T) {
@@ -40,7 +42,7 @@ func TestBaseOperationCoordinatorMatchesCachedPhysicalIdentity(t *testing.T) {
 	if err := os.Symlink(physical, alias); err != nil {
 		t.Skipf("Symlink() unavailable: %v", err)
 	}
-	pinnedInfo, err := os.Stat(alias)
+	pinnedInfo, err := fileidentity.Stat(alias)
 	if err != nil {
 		t.Fatalf("Stat(alias) error = %v", err)
 	}
@@ -62,7 +64,7 @@ func TestBaseOperationCoordinatorClearsPhysicalConflictAliases(t *testing.T) {
 	if err := os.Symlink(physical, alias); err != nil {
 		t.Skipf("Symlink() unavailable: %v", err)
 	}
-	captured, err := os.Stat(physical)
+	captured, err := fileidentity.Stat(physical)
 	if err != nil {
 		t.Fatalf("Stat(physical) error = %v", err)
 	}
@@ -117,7 +119,7 @@ func TestBaseOperationCoordinatorCapturedClearUsesSuppliedIdentity(t *testing.T)
 	if err := os.Mkdir(retainedPath, 0o755); err != nil {
 		t.Fatalf("Mkdir(retained) error = %v", err)
 	}
-	captured, err := os.Stat(removedPath)
+	captured, err := fileidentity.Stat(removedPath)
 	if err != nil {
 		t.Fatalf("Stat(removed) error = %v", err)
 	}
@@ -148,7 +150,7 @@ func TestBaseOperationCoordinatorCapturedClearPreservesReboundCachedIdentity(t *
 	if err := os.Mkdir(originalPath, 0o755); err != nil {
 		t.Fatalf("Mkdir(original) error = %v", err)
 	}
-	originalInfo, err := os.Stat(originalPath)
+	originalInfo, err := fileidentity.Stat(originalPath)
 	if err != nil {
 		t.Fatalf("Stat(original) error = %v", err)
 	}

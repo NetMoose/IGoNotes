@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -417,6 +418,9 @@ func TestInitializeConflictCheckpointFailurePreservesTypedConflict(t *testing.T)
 }
 
 func TestInitializeConflictWithNewlineFilenamePreservesTypedGate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows filenames cannot contain newline")
+	}
 	fixture := newConnectFixture(t)
 	fixture.seedRemote()
 	seed := filepath.Join(filepath.Dir(fixture.root), "seed")

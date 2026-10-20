@@ -599,9 +599,19 @@ func TestNoteServiceBasePersistenceRollbackRetainsPinnedOldRoot(t *testing.T) {
 	store := &fakeConfigStore{saveErr: persistErr, saveStarted: persistStarted, saveRelease: persistRelease}
 	done := make(chan baseTransactionResult, 1)
 	go func() {
+		defer close(done)
 		operationErr, rollbackErr := service.switchBaseTransaction(target, store, &model.Config{}, &model.Config{})
 		done <- baseTransactionResult{operationErr: operationErr, rollbackErr: rollbackErr}
 	}()
+	// Release persistence before service cleanup even if a filesystem assertion fails.
+	t.Cleanup(func() {
+		select {
+		case <-persistRelease:
+		default:
+			close(persistRelease)
+		}
+		<-done
+	})
 	<-persistStarted
 	originalPath := filepath.Join(parent, "original")
 	if err := os.Rename(oldPath, originalPath); err != nil {

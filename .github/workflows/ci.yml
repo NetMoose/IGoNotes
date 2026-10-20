@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [develop, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Verify frontend
+        working-directory: web
+        run: npm ci && npm run verify
+      - name: Audit frontend dependencies
+        working-directory: web
+        run: npm audit --audit-level=high
+
+  native:
+    name: Native Git (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: ubuntu-latest
+            suite: all
+          - os: macos-latest
+            label: macos-latest
+            suite: all
+          - os: windows-latest
+            label: windows-latest / git
+            suite: git
+          - os: windows-latest
+            label: windows-latest / application
+            suite: application
+    env:
+      IGONOTES_REQUIRE_GIT_INTEGRATION: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build embedded frontend
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Native Git version
+        run: git --version
+      - name: Full Go suite with mandatory native Git
+        shell: bash
+        env:
+          SUITE: ${{ matrix.suite }}
+        # Isolate Windows' two native-process-heavy suites from each other.
+        # Together the shards still execute every package from go list ./....
+        run: |
+          set -euo pipefail
+          case "$SUITE" in
+            git)
+              go test ./internal/git -count=1 -timeout=45m
+              ;;
+            application)
+              package_list=$(go list ./...)
+              packages=()
+              while IFS= read -r package; do
+                if [[ "$package" != IGoNotes/internal/git ]]; then
+                  packages+=("$package")
+                fi
+              done <<< "$package_list"
+              go test "${packages[@]}" -p 1 -count=1 -timeout=45m
+              ;;
+            all)
+              go test ./... -count=1 -timeout=30m
+              ;;
+            *) exit 1 ;;
+          esac
+      - name: Repeat native, process-tree, and two-device integration
+        if: matrix.suite != 'application'
+        run: >-
+          go test ./internal/git -count=3 -timeout=15m
+          -run '^(TestNativeGitRunnerPreservesUnusualPaths|TestNativeGitRunnerHonorsIgnoreAssetsAndDeletes|TestCommandRunnerTerminatesProcessTree|TestCommandRunnerProcessTreeLifecycle|TestCommandRunnerProcessTreeCancellationLifetime|TestTwoDeviceEndToEndConvergesCreateEditRenameDeleteAndAssets|TestTwoDeviceEndToEndConflictSurvivesRestartAndLosesNoData)$'
+
+  race-vet-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IGONOTES_REQUIRE_GIT_INTEGRATION: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify tests, race detector, vet, and build
+        run: make verify all
+      - name: Cross-compile all release platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          for os in linux windows darwin; do
+            for arch in amd64 arm64; do
+              output="builds/igonotes-${os}-${arch}"
+              if [[ "$os" == windows ]]; then
+                output+=".exe"
+              fi
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+                go build -trimpath -o "$output" ./cmd/api
+            done
+          done

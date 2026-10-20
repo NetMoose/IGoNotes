@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,6 +19,7 @@ const (
 	DefaultNetworkTimeout = 60 * time.Second
 	DefaultOutputLimit    = 64 * 1024
 	AllowedGitProtocols   = "file:http:https:ssh:git"
+	processWaitDelay      = 5 * time.Second
 )
 
 type OperationScope uint8
@@ -48,12 +51,23 @@ type Runner interface {
 
 type commandFactory func(context.Context, string, ...string) *exec.Cmd
 
+// Start owns cleanup and reaping if setup fails after creating the process.
+// After a successful Start, the caller owns exactly one Wait and then Close.
+type processTree interface {
+	Start(*exec.Cmd) error
+	Terminate(*exec.Cmd) error
+	Close() error
+}
+
+type processTreeFactory func() (processTree, error)
+
 type CommandRunner struct {
 	executable     string
 	localTimeout   time.Duration
 	networkTimeout time.Duration
 	outputLimit    int
 	command        commandFactory
+	newProcessTree processTreeFactory
 }
 
 func NewCommandRunner() *CommandRunner {
@@ -73,6 +87,7 @@ func newCommandRunner(
 		networkTimeout: networkTimeout,
 		outputLimit:    outputLimit,
 		command:        command,
+		newProcessTree: newProcessTree,
 	}
 }
 
@@ -105,7 +120,66 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 	cmd.Stderr = stderr
 	cmd.Stdin = command.Stdin
 
-	runErr := cmd.Run()
+	tree, runErr := r.newProcessTree()
+	if runErr != nil {
+		runErr = newSafeProcessError("prepare Git process tree", runErr)
+	} else {
+		defer tree.Close()
+		// exec's watcher ends when the parent is reaped, before Wait drains
+		// inherited pipes. Share one termination attempt with a full-Wait
+		// context callback, and disable it before Close to avoid late PID reuse.
+		var terminationMu sync.Mutex
+		terminationActive, terminated := true, false
+		var terminationErr error
+		terminate := func() error {
+			terminationMu.Lock()
+			defer terminationMu.Unlock()
+			if !terminationActive {
+				return os.ErrProcessDone
+			}
+			if !terminated {
+				terminationErr = tree.Terminate(cmd)
+				terminated = true
+			}
+			return terminationErr
+		}
+		cmd.Cancel = terminate
+		cmd.WaitDelay = processWaitDelay
+		runErr = tree.Start(cmd)
+		if runErr == nil {
+			// Register only after Start succeeds: failed post-create setup owns
+			// its own kill/Wait, and Windows cancellation must obey its launch gate.
+			callbackDone := make(chan struct{})
+			stopCancellation := context.AfterFunc(commandContext, func() {
+				defer close(callbackDone)
+				_ = terminate()
+			})
+			runErr = cmd.Wait()
+			// WaitDelay closes inherited pipes, not their owning descendants.
+			// An ExitError can also mask ErrWaitDelay. Clean up failed waits
+			// while termination is still active, before releasing the base lock
+			// to the caller. Start failures own their separate kill/reap path.
+			if runErr != nil || commandContext.Err() != nil {
+				if err := terminate(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					runErr = errors.Join(runErr, err)
+				}
+			}
+			terminationMu.Lock()
+			terminationActive = false
+			terminationMu.Unlock()
+			if !stopCancellation() {
+				<-callbackDone
+			}
+		} else {
+			terminationMu.Lock()
+			terminationActive = false
+			terminationMu.Unlock()
+		}
+	}
+	// Cancellation wins even if the process exited successfully at the same time.
+	if commandContext.Err() != nil {
+		runErr = commandContext.Err()
+	}
 	diagnostic, diagnosticTruncated := redactAndLimit(
 		stderr.buffer.String(), command.Secrets, r.outputLimit, stderr.truncated,
 	)
@@ -119,9 +193,6 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 		}, nil
 	}
 
-	if commandContext.Err() != nil {
-		runErr = commandContext.Err()
-	}
 	var execErr *exec.Error
 	if errors.As(runErr, &execErr) {
 		return Result{}, &SafeError{
@@ -131,6 +202,10 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 			cause:      runErr,
 		}
 	}
+	var processErr *SafeError
+	if errors.As(runErr, &processErr) {
+		return Result{}, processErr
+	}
 
 	safeErr := classifyFailure(runErr, diagnostic)
 	safeErr.diagnostic = diagnostic
@@ -139,6 +214,13 @@ func (r *CommandRunner) Run(ctx context.Context, command Command) (Result, error
 		safeErr.ExitCode = exitErr.ExitCode()
 	}
 	return Result{}, safeErr
+}
+
+func newSafeProcessError(action string, err error) *SafeError {
+	return &SafeError{
+		Code: CodeCommandFailed, Message: "Git command failed",
+		cause: fmt.Errorf("%s: %w", action, err),
+	}
 }
 
 func canonicalDirectory(dir string) (string, error) {

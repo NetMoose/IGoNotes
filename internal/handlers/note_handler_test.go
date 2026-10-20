@@ -82,7 +82,7 @@ func TestNoteHandlerReturnsStructuredErrors(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(base, "existing.md"), []byte("existing"), 0644); err != nil {
 			t.Fatalf("os.WriteFile() error = %v", err)
 		}
-		handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator()))
+		handler := newFilesystemNoteHandlerAt(t, base, service.NewBaseOperationCoordinator())
 		recorder := httptest.NewRecorder()
 		handler.CreateNote(recorder, httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"name":"existing","type":"file"}`)))
 
@@ -500,6 +500,7 @@ func TestNoteHandlerGetRawFileServesDescriptorAndClosesIt(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 	noteService := service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator())
+	t.Cleanup(func() { _ = noteService.Close() })
 	handler := NewNoteHandler(noteService)
 	recorder := httptest.NewRecorder()
 
@@ -537,7 +538,7 @@ func TestNoteHandlerGetRawFileDoesNotFollowEscapingSymlink(t *testing.T) {
 		}
 		t.Fatalf("os.Symlink() error = %v", err)
 	}
-	handler := NewNoteHandler(service.NewNoteService(handlerNoteRepository{}, base, service.NewBaseOperationCoordinator()))
+	handler := newFilesystemNoteHandlerAt(t, base, service.NewBaseOperationCoordinator())
 	recorder := httptest.NewRecorder()
 
 	handler.GetRawFile(recorder, httptest.NewRequest(http.MethodGet, "/api/raw?path=escape.txt", nil))

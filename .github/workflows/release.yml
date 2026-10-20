@@ -6,11 +6,20 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      IGONOTES_REQUIRE_GIT_INTEGRATION: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -30,9 +39,9 @@ jobs:
         working-directory: web
         run: npm audit --audit-level=high
 
-      - name: Build frontend
+      - name: Verify frontend and build embedded assets
         working-directory: web
-        run: npm run build
+        run: npm run verify
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -40,8 +49,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test
-        run: go test ./...
+      - name: Native Git version
+        run: git --version
+
+      - name: Full Go suite with mandatory native Git
+        run: go test ./... -count=1 -timeout=20m
+
+      - name: Race detector
+        run: go test -race ./... -count=1 -timeout=20m
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Build release archives
         env:
@@ -81,21 +99,51 @@ jobs:
           cd release
           sha256sum ./*.tar.gz ./*.zip > checksums.txt
 
-      - name: Publish GitHub release
+      - name: Upload verified release archives
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-archives
+          path: release/*
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release archives
+        uses: actions/download-artifact@v7
+        with:
+          name: release-archives
+          path: release
+
+      - name: Verify checksums and publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           PRERELEASE: ${{ contains(github.ref_name, '-') }}
         run: |
           set -euo pipefail
+          cd release
+          archives=(./*.tar.gz ./*.zip)
+          [[ "${#archives[@]}" -eq 6 ]]
+          [[ "$(wc -l < checksums.txt)" -eq 6 ]]
+          # Verify the exact six expected archives, including their names.
+          sha256sum "${archives[@]}" > expected-checksums.txt
+          cmp checksums.txt expected-checksums.txt
+          sha256sum --check checksums.txt
+
           prerelease_args=()
           if [[ "$PRERELEASE" == "true" ]]; then
             prerelease_args+=(--prerelease)
           fi
 
           gh release create "${GITHUB_REF_NAME}" \
-            release/*.tar.gz \
-            release/*.zip \
-            release/checksums.txt \
+            "${archives[@]}" \
+            checksums.txt \
             --verify-tag \
             --generate-notes \
             --title "${GITHUB_REF_NAME}" \

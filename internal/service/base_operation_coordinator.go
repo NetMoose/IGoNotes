@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	"IGoNotes/internal/fileidentity"
 )
 
 var ErrGitConflictPending = errors.New("git conflict pending")
@@ -51,7 +53,7 @@ func (c *BaseOperationCoordinator) SetConflict(canonicalBasePath string, pending
 	basePath := filepath.Clean(canonicalBasePath)
 	var identity fs.FileInfo
 	if pending {
-		identity, _ = os.Stat(basePath)
+		identity, _ = fileidentity.Stat(basePath)
 	}
 	for {
 		current := c.conflicts.Load()

@@ -37,6 +37,11 @@ func newSettingsHandlerFixture(t *testing.T) settingsHandlerFixture {
 
 	coordinator := service.NewBaseOperationCoordinator()
 	notes := service.NewNoteService(repository.NewNoteRepository(db), "", coordinator)
+	t.Cleanup(func() {
+		if err := notes.Close(); err != nil {
+			t.Errorf("NoteService.Close() error = %v", err)
+		}
+	})
 	if err := notes.SyncFS(); err != nil {
 		t.Fatalf("NoteService.SyncFS() error = %v", err)
 	}
@@ -148,13 +153,13 @@ func TestSettingsHandlerTreatsWhitespaceFieldsAsPresent(t *testing.T) {
 	}{
 		{
 			name:   "mode",
-			body:   `{"mode":" ","name":"base","path":"` + path + `"}`,
+			body:   mutationJSON(t, model.BaseMutationRequest{Mode: " ", Name: "base", Path: path}),
 			status: http.StatusBadRequest,
 			want:   model.APIError{Code: "invalid_mode", Message: "mode must be create or connect", Field: "mode"},
 		},
 		{
 			name:   "name",
-			body:   `{"mode":"connect","name":" ","path":"` + path + `"}`,
+			body:   mutationJSON(t, model.BaseMutationRequest{Mode: "connect", Name: " ", Path: path}),
 			status: http.StatusUnprocessableEntity,
 			want:   model.APIError{Code: "invalid_base_name", Message: "base name is required", Field: "name"},
 		},

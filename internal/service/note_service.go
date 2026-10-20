@@ -78,10 +78,10 @@ func NewNoteService(repo noteRepository, basePath string, coordinator *BaseOpera
 		basePath:        basePath,
 		initialSyncDone: make(chan struct{}),
 		scan:            scanNotes,
-		openRoot:        os.OpenRoot,
+		openRoot:        openBaseRoot,
 	}
 	if basePath != "" {
-		service.baseRoot, service.baseErr = os.OpenRoot(basePath)
+		service.baseRoot, service.baseErr = openBaseRoot(basePath)
 		if service.baseErr == nil {
 			service.conflictBasePath, service.conflictBaseInfo, service.baseErr = canonicalPinnedRootIdentity(service.baseRoot, basePath)
 			if service.baseErr != nil {
@@ -207,7 +207,7 @@ func (s *NoteService) baseIdentityLocked(expectedPath string) (bool, string, err
 	if err != nil {
 		return false, "", err
 	}
-	expectedRoot, err := os.OpenRoot(canonicalExpected)
+	expectedRoot, err := openBaseRoot(canonicalExpected)
 	if err != nil {
 		return false, "", err
 	}

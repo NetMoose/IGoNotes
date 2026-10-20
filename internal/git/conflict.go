@@ -639,8 +639,11 @@ func (s *Service) checkoutConflictStage(ctx context.Context, gitDir, tempRoot, i
 		return "", ErrRecoveryRequired
 	}
 	input := bytes.NewReader(append([]byte(indexPath), 0))
+	// Stage bytes are verified against the selected blob OID. Platform-default
+	// line-ending conversion must not alter this private materialization.
 	result, err := s.runLocalInput(ctx, tempRoot, true, input,
-		"--git-dir="+gitDir, "--work-tree="+tempRoot, "--literal-pathspecs", "checkout-index", "--temp", "--stage="+strconv.Itoa(stage), "-z", "--stdin")
+		"--git-dir="+gitDir, "--work-tree="+tempRoot, "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+		"--literal-pathspecs", "checkout-index", "--temp", "--stage="+strconv.Itoa(stage), "-z", "--stdin")
 	if err != nil || result.StdoutTruncated || result.StderrTruncated {
 		return "", ErrRecoveryRequired
 	}

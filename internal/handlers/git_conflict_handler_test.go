@@ -374,6 +374,7 @@ func newGitConflictRESTFixture(t *testing.T) *gitConflictRESTFixture {
 		local:  filepath.Join(root, "local"),
 		other:  filepath.Join(root, "other"),
 	}
+	fixture.git(t, root, "config", "--global", "core.autocrlf", "false")
 	fixture.git(t, root, "init", "--bare", "--initial-branch", "main", fixture.remote)
 	seed := filepath.Join(root, "seed")
 	fixture.git(t, root, "init", "--initial-branch", "main", seed)
@@ -735,7 +736,8 @@ func (f *gitConflictRESTFixture) serveConflict(t *testing.T, method, path string
 
 func (f *gitConflictRESTFixture) waitForState(t *testing.T, want model.GitState) model.GitStatus {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Terminal publication follows a complete native Git operation.
+	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) {
 		status, found, err := f.statuses.Get(context.Background(), f.local)
 		if err != nil {
