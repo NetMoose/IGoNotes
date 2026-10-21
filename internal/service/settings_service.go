@@ -61,6 +61,7 @@ type SettingsService struct {
 	gitConfigChanged chan struct{}
 	config           model.Config
 	degraded         error
+	clipperBindings  map[string]*clipperDestinationBinding
 }
 
 func NewSettingsService(
@@ -408,6 +409,7 @@ func sameConflictIdentity(left, right conflictPathResolution) bool {
 }
 
 func (s *SettingsService) publishConfigLocked(next model.Config, conflicts conflictReconciliationSnapshot) {
+	s.invalidateClipperBindingsLocked(next)
 	s.config = cloneConfig(next)
 	for _, entry := range conflicts.entriesToClear {
 		s.coordinator.clearConflictForIdentity(entry.path, entry.info)

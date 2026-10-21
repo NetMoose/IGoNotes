@@ -26,6 +26,7 @@ go.work.sum
 .env
 
 opencode.json
+.opencode
 igonotes
 .vscode
 __debug*

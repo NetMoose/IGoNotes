@@ -263,6 +263,32 @@ export function getConfig() {
   return request('/api/config', { method: 'GET' })
 }
 
+function validClipperConnection(value) {
+  return isObject(value)
+    && typeof value.id === 'string' && value.id.length > 0
+    && typeof value.label === 'string'
+    && typeof value.created_at === 'string'
+    && (value.revoked_at === null || typeof value.revoked_at === 'string')
+}
+
+export async function getClipperConnections() {
+  return requestChecked(await requestWithStatus('/api/clipper/connections', { method: 'GET' }),
+    (value) => isObject(value) && Array.isArray(value.connections) && value.connections.every(validClipperConnection))
+}
+
+export async function createClipperConnection(label) {
+  return requestChecked(await requestWithStatus('/api/clipper/connections', {
+    method: 'POST',
+    body: jsonBody({ label }),
+  }), (value) => isObject(value) && validClipperConnection(value.connection)
+    && typeof value.secret === 'string' && value.secret.length > 0)
+}
+
+export async function revokeClipperConnection(id) {
+  const { status } = await requestWithStatus(`/api/clipper/connections?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+  if (status !== 204) throw invalidResponse(status)
+}
+
 export function probeGit({ base, git_url, git_branch = '' }) {
   return requestGit('/api/git/probe', {
     method: 'POST',

@@ -105,6 +105,41 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		return
 	}
 
+	var clipperErr *model.ClipperError
+	if errors.As(err, &clipperErr) && clipperErr != nil {
+		status, message := http.StatusInternalServerError, internalErrorMessage
+		switch clipperErr.Code {
+		case model.ClipperUnauthorized:
+			status, message = http.StatusUnauthorized, "Clipper authorization failed"
+		case model.ClipperInvalidRequest:
+			status, message = http.StatusBadRequest, "Invalid Clipper request"
+		case model.ClipperTooLarge:
+			status, message = http.StatusRequestEntityTooLarge, "Clipper request exceeds limits"
+		case model.ClipperUnsupportedImage:
+			status, message = http.StatusUnsupportedMediaType, "Unsupported Clipper image"
+		case model.ClipperDestinationNotFound:
+			status, message = http.StatusNotFound, "Clipper destination not found"
+		case model.ClipperDestinationChanged:
+			status, message = http.StatusConflict, "Clipper destination changed"
+		case model.ClipperNoteConflict:
+			status, message = http.StatusConflict, "Note already exists"
+		case model.ClipperRequestChanged:
+			status, message = http.StatusConflict, "Clipper request changed"
+		case model.ClipperRecoveryRequired:
+			status, message = http.StatusConflict, "Clipper import requires recovery"
+		case model.ClipperImportAbandoned:
+			status, message = http.StatusConflict, "Clipper import abandoned; files may already exist"
+		case model.ClipperPending:
+			status, message = http.StatusAccepted, "Clipper import pending"
+		}
+		code := string(clipperErr.Code)
+		if status == http.StatusInternalServerError {
+			code = "internal_error"
+		}
+		WriteAPIError(w, status, code, message, "")
+		return
+	}
+
 	for _, mapping := range serviceErrorMappings {
 		if !errors.Is(err, mapping.kind) {
 			continue

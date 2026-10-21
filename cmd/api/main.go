@@ -137,6 +137,11 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	}()
 
 	noteHandler := handlers.NewNoteHandler(noteService)
+	clipperConnectionRepo := repository.NewClipperConnectionRepository(db)
+	clipperConnectionService := service.NewClipperConnectionService(clipperConnectionRepo)
+	clipperConnectionHandler := handlers.NewClipperConnectionHandler(clipperConnectionService)
+	clipperDestinationService := service.NewClipperDestinationService(settingsService)
+	clipperDiscoveryHandler := handlers.NewClipperDiscoveryHandler(clipperDestinationService)
 	settingsHandler := handlers.NewSettingsHandler(settingsService)
 	directoryPicker := service.NewDirectoryPicker(service.ExecCommandRunner{}, runtime.GOOS)
 	systemHandler := handlers.NewSystemHandler(directoryPicker)
@@ -148,6 +153,8 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	spaHandler := handlers.NewSPAHandler(distFS)
 
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
+	handlers.RegisterClipperConnectionRoutes(router, clipperConnectionHandler, settingsService)
+	handlers.RegisterClipperDiscoveryRoutes(router, clipperDiscoveryHandler, clipperConnectionService, settingsService)
 	handlers.RegisterGitRoutes(router, gitHandler, settingsService)
 	gitConflictHandler := handlers.NewGitConflictHandler(gitManager)
 	handlers.RegisterGitConflictRoutes(router, gitConflictHandler, settingsService)

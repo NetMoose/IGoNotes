@@ -1,0 +1,32 @@
+[
+  {
+    "name": "empty-assets",
+    "manifest": {"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","destination_revision":"opaque","parent":"","filename":"clip.md","markdown":"Hello\n","source_url":"https://example.test/","captured_at":"2026-10-21T12:00:00Z","assets":[],"external_images":[]},
+    "canonical": "[\"igonotes-clipper\",1,\"550e8400-e29b-41d4-a716-446655440000\",\"work\",\"opaque\",\"\",\"clip.md\",\"Hello\\n\",\"https://example.test/\",\"2026-10-21T12:00:00Z\",[],[]]",
+    "digest": "4e864bead648d1e1d07e3d4d4695ed9adc270eb13619e0827d858876036b34b0"
+  },
+  {
+    "name": "sorted-assets",
+    "manifest": {"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","destination_revision":"opaque","parent":"","filename":"clip.md","markdown":"Hello\n","source_url":"https://example.test/","captured_at":"2026-10-21T12:00:00Z","assets":[{"id":"z","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","media_type":"image/png","size":10},{"id":"A_","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","media_type":"image/png","size":2},{"id":"A","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","media_type":"image/png","size":1}],"external_images":[]},
+    "canonical": "[\"igonotes-clipper\",1,\"550e8400-e29b-41d4-a716-446655440000\",\"work\",\"opaque\",\"\",\"clip.md\",\"Hello\\n\",\"https://example.test/\",\"2026-10-21T12:00:00Z\",[[\"A\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"image/png\",1],[\"A_\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"image/png\",2],[\"z\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"image/png\",10]],[]]",
+    "digest": "0457504767cea6ae449171891d5e040a78402b3fe0322b69f8af2e25eb27e4e0"
+  },
+  {
+    "name": "unicode-escaping",
+    "manifest": {"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","destination_revision":"opaque","parent":"","filename":"Заметка 😀.md","markdown":"---\ntitle: YAML-like\n---\nКириллица 😀 e\u0301 é \u2028\u2029 <>& / \" \\ \b\t\n\f\r\u0000\u0001\u000b\u001f\u007f","source_url":"https://example.test/","captured_at":"2026-10-21T12:00:00Z","assets":[],"external_images":[]},
+    "canonical": "[\"igonotes-clipper\",1,\"550e8400-e29b-41d4-a716-446655440000\",\"work\",\"opaque\",\"\",\"Заметка 😀.md\",\"---\\ntitle: YAML-like\\n---\\nКириллица 😀 e\u0301 é \u2028\u2029 <>& / \\\" \\\\ \\b\\t\\n\\f\\r\\u0000\\u0001\\u000b\\u001f\u007f\",\"https://example.test/\",\"2026-10-21T12:00:00Z\",[],[]]",
+    "digest": "23cb6c380d4f9678640f1078800e624d4d2f561f1b3635bcb3202a1842938473"
+  },
+  {
+    "name": "external-array-order",
+    "manifest": {"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","destination_revision":"opaque","parent":"","filename":"clip.md","markdown":"Hello\n","source_url":"https://example.test/","captured_at":"2026-10-21T12:00:00Z","assets":[],"external_images":[{"url":"https://example.test/z.png#part","reason":"permission_denied"},{"url":"https://example.test/a.png?q=1&x=2","reason":"download_failed"}]},
+    "canonical": "[\"igonotes-clipper\",1,\"550e8400-e29b-41d4-a716-446655440000\",\"work\",\"opaque\",\"\",\"clip.md\",\"Hello\\n\",\"https://example.test/\",\"2026-10-21T12:00:00Z\",[],[[\"https://example.test/z.png#part\",\"permission_denied\"],[\"https://example.test/a.png?q=1&x=2\",\"download_failed\"]]]",
+    "digest": "431670e661f43771532a78d24e37d6242388edbe49662ee768d42fc722723417"
+  },
+  {
+    "name": "exact-newline",
+    "manifest": {"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","destination_revision":"opaque","parent":"","filename":"clip.md","markdown":"---\r\ntitle: YAML-like\r\n---\r\n# Текст\r\n","source_url":"HTTPS://Example.test:443/a%2Fb?q=1&x=2#part","captured_at":"2026-10-21T12:00:00.1200Z","assets":[],"external_images":[]},
+    "canonical": "[\"igonotes-clipper\",1,\"550e8400-e29b-41d4-a716-446655440000\",\"work\",\"opaque\",\"\",\"clip.md\",\"---\\r\\ntitle: YAML-like\\r\\n---\\r\\n# Текст\\r\\n\",\"HTTPS://Example.test:443/a%2Fb?q=1&x=2#part\",\"2026-10-21T12:00:00.1200Z\",[],[]]",
+    "digest": "b548cca10b017a1b0c3efa6e9c6c7042ab16dcd66a8199f65f784f2a80046754"
+  }
+]
