@@ -79,7 +79,7 @@ http://127.0.0.1:8080
 
 ## Web Clipper v1 — discovery и HTTP import доступны
 
-Доступны управление подключениями, три discovery GET-маршрута и HTTP import/status `/api/clipper/v1/` с Bearer-доступом, включая публикацию проверенных изображений и автоматическое локальное восстановление импорта при запуске. Chromium-расширение и административные recovery list/abandon endpoints (5.5) остаются **PLANNED**. Расширение пока нельзя установить и отправлять им страницы. DTO и лимиты находятся в `internal/model/clipper.go`: импорт использует `ClipperManifest`, `ClipperImportResult`, `ClipperImportStatusResponse`.
+Доступны управление подключениями, три discovery GET-маршрута и HTTP import/status `/api/clipper/v1/` с Bearer-доступом, включая публикацию проверенных изображений и автоматическое локальное восстановление импорта при запуске. Административные recovery list/abandon endpoints и UI доступны только локальному интерфейсу. Chromium-расширение остаётся **PLANNED**: его пока нельзя установить и отправлять им страницы. DTO и лимиты находятся в `internal/model/clipper.go`: импорт использует `ClipperManifest`, `ClipperImportResult`, `ClipperImportStatusResponse`.
 
 ### Доступ и preflight — доступны
 
@@ -218,11 +218,19 @@ Pending не содержит `result`/`error`; succeeded содержит то�
 
 Timeout, сетевой обрыв и 5xx сами по себе означают неопределённый исход: сохранять immutable attempt, включая ID, весь payload и исходную destination_revision, и запрашивать GET/повторять точно тот же POST. Не удалять expected checks, не менять базу/папку/filename/Markdown/revision для обхода отказа и не создавать новый ID, пока исход не разрешён. `pending` и `recovery_required` не являются rejected; `400` на GET неизвестного/некорректного ID не доказывает отсутствие ещё выполняющегося POST. Только подтверждённый rejected (явный окончательный отказ POST либо снимок `state: rejected`, в том числе с `internal_error`) позволяет исправить запрос и создать новый ID после повторного подтверждения назначения. Один `500 internal_error` такого подтверждения не даёт.
 
-Private SQLite journal хранит точный Markdown, `prepared`/`publishing`, checkpoints и durable receipt; незавершённые состояния отображаются как `pending`/`recovery_required`, новые публикации в корень с unresolved import блокируются. При запуске `ClipImportService.RecoverLocal(ctx) error` вызывается после local Git recovery, до GitManager.Start, первичной фоновой индексации и HTTP. Ошибка БД или отмена recovery прерывает запуск с безопасной ошибкой без приватной диагностики; durable per-record `recovery_required` не останавливает сервер, доступен через прежний Bearer GET status и не блокирует обычную работу несвязанных баз. Новых HTTP recovery-маршрутов нет.
+Private SQLite journal хранит точный Markdown, `prepared`/`publishing`, checkpoints и durable receipt; незавершённые состояния отображаются как `pending`/`recovery_required`, новые публикации в корень с unresolved import блокируются. При запуске `ClipImportService.RecoverLocal(ctx) error` вызывается после local Git recovery, до GitManager.Start, первичной фоновой индексации и HTTP. Ошибка БД или отмена recovery прерывает запуск с безопасной ошибкой без приватной диагностики; durable per-record `recovery_required` не останавливает сервер, доступен через Bearer GET status и локальный административный список и не блокирует обычную работу несвязанных баз.
 
 Recovery сопоставляет журнал с текущим настроенным физическим корнем, native identity, SHA/size всех note/assets/temp и собственных private sources. Перемещение/переименование того же корня с обновлением настройки допустимо; receipt сохраняет исторические base/path и revision `sha256:<hex>`. Чужие/изменённые файлы, неизвестные схемы, потерянные источники и недоказуемое владение дают durable `clipper_recovery_required` без перезаписи/удаления public files; Git conflict также запрещает изменения worktree. Ошибки БД и отмена возвращаются вызывающему коду, остальные записи могут обрабатываться независимо. Terminal receipts не перепроверяются и не восстанавливают удалённые позднее файлы.
 
-Административные list/abandon endpoints и recovery UI также PLANNED (5.5); будущий abandon должен завершать попытку как rejected с `clipper_import_abandoned`, не удаляя файлы и не допуская повторную публикацию прежнего ID.
+#### Локальное управление незавершёнными импортами
+
+`GET /api/clipper/imports` и `POST /api/clipper/imports/abandon?id=<lowercase-UUID-v4>` используют `RequireLocalOrigin` и `RequireSetup`. Clipper Bearer не даёт административных полномочий: любой заголовок Authorization отклоняется с `403 forbidden_origin`, в том числе без Origin. Origin/Authorization guard выполняется до проверки метода и setup; неподдерживаемый метод — `405 method_not_allowed` с Allow, незавершённая настройка — `428 setup_required`. Точные маршруты имеют приоритет над fallback `/api/clipper/`; Bearer namespace `/api/clipper/v1/` сохраняет отдельные правила. Ответы имеют `Cache-Control: no-store`.
+
+GET принимает пустое тело и не принимает query-параметры. Ответ `200`: `{"imports":[]}` либо `{"imports":[{"import_id":"12345678-1234-4123-8123-123456789abc","base":"notes","path":"nested/note.md","state":"recovery_required","error":{"code":"clipper_recovery_required","message":"Clipper import requires recovery"}}]}`. Только незавершённые записи: `prepared`/`publishing` представлены как `pending` без error; `recovery_required` — с фиксированной безопасной ошибкой. Base/path исторические, путь относительный; абсолютные корни, staging references, identity/hash/digest, конфигурация и journal не возвращаются.
+
+POST принимает **пустое тело**, без JSON. Требуется ровно один `id`, raw query не более 8192 байт; лишние/повторные параметры, неверный UUID, непустое тело и неизвестный ID дают `400 clipper_invalid_request`. Только `recovery_required` можно прекратить. `pending`, `succeeded` и другие `rejected` дают `409 clipper_import_not_abandonable` (`Clipper import is not eligible for abandonment`). Повтор уже подтверждённого abandon идемпотентен. Успех `200`: `{"import_id":"12345678-1234-4123-8123-123456789abc","state":"rejected","error":{"code":"clipper_import_abandoned","message":"Clipper import abandoned; files may already exist"}}`.
+
+Abandon изменяет только terminal metadata, не удаляет и не меняет public/private файлы или journal. Файлы могут уже существовать. Старый ID с прежним payload всегда возвращает отказ, в том числе после restart; другой payload — прежний `409 clipper_request_changed`. Из `ListUnfinished` исключается только прекращённая запись: другие незавершённые операции того же корня продолжают блокировать публикацию. Git paused/conflict и выбранная активная база не меняются. Ошибка БД даёт безопасный `500 internal_error`; при потерянном ответе проверяйте список/status или явно повторите abandon, не считая файлы удалёнными.
 
 Новые private plans для text/image imports до файловых эффектов сохраняют ordered `warnings`, включая дубликаты и явный пустой массив. Receipt использует именно эту durable metadata. Отсутствующее поле или `null` в старом незавершённом плане означает неизвестные warnings, а не `[]`; local recovery оставляет такую попытку для ручного вмешательства. Завершённые исторические receipts воспроизводятся без изменений.
 
@@ -230,7 +238,7 @@ Recovery сопоставляет журнал с текущим настрое�
 
 Форма — существующий `APIError {code,message,field?}`. Пример: `409 {"code":"clipper_destination_changed","message":"Clipper destination changed"}`. Типизированные Clipper errors получают фиксированные безопасные сообщения; внутренние пути, токены и wrapped diagnostics не выдаются.
 
-Discovery и import используют коды ниже; origin/method/namespace ошибки описаны выше. `clipper_import_abandoned` зарезервирован для будущего abandon endpoint. `clipper_unsupported_image` возможен при проверке descriptor, MIME и неподдерживаемой анимации.
+Discovery и import используют коды ниже; origin/method/namespace ошибки описаны выше. `clipper_import_abandoned` — окончательный отказ после административного abandon. `clipper_unsupported_image` возможен при проверке descriptor, MIME и неподдерживаемой анимации.
 
 | HTTP | code | Значение / пример message |
 |:---|:---|:---|
@@ -245,6 +253,7 @@ Discovery и import используют коды ниже; origin/method/namesp
 | 409 | `clipper_request_changed` | `Clipper request changed` |
 | 409 | `clipper_recovery_required` | `Clipper import requires recovery`; не окончательный отказ |
 | 409 | `clipper_import_abandoned` | `Clipper import abandoned; files may already exist` |
+| 409 | `clipper_import_not_abandonable` | `Clipper import is not eligible for abandonment` |
 | 202 | `clipper_import_pending` | `Clipper import pending`; ещё не успех и не отказ |
 | 428 | `setup_required` | `setup required`; существующий setup gate |
 | 500 | `internal_error` | `Internal server error`; неизвестная ошибка, не подтверждённый rejected |

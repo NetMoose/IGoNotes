@@ -11,6 +11,7 @@ vi.mock('../api.js', async (importOriginal) => {
     updateBase: vi.fn(),
     forgetBase: vi.fn(),
     getClipperConnections: vi.fn(),
+    getClipperImports: vi.fn().mockResolvedValue({ imports: [] }),
     createClipperConnection: vi.fn(),
   }
 })

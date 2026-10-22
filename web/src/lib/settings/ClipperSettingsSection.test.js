@@ -4,6 +4,8 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { tick } from 'svelte'
 
 vi.mock('../api.js', () => ({
+  getClipperImports: vi.fn().mockResolvedValue({ imports: [] }),
+  abandonClipperImport: vi.fn(),
   getClipperConnections: vi.fn(),
   createClipperConnection: vi.fn(),
   revokeClipperConnection: vi.fn(),
@@ -33,7 +35,7 @@ it('loads metadata, shows revoked status and disables revoked actions', async ()
   const pending = deferred()
   vi.mocked(getClipperConnections).mockReturnValue(pending.promise)
   render(ClipperSettingsSection)
-  expect(screen.getByRole('status')).toHaveTextContent('Загрузка подключений')
+  expect(screen.getByText('Загрузка подключений…')).toBeVisible()
   pending.resolve({ connections: [connection, { ...connection, id: 'old', label: 'Old', revoked_at: '2026-10-22T00:00:00Z' }] })
   const active = await screen.findByRole('article', { name: 'Подключение Browser' })
   expect(within(active).getByText('Активно')).toBeVisible()

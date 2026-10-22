@@ -289,6 +289,25 @@ export async function revokeClipperConnection(id) {
   if (status !== 204) throw invalidResponse(status)
 }
 
+function validClipperPublicError(value) {
+  return isObject(value) && typeof value.code === 'string' && typeof value.message === 'string'
+}
+
+export async function getClipperImports() {
+  return requestChecked(await requestWithStatus('/api/clipper/imports', { method: 'GET' }),
+    (value) => isObject(value) && Array.isArray(value.imports) && value.imports.every((item) =>
+      isObject(item) && typeof item.import_id === 'string' && item.import_id.length > 0
+      && typeof item.base === 'string' && typeof item.path === 'string'
+      && ['pending', 'recovery_required'].includes(item.state)
+      && (item.error === undefined || validClipperPublicError(item.error))))
+}
+
+export async function abandonClipperImport(id) {
+  return requestChecked(await requestWithStatus(`/api/clipper/imports/abandon?id=${encodeURIComponent(id)}`, { method: 'POST' }),
+    (value) => isObject(value) && value.import_id === id && value.state === 'rejected'
+      && validClipperPublicError(value.error) && value.error.code === 'clipper_import_abandoned')
+}
+
 export function probeGit({ base, git_url, git_branch = '' }) {
   return requestGit('/api/git/probe', {
     method: 'POST',

@@ -170,6 +170,7 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
 	handlers.RegisterClipperConnectionRoutes(router, clipperConnectionHandler, settingsService)
+	handlers.RegisterClipImportManagementRoutes(router, handlers.NewClipImportManagementHandler(clipImportService), settingsService)
 	handlers.RegisterClipperDiscoveryRoutes(router, clipperDiscoveryHandler, clipperConnectionService, settingsService)
 	handlers.RegisterClipImportRoutes(router, clipImportHandler, clipperConnectionService, settingsService)
 	handlers.RegisterGitRoutes(router, gitHandler, settingsService)

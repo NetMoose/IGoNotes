@@ -30,6 +30,10 @@ func TestClipperManagementWiringCredentialLifecycle(t *testing.T) {
 	state := clipperWiringSetupState(true)
 	router := handlers.NewRouter(handlers.NewNoteHandler(nil), handlers.NewSettingsHandler(nil), state, http.NotFoundHandler())
 	handlers.RegisterClipperConnectionRoutes(router, handlers.NewClipperConnectionHandler(connections), state)
+	// Both management namespaces coexist with the v1 fallback. Real credentials
+	// remain forbidden even without an extension Origin.
+	handlers.RegisterClipImportManagementRoutes(router, handlers.NewClipImportManagementHandler(nil), state)
+	handlers.RegisterClipperDiscoveryRoutes(router, handlers.NewClipperDiscoveryHandler(nil), connections, state)
 	request := func(method, path, body, origin, token string) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(method, "http://127.0.0.1:8080"+path, strings.NewReader(body))
@@ -54,6 +58,22 @@ func TestClipperManagementWiringCredentialLifecycle(t *testing.T) {
 	}
 	if err := connections.Authenticate(context.Background(), created.Secret); err != nil {
 		t.Fatal("issued credential did not authenticate")
+	}
+	for _, recoveryPath := range []string{"/api/clipper/imports", "/api/clipper/imports/abandon?id=12345678-1234-4123-8123-123456789abc"} {
+		for _, method := range []string{"GET", "POST", "OPTIONS", "DELETE"} {
+			for _, extensionOrigin := range []string{"", "chrome-extension://" + strings.Repeat("a", 32)} {
+				r := httptest.NewRequest(method, "http://127.0.0.1:8080"+recoveryPath, nil)
+				if extensionOrigin != "" {
+					r.Header.Set("Origin", extensionOrigin)
+				}
+				r.Header.Set("Authorization", "Bearer "+created.Secret)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, r)
+				if w.Code != 403 {
+					t.Fatalf("recovery credential guard: %d %s", w.Code, w.Body.String())
+				}
+			}
+		}
 	}
 	// A real, active credential cannot bypass the local UI origin guard.
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {

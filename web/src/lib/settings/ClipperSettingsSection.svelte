@@ -1,6 +1,7 @@
 <script>
   import { onDestroy, onMount, tick } from 'svelte'
   import { createClipperConnection, getClipperConnections, revokeClipperConnection } from '../api.js'
+  import ClipperRecoverySection from './ClipperRecoverySection.svelte'
 
   let connections = $state([])
   let loading = $state(true)
@@ -170,4 +171,5 @@
       </article>
     {/each}
   </div>
+  <ClipperRecoverySection />
 </section>

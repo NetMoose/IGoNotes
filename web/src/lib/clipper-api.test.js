@@ -51,3 +51,21 @@ it.each([
   expect(typeof helper).toBe('function')
   await expect(helper('Browser')).rejects.toMatchObject({ code: 'invalid_response' })
 })
+it('loads recovery summaries and sends an empty administrative POST', async () => {
+  const row = { import_id: 'id /?', base: 'Notes', path: 'nested/note.md', state: 'recovery_required', error: { code: 'clipper_recovery_required', message: 'Requires recovery' } }
+  const fetch = respond({ imports: [row] })
+  expect(typeof api.getClipperImports).toBe('function')
+  expect(await api.getClipperImports()).toEqual({ imports: [row] })
+  expect(fetch).toHaveBeenCalledWith('/api/clipper/imports', expect.objectContaining({ method: 'GET' }))
+  const receipt = { import_id: row.import_id, state: 'rejected', error: { code: 'clipper_import_abandoned', message: 'Files may already exist' } }
+  respond(receipt)
+  expect(await api.abandonClipperImport(row.import_id)).toEqual(receipt)
+  expect(globalThis.fetch).toHaveBeenCalledWith('/api/clipper/imports/abandon?id=id%20%2F%3F', expect.objectContaining({ method: 'POST' }))
+  expect(globalThis.fetch.mock.calls[0][1].body).toBeUndefined()
+})
+
+it.each([{ imports: null }, { imports: [{}] }, { imports: [{ import_id: 'id', base: 'N', path: 'x', state: 'succeeded' }] }])('rejects invalid recovery summary %j', async (payload) => {
+  respond(payload)
+  expect(typeof api.getClipperImports).toBe('function')
+  await expect(api.getClipperImports()).rejects.toMatchObject({ code: 'invalid_response' })
+})

@@ -129,6 +129,8 @@ func writeServiceError(w http.ResponseWriter, err error) {
 			status, message = http.StatusConflict, "Clipper import requires recovery"
 		case model.ClipperImportAbandoned:
 			status, message = http.StatusConflict, "Clipper import abandoned; files may already exist"
+		case model.ClipperImportNotAbandonable:
+			status, message = http.StatusConflict, "Clipper import is not eligible for abandonment"
 		case model.ClipperPending:
 			status, message = http.StatusAccepted, "Clipper import pending"
 		}

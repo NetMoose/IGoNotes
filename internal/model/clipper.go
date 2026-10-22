@@ -116,6 +116,19 @@ type ClipperImportStatusResponse struct {
 	Error    *APIError            `json:"error,omitempty"`
 }
 
+// Administrative summaries contain only historical public destination metadata.
+type ClipperImportSummary struct {
+	ImportID string             `json:"import_id"`
+	Base     string             `json:"base"`
+	Path     string             `json:"path"`
+	State    ClipperImportState `json:"state"`
+	Error    *APIError          `json:"error,omitempty"`
+}
+
+type ClipperImportsResponse struct {
+	Imports []ClipperImportSummary `json:"imports"`
+}
+
 type ClipperConnectionRequest struct {
 	Label string `json:"label"`
 }
@@ -141,17 +154,18 @@ type ClipperConnectionCreatedResponse struct {
 type ClipperErrorCode string
 
 const (
-	ClipperUnauthorized        ClipperErrorCode = "clipper_unauthorized"
-	ClipperInvalidRequest      ClipperErrorCode = "clipper_invalid_request"
-	ClipperTooLarge            ClipperErrorCode = "clipper_too_large"
-	ClipperUnsupportedImage    ClipperErrorCode = "clipper_unsupported_image"
-	ClipperDestinationNotFound ClipperErrorCode = "clipper_destination_not_found"
-	ClipperDestinationChanged  ClipperErrorCode = "clipper_destination_changed"
-	ClipperNoteConflict        ClipperErrorCode = "note_conflict"
-	ClipperRequestChanged      ClipperErrorCode = "clipper_request_changed"
-	ClipperRecoveryRequired    ClipperErrorCode = "clipper_recovery_required"
-	ClipperImportAbandoned     ClipperErrorCode = "clipper_import_abandoned"
-	ClipperPending             ClipperErrorCode = "clipper_import_pending"
+	ClipperUnauthorized         ClipperErrorCode = "clipper_unauthorized"
+	ClipperInvalidRequest       ClipperErrorCode = "clipper_invalid_request"
+	ClipperTooLarge             ClipperErrorCode = "clipper_too_large"
+	ClipperUnsupportedImage     ClipperErrorCode = "clipper_unsupported_image"
+	ClipperDestinationNotFound  ClipperErrorCode = "clipper_destination_not_found"
+	ClipperDestinationChanged   ClipperErrorCode = "clipper_destination_changed"
+	ClipperNoteConflict         ClipperErrorCode = "note_conflict"
+	ClipperRequestChanged       ClipperErrorCode = "clipper_request_changed"
+	ClipperRecoveryRequired     ClipperErrorCode = "clipper_recovery_required"
+	ClipperImportAbandoned      ClipperErrorCode = "clipper_import_abandoned"
+	ClipperImportNotAbandonable ClipperErrorCode = "clipper_import_not_abandonable"
+	ClipperPending              ClipperErrorCode = "clipper_import_pending"
 )
 
 // ClipperError selects a fixed public message at the HTTP boundary. Wrap it to
