@@ -28,6 +28,7 @@ var (
 type clipNoteFile struct {
 	plan     clipNotePlan
 	markdown string
+	source   func() (io.ReadCloser, error)
 	parent   *os.Root
 	dir      *os.File
 	file     *os.File
@@ -94,14 +95,23 @@ func prepareClipNote(root *os.Root, parent, filename, markdown string) (*clipNot
 			}
 		}
 	}
+	plan := clipNotePlan{Parent: parent, Filename: filename, TempName: "igonotes-clip-" + rand.Text() + ".tmp", SHA256: clipContentHash([]byte(markdown)), Size: int64(len(markdown))}
+	f, err := prepareClipFile(root, plan)
+	if err == nil {
+		f.markdown = markdown
+	}
+	return f, err
+}
+
+func prepareClipFile(root *os.Root, plan clipNotePlan) (*clipNoteFile, error) {
 	// Pin each child separately, using the enumeration identity/type checks. This
 	// rejects even in-root symlinks into .git, not just escapes from the base root.
 	pinned, err := root.OpenRoot(".")
 	if err != nil {
 		return nil, err
 	}
-	if parent != "" {
-		for _, component := range strings.Split(parent, "/") {
+	if plan.Parent != "" {
+		for _, component := range strings.Split(plan.Parent, "/") {
 			info, err := pinned.Lstat(component)
 			if err != nil {
 				return nil, errors.Join(err, pinned.Close())
@@ -122,8 +132,7 @@ func prepareClipNote(root *os.Root, parent, filename, markdown string) (*clipNot
 		return nil, errors.Join(err, pinned.Close())
 	}
 	f := &clipNoteFile{
-		plan:     clipNotePlan{Parent: parent, Filename: filename, TempName: "igonotes-clip-" + rand.Text() + ".tmp", SHA256: clipContentHash([]byte(markdown)), Size: int64(len(markdown))},
-		markdown: markdown, parent: pinned, dir: dir,
+		plan: plan, parent: pinned, dir: dir,
 		ops: clipFileOps{
 			write: (*os.File).Write, sync: (*os.File).Sync, close: (*os.File).Close,
 			rename: renameNoReplace, syncParent: syncClipDirectory,
@@ -164,27 +173,54 @@ func (f *clipNoteFile) write() (clipFileProgress, error) {
 		return f.progress, os.ErrInvalid
 	}
 	file := f.file
-	data := []byte(f.markdown)
-	var writeErr error
-	written := 0
-	for written < len(data) {
-		n, err := f.ops.write(file, data[written:])
-		if n < 0 || n > len(data)-written {
-			writeErr = io.ErrShortWrite
-			break
-		}
-		written += n
+	var input io.ReadCloser = io.NopCloser(strings.NewReader(f.markdown))
+	if f.source != nil {
+		var err error
+		input, err = f.source()
 		if err != nil {
-			writeErr = err
+			return f.progress, err
+		}
+	}
+	hash := sha256.New()
+	var writeErr error
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		n, readErr := io.LimitReader(input, f.plan.Size+1-written).Read(buf)
+		for offset := 0; offset < n; {
+			count, err := f.ops.write(file, buf[offset:n])
+			if count < 0 || count > n-offset {
+				writeErr = io.ErrShortWrite
+				break
+			}
+			hash.Write(buf[offset : offset+count])
+			offset += count
+			written += int64(count)
+			if err != nil {
+				writeErr = err
+				break
+			}
+			if count == 0 {
+				writeErr = io.ErrShortWrite
+				break
+			}
+		}
+		if writeErr != nil {
 			break
 		}
-		if n == 0 {
-			writeErr = io.ErrShortWrite
+		if readErr != nil {
+			if readErr != io.EOF {
+				writeErr = readErr
+			}
 			break
 		}
 	}
-	f.progress.Size = int64(written)
-	f.progress.SHA256 = clipContentHash(data[:written])
+	f.progress.Size = written
+	f.progress.SHA256 = hex.EncodeToString(hash.Sum(nil))
+	writeErr = errors.Join(writeErr, input.Close())
+	if writeErr == nil && (written != f.plan.Size || f.progress.SHA256 != f.plan.SHA256) {
+		writeErr = errClipFileChanged
+	}
 	if writeErr == nil {
 		writeErr = f.ops.sync(file)
 	}

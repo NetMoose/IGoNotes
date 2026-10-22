@@ -26,11 +26,12 @@ type ClipImportStore interface {
 }
 
 type ClipImportService struct {
-	settings     *SettingsService
-	destinations *ClipperDestinationService
-	notes        *NoteService
-	store        ClipImportStore
-	prepare      func(*os.Root, string, string, string) (*clipNoteFile, error)
+	settings      *SettingsService
+	destinations  *ClipperDestinationService
+	notes         *NoteService
+	store         ClipImportStore
+	prepare       func(*os.Root, string, string, string) (*clipNoteFile, error)
+	prepareBinary func(*os.Root, clipNotePlan, func() (io.ReadCloser, error)) (*clipNoteFile, error)
 }
 
 func NewClipImportService(settings *SettingsService, destinations *ClipperDestinationService, notes *NoteService, store ClipImportStore) (*ClipImportService, error) {
@@ -39,7 +40,7 @@ func NewClipImportService(settings *SettingsService, destinations *ClipperDestin
 		destinations.settings != settings || settings.notes != notes || settings.coordinator == nil || notes.coordinator != settings.coordinator {
 		return nil, ErrInvalidConfig
 	}
-	return &ClipImportService{settings: settings, destinations: destinations, notes: notes, store: store, prepare: prepareClipNote}, nil
+	return &ClipImportService{settings: settings, destinations: destinations, notes: notes, store: store, prepare: prepareClipNote, prepareBinary: prepareClipBinary}, nil
 }
 
 // Versioned private journal: the immutable text is deliberately retained until
@@ -50,6 +51,8 @@ type clipImportPlan struct {
 	Version  int          `json:"version"`
 	Note     clipNotePlan `json:"note"`
 	Markdown string       `json:"markdown"`
+	// Nil means a legacy plan with unknown warnings, not a known empty array.
+	Warnings *[]string `json:"warnings,omitempty"`
 }
 
 type clipImportCheckpoint struct {
@@ -63,6 +66,10 @@ type clipImportCheckpoint struct {
 // snapshots carry fixed public errors. Transport/authentication belongs upstream.
 // Completed receipts are looked up BEFORE touching the process-local registry.
 func (s *ClipImportService) Import(ctx context.Context, manifest model.ClipperManifest) (status model.ClipperImportStatusResponse, replay bool, err error) {
+	return s.importClip(ctx, manifest, nil)
+}
+
+func (s *ClipImportService) importClip(ctx context.Context, manifest model.ClipperManifest, owned *ownedClipSources) (status model.ClipperImportStatusResponse, replay bool, err error) {
 	digest, err := ClipperManifestDigest(manifest)
 	if err != nil {
 		return status, false, fixedClipperError(err)
@@ -84,9 +91,8 @@ func (s *ClipImportService) Import(ctx context.Context, manifest model.ClipperMa
 	if found, err := lookup(); found || err != nil {
 		return status, replay, err
 	}
-	// Stage 4 has no asset bytes. Reject before claiming; the manifest and journal
-	// APIs remain extensible for the asset publication stage.
-	if len(manifest.Assets) != 0 {
+	// Manifest-only callers cannot publish attachments without validated bytes.
+	if len(manifest.Assets) != 0 && owned == nil {
 		return status, false, &model.ClipperError{Code: model.ClipperInvalidRequest}
 	}
 	s.settings.coordinator.Lock()
@@ -106,7 +112,7 @@ func (s *ClipImportService) Import(ctx context.Context, manifest model.ClipperMa
 	}
 	err = s.destinations.withDestinationCoordinatorLocked(manifest.Base, manifest.DestinationRevision, func(snapshot ClipperDestinationSnapshot, root *os.Root) error {
 		var err error
-		status, replay, err = s.importDestinationLocked(ctx, manifest, digest, snapshot, root)
+		status, replay, err = s.importDestinationLocked(ctx, manifest, digest, snapshot, root, owned)
 		return err
 	})
 	// Closing a scoped root cannot invalidate an already persisted receipt or
@@ -120,7 +126,7 @@ func (s *ClipImportService) Import(ctx context.Context, manifest model.ClipperMa
 // importDestinationLocked is deliberately below the scoped snapshot boundary:
 // coordinator -> settings.mu -> notes.baseMu are ALREADY held. No public service
 // calls, lock reacquisition, runtime switching or network IO is allowed here.
-func (s *ClipImportService) importDestinationLocked(ctx context.Context, m model.ClipperManifest, digest string, snapshot ClipperDestinationSnapshot, root *os.Root) (model.ClipperImportStatusResponse, bool, error) {
+func (s *ClipImportService) importDestinationLocked(ctx context.Context, m model.ClipperManifest, digest string, snapshot ClipperDestinationSnapshot, root *os.Root, owned *ownedClipSources) (model.ClipperImportStatusResponse, bool, error) {
 	zero := model.ClipperImportStatusResponse{}
 	if err := s.settings.coordinator.checkMutationForIdentity(snapshot.CanonicalPath, snapshot.RootIdentity); err != nil {
 		return zero, false, err
@@ -162,8 +168,11 @@ func (s *ClipImportService) importDestinationLocked(ctx context.Context, m model
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return zero, false, err
 	}
+	if owned != nil {
+		return s.publishClipImagesLocked(ctx, m, digest, snapshot, root, identity, file, owned)
+	}
 	identityJSON, _ := json.Marshal(identity)
-	planJSON, _ := json.Marshal(clipImportPlan{Version: 1, Note: file.plan, Markdown: m.Markdown})
+	planJSON, _ := json.Marshal(clipImportPlan{Version: 1, Note: file.plan, Markdown: m.Markdown, Warnings: clipImportPlanWarnings(m)})
 	checkpoint := clipImportCheckpoint{Step: "creating"}
 	checkpointJSON, _ := json.Marshal(checkpoint)
 	now := time.Now().UTC()
@@ -230,9 +239,9 @@ func (s *ClipImportService) importDestinationLocked(ctx context.Context, m model
 	if err := progress("receipt"); err != nil {
 		return fail(err)
 	}
-	warnings := make([]string, 0, len(m.ExternalImages))
-	for _, external := range m.ExternalImages {
-		warnings = append(warnings, external.Reason)
+	warnings, err := clipImportReceiptWarnings(record.Journal.Plan)
+	if err != nil {
+		return fail(err)
 	}
 	result := &model.ClipperImportResult{ImportID: record.ImportID, Base: record.BaseName, Path: record.NotePath, Revision: noteRevision([]byte(m.Markdown)), Warnings: warnings}
 	if err := s.store.Transition(ctx, record.ImportID, record.Version(), repository.ClipImportSucceeded, result, nil); err != nil {
@@ -240,6 +249,31 @@ func (s *ClipImportService) importDestinationLocked(ctx context.Context, m model
 	}
 	record.State, record.Result, record.Error = repository.ClipImportSucceeded, result, nil
 	return publicClipImport(record), false, nil
+}
+
+// Preserve exact order and duplicates in the immutable plan before any effects.
+func clipImportPlanWarnings(m model.ClipperManifest) *[]string {
+	warnings := make([]string, 0, len(m.ExternalImages))
+	for _, external := range m.ExternalImages {
+		warnings = append(warnings, external.Reason)
+	}
+	return &warnings
+}
+
+// New receipts use durable metadata, never a still-live request. Missing/null
+// warnings in legacy plans are unknown; they cannot justify inventing an empty
+// result. Completed receipts bypass this path and remain historical snapshots.
+func clipImportReceiptWarnings(raw json.RawMessage) ([]string, error) {
+	var plan struct {
+		Warnings *[]string `json:"warnings"`
+	}
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return nil, err
+	}
+	if plan.Warnings == nil {
+		return nil, errors.New("clip import plan warnings unavailable")
+	}
+	return append([]string{}, (*plan.Warnings)...), nil
 }
 
 // Decode only the immutable native identity shape written by this service. Do

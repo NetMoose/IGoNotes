@@ -199,11 +199,6 @@ func TestClipImportHTTPStagedAssetsLifetimeAndValidation(t *testing.T) {
 				t.Fatal("invalid payload reached importer")
 			}
 			assertImportUnclaimedAndClean(t, f, m.ImportID)
-			if tc == "valid" {
-				response := importRequest(f.router, "POST", importsPath, f.created.Secret, w.FormDataContentType(), bytes.NewReader(body.Bytes()))
-				assertDiscoveryError(t, response, 400, "clipper_invalid_request")
-				assertImportUnclaimedAndClean(t, f, m.ImportID)
-			}
 		})
 	}
 }

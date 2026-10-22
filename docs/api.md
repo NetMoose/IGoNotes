@@ -68,14 +68,14 @@ http://127.0.0.1:8080
 | GET | `/api/clipper/v1/info` | 200 | Версия протокола и приложения, лимиты и MIME |
 | GET | `/api/clipper/v1/bases` | 200 | Имена настроенных баз |
 | GET | `/api/clipper/v1/folders?base=<name>` | 200 | Папки выбранной базы и ревизия назначения |
-| POST | `/api/clipper/v1/imports` | 201 / 200 / 202 | Новый text import / успешный replay / pending APIError |
+| POST | `/api/clipper/v1/imports` | 201 / 200 / 202 | Новый import с изображениями или без / успешный replay / pending APIError |
 | GET | `/api/clipper/v1/imports?id=<uuid>` | 200 | Снимок состояния известной попытки |
 
 `POST /api/sync` обновляет только индекс файловой системы; Git-синхронизация запускается через `POST /api/git/sync`.
 
-## Web Clipper v1 — discovery и HTTP text import доступны
+## Web Clipper v1 — discovery и HTTP import доступны
 
-Доступны управление подключениями, три discovery GET-маршрута и HTTP text import/status `/api/clipper/v1/` с Bearer-доступом. Chromium-расширение, публикация изображений, startup recovery и административные recovery list/abandon endpoints остаются **PLANNED** (задачи 5.3–5.5 для recovery). Расширение пока нельзя установить и отправлять им страницы. DTO и лимиты находятся в `internal/model/clipper.go`: импорт использует `ClipperManifest`, `ClipperImportResult`, `ClipperImportStatusResponse`.
+Доступны управление подключениями, три discovery GET-маршрута и HTTP import/status `/api/clipper/v1/` с Bearer-доступом, включая публикацию проверенных изображений. Chromium-расширение, startup recovery и административные recovery list/abandon endpoints остаются **PLANNED** (задачи 5.3–5.5 для recovery). Расширение пока нельзя установить и отправлять им страницы. DTO и лимиты находятся в `internal/model/clipper.go`: импорт использует `ClipperManifest`, `ClipperImportResult`, `ClipperImportStatusResponse`.
 
 ### Доступ и preflight — доступны
 
@@ -103,7 +103,7 @@ Bearer Clipper не открывает `/api/config`, `/api/save`, Git API ил�
 {"protocol_version":1,"app_name":"IGoNotes","app_version":"dev","limits":{"markdown_bytes":5242880,"assets":100,"asset_bytes":10485760,"total_asset_bytes":52428800,"multipart_bytes":67108864,"image_pixels":40000000,"gif_frames":100,"gif_total_pixels":200000000},"supported_image_types":["image/png","image/jpeg","image/gif","image/webp"]}
 ```
 
-Объявленные лимиты включительные: Markdown — 5 MiB точных декодированных UTF-8 байтов, максимум 100 assets, каждое изображение — 10 MiB, сумма изображений — 50 MiB, всё HTTP multipart-тело вместе с JSON escaping overhead, manifest, MIME-заголовками и разделителями — 64 MiB (`1 MiB = 1048576` байт). `image_pixels` — 40000000 пикселей на изображение, логический canvas GIF и каждый его кадр; `gif_frames` — 100 кадров; `gif_total_pixels` — 200000000 пикселей суммарно по кадрам одного GIF. Превышение любого бюджета — `413 clipper_too_large`. JSON-часть может превышать 5 MiB, если декодированный Markdown укладывается в лимит. Валидатор 5.1 поддерживает статические PNG/JPEG/WebP и GIF, включая анимацию; APNG, animated WebP и SVG/PDF дают `415 clipper_unsupported_image`. Публикация изображений остаётся **PLANNED (5.2)**: действующий text importer отклоняет даже корректные непустые assets как `400 clipper_invalid_request`, без claim/публикации. Старый лимит `/api/assets` не меняется.
+Объявленные лимиты включительные: Markdown — 5 MiB точных декодированных UTF-8 байтов, максимум 100 assets, каждое изображение — 10 MiB, сумма изображений — 50 MiB, всё HTTP multipart-тело вместе с JSON escaping overhead, manifest, MIME-заголовками и разделителями — 64 MiB (`1 MiB = 1048576` байт). `image_pixels` — 40000000 пикселей на изображение, логический canvas GIF и каждый его кадр; `gif_frames` — 100 кадров; `gif_total_pixels` — 200000000 пикселей суммарно по кадрам одного GIF. Превышение любого бюджета — `413 clipper_too_large`. JSON-часть может превышать 5 MiB, если декодированный Markdown укладывается в лимит. Поддерживаются статические PNG/JPEG/WebP и GIF, включая анимацию; APNG, animated WebP и SVG/PDF дают `415 clipper_unsupported_image`. Корректные вложения публикуются вместе с Markdown через HTTP import. Старый лимит `/api/assets` не меняется.
 
 `bases` возвращает только имена в порядке конфигурации. Пустые списки сериализуются как `[]`, не `null`. Discovery не выдаёт абсолютные пути, Git-настройки/секреты, токен/digest подключения или содержимое заметок.
 
@@ -128,9 +128,9 @@ Bearer Clipper не открывает `/api/config`, `/api/save`, Git API ил�
 
 Сервер не загружает URL из manifest и не генерирует title/frontmatter: клиент передаёт уже подготовленный Markdown, включая нужные YAML-метаданные.
 
-### Multipart и manifest — text-only
+### Multipart и manifest — Markdown и изображения
 
-POST принимает только `multipart/form-data; boundary=...`, без query и без дополнительных параметров outer Content-Type. Ровно одна часть `manifest`: `Content-Disposition: form-data; name="manifest"` и `Content-Type: application/json` (допускается только дополнительный `charset=utf-8`). Валидатор также разбирает бинарные части в любом порядке, в том числе до manifest: имя части должно точно совпадать с объявленным asset ID, каждая объявленная часть обязательна ровно один раз. MIME бинарной части без параметров должен совпасть с descriptor и фактическим форматом байтов; size и SHA-256 проверяются сервером. Необязательный `filename` игнорируется и не определяет путь на диске. Другие part headers, включая Content-Transfer-Encoding, не допускаются. Голый JSON, отсутствующие/неописанные/повторные части, mismatch size/hash/MIME, повреждённые/обрезанные данные и некорректный envelope дают `400 clipper_invalid_request`. Успешная публикация пока требует `assets: []`; attachments не отбрасываются молча. Используйте стандартный multipart writer с CRLF: closing delimiter без SP/HTAB padding, затем CRLF либо сразу EOF; LF-only closing и любой epilogue, даже после корректного closing, запрещены. Похожая на delimiter строка внутри бинарных данных сама по себе не является closing.
+POST принимает только `multipart/form-data; boundary=...`, без query и без дополнительных параметров outer Content-Type. Ровно одна часть `manifest`: `Content-Disposition: form-data; name="manifest"` и `Content-Type: application/json` (допускается только дополнительный `charset=utf-8`). Бинарные части разрешены в любом порядке, в том числе до manifest: имя части должно точно совпадать с объявленным asset ID, каждая объявленная часть обязательна ровно один раз. MIME бинарной части без параметров должен совпасть с descriptor и фактическим форматом байтов; size и SHA-256 проверяются сервером. Необязательный `filename` игнорируется и не определяет путь на диске. Другие part headers, включая Content-Transfer-Encoding, не допускаются. Голый JSON, отсутствующие/неописанные/повторные части, mismatch size/hash/MIME, повреждённые/обрезанные данные и некорректный envelope дают `400 clipper_invalid_request`. Допускаются как `assets: []`, так и проверенные вложения. Используйте стандартный multipart writer с CRLF: closing delimiter без SP/HTAB padding, затем CRLF либо сразу EOF; LF-only closing и любой epilogue, даже после корректного closing, запрещены. Похожая на delimiter строка внутри бинарных данных сама по себе не является closing.
 
 На точном imports endpoint **все** ответы, включая guards, ошибки и OPTIONS, имеют `Cache-Control: no-store`; JSON-ответы — `Content-Type: application/json`. Host/Origin/Bearer/setup проверяются до чтения тела и создания staging. После полного staging и строгого разбора секрет повторно авторизуется перед вызовом Import: отзыв во время upload даёт `401`, без публикации; operational auth error — безопасный `500`. Приватные временные файлы доступны только до возврата importer и затем удаляются на любом исходе. Отзыв после этой проверки не отменяет уже принятую операцию.
 
@@ -140,7 +140,7 @@ POST принимает только `multipart/form-data; boundary=...`, без
 {"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","destination_revision":"opaque","parent":"","filename":"clip.md","markdown":"Hello\n","source_url":"https://example.test/","captured_at":"2026-10-21T12:00:00Z","assets":[],"external_images":[]}
 ```
 
-Будущий пример descriptors для клипа с изображением и явно подтверждённой внешней ссылкой (сейчас непустой `assets` не принимается; sha256 — SHA-256 байтов изображения, не Markdown):
+Пример descriptors для клипа с изображением и явно подтверждённой внешней ссылкой (sha256 — SHA-256 байтов изображения, не Markdown):
 
 ```json
 {"assets":[{"id":"a1","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","media_type":"image/png","size":123}],"external_images":[{"url":"https://example.test/unavailable.png","reason":"permission_denied"}]}
@@ -150,7 +150,9 @@ POST принимает только `multipart/form-data; boundary=...`, без
 
 `parent` — существующая относительная папка, видимая в дереве заметок, либо `""`; `filename` — один безопасный компонент с `.md`. Новый импорт с любым компонентом `parent`, начинающимся с `.`, либо равным `assets` без учёта регистра отклоняется как `400 clipper_invalid_request`, включая ручной запрос в активную или неактивную базу и вложенные пути вроде `nested/.cache/deep` и `nested/assets/x`. Эта политика применяется до journal claim и файловых записей. Она не меняет синтаксическую проверку/canonical digest и применяется после поиска receipt: точный replay ранее завершённой попытки возвращает исторический результат. Политика относится только к родительским папкам заметки, не к её filename и не к серверным attachment paths. Абсолютные пути, выход из корня, `.git`, separators/control characters и Windows reserved names/characters отклоняются. Markdown — непустой подготовленный текст; сервер сохраняет его без нормализации окончаний строк.
 
-Будущая публикация изображений предусматривает `assets/images/clip-<import_id>-<sha256>.<verified-ext>` (`png`, `jpg`, `gif`, `webp`); attachment paths не задаются multipart filename.
+Изображения публикуются как `assets/images/clip-<import_id>-<sha256>.<verified-ext>` (`png`, `jpg`, `gif`, `webp`); attachment paths не задаются multipart filename. Одинаковые SHA-256/verified-ext внутри одной попытки дают один физический файл, даже при нескольких asset IDs. Существующие файлы никогда не перезаписываются и не принимаются как свои, даже при совпадении байтов. Заметка публикуется последней. Markdown сохраняется точно: клиент заранее подготавливает ссылки, например `../../assets/images/clip-<import_id>-<sha256>.png` для `research/articles/note.md`; сервер не выполняет глобальную замену URL. Поддержка этих относительных путей в preview редактора остаётся задачей 5.7.
+
+До записи в базу importer копирует проверенные bytes из request directory в собственный случайный подкаталог зарезервированного private staging, синхронизирует bytes/каталоги и сохраняет immutable journal v2 с источниками восстановления. Handler всегда удаляет исходный request directory. После устойчивого success receipt или подтверждённого безопасного отказа собственные источники удаляются; при pending/неопределённой публикации сохраняются. Возможен частичный результат: только в исходной критической секции разрешена очистка своих неизменённых assets по native identity и hash. Неопределённый rename (включая EEXIST), изменение файла пользователем, ошибки index/receipt после публикации заметки требуют recovery, а не обещания all-or-nothing.
 
 HTTP handler использует публичный строгий `DecodeClipperManifest` из `internal/service/clip_import_manifest.go`. Decoder требует все поля также внутри asset/external-image объектов, отклоняет `null`, неизвестные и повторные ключи на любом уровне (в том числе escape-эквивалентные), неверные типы и trailing JSON. Вход ограничен 64 MiB, включая JSON escapes; превышение — `clipper_too_large`. Проверка descriptors не проверяет фактические байты изображений и не обращается к сети/файловой системе.
 
@@ -216,11 +218,13 @@ Timeout, сетевой обрыв и 5xx сами по себе означаю�
 
 Административные list/abandon endpoints и recovery UI также PLANNED (5.5); будущий abandon должен завершать попытку как rejected с `clipper_import_abandoned`, не удаляя файлы и не допуская повторную публикацию прежнего ID.
 
+Новые private plans для text/image imports до файловых эффектов сохраняют ordered `warnings`, включая дубликаты и явный пустой массив. Receipt использует именно эту durable metadata. Отсутствующее поле в старом незавершённом плане означает неизвестные warnings, а не `[]`; будущая recovery должна требовать ручного вмешательства, если исходное значение нельзя достоверно восстановить. Завершённые исторические receipts воспроизводятся без изменений.
+
 ### Ошибки Clipper
 
 Форма — существующий `APIError {code,message,field?}`. Пример: `409 {"code":"clipper_destination_changed","message":"Clipper destination changed"}`. Типизированные Clipper errors получают фиксированные безопасные сообщения; внутренние пути, токены и wrapped diagnostics не выдаются.
 
-Discovery и text import используют коды ниже; origin/method/namespace ошибки описаны выше. `clipper_import_abandoned` зарезервирован для будущего abandon endpoint. `clipper_unsupported_image` возможен при проверке descriptor, MIME и неподдерживаемой анимации; публикация байтов изображений пока недоступна.
+Discovery и import используют коды ниже; origin/method/namespace ошибки описаны выше. `clipper_import_abandoned` зарезервирован для будущего abandon endpoint. `clipper_unsupported_image` возможен при проверке descriptor, MIME и неподдерживаемой анимации.
 
 | HTTP | code | Значение / пример message |
 |:---|:---|:---|
