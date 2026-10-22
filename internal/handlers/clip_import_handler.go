@@ -21,11 +21,17 @@ import (
 	"IGoNotes/internal/service"
 )
 
-// ClipImporter accepts validated text metadata. Asset staging/ownership can extend
-// this boundary when binary publication is implemented; it is not accepted yet.
+// ClipImporter is the text-only publication boundary.
 type ClipImporter interface {
 	Import(context.Context, model.ClipperManifest) (model.ClipperImportStatusResponse, bool, error)
 	Status(context.Context, string) (model.ClipperImportStatusResponse, error)
+}
+
+// StagedClipImporter optionally consumes validated assets while their private
+// request root is alive. Returning does NOT retain or transfer staging ownership.
+// An implementation must durably own every byte before reporting success.
+type StagedClipImporter interface {
+	ImportStaged(context.Context, *service.StagedClip) (model.ClipperImportStatusResponse, bool, error)
 }
 
 type ClipImportHandler struct {
@@ -80,18 +86,27 @@ func (h *ClipImportHandler) serveHTTP(w http.ResponseWriter, r *http.Request, re
 		WriteAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		return
 	}
-	manifest, err := h.stageManifest(w, r)
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	// Staging has already been removed. All text needed for recovery is retained
-	// durably by Import's journal; network/body IO never holds service/SQLite locks.
-	if err := reauthorize(); err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	status, replay, err := h.imports.Import(r.Context(), manifest)
+	var status model.ClipperImportStatusResponse
+	var replay bool
+	_, err := h.stageClip(w, r, func(payload *service.StagedClip) error {
+		if err := reauthorize(); err != nil {
+			return err
+		}
+		if err := r.Context().Err(); err != nil {
+			return err
+		}
+		var err error
+		if importer, ok := h.imports.(StagedClipImporter); ok {
+			status, replay, err = importer.ImportStaged(r.Context(), payload)
+		} else {
+			// Never silently drop attachments at the legacy text boundary.
+			if len(payload.Assets) != 0 {
+				return invalidClipImport()
+			}
+			status, replay, err = h.imports.Import(r.Context(), payload.Manifest)
+		}
+		return err
+	})
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -156,7 +171,7 @@ func writeClipImportJSON(w http.ResponseWriter, code int, value any) {
 
 func invalidClipImport() error { return &model.ClipperError{Code: model.ClipperInvalidRequest} }
 
-func (h *ClipImportHandler) stageManifest(w http.ResponseWriter, r *http.Request) (manifest model.ClipperManifest, err error) {
+func (h *ClipImportHandler) stageClip(w http.ResponseWriter, r *http.Request, consume func(*service.StagedClip) error) (manifest model.ClipperManifest, err error) {
 	if r.URL.RawQuery != "" || len(r.Header.Values("Content-Type")) != 1 {
 		return manifest, invalidClipImport()
 	}
@@ -196,7 +211,7 @@ func (h *ClipImportHandler) stageManifest(w http.ResponseWriter, r *http.Request
 	// Spool the entire bounded wire body before parsing or taking service locks.
 	// This also forces the total cap to cover MIME headers and any epilogue.
 	r.Body = http.MaxBytesReader(w, r.Body, model.ClipperMaxMultipartBytes)
-	if _, err := io.Copy(file, r.Body); err != nil {
+	if _, err := io.Copy(file, importContextReader{r.Context(), r.Body}); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			return manifest, &model.ClipperError{Code: model.ClipperTooLarge}
@@ -208,48 +223,29 @@ func (h *ClipImportHandler) stageManifest(w http.ResponseWriter, r *http.Request
 	}
 	// multipart.Reader accepts epilogues. v1 deliberately accepts none: verify
 	// the first final delimiter is at EOF, using only bounded line-prefix memory.
-	if err := clipImportEnvelope(file, boundary); err != nil {
+	if err := clipImportEnvelope(importContextReader{r.Context(), file}, boundary); err != nil {
 		return manifest, err
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return manifest, err
 	}
-	reader := multipart.NewReader(file, boundary)
-	part, err := reader.NextRawPart()
-	if err != nil {
-		return manifest, invalidClipImport()
-	}
-	if len(part.Header.Values("Content-Disposition")) != 1 || len(part.Header.Values("Content-Type")) != 1 {
-		return manifest, invalidClipImport()
-	}
-	disposition, fields, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-	if err != nil || disposition != "form-data" || fields["name"] != "manifest" {
-		return manifest, invalidClipImport()
-	}
-	for key := range fields {
-		if key != "name" && key != "filename" {
-			return manifest, invalidClipImport()
-		}
-	}
-	for key := range part.Header {
-		if key != "Content-Disposition" && key != "Content-Type" {
-			return manifest, invalidClipImport()
-		}
-	}
-	media, params, err = mime.ParseMediaType(part.Header.Get("Content-Type"))
-	if err != nil || media != "application/json" || len(params) > 1 || (len(params) == 1 && !strings.EqualFold(params["charset"], "utf-8")) {
-		return manifest, invalidClipImport()
-	}
-	manifest, err = service.DecodeClipperManifest(part)
+	payload, err := service.StageClip(r.Context(), stage, multipart.NewReader(file, boundary))
 	if err != nil {
 		return manifest, err
 	}
-	// Missing/duplicate/unadvertised binary parts and missing final boundaries
-	// are all rejected before the journal or a base can be touched.
-	if _, err := reader.NextRawPart(); err != io.EOF {
-		return manifest, invalidClipImport()
+	return payload.Manifest, consume(payload)
+}
+
+type importContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r importContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
 	}
-	return manifest, nil
+	return r.r.Read(p)
 }
 
 func clipImportEnvelope(input io.Reader, boundary string) error {
@@ -259,10 +255,38 @@ func clipImportEnvelope(input io.Reader, boundary string) error {
 	for {
 		prefix = prefix[:0]
 		length := 0
+		// Track the entire suffix in constant memory. A binary line beginning
+		// with "--boundary-- <other bytes>" is data, not a final delimiter.
+		suffixState := 0 // 0: padding, 1: CR, 2: LF, 3: not a delimiter
 		var err error
 		for {
 			var fragment []byte
 			fragment, err = reader.ReadSlice('\n')
+			for i, b := range fragment {
+				if length+i < len(closing) {
+					continue
+				}
+				switch suffixState {
+				case 0:
+					switch b {
+					case ' ', '\t':
+					case '\r':
+						suffixState = 1
+					case '\n':
+						suffixState = 2
+					default:
+						suffixState = 3
+					}
+				case 1:
+					if b == '\n' {
+						suffixState = 2
+					} else {
+						suffixState = 3
+					}
+				case 2:
+					suffixState = 3
+				}
+			}
 			length += len(fragment)
 			if len(prefix) < cap(prefix) {
 				n := min(cap(prefix)-len(prefix), len(fragment))
@@ -277,7 +301,7 @@ func clipImportEnvelope(input io.Reader, boundary string) error {
 		// mode. Our strict envelope permits only an unpadded CRLF final line or
 		// an unpadded closing at EOF. Reject other closing forms immediately:
 		// ignoring one could let the parser stop before an unchecked epilogue.
-		if strings.HasPrefix(string(prefix), closing) && len(prefix) > len(closing) {
+		if suffixState != 3 && strings.HasPrefix(string(prefix), closing) && len(prefix) > len(closing) {
 			switch prefix[len(closing)] {
 			case ' ', '\t', '\n':
 				return invalidClipImport()

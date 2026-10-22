@@ -9,6 +9,9 @@ const (
 	ClipperMaxAssetBytes      = 10 << 20
 	ClipperMaxTotalAssetBytes = 50 << 20
 	ClipperMaxMultipartBytes  = 64 << 20
+	ClipperMaxImagePixels     = 40_000_000
+	ClipperMaxGIFFrames       = 100
+	ClipperMaxGIFTotalPixels  = 200_000_000
 
 	ClipperImagePNG  = "image/png"
 	ClipperImageJPEG = "image/jpeg"
@@ -22,6 +25,9 @@ type ClipperLimits struct {
 	AssetBytes      int64 `json:"asset_bytes"`
 	TotalAssetBytes int64 `json:"total_asset_bytes"`
 	MultipartBytes  int64 `json:"multipart_bytes"`
+	ImagePixels     int64 `json:"image_pixels"`
+	GIFFrames       int   `json:"gif_frames"`
+	GIFTotalPixels  int64 `json:"gif_total_pixels"`
 }
 
 func ClipperV1Limits() ClipperLimits {
@@ -31,6 +37,9 @@ func ClipperV1Limits() ClipperLimits {
 		AssetBytes:      ClipperMaxAssetBytes,
 		TotalAssetBytes: ClipperMaxTotalAssetBytes,
 		MultipartBytes:  ClipperMaxMultipartBytes,
+		ImagePixels:     ClipperMaxImagePixels,
+		GIFFrames:       ClipperMaxGIFFrames,
+		GIFTotalPixels:  ClipperMaxGIFTotalPixels,
 	}
 }
 
