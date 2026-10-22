@@ -64,11 +64,51 @@ go build -trimpath -ldflags="-X IGoNotes/internal/appinfo.Version=v0.0.1-alpha.6
 
 `ResolveStartupBase` проверяет все `Base.Path`, включая неактивные, до `InitDB`, runtime/index writes и до создания default/config при первом запуске. `BaseDir` — контейнер и не является базой. Конструкторы settings проверяют snapshot до миграции setup. Setup/add проверяются до `Mkdir`, а изменения конфигурации и switch — под `coordinator -> SettingsService.mu` до persistence/runtime transaction; общая проверка предшествует записи Git statuses. Дополнительно Clipper destination проверяется заново при использовании пути. Symlink ancestors разрешаются заново, включая отсутствующий хвост пути; containment использует `filepath.Rel` с Windows case handling и native identity, а не строковый prefix. Не резервируется весь `appDataDir`: `~/.igonotes/bases/default` допустим.
 
-Для интеграции task 4.4 предназначен `SettingsService.OpenPrivateStagingRoot() (*os.Root, error)`: под короткими lifecycle locks проверяет актуальные базы, создаёт только выделенный staging (0700), открывает и проверяет pinned root identity. Владение возвращённым handle и `Close` — у вызывающего кода; временные файлы создаются root-relative, сетевое чтение выполняется после освобождения locks. Не использовать весь `appDataDir` как временный каталог. HTTP импорт/статус пока **PLANNED**. Внешняя злонамеренная подмена filesystem не сериализуется coordinator и не входит в гарантию; API lifecycle не может объявить staging частью базы во время upload.
+HTTP text import использует `SettingsService.OpenPrivateStagingRoot() (*os.Root, error)`: под короткими lifecycle locks проверяет актуальные базы, создаёт только выделенный staging (0700), открывает и проверяет pinned root identity. Владение возвращённым handle и `Close` — у вызывающего кода; временные файлы создаются root-relative, сетевое чтение выполняется после освобождения locks. Не использовать весь `appDataDir` как временный каталог. `~/.igonotes/clipper-staging/` зарезервирован постоянно, независимо от наличия upload; временный wire body удаляется после staging/разбора, до Import. Внешняя злонамеренная подмена filesystem не сериализуется coordinator и не входит в гарантию; API lifecycle не может объявить staging частью базы во время upload.
 
 При несовместимой существующей конфигурации startup сообщает имя базы и требует вручную исправить `config.json`; никаких автоматических moves/deletes. Остановите приложение, сохраните backup и укажите отдельные фактические каталоги заметок во всех несовместимых `bases[].path`; вынесите `--config` из базы при необходимости (подробности в user docs). API использует прежний безопасный `422 invalid_base_path`/`FieldError`, без абсолютных служебных путей. Focused regression: `go test ./internal/service ./internal/handlers ./cmd/api -run PrivateStorage -count=1`; зеркала документации проверяет `go test ./internal/docs -count=1`.
 
 Accessor `ConfigService.PrivateStoragePolicy()` возвращает отдельную копию; settings дополнительно копирует policy любого provider при конструировании и не сохраняет внешнюю изменяемую ссылку. Поля policy — строки, поэтому поверхностная копия полностью отделяет snapshot. Ненулевой указатель на zero-value policy отклоняется даже при пустой конфигурации; отсутствие provider (`nil`) допускается только для pathless stores. `NewPrivateStoragePolicy` требует все три назначения; обычный `NewConfigService` без полного layout всё равно резервирует собственный config directory. Native-alias containment сравнивает идентичности существующих предков вместе с оставшимися компонентами, в том числе когда оба конечных пути ещё отсутствуют. Windows-only regression проверяет `subst` и отказ Add/create до `Mkdir`; на других ОС она не исполняется.
+
+## HTTP text import Web Clipper
+
+`RegisterClipImportRoutes` регистрирует ровно `/api/clipper/v1/imports` (GET/POST/OPTIONS), с loopback Host, extension Origin/Bearer guard и setup guard; endpoint по умолчанию `http://127.0.0.1:8080`. Авторизация и setup предшествуют чтению тела/созданию staging, после staging тот же секрет повторно проверяется перед Import. Внешняя обёртка ставит `Cache-Control: no-store` также на ошибки guards и OPTIONS; JSON-ответы имеют `Content-Type: application/json`.
+
+POST принимает только multipart с единственной JSON-частью `manifest`: `Content-Disposition: form-data; name="manifest"`, `Content-Type: application/json` (опционально `charset=utf-8`), `assets: []`. Голый JSON и бинарные/повторные/дополнительные части отвергаются как `400 clipper_invalid_request`. Стандартный multipart writer формирует CRLF; closing без padding SP/HTAB, с CRLF или сразу EOF. LF-only closing, обрыв и любой epilogue запрещены. Wire cap 64 MiB включает JSON escaping, MIME headers и framing; лимит Markdown 5 MiB относится к декодированным UTF-8 байтам. Поэтому JSON-часть может превышать 5 MiB. Строгий публичный `service.DecodeClipperManifest` проверяет полную схему, Unicode, дубли/неизвестные/null поля и trailing JSON. Canonical digest v1 в [API](api.md) остаётся точным определением immutable payload.
+
+`ClipImportService` ищет durable receipt по ID/digest до текущей проверки назначения/revision и видимости parent. Новый импорт требует существующий видимый parent (корень `""` разрешён; dot/`assets` components запрещены), актуальную destination_revision, private-storage policy и Git conflict gate; не переключает активную базу и не создаёт папки. Порядок locks: `coordinator -> SettingsService.mu -> NoteService.baseMu -> repository/SQLite`. Network/body IO идёт вне них. Markdown сохраняется побайтно: title/YAML должны быть уже включены клиентом, URL сервер не загружает.
+
+POST возвращает `201` с `ClipperImportResult` при новой публикации, `200` с тем же телом при успешном same-ID/same-payload replay, `202` с **APIError**, не result, при pending: `{"code":"clipper_import_pending","message":"Clipper import pending"}`. GET с единственным `id=<lowercase-UUID-v4>` (raw query до 8192 байт) возвращает `200` и `ClipperImportStatusResponse`: `pending` без result/error, `succeeded` только с result, `rejected`/`recovery_required` только с error. Неизвестный/невалидный ID даёт `400`, что не доказывает отсутствия ещё выполняющегося POST. Все публичные ошибки безопасны, без private paths/journal/token.
+
+Timeout, network error и неразрешённый 5xx требуют GET/точного replay прежнего ID с неизменными payload и destination_revision. Не удалять expected checks и не обновлять revision/назначение автоматически. Только подтверждённый rejected позволяет исправить запрос с новым ID и заново подтвердить назначение; pending/recovery_required и один `500` не являются таким подтверждением. Другой digest под старым ID — `409 clipper_request_changed`. Исторический успешный receipt возвращается без перепубликации даже после restart/rename/удаления файла или смены действующего токена.
+
+Revision нового result вычисляется общим `noteRevision` как `sha256:<hex>` по точным байтам Markdown и совпадает с ревизией `NoteService.GetNote`. Private file/journal hashes и canonical request digest остаются bare hex. Replay возвращает сохранённый исторический result без преобразования.
+
+Private SQLite journal уже хранит точный Markdown, план/identity/hash, состояния `prepared`/`publishing`, checkpoints и durable receipt. Временный HTTP wire body не является recovery-копией текста; после его удаления текст остаётся в private journal. Ошибки после возможной публикации не приводят к позднему удалению файлов; unresolved import блокирует новую публикацию в тот же корень. Это не завершённый recovery pipeline: roll-forward (5.3), startup recovery после local Git recovery и до GitManager.Start/HTTP (5.4), same-origin list/abandon endpoints и recovery UI (5.5) всё ещё **PLANNED**, как Chromium-расширение и публикация изображений.
+
+### Локальный request fixture
+
+`testdata/clipper/text-import.json` — полный manifest без секрета, с фиксированным валидным UUID v4, базой `target`, готовым UTF-8 Markdown/YAML и явно нерабочим placeholder destination_revision. Для ручной отправки:
+
+1. Запустите IGoNotes, завершите setup, создайте подключение в `Настройки → Веб-клиппер`. Сохраните выданный секрет вне fixture и репозитория, например в переменной окружения `CLIPPER_SECRET`. Используйте точный loopback endpoint/порт своей установки.
+2. С этим Bearer выполните `GET /api/clipper/v1/bases`, затем `GET /api/clipper/v1/folders?base=<URL-encoded-реальное-имя>`. Явно подтвердите базу/папку. В локальной копии fixture задайте реальное имя `base`, возвращённый `destination_revision` и существующий `parent` (или `""`); placeholder и `opaque` из примеров не являются рабочими handles.
+3. Перед **новой** попыткой сгенерируйте свежий lowercase UUID v4, например стандартным Python `uuid.uuid4()`, и задайте `import_id`. Выберите свободный filename, если `text-import.md` уже существует. После начала попытки сохраните эту копию неизменной для status/replay.
+4. Передайте локальную копию как единственную multipart-часть с JSON MIME; не используйте обычный form field без Content-Type. Пример из корня checkout, где `text-import.local.json` — подготовленная копия, а `CLIPPER_SECRET` содержит реальный секрет:
+
+   ```bash
+   curl --include --header "Authorization: Bearer ${CLIPPER_SECRET}" \
+     --form 'manifest=@text-import.local.json;type=application/json' \
+     http://127.0.0.1:8080/api/clipper/v1/imports
+   ```
+
+   Для статуса отправьте GET на тот же endpoint с `?id=<UUID-из-копии>` и тем же Bearer. CLI без Origin допустим; реальный extension Origin должен пройти guard. На uncertain outcome используйте прежнюю копию, а не новый UUID или свежую revision.
+
+`internal/handlers/clip_import_fixture_test.go` читает fixture с диска через тот же публичный строгий decoder, заменяет только process-local revision реальным folders handle, использует базу `target` тестового окружения и реальный service/SQLite/router. Проверяет 201 → 200 с побайтно одинаковым receipt, отсутствие дублей, точный Markdown/hash, index path и точный GET snapshot. Секрет создаётся только в изолированном тесте. Проверки без frontend-команд и внешней сети:
+
+```bash
+go test ./internal/handlers -run 'ClipImport.*Fixture|ClipImportHTTP' -count=1
+go test ./internal/docs -count=1
+```
 
 ## Архитектура frontend
 

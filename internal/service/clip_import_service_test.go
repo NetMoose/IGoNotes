@@ -88,7 +88,7 @@ func TestClipImportActiveInactiveReceiptReplay(t *testing.T) {
 				root = f.target
 			}
 			data, err := os.ReadFile(filepath.Join(root, m.Filename))
-			if err != nil || string(data) != m.Markdown || status.Result.Revision != clipContentHash(data) {
+			if err != nil || string(data) != m.Markdown || status.Result.Revision != noteRevision(data) {
 				t.Fatalf("content/revision = %q, %+v, %v", data, status, err)
 			}
 			nodes, err := f.index.GetAllNodes()
@@ -563,7 +563,7 @@ func TestClipImportActiveReceiptOrderingAndExactBytes(t *testing.T) {
 		return nil
 	}}
 	status, _, err := f.service.Import(context.Background(), m)
-	if err != nil || !checked || status.Result == nil || status.Result.Path != "research/articles/clip.md" || status.Result.Revision != clipContentHash([]byte(m.Markdown)) || !reflect.DeepEqual(status.Result.Warnings, []string{"Image unavailable"}) {
+	if err != nil || !checked || status.Result == nil || status.Result.Path != "research/articles/clip.md" || status.Result.Revision != noteRevision([]byte(m.Markdown)) || !reflect.DeepEqual(status.Result.Warnings, []string{"Image unavailable"}) {
 		t.Fatalf("result = %+v %v", status, err)
 	}
 	data, err := os.ReadFile(filepath.Join(f.active, filepath.FromSlash(status.Result.Path)))

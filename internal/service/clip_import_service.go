@@ -234,7 +234,7 @@ func (s *ClipImportService) importDestinationLocked(ctx context.Context, m model
 	for _, external := range m.ExternalImages {
 		warnings = append(warnings, external.Reason)
 	}
-	result := &model.ClipperImportResult{ImportID: record.ImportID, Base: record.BaseName, Path: record.NotePath, Revision: file.plan.SHA256, Warnings: warnings}
+	result := &model.ClipperImportResult{ImportID: record.ImportID, Base: record.BaseName, Path: record.NotePath, Revision: noteRevision([]byte(m.Markdown)), Warnings: warnings}
 	if err := s.store.Transition(ctx, record.ImportID, record.Version(), repository.ClipImportSucceeded, result, nil); err != nil {
 		return fail(err)
 	}
