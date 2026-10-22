@@ -120,7 +120,8 @@ func TestEmptyConfigStartupCanCompleteSetup(t *testing.T) {
 				t.Fatalf("migrated SetupCompleted = %v, want false", migrated.SetupCompleted)
 			}
 
-			requestPath := filepath.Join(root, "base-parent")
+			// The entire config folder is private; notes use a separate root.
+			requestPath := filepath.Join(t.TempDir(), "base-parent")
 			if err := os.Mkdir(requestPath, 0755); err != nil {
 				t.Fatalf("os.Mkdir() error = %v, want nil", err)
 			}

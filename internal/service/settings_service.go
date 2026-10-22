@@ -62,6 +62,7 @@ type SettingsService struct {
 	config           model.Config
 	degraded         error
 	clipperBindings  map[string]*clipperDestinationBinding
+	privateStorage   *PrivateStoragePolicy
 }
 
 func NewSettingsService(
@@ -103,6 +104,10 @@ func NewSettingsServiceWithGit(
 		return nil, fmt.Errorf("load settings: %w: store returned nil config", ErrInvalidConfig)
 	}
 	config := cloneConfig(*loadedConfig)
+	policy := privatePolicyFromStore(store)
+	if err := policy.validateConfig(config); err != nil {
+		return nil, err
+	}
 	effectiveBaseName := config.CurrentBase
 	if activeBaseName != "" {
 		effectiveBaseName = activeBaseName
@@ -149,6 +154,7 @@ func NewSettingsServiceWithGit(
 
 	return &SettingsService{
 		store:            store,
+		privateStorage:   policy,
 		notes:            notes,
 		coordinator:      coordinator,
 		logger:           logger,
@@ -279,6 +285,9 @@ func (s *SettingsService) applyConfigWithConflictSnapshotLocked(
 	targetPath string,
 	conflicts conflictReconciliationSnapshot,
 ) error {
+	if err := s.privateStorage.validateConfig(next); err != nil {
+		return err
+	}
 	expectedPath, err := configuredBasePath(next, next.CurrentBase)
 	if err != nil {
 		return err
@@ -496,6 +505,9 @@ func (s *SettingsService) applyConfigWithGitStatusesLocked(
 	targetPath string,
 	changes []gitStatusChange,
 ) error {
+	if err := s.privateStorage.validateConfig(next); err != nil {
+		return err
+	}
 	if s.gitStatuses == nil || len(changes) == 0 {
 		return s.applyConfigLocked(next, targetPath)
 	}
@@ -806,6 +818,9 @@ func (s *SettingsService) GitSnapshot(name string) (gitcmd.ConfiguredBase, bool,
 	if index < 0 {
 		return gitcmd.ConfiguredBase{}, false, ErrBaseNotFound
 	}
+	if err := s.privateStorage.ValidateBasePath(s.config.Bases[index].Path); err != nil {
+		return gitcmd.ConfiguredBase{}, false, err
+	}
 	snapshot, err := configuredBase(s.config.Bases[index])
 	if err != nil {
 		return gitcmd.ConfiguredBase{}, false, err
@@ -823,6 +838,9 @@ func (s *SettingsService) GitSnapshots() ([]gitcmd.ConfiguredBase, error) {
 	for _, base := range s.config.Bases {
 		if !base.GitConfigured() {
 			continue
+		}
+		if err := s.privateStorage.ValidateBasePath(base.Path); err != nil {
+			return nil, err
 		}
 		snapshot, err := configuredBase(base)
 		if err != nil {
@@ -900,6 +918,9 @@ func (s *SettingsService) CompleteSetup(request model.BaseMutationRequest) (mode
 	if err != nil {
 		return model.SettingsResponse{}, err
 	}
+	if err := s.privateStorage.ValidateBasePath(prepared.base.Path); err != nil {
+		return model.SettingsResponse{}, err
+	}
 
 	if prepared.create {
 		if err := createBaseDirectory(prepared); err != nil {
@@ -943,6 +964,11 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 	if err := ensureUniqueName(s.config, prepared.base.Name, ""); err != nil {
 		return model.SettingsResponse{}, err
 	}
+	next := cloneConfig(s.config)
+	next.Bases = append(next.Bases, prepared.base)
+	if err := s.privateStorage.validateConfig(next); err != nil {
+		return model.SettingsResponse{}, err
+	}
 
 	if prepared.create {
 		if err := createBaseDirectory(prepared); err != nil {
@@ -950,8 +976,6 @@ func (s *SettingsService) AddBase(request model.BaseMutationRequest) (model.Sett
 		}
 	}
 
-	next := cloneConfig(s.config)
-	next.Bases = append(next.Bases, prepared.base)
 	if err := s.applyConfigLocked(next, ""); err != nil {
 		return model.SettingsResponse{}, err
 	}

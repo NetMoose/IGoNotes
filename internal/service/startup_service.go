@@ -13,6 +13,15 @@ const defaultBaseName = "default"
 
 // ResolveStartupBase initializes configuration when needed and returns the selected base path.
 func ResolveStartupBase(configService *ConfigService, requestedBase, dataDir string) (string, error) {
+	// Startup runs before the store is shared. Production supplies the complete
+	// immutable layout at construction; standalone startup callers get it here.
+	if configService.privateStorage.sqlitePath == "" {
+		policy, err := NewPrivateStoragePolicy(filepath.Dir(configService.configPath), filepath.Join(dataDir, "metadata.db"), filepath.Join(dataDir, "clipper-staging"))
+		if err != nil {
+			return "", err
+		}
+		configService.privateStorage = policy
+	}
 	needsInitialization, err := configService.NeedsInitialization()
 	if err != nil {
 		return "", fmt.Errorf("не удалось проверить конфигурацию: %w", err)
@@ -31,6 +40,17 @@ func ResolveStartupBase(configService *ConfigService, requestedBase, dataDir str
 		}
 	}
 
+	for _, base := range config.Bases {
+		if base.Path == "" {
+			return "", fmt.Errorf("у базы %q пустой путь", base.Name)
+		}
+		if _, err := canonicalProspectivePath(base.Path); err != nil {
+			return "", fmt.Errorf("не удалось проверить путь базы %q; исправьте config.json вручную: %w", base.Name, err)
+		}
+		if err := configService.privateStorage.ValidateBasePath(base.Path); err != nil {
+			return "", fmt.Errorf("база %q: несовместимый путь служебного хранения; исправьте путь базы в config.json вручную перед запуском: %w", base.Name, err)
+		}
+	}
 	structurallyEmpty := config.BaseDir == "" && len(config.Bases) == 0 && config.CurrentBase == ""
 	setupIncomplete := config.SetupCompleted == nil || !*config.SetupCompleted
 	if structurallyEmpty && setupIncomplete && requestedBase == "" {
@@ -46,6 +66,9 @@ func initializeDefaultConfig(configService *ConfigService, dataDir string) (*mod
 		return nil, fmt.Errorf("не удалось определить абсолютный путь каталога баз: %w", err)
 	}
 	basePath := filepath.Join(baseRoot, defaultBaseName)
+	if err := configService.privateStorage.ValidateBasePath(basePath); err != nil {
+		return nil, fmt.Errorf("база по умолчанию: исправьте каталог --config вручную перед запуском: %w", err)
+	}
 	if err := os.MkdirAll(basePath, 0755); err != nil {
 		return nil, fmt.Errorf("не удалось создать базу по умолчанию %q: %w", basePath, err)
 	}

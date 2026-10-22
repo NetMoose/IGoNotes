@@ -65,7 +65,8 @@ func TestClipperDiscoveryRouterIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	config := service.NewConfigService(filepath.Join(root, "config.json"))
+	configPath := filepath.Join(root, "config", "config.json")
+	config := service.NewConfigService(configPath)
 	complete := true
 	cfg := model.Config{CurrentBase: "active", SetupCompleted: &complete, Bases: []model.Base{
 		{Name: "active", Path: active}, {Name: "inactive", Path: inactive, GitURL: "https://user:GIT_SECRET@example.invalid/repo", GitBranch: "private-branch"},
@@ -97,7 +98,7 @@ func TestClipperDiscoveryRouterIntegration(t *testing.T) {
 		return router
 	}
 	router := routerFor(settings)
-	beforeConfig, _ := os.ReadFile(filepath.Join(root, "config.json"))
+	beforeConfig, _ := os.ReadFile(configPath)
 	beforeTree, err := notes.GetTree()
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +153,7 @@ func TestClipperDiscoveryRouterIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	afterConfig, _ := os.ReadFile(filepath.Join(root, "config.json"))
+	afterConfig, _ := os.ReadFile(configPath)
 	if !reflect.DeepEqual(beforeTree, afterTree) || string(beforeConfig) != string(afterConfig) || notes.GetBasePath() != active || settings.GetConfig().CurrentBase != "active" {
 		t.Fatal("discovery changed editor/config/index")
 	}

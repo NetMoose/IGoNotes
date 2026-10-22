@@ -168,6 +168,9 @@ func (s *SettingsService) withClipperDestinationSnapshotLocked(name string, use 
 	if name == "" || index < 0 {
 		return &model.ClipperError{Code: model.ClipperDestinationNotFound}
 	}
+	if err := s.privateStorage.ValidateBasePath(s.config.Bases[index].Path); err != nil {
+		return err
+	}
 	notes, ok := s.notes.(*NoteService)
 	if !ok || notes.coordinator != s.coordinator {
 		return fmt.Errorf("Clipper pinned runtime dependency: %w", ErrInvalidConfig)

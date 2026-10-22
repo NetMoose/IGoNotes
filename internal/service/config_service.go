@@ -11,13 +11,32 @@ import (
 
 // ConfigService предоставляет методы для работы с конфигурацией приложения
 type ConfigService struct {
-	configPath string
-	replace    func(string, string) error
+	configPath     string
+	replace        func(string, string) error
+	privateStorage *PrivateStoragePolicy
 }
 
 // NewConfigService создает новый экземпляр ConfigService
-func NewConfigService(configPath string) *ConfigService {
-	return &ConfigService{configPath: configPath, replace: replaceFile}
+func NewConfigService(configPath string, policy ...*PrivateStoragePolicy) *ConfigService {
+	// Even callers without a full application layout reserve the config folder.
+	configDir := filepath.Dir(configPath)
+	if absolute, err := filepath.Abs(configDir); err == nil {
+		configDir = absolute
+	}
+	p := &PrivateStoragePolicy{configDir: configDir}
+	if len(policy) > 0 && policy[0] != nil {
+		copied := *policy[0]
+		// An explicit layout can add reservations but cannot exempt this store's
+		// actual config folder. Copy rather than modifying the caller's policy.
+		copied.configDir = configDir
+		p = &copied
+	}
+	return &ConfigService{configPath: configPath, replace: replaceFile, privateStorage: p}
+}
+
+// PrivateStoragePolicy returns a detached snapshot, never the store's live policy.
+func (s *ConfigService) PrivateStoragePolicy() *PrivateStoragePolicy {
+	return s.privateStorage.clone()
 }
 
 // Load загружает конфигурацию из файла

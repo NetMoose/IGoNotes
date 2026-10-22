@@ -60,18 +60,22 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 		return fmt.Errorf("определить каталог конфигурации: %w", err)
 	}
 	configFile := filepath.Join(resolvedConfigDir, "config.json")
-	configService := service.NewConfigService(configFile)
 
 	appDataDir, err := resolveDataDir(os.UserHomeDir)
 	if err != nil {
 		return fmt.Errorf("определить каталог данных: %w", err)
 	}
+	dbPath := filepath.Join(appDataDir, "metadata.db")
+	privateStorage, err := service.NewPrivateStoragePolicy(resolvedConfigDir, dbPath, filepath.Join(appDataDir, "clipper-staging"))
+	if err != nil {
+		return fmt.Errorf("определить служебное хранение: %w", err)
+	}
+	configService := service.NewConfigService(configFile, privateStorage)
 	basePath, err := service.ResolveStartupBase(configService, options.base, appDataDir)
 	if err != nil {
 		return fmt.Errorf("выбрать базу заметок: %w", err)
 	}
 
-	dbPath := filepath.Join(appDataDir, "metadata.db")
 	db, err := repository.InitDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("инициализировать БД: %w", err)
