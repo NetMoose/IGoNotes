@@ -160,3 +160,27 @@ func TestClipperDiscoveryWiringBearerAndSetup(t *testing.T) {
 		}
 	}
 }
+
+func TestRunServerWiresClipImportsWithPrivateDataBeforeServing(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := string(source)
+	for _, snippet := range []string{
+		"clipperDestinationService := service.NewClipperDestinationService(settingsService)",
+		"clipImportRepo := repository.NewClipImportRepository(db)",
+		"clipImportService, err := service.NewClipImportService(settingsService, clipperDestinationService, noteService, clipImportRepo)",
+		"if err != nil {",
+		"clipImportHandler, err := handlers.NewClipImportHandler(clipImportService, settingsService)",
+		"if err != nil {",
+		"handlers.RegisterClipImportRoutes(router, clipImportHandler, clipperConnectionService, settingsService)",
+		"return serveLocal(ctx, address, newHTTPServer(router)",
+	} {
+		index := strings.Index(remaining, snippet)
+		if index < 0 {
+			t.Fatalf("missing production import wiring in order: %q", snippet)
+		}
+		remaining = remaining[index+len(snippet):]
+	}
+}

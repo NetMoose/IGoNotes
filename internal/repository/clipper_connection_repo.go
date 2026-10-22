@@ -49,10 +49,13 @@ func (r *ClipperConnectionRepository) Create(ctx context.Context, connection mod
 	if len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "" {
 		return errors.New("create Clipper connection: invalid SHA-256 digest")
 	}
-	_, err := r.db.ExecContext(ctx, `
+	err := retryClipImportLocked(ctx, func() error {
+		_, err := r.db.ExecContext(ctx, `
 		INSERT INTO clipper_connections (id, label, secret_digest, created_at)
 		VALUES (?, ?, ?, ?)
 	`, connection.ID, connection.Label, digest, connection.CreatedAt.UTC().Format(time.RFC3339Nano))
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("create Clipper connection: %w", err)
 	}
@@ -62,6 +65,16 @@ func (r *ClipperConnectionRepository) Create(ctx context.Context, connection mod
 // List returns public metadata, including revoked connections, in ID order.
 // Its query intentionally never reads the credential column.
 func (r *ClipperConnectionRepository) List(ctx context.Context) ([]model.ClipperConnection, error) {
+	var connections []model.ClipperConnection
+	err := retryClipImportLocked(ctx, func() error {
+		var err error
+		connections, err = r.list(ctx)
+		return err
+	})
+	return connections, err
+}
+
+func (r *ClipperConnectionRepository) list(ctx context.Context) ([]model.ClipperConnection, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT id, label, created_at, revoked_at FROM clipper_connections ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list Clipper connections: %w", err)
@@ -90,6 +103,17 @@ func (r *ClipperConnectionRepository) List(ctx context.Context) ([]model.Clipper
 // authenticate: callers must check revocation and compare the digest themselves.
 func (r *ClipperConnectionRepository) CredentialByID(ctx context.Context, id string) (ClipperConnectionCredential, bool, error) {
 	var credential ClipperConnectionCredential
+	var found bool
+	err := retryClipImportLocked(ctx, func() error {
+		var err error
+		credential, found, err = r.credentialByID(ctx, id)
+		return err
+	})
+	return credential, found, err
+}
+
+func (r *ClipperConnectionRepository) credentialByID(ctx context.Context, id string) (ClipperConnectionCredential, bool, error) {
+	var credential ClipperConnectionCredential
 	var created string
 	var revoked sql.NullString
 	err := r.db.QueryRowContext(ctx, `SELECT id, label, created_at, revoked_at, secret_digest FROM clipper_connections WHERE id = ?`, id).Scan(
@@ -113,7 +137,12 @@ func (r *ClipperConnectionRepository) Revoke(ctx context.Context, id string, rev
 	if !validClipperConnectionTime(revokedAt) {
 		return errors.New("revoke Clipper connection: invalid time")
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE clipper_connections SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?`, revokedAt.UTC().Format(time.RFC3339Nano), id)
+	var result sql.Result
+	err := retryClipImportLocked(ctx, func() error {
+		var err error
+		result, err = r.db.ExecContext(ctx, `UPDATE clipper_connections SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?`, revokedAt.UTC().Format(time.RFC3339Nano), id)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("revoke Clipper connection: %w", err)
 	}

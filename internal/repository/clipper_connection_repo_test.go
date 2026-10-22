@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -213,5 +214,99 @@ func TestClipperConnectionRepositoryValidationAndContext(t *testing.T) {
 	got, found, err := repo.CredentialByID(context.Background(), connection.ID)
 	if err != nil || !found || got.Connection.RevokedAt != nil {
 		t.Fatal("failed revoke changed state")
+	}
+}
+
+func TestClipperConnectionRepositoryContentionWaitAndCancellation(t *testing.T) {
+	for _, operation := range []string{"credential", "list", "create", "revoke"} {
+		for _, canceled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%v", operation, canceled), func(t *testing.T) {
+				db, err := InitDB(filepath.Join(t.TempDir(), "metadata.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				repo := NewClipperConnectionRepository(db)
+				connection, digest := clipperConnectionFixture()
+				if err := repo.Create(t.Context(), connection, digest); err != nil {
+					t.Fatal(err)
+				}
+				locker, err := db.Conn(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer locker.Close()
+				if _, err := locker.ExecContext(t.Context(), "BEGIN EXCLUSIVE"); err != nil {
+					t.Fatal(err)
+				}
+				defer locker.ExecContext(context.Background(), "ROLLBACK")
+				revoked := connection.CreatedAt.Add(time.Hour).UTC()
+				// A lookup that waited for the writer must observe committed revocation,
+				// not credentials cached before contention or an authorization bypass.
+				if operation == "credential" {
+					if _, err := locker.ExecContext(t.Context(), "UPDATE clipper_connections SET revoked_at=? WHERE id=?", revoked.Format(time.RFC3339Nano), connection.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				result := make(chan error, 1)
+				go func() {
+					var err error
+					switch operation {
+					case "credential":
+						var got ClipperConnectionCredential
+						var found bool
+						got, found, err = repo.CredentialByID(ctx, connection.ID)
+						if err == nil && (!found || got.Connection.RevokedAt == nil || !got.Connection.RevokedAt.Equal(revoked)) {
+							err = errors.New("lookup did not observe committed revocation")
+						}
+					case "list":
+						var got []model.ClipperConnection
+						got, err = repo.List(ctx)
+						if err == nil && len(got) != 1 {
+							err = errors.New("list changed during contention")
+						}
+					case "create":
+						other := connection
+						other.ID = "after-lock"
+						err = repo.Create(ctx, other, strings.Repeat("b", 64))
+					case "revoke":
+						err = repo.Revoke(ctx, connection.ID, revoked)
+					}
+					result <- err
+				}()
+				select {
+				case err := <-result:
+					t.Fatalf("operation returned before lock release/cancel: %v", err)
+				case <-time.After(50 * time.Millisecond):
+				}
+				if canceled {
+					cancel()
+				} else if _, err := locker.ExecContext(t.Context(), "COMMIT"); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err := <-result:
+					if canceled && !errors.Is(err, context.Canceled) {
+						t.Fatalf("cancellation: %v", err)
+					}
+					if !canceled && err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("operation did not finish")
+				}
+				if !canceled && operation == "revoke" {
+					if err := repo.Revoke(t.Context(), connection.ID, revoked.Add(time.Hour)); err != nil {
+						t.Fatal(err)
+					}
+					got, found, err := repo.CredentialByID(t.Context(), connection.ID)
+					if err != nil || !found || got.Connection.RevokedAt == nil || !got.Connection.RevokedAt.Equal(revoked) {
+						t.Fatalf("first revocation changed: %+v %v", got.Connection, err)
+					}
+				}
+			})
+		}
 	}
 }

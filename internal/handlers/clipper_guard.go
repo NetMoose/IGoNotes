@@ -19,6 +19,15 @@ type ClipperAuthenticator interface {
 // RequireLocalOrigin, with setup checks inside next. Never wrap ordinary or
 // management APIs with this guard. No routes are registered here.
 func RequireClipper(auth ClipperAuthenticator, next http.Handler, methods ...string) http.Handler {
+	return requireClipper(auth, func(w http.ResponseWriter, r *http.Request, _ string) {
+		next.ServeHTTP(w, r)
+	}, methods...)
+}
+
+// requireClipper passes the strictly parsed, authenticated token only to its
+// request-scoped callback. Import routes can recheck that same authority after
+// upload without another token parser or persisting credentials in context/URLs.
+func requireClipper(auth ClipperAuthenticator, next func(http.ResponseWriter, *http.Request, string), methods ...string) http.Handler {
 	allowed := make(map[string]bool, len(methods))
 	for _, method := range methods {
 		if method == http.MethodGet || method == http.MethodPost {
@@ -90,7 +99,7 @@ func RequireClipper(auth ClipperAuthenticator, next http.Handler, methods ...str
 		}
 		// Fetch metadata is not authorization: extension fetch may be cross-site,
 		// and native clients may omit it. Both still require the Bearer above.
-		next.ServeHTTP(w, r)
+		next(w, r, token)
 	})
 }
 
