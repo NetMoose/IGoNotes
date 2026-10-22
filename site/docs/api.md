@@ -74,6 +74,8 @@ http://127.0.0.1:8080
 | GET | `/api/clipper/v1/folders?base=<name>` | 200 | Папки выбранной базы и ревизия назначения |
 | POST | `/api/clipper/v1/imports` | 201 / 200 / 202 | Новый import с изображениями или без / успешный replay / pending APIError |
 | GET | `/api/clipper/v1/imports?id=<uuid>` | 200 | Снимок состояния известной попытки |
+| GET | `/api/clipper/imports` | 200 | Локальный административный список незавершённых импортов |
+| POST | `/api/clipper/imports/abandon?id=<uuid>` | 200 | Прекратить recovery_required; снимок rejected, файлы сохраняются |
 
 `POST /api/sync` обновляет только индекс файловой системы; Git-синхронизация запускается через `POST /api/git/sync`.
 
@@ -221,6 +223,10 @@ Timeout, сетевой обрыв и 5xx сами по себе означаю�
 Private SQLite journal хранит точный Markdown, `prepared`/`publishing`, checkpoints и durable receipt; незавершённые состояния отображаются как `pending`/`recovery_required`, новые публикации в корень с unresolved import блокируются. При запуске `ClipImportService.RecoverLocal(ctx) error` вызывается после local Git recovery, до GitManager.Start, первичной фоновой индексации и HTTP. Ошибка БД или отмена recovery прерывает запуск с безопасной ошибкой без приватной диагностики; durable per-record `recovery_required` не останавливает сервер, доступен через Bearer GET status и локальный административный список и не блокирует обычную работу несвязанных баз.
 
 Recovery сопоставляет журнал с текущим настроенным физическим корнем, native identity, SHA/size всех note/assets/temp и собственных private sources. Перемещение/переименование того же корня с обновлением настройки допустимо; receipt сохраняет исторические base/path и revision `sha256:<hex>`. Чужие/изменённые файлы, неизвестные схемы, потерянные источники и недоказуемое владение дают durable `clipper_recovery_required` без перезаписи/удаления public files; Git conflict также запрещает изменения worktree. Ошибки БД и отмена возвращаются вызывающему коду, остальные записи могут обрабатываться независимо. Terminal receipts не перепроверяются и не восстанавливают удалённые позднее файлы.
+
+Одинаковые bytes/hash и pathname не заменяют native identity: скопированный корень, temp/final или private source может потребовать ручного восстановления даже после полного backup restore. Молчаливого присвоения файлов по одному hash нет. Journal и pending owned sources нельзя удалять для снятия root gate. Crash после terminal receipt до cleanup может оставить private orphan: startup пропускает terminal запись, не выполняет слепую рекурсивную очистку и не делает поздний public rollback. Эти гарантии lifecycle не сериализуют независимые злонамеренные изменения filesystem другими процессами.
+
+Backup/restore — ручная операция при полностью остановленном приложении, после завершения HTTP/Git workers и закрытия SQLite: согласованно сохраняют фактический config directory, SQLite с необходимыми sidecars, private staging и все базы с assets. Копия только live SQLite или частичный restore не являются атомарным снимком импорта. Schema migration v5 не имеет автоматического downgrade; старым бинарникам нужен pre-upgrade комплект. Пути, сохранение новой работы перед rollback и ограничения native identity описаны в [руководстве пользователя](user.md#резервная-копия-и-восстановление), ownership/CAS и порядок locks — в [руководстве разработчика](developer.md#http-import-web-clipper).
 
 #### Локальное управление незавершёнными импортами
 
