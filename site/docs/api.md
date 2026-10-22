@@ -79,7 +79,7 @@ http://127.0.0.1:8080
 
 ## Web Clipper v1 — discovery и HTTP import доступны
 
-Доступны управление подключениями, три discovery GET-маршрута и HTTP import/status `/api/clipper/v1/` с Bearer-доступом, включая публикацию проверенных изображений. Chromium-расширение, startup recovery и административные recovery list/abandon endpoints остаются **PLANNED** (задачи 5.3–5.5 для recovery). Расширение пока нельзя установить и отправлять им страницы. DTO и лимиты находятся в `internal/model/clipper.go`: импорт использует `ClipperManifest`, `ClipperImportResult`, `ClipperImportStatusResponse`.
+Доступны управление подключениями, три discovery GET-маршрута и HTTP import/status `/api/clipper/v1/` с Bearer-доступом, включая публикацию проверенных изображений. Библиотечный local recovery реализован в task 5.3; Chromium-расширение, автоматический startup recovery (5.4) и административные recovery list/abandon endpoints (5.5) остаются **PLANNED**. Расширение пока нельзя установить и отправлять им страницы. DTO и лимиты находятся в `internal/model/clipper.go`: импорт использует `ClipperManifest`, `ClipperImportResult`, `ClipperImportStatusResponse`.
 
 ### Доступ и preflight — доступны
 
@@ -218,11 +218,13 @@ Pending не содержит `result`/`error`; succeeded содержит то�
 
 Timeout, сетевой обрыв и 5xx сами по себе означают неопределённый исход: сохранять immutable attempt, включая ID, весь payload и исходную destination_revision, и запрашивать GET/повторять точно тот же POST. Не удалять expected checks, не менять базу/папку/filename/Markdown/revision для обхода отказа и не создавать новый ID, пока исход не разрешён. `pending` и `recovery_required` не являются rejected; `400` на GET неизвестного/некорректного ID не доказывает отсутствие ещё выполняющегося POST. Только подтверждённый rejected (явный окончательный отказ POST либо снимок `state: rejected`, в том числе с `internal_error`) позволяет исправить запрос и создать новый ID после повторного подтверждения назначения. Один `500 internal_error` такого подтверждения не даёт.
 
-Уже есть private SQLite journal с точным Markdown, `prepared`/`publishing`, checkpoints, durable receipt и отображение незавершённых состояний как `pending`/`recovery_required`; новые публикации в корень с unresolved import блокируются. Это ещё не startup recovery: roll-forward после сбоя и его подключение до HTTP/GitManager остаются PLANNED (5.3/5.4).
+Private SQLite journal хранит точный Markdown, `prepared`/`publishing`, checkpoints и durable receipt; незавершённые состояния отображаются как `pending`/`recovery_required`, новые публикации в корень с unresolved import блокируются. Библиотечный `ClipImportService.RecoverLocal(ctx) error` умеет roll-forward после сбоя, но ещё не вызывается при запуске: автоматическое подключение после local Git recovery и до GitManager.Start/HTTP остаётся **PLANNED (5.4)**. Новых HTTP recovery-маршрутов в task 5.3 нет.
+
+Recovery сопоставляет журнал с текущим настроенным физическим корнем, native identity, SHA/size всех note/assets/temp и собственных private sources. Перемещение/переименование того же корня с обновлением настройки допустимо; receipt сохраняет исторические base/path и revision `sha256:<hex>`. Чужие/изменённые файлы, неизвестные схемы, потерянные источники и недоказуемое владение дают durable `clipper_recovery_required` без перезаписи/удаления public files; Git conflict также запрещает изменения worktree. Ошибки БД и отмена возвращаются вызывающему коду, остальные записи могут обрабатываться независимо. Terminal receipts не перепроверяются и не восстанавливают удалённые позднее файлы.
 
 Административные list/abandon endpoints и recovery UI также PLANNED (5.5); будущий abandon должен завершать попытку как rejected с `clipper_import_abandoned`, не удаляя файлы и не допуская повторную публикацию прежнего ID.
 
-Новые private plans для text/image imports до файловых эффектов сохраняют ordered `warnings`, включая дубликаты и явный пустой массив. Receipt использует именно эту durable metadata. Отсутствующее поле в старом незавершённом плане означает неизвестные warnings, а не `[]`; будущая recovery должна требовать ручного вмешательства, если исходное значение нельзя достоверно восстановить. Завершённые исторические receipts воспроизводятся без изменений.
+Новые private plans для text/image imports до файловых эффектов сохраняют ordered `warnings`, включая дубликаты и явный пустой массив. Receipt использует именно эту durable metadata. Отсутствующее поле или `null` в старом незавершённом плане означает неизвестные warnings, а не `[]`; local recovery оставляет такую попытку для ручного вмешательства. Завершённые исторические receipts воспроизводятся без изменений.
 
 ### Ошибки Clipper
 

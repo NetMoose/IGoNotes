@@ -26,12 +26,13 @@ type ClipImportStore interface {
 }
 
 type ClipImportService struct {
-	settings      *SettingsService
-	destinations  *ClipperDestinationService
-	notes         *NoteService
-	store         ClipImportStore
-	prepare       func(*os.Root, string, string, string) (*clipNoteFile, error)
-	prepareBinary func(*os.Root, clipNotePlan, func() (io.ReadCloser, error)) (*clipNoteFile, error)
+	settings        *SettingsService
+	destinations    *ClipperDestinationService
+	notes           *NoteService
+	store           ClipImportStore
+	prepare         func(*os.Root, string, string, string) (*clipNoteFile, error)
+	prepareBinary   func(*os.Root, clipNotePlan, func() (io.ReadCloser, error)) (*clipNoteFile, error)
+	prepareRecovery func(*os.Root, clipNotePlan) (*clipNoteFile, error)
 }
 
 func NewClipImportService(settings *SettingsService, destinations *ClipperDestinationService, notes *NoteService, store ClipImportStore) (*ClipImportService, error) {
@@ -40,7 +41,7 @@ func NewClipImportService(settings *SettingsService, destinations *ClipperDestin
 		destinations.settings != settings || settings.notes != notes || settings.coordinator == nil || notes.coordinator != settings.coordinator {
 		return nil, ErrInvalidConfig
 	}
-	return &ClipImportService{settings: settings, destinations: destinations, notes: notes, store: store, prepare: prepareClipNote, prepareBinary: prepareClipBinary}, nil
+	return &ClipImportService{settings: settings, destinations: destinations, notes: notes, store: store, prepare: prepareClipNote, prepareBinary: prepareClipBinary, prepareRecovery: prepareClipFile}, nil
 }
 
 // Versioned private journal: the immutable text is deliberately retained until

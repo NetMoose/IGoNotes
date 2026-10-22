@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -37,20 +38,23 @@ type ClipImportJournal struct {
 // ClipImportRecord is private durable state, deliberately excluded from JSON.
 // Only Result and Error may be copied into a public status DTO.
 type ClipImportRecord struct {
-	ImportID            string                     `json:"-"`
-	RequestDigest       string                     `json:"-"`
-	BaseName            string                     `json:"-"`
-	BasePath            string                     `json:"-"`
-	RootIdentity        string                     `json:"-"`
-	DestinationRevision string                     `json:"-"`
-	NotePath            string                     `json:"-"`
-	NoteContentHash     string                     `json:"-"`
-	Journal             ClipImportJournal          `json:"-"`
-	State               ClipImportState            `json:"-"`
-	Result              *model.ClipperImportResult `json:"-"`
-	Error               *model.APIError            `json:"-"`
-	CreatedAt           time.Time                  `json:"-"`
-	UpdatedAt           time.Time                  `json:"-"`
+	ImportID            string            `json:"-"`
+	RequestDigest       string            `json:"-"`
+	BaseName            string            `json:"-"`
+	BasePath            string            `json:"-"`
+	RootIdentity        string            `json:"-"`
+	DestinationRevision string            `json:"-"`
+	NotePath            string            `json:"-"`
+	NoteContentHash     string            `json:"-"`
+	Journal             ClipImportJournal `json:"-"`
+	// Invalid private envelopes are data errors, not failed database IO. Keep
+	// them listable so recovery can mark this row safe without rewriting bytes.
+	JournalInvalid bool                       `json:"-"`
+	State          ClipImportState            `json:"-"`
+	Result         *model.ClipperImportResult `json:"-"`
+	Error          *model.APIError            `json:"-"`
+	CreatedAt      time.Time                  `json:"-"`
+	UpdatedAt      time.Time                  `json:"-"`
 }
 
 // ClipImportVersion guards both state transitions and same-state checkpoints.
@@ -268,7 +272,7 @@ func validateClipImportPrepared(v ClipImportRecord) error {
 	if v.State != ClipImportPrepared || v.Result != nil || v.Error != nil {
 		return errors.New("expected prepared state without receipt")
 	}
-	if !clipJSONObject(v.Journal.Plan) || !clipJSONObject(v.Journal.Checkpoint) {
+	if v.JournalInvalid || !clipJSONObject(v.Journal.Plan) || !clipJSONObject(v.Journal.Checkpoint) {
 		return errors.New("journal plan and checkpoint must be JSON objects")
 	}
 	if !validClipperConnectionTime(v.CreatedAt) || !validClipperConnectionTime(v.UpdatedAt) || v.UpdatedAt.Before(v.CreatedAt) {
@@ -284,9 +288,7 @@ func scanClipImport(scanner rowScanner) (ClipImportRecord, error) {
 	if err := scanner.Scan(&v.ImportID, &v.RequestDigest, &v.BaseName, &v.BasePath, &v.RootIdentity, &v.DestinationRevision, &v.NotePath, &v.NoteContentHash, &journal, &v.State, &result, &code, &message, &field, &created, &updated); err != nil {
 		return ClipImportRecord{}, err
 	}
-	if err := json.Unmarshal([]byte(journal), &v.Journal); err != nil {
-		return ClipImportRecord{}, fmt.Errorf("decode import journal: %w", err)
-	}
+	v.Journal, v.JournalInvalid = decodeClipImportJournalEnvelope(journal)
 	if result.Valid {
 		if err := json.Unmarshal([]byte(result.String), &v.Result); err != nil {
 			return ClipImportRecord{}, fmt.Errorf("decode import result: %w", err)
@@ -305,6 +307,41 @@ func scanClipImport(scanner rowScanner) (ClipImportRecord, error) {
 		return ClipImportRecord{}, fmt.Errorf("parse import update time: %w", err)
 	}
 	return v, nil
+}
+
+// The envelope schema belongs here; plan/checkpoint versions belong to service.
+// Never normalize, repair or persist a malformed envelope during a read.
+func decodeClipImportJournalEnvelope(raw string) (ClipImportJournal, bool) {
+	var journal ClipImportJournal
+	d := json.NewDecoder(strings.NewReader(raw))
+	if token, err := d.Token(); err != nil || token != json.Delim('{') {
+		return journal, true
+	}
+	seen := map[string]bool{}
+	for d.More() {
+		token, err := d.Token()
+		name, ok := token.(string)
+		if err != nil || !ok || seen[name] || (name != "plan" && name != "checkpoint") {
+			return journal, true
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if err := d.Decode(&value); err != nil || !clipJSONObject(value) {
+			return journal, true
+		}
+		if name == "plan" {
+			journal.Plan = value
+		} else {
+			journal.Checkpoint = value
+		}
+	}
+	if token, err := d.Token(); err != nil || token != json.Delim('}') || len(seen) != 2 {
+		return journal, true
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return journal, true
+	}
+	return journal, false
 }
 
 func (r *ClipImportRepository) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
