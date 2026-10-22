@@ -117,12 +117,21 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 			returnErr = errors.Join(returnErr, gitLifecycleError("закрыть менеджер Git", err))
 		}
 	}()
+	clipperDestinationService := service.NewClipperDestinationService(settingsService)
+	clipImportRepo := repository.NewClipImportRepository(db)
+	clipImportService, err := service.NewClipImportService(settingsService, clipperDestinationService, noteService, clipImportRepo)
+	if err != nil {
+		return gitLifecycleError("инициализировать сервис импорта Clipper", err)
+	}
 	configuredSnapshots, err := configuredGitSnapshots(settingsService)
 	if err != nil {
 		return gitLifecycleError("получить настройки локальных репозиториев Git", err)
 	}
 	if err := gitManager.RecoverLocal(ctx, configuredSnapshots); err != nil {
 		return gitLifecycleError("восстановить локальные репозитории Git", err)
+	}
+	if err := clipImportService.RecoverLocal(ctx); err != nil {
+		return gitLifecycleError("восстановить импорт Clipper", err)
 	}
 	if err := gitManager.Start(); err != nil {
 		return gitLifecycleError("запустить менеджер Git", err)
@@ -144,13 +153,7 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	clipperConnectionRepo := repository.NewClipperConnectionRepository(db)
 	clipperConnectionService := service.NewClipperConnectionService(clipperConnectionRepo)
 	clipperConnectionHandler := handlers.NewClipperConnectionHandler(clipperConnectionService)
-	clipperDestinationService := service.NewClipperDestinationService(settingsService)
 	clipperDiscoveryHandler := handlers.NewClipperDiscoveryHandler(clipperDestinationService)
-	clipImportRepo := repository.NewClipImportRepository(db)
-	clipImportService, err := service.NewClipImportService(settingsService, clipperDestinationService, noteService, clipImportRepo)
-	if err != nil {
-		return gitLifecycleError("инициализировать сервис импорта Clipper", err)
-	}
 	clipImportHandler, err := handlers.NewClipImportHandler(clipImportService, settingsService)
 	if err != nil {
 		return gitLifecycleError("инициализировать обработчик импорта Clipper", err)
