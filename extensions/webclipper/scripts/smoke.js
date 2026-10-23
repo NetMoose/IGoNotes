@@ -18,7 +18,8 @@ const startedAt = performance.now();
 const cleanupStepMs = 2000;
 const dist = resolve(import.meta.dirname, '../dist');
 const imageMode = process.env.CLIPPER_SMOKE_IMAGES === '1';
-const deliveryMode = process.env.CLIPPER_SMOKE_DELIVERY === '1';
+const restartMode = process.env.CLIPPER_SMOKE_RESTART === '1';
+const deliveryMode = process.env.CLIPPER_SMOKE_DELIVERY === '1' || restartMode;
 if (deliveryMode && !process.env.CLIPPER_SMOKE_GO_BINARY) throw Error('CLIPPER_SMOKE_GO_BINARY must name the current Go build');
 const imageRequests = [];
 let profile;
@@ -132,12 +133,42 @@ async function closeOwnedBrowser() {
   }
 }
 
+let extensionPath = dist;
+async function launchBrowser() {
+  endpoint = undefined; browserLog = '';
+  browser = owned(process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', [
+    `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
+    `--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`,
+    '--disable-background-networking', '--disable-component-update', '--disable-sync',
+    '--no-first-run', '--no-default-browser-check',
+    imageMode || restartMode ? '--host-resolver-rules=MAP images.example.test 127.0.0.1, MAP cdn.example.test 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1' : '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1',
+    ...(imageMode || restartMode ? ['--no-proxy-server'] : []),
+    ...(process.env.CLIPPER_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []),
+    'about:blank',
+  ]);
+  const launched = browser;
+  const ready = new Promise((resolve, reject) => {
+    launched.stderr.on('data', chunk => {
+      browserLog = (browserLog + chunk).slice(-16000);
+      const match = browserLog.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+      if (match) { endpoint = match[1]; resolve(); }
+    });
+    launched.finished.then(() => reject(new Error(`Chromium exited before smoke finished:\n${browserLog}`)), reject);
+  });
+  ready.catch(() => {});
+  console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, fixtureURL })}`);
+  if (fault === 'launch-hang') {
+    const stalled = faultPhase(new Promise(() => {}));
+    console.log('SMOKE_FAULT_REACHED launch-hang'); await stalled;
+  }
+  await ready;
+}
+
 async function run() {
   // Allocate synchronously so a deadline cannot race an unfinished mkdtemp and
   // create an unrecorded directory after cleanup has already inspected profile.
   profile = mkdtempSync(join(process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode', 'clipper-profile-'));
   if (deliveryMode) delivery = await deliveryFixture(profile, owned, child => { backend = child; });
-  let extensionPath = dist;
   if (imageMode) {
     // Test-only copy: exercise the unconnected image APIs in a real extension
     // context, without adding an entry point or acquisition UI to the package.
@@ -151,35 +182,8 @@ async function run() {
     server.listen(0, '127.0.0.1', resolve);
   });
   fixtureURL = `http://${imageMode ? 'images.example.test' : '127.0.0.1'}:${server.address().port}/`;
-  browser = owned(process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', [
-    `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
-    `--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`,
-    '--disable-background-networking', '--disable-component-update', '--disable-sync',
-    '--no-first-run', '--no-default-browser-check',
-    imageMode ? '--host-resolver-rules=MAP images.example.test 127.0.0.1, MAP cdn.example.test 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1' : '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1',
-    ...(imageMode ? ['--no-proxy-server'] : []),
-    ...(process.env.CLIPPER_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []),
-    'about:blank',
-  ]);
-  const ready = new Promise((resolve, reject) => {
-    browser.stderr.on('data', (chunk) => {
-      browserLog = (browserLog + chunk).slice(-16000);
-      const match = browserLog.match(/DevTools listening on (ws:\/\/[^\s]+)/);
-      if (match) { endpoint = match[1]; resolve(); }
-    });
-    browser.finished.then(() => reject(new Error(`Chromium exited before smoke finished:\n${browserLog}`)), reject);
-  });
-  // The browser readiness listener stays active even when launch is deliberately
-  // stalled, so emergency cleanup still has an independent CDP close endpoint.
-  ready.catch(() => {});
-  console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, fixtureURL })}`);
-  if (fault === 'launch-hang') {
-    const stalled = faultPhase(new Promise(() => {}));
-    console.log('SMOKE_FAULT_REACHED launch-hang');
-    await stalled;
-  }
-  await ready;
-  worker = owned(process.execPath, [resolve(import.meta.dirname, fault ? 'smoke-fault-worker.js' : deliveryMode ? 'smoke-delivery-worker.js' : imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL, extensionPath], {
+  await launchBrowser();
+  worker = owned(process.execPath, [resolve(import.meta.dirname, fault ? 'smoke-fault-worker.js' : restartMode ? 'smoke-restart-worker.js' : deliveryMode ? 'smoke-delivery-worker.js' : imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL, extensionPath], {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     ...(deliveryMode ? { env: { ...process.env, CLIPPER_SMOKE_BACKEND: delivery.endpoint, CLIPPER_SMOKE_HOME: delivery.home, CLIPPER_SMOKE_SECRET: delivery.secret } } : {}),
   });
@@ -199,7 +203,20 @@ async function run() {
       worker.finished.then(() => { if (!armed) reject(new Error('Smoke fault worker exited before its phase barrier')); }, reject);
     });
   } else {
-    worker.on('message', message => { result = message; });
+    worker.on('message', message => {
+      if (restartMode && message?.command) {
+        void (async () => {
+          if (message.command === 'restart-browser') {
+            const oldPid = browser.pid; await closeOwnedBrowser(); await launchBrowser();
+            console.log(`SMOKE_BROWSER_RESTART ${JSON.stringify({ oldPid, newPid: browser.pid, sameProfile: profile })}`);
+          } else if (message.command === 'restart-go') {
+            const oldPid = backend.pid; await terminate(backend); await delivery.restart();
+            console.log(`SMOKE_GO_RESTART ${JSON.stringify({ oldPid, newPid: backend.pid, endpoint: delivery.endpoint, home: delivery.home })}`);
+          } else throw Error('Unknown restart command');
+          worker.send({ command: message.command, endpoint });
+        })().catch(error => { failure = error; signalGroup(worker, 'SIGKILL'); });
+      } else result = message;
+    });
     exit = await worker.finished;
   }
   if (exit.code !== 0 || !result) throw new Error(`Smoke worker failed (${exit.code ?? exit.signal})`);

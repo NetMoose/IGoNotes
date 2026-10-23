@@ -27,6 +27,32 @@ function delayed(acq) {
   return { started, release, acquire: async (...args) => { entered(); await gate; return acq.acquire(...args); } };
 }
 
+it('checkpoints a completed image while a sibling stream is pending, then close/reopen retries only missing bytes', async () => {
+  const { store, indexedDB } = await setup([a, b].map(image).join('\n'));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const acq = createImageAcquirer({ permissions: { contains: async () => true }, fetch: async url => {
+    if (url === b) await gate;
+    return new Response(png, { headers: { 'Content-Type': 'image/png' } });
+  } });
+  let checkpoint;
+  const saved = new Promise(resolve => { checkpoint = resolve; });
+  const pending = prepareDraftImages(store, 'd', { acquirer: acq, progress: p => { if (p.ready === 1) checkpoint(); } });
+  // On the old implementation neither image is durable until the slow sibling
+  // finishes. Bound the observation and always release it, including on failure.
+  try {
+    await Promise.race([saved, new Promise((_, reject) => setTimeout(() => reject(Error('No partial durable checkpoint')), 300))]);
+    const before = await store.getAssets('d'); expect(before.find(r => r.normalizedUrl === a).blob).toBeInstanceOf(Blob);
+    store.close();
+    const reopened = createDraftStore({ indexedDB }), next = acquirer();
+    expect((await reopened.getAssets('d')).find(r => r.normalizedUrl === b).descriptor.status).toBe('pending');
+    expect((await prepareDraftImages(reopened, 'd', { acquirer: next })).ok).toBe(true);
+    expect(next.fetch.mock.calls.map(([url]) => url)).toEqual([b]);
+    expect(new Uint8Array(await (await reopened.getAssets('d')).find(r => r.normalizedUrl === a).blob.arrayBuffer())).toEqual(png);
+    reopened.close();
+  } finally { release(); await pending.catch(() => {}); store.close(); }
+});
+
 it('commits real Blob/hash/status before progress; reopens offline without any acquisition or permission call', async () => {
   const { store, indexedDB } = await setup();
   const acq = acquirer(), observations = [];
@@ -243,13 +269,14 @@ it('keeps old ready bytes, latest metadata and attempts unchanged when adding di
   store.close();
 });
 
-it('persists HTTP and cancellation codes without modifying the original body', async () => {
+it('persists HTTP errors and starts no work for pre-cancelled acquisition without modifying the original body', async () => {
   for (const cancelled of [false, true]) {
     const { store } = await setup(); const acq = acquirer(); const controller = new AbortController();
     if (cancelled) controller.abort();
     else acq.fetch.mockResolvedValue(new Response('missing', { status: 404 }));
     const result = await prepareDraftImages(store, 'd', { acquirer: acq, signal: controller.signal });
-    expect(result.assets[0].descriptor.error).toMatchObject({ code: cancelled ? 'cancel' : 'http', ...(cancelled ? {} : { status: 404 }) });
+    if (cancelled) { expect(result).toMatchObject({ ok: false, cancelled: true, assets: [] }); expect(acq.fetch).not.toHaveBeenCalled(); }
+    else expect(result.assets[0].descriptor.error).toMatchObject({ code: 'http', status: 404 });
     expect((await store.getDraft('d')).markdown).toBe(image(a));
     store.close();
   }

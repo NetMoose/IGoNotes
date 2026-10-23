@@ -92,9 +92,76 @@ it fails atomically and keeps the frozen attempt. Generic historical snapshots
 without lifecycle metadata remain untouched. No database-version/schema migration,
 manifest/digest/endpoint/asset rewrite, or duplicate Blob copy is involved.
 
-**Still planned (8.6):** full interrupted preparing/sending restoration and
-cross-instance/browser/server restart acceptance. This foreground delivery smoke
-does not claim that acceptance. The comprehensive image/delivery guide is task 8.7.
+**Available (8.6): interrupted preparation and delivery recovery.** Opening or
+reopening the editor, worker wake/re-evaluation, connection saves and offline/online
+events never resume delivery or acquire images. Mount reads local state and checks
+cached Blob signatures/hashes only; it makes no status GET or import POST.
+`delivery.recoverDraft(draftId)` returns a read-only classification, including
+`observedState`, `phase`, and `lifecycleRevision` for a valid frozen attempt. It does
+not mutate lifecycle metadata or take ownership from another open window.
+
+- **Preparing interrupted:** committed images still show **Stored locally** after
+  local verification. Pending/error rows need manual **Prepare images**. Completed
+  images checkpoint independently of slower sibling streams; retries reuse valid
+  cached bytes without fetching the source page. Cancellation leaves unfinished
+  rows pending (or retains an earlier error), without late completion writes.
+  Preparation checks cancellation after async reads/Blob verification and before
+  every checkpoint/CAS retry/progress callback. The assets-only
+  `updateDraftAssets(id, { expectedMarkdown, expectedAssets, assets, signal? })`
+  accepts an optional AbortSignal: pre-aborted operations open no transaction;
+  queued/in-flight transactions abort and roll back while still abortable. The
+  signal is never stored in JSON. A checkpoint already committed before abort is
+  retained. `prepareDraftImages` returns `{ ok: false, cancelled: true, ... }`
+  without a persistence-error checkpoint or late ready progress. Markdown/source
+  changes and unmount use the same cancellation path.
+- **Sending interrupted (prepared or posting):** shown as unresolved, possibly
+  still active in another window, rather than permanently running in this editor.
+  **Check attempt** is manual; **Check / retry exact attempt** can replay only the
+  original ID/manifest/digest/bytes. There is no time-based lease or automatic unlock.
+  Download of the original Markdown and **Connection settings** remain available.
+- **Pending/recovery/identity conflict:** the immutable hold survives restart.
+  Server recovery needs administrative resolution/abandon in IGoNotes; a sticky
+  `clipper_request_changed` cannot be cleared by restore or a later response.
+- **Saved local success, cleanup failed:** manual Check verifies the exact saved
+  manifest digest and matching receipt, then finishes local cleanup without HTTP.
+  Missing/malformed metadata or a mismatched receipt preserves the draft.
+- **Changed endpoint:** neither GET nor POST may send the old ID/token to a new
+  address. Restore the original endpoint; a new valid token there is allowed.
+- **IGoNotes restart:** a new Send detects stale process-local destination revision
+  before POST and requires Load → choose base/folder → explicit Confirm again.
+  It never writes a fresh revision or chooses a base automatically. An already
+  completed historical attempt can still resolve via manual GET/exact replay with
+  its old ID/revision, without new destination confirmation or another publication.
+
+Only **Saved locally** text and **Stored locally** bytes are promised after close.
+Forced browser close can lose unsaved edits and unfinished image streams; the unload
+warning is not an autosave guarantee. The comprehensive image/delivery guide is 8.7.
+
+Native process-restart smoke (Linux/system Chromium, bounded supervisor; default
+normal smoke remains 30s; explicitly allow 60s/90s for restart runs):
+
+```sh
+node --version # Node.js 24
+npm --prefix extensions/webclipper run verify
+go build -trimpath -o /tmp/opencode/igonotes-task86 ./cmd/api
+CLIPPER_SMOKE_RESTART=1 CLIPPER_SMOKE_TIMEOUT_MS=90000 \
+  CLIPPER_SMOKE_GO_BINARY=/tmp/opencode/igonotes-task86 \
+  xvfb-run -a npm --prefix extensions/webclipper run smoke
+```
+
+On 2026-10-23, headed Chromium **154.0.8037.97** passed two actual browser process
+close/relaunch cycles with the same profile and two actual Go process restarts with
+the same HOME/config/SQLite/base roots and endpoint. This is not page.reload evidence.
+`scripts/smoke-restart-worker.js` checks data-image ready bytes beside an interrupted
+HTTP stream, no automatic acquisition/GET/POST on reopen, manual missing-image-only
+preparation, a completed backend receipt held before client outcome persistence,
+unchanged posting snapshot after both restarts, manual GET cleanup with original
+ID/warnings/paths/hashes and no duplicate files, zero requests at a changed endpoint,
+online/offline events, actual worker Target.closeTarget followed by popup capture
+wake, and explicit destination reconfirmation before a fresh Send after Go restart.
+The supervisor logs old/new PIDs and cleans owned groups/profiles/listeners.
+Image hosts are **test-only developerPrivate pregranted for each browser session**;
+native permission-dialog acceptance and the broader browser matrix remain task 9.
 
 Focused headed smoke (Linux, system Chromium; isolated temporary HOME/custom Go
 port, owned-process supervisor cleanup):
@@ -302,8 +369,8 @@ applies: unsafe schemes, private/loopback literal sources and unsupported data
 images cannot be authorized by a fallback acknowledgement or a fabricated URL.
 Remove/replace those body items, or prepare supported data images locally.
 
-The explicit acknowledgement UI and foreground manual delivery/replay are available;
-full interrupted-lifecycle restoration acceptance remains planned (8.6).
+The explicit acknowledgement UI, foreground manual delivery/replay and interrupted
+preparation/delivery restoration (8.6) are available; see the recovery section above.
 
 ### Capture failures and supported sources
 
@@ -745,8 +812,8 @@ IGoNotes process. It also exercises actual Editor Prepare/Retry with data/HTTP,
 unsaved-body flush, 404, separate external confirmation and consent reset on reload.
 The native test uses developerPrivate pregrant and verifies click user activation;
 it does not claim manual acceptance of Chrome's real permission prompt.
-The focused real-backend foreground delivery smoke is described above; full
-restart/browser-matrix acceptance remains tasks 8.6/9.1/9.2.
+The focused real-backend foreground and actual browser/Go process-restart smokes are
+described above; the broader browser-matrix acceptance remains tasks 9.1/9.2.
 
 ## Packaging smoke
 

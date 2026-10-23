@@ -31,6 +31,27 @@ async function validReceipt(attempt, result) {
     JSON.stringify(result.warnings) === JSON.stringify(m.external_images.map(e => e.reason));
 }
 
+// Validate restored metadata before using an ID/endpoint or trusting a terminal
+// receipt. This is a local read, not authority to transition a live controller.
+async function restoredAttempt(bundle) {
+  const attempt = bundle.attempts.find(a => a.id === bundle.draft?.activeAttemptId);
+  try {
+    if (!isFrozen(bundle.draft) || !attempt || attempt.draftId !== bundle.draft.id ||
+      attempt.id !== attempt.manifest.import_id ||
+      !['sending', 'uncertain', 'pending', 'succeeded'].includes(attempt.state) ||
+      !['prepared', 'posting'].includes(attempt.phase)) fail('invalid_snapshot');
+    if (Object.hasOwn(attempt, 'code') && (typeof attempt.code !== 'string' || !attempt.code.trim() ||
+      !attempt.code.isWellFormed() || attempt.code.includes('\0'))) fail('invalid_snapshot');
+    if (attempt.state === 'succeeded' ? !attempt.result || Object.getPrototypeOf(attempt.result) !== Object.prototype :
+      Object.hasOwn(attempt, 'result')) fail('invalid_snapshot');
+    attemptLifecycleRevision(attempt);
+    validateEndpoint(attempt.deliverySnapshot.endpoint);
+    if (await manifestDigest(attempt.manifest) !== attempt.deliverySnapshot.digest ||
+      JSON.stringify(attempt.deliverySnapshot.assetIds) !== JSON.stringify(attempt.manifest.assets.map(a => a.id))) fail('invalid_snapshot');
+  } catch { fail('invalid_snapshot'); }
+  return attempt;
+}
+
 // Re-read only persisted frozen data. A metadata CAS cannot prove Blob contents:
 // hashing happens AFTER freezing, outside any IndexedDB transaction, on each POST.
 async function persistedBody(store, draftId, attempt) {
@@ -93,7 +114,10 @@ export function createDelivery({ store, connectionStore = createConnectionStore(
     { state: attempt.state, phase: attempt.phase, lifecycleRevision: attemptLifecycleRevision(attempt) });
   async function finish(draftId, attempt, result, alreadyPersisted = false) {
     if (attempt.code === 'clipper_request_changed') return authoritativeHold(draftId, 'identity_conflict');
-    if (!await validReceipt(attempt, result)) return transition(draftId, attempt, { state: 'uncertain', phase: attempt.phase, code: attempt.code === 'clipper_request_changed' ? attempt.code : 'invalid_receipt' });
+    if (!await validReceipt(attempt, result)) {
+      if (alreadyPersisted) fail('invalid_receipt');
+      return transition(draftId, attempt, { state: 'uncertain', phase: attempt.phase, code: 'invalid_receipt' });
+    }
     // Failure to store the terminal receipt leaves the immutable posting attempt
     // frozen. No cleanup and no new ID; a later manual GET can confirm it again.
     if (!alreadyPersisted) attempt = await transition(draftId, attempt, { state: 'succeeded', phase: attempt.phase, result });
@@ -131,8 +155,8 @@ export function createDelivery({ store, connectionStore = createConnectionStore(
   }
   async function check(draftId, replayUnknown) {
     const bundle = await store.readBundle(draftId);
-    const attempt = bundle.attempts.find(a => a.id === bundle.draft?.activeAttemptId);
-    if (!attempt || !isFrozen(bundle.draft)) fail('no_active_attempt');
+    if (!isFrozen(bundle.draft)) fail('no_active_attempt');
+    const attempt = await restoredAttempt(bundle);
     if (attempt.state === 'succeeded') return finish(draftId, attempt, attempt.result, true);
     const { api } = await connection(attempt.deliverySnapshot.endpoint);
     let outcome;
@@ -150,6 +174,18 @@ export function createDelivery({ store, connectionStore = createConnectionStore(
     return accept(draftId, attempt, outcome);
   }
   return Object.freeze({
+    recoverDraft: async draftId => {
+      const bundle = await store.readBundle(draftId);
+      if (!isFrozen(bundle.draft)) return { state: bundle.draft ? 'draft' : 'removed', readOnly: true };
+      let attempt;
+      try { attempt = await restoredAttempt(bundle); }
+      catch { return { state: 'uncertain', code: 'invalid_snapshot', readOnly: true }; }
+      const state = attempt.state === 'sending' ? 'uncertain' : attempt.state;
+      return { state, readOnly: true, observedState: attempt.state, phase: attempt.phase,
+        lifecycleRevision: attemptLifecycleRevision(attempt),
+        ...(attempt.code ? { code: attempt.code } : attempt.state === 'sending' ? { code: 'interrupted' } :
+          attempt.state === 'succeeded' ? { code: await validReceipt(attempt, attempt.result) ? 'cleanup_pending' : 'invalid_receipt' } : {}) };
+    },
     loadDestinations: () => exclusive(async () => {
       const { endpoint, api } = await connection();
       await api.info(); const result = await api.bases();

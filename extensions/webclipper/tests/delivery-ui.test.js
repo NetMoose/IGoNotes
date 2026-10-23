@@ -5,6 +5,7 @@ import { IDBFactory } from 'fake-indexeddb';
 import { webcrypto } from 'node:crypto';
 import { createDraftStore } from '../src/storage/drafts.js';
 import Editor from '../src/ui/Editor.svelte';
+import { buildImportSnapshot } from '../src/images/rewrite.js';
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); window.history.replaceState(null, '', '/'); });
 async function setup() {
   vi.stubGlobal('crypto', webcrypto);
@@ -24,6 +25,20 @@ async function setup() {
   return { store, api, transportFactory };
 }
 const click = name => fireEvent.click(screen.getByRole('button', { name, exact: true }));
+it('reopened posting draft is visibly unresolved, never running, with download/settings and no network on online/offline', async () => {
+  const f = await setup(); cleanup();
+  await f.store.updateMetadata('d', { base: 'work', parent: '', destinationRevision: 'old' });
+  const snapshot = await buildImportSnapshot({ ...await f.store.readBundle('d'), endpoint: 'http://localhost:9123', importId: '550e8400-e29b-41d4-a716-446655440000' });
+  await f.store.beginAttempt('d', snapshot);
+  render(Editor, { store: f.store, deliveryOptions: { transportFactory: f.transportFactory } });
+  await screen.findByText(/Interrupted or still active in another window/);
+  window.dispatchEvent(new Event('offline')); window.dispatchEvent(new Event('online'));
+  expect(f.transportFactory).not.toHaveBeenCalled();
+  expect(screen.getByRole('button', { name: 'Check attempt', exact: true }).disabled).toBe(false);
+  expect(screen.getByRole('button', { name: 'Download Markdown', exact: true }).disabled).toBe(false);
+  expect(screen.getByRole('button', { name: 'Connection settings', exact: true }).disabled).toBe(false);
+  expect(screen.getByLabelText('Markdown').closest('fieldset').disabled).toBe(true);
+});
 async function confirm() {
   await waitFor(() => expect(screen.getByRole('button', { name: 'Load destinations', exact: true }).disabled).toBe(false));
   await click('Load destinations');

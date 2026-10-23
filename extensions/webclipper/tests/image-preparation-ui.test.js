@@ -6,7 +6,7 @@ import { Blob as NativeBlob } from 'node:buffer';
 import { webcrypto } from 'node:crypto';
 import { tick } from 'svelte';
 import { createDraftStore } from '../src/storage/drafts.js';
-import { createImageAcquirer } from '../src/images/acquire.js';
+import { createImageAcquirer, inspectImageBlob } from '../src/images/acquire.js';
 import { buildImportSnapshot } from '../src/images/rewrite.js';
 import Editor from '../src/ui/Editor.svelte';
 import ImagePreparationHost from './helpers/ImagePreparationHost.svelte';
@@ -33,6 +33,47 @@ async function setup({ markdown = image(a), storeOptions, wrap = x => x, fetch, 
   return { store, indexedDB, fetch, permissions, onImageState, view, state: () => onImageState.mock.calls.at(-1)?.[0] };
 }
 afterEach(() => { cleanup(); handles.splice(0).forEach(x => x.close()); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+it.each(['cancel', 'markdown', 'source', 'unmount'])('%s during result Blob verification stops late writes and keeps the previous committed image', async action => {
+  const ctx = await setup(); await click('Prepare images');
+  await waitFor(() => expect(ctx.state().ready).toBe(true)); ctx.view.unmount();
+  const prior = await ctx.store.getAssets('a');
+  await ctx.store.saveDraft({ ...await ctx.store.getDraft('a'), markdown: image(a) + '\n' + image(b) });
+  const blob = new NativeBlob([png], { type: 'image/png' }), actual = await inspectImageBlob(blob);
+  const entered = deferred(), release = deferred(), finished = deferred(); let signal;
+  const acquirer = { requestAccessFromUserGesture: async () => ({ ok: true }), acquire: async (_urls, options) => {
+    signal = options.signal;
+    try { const result = { ok: true, url: b, blob, ...actual }; await options.onResult(result); return [result]; }
+    finally { finished.resolve(); }
+  } };
+  const view = render(ImagePreparationHost, { store: ctx.store, draft: await ctx.store.getDraft('a'), acquirer });
+  await screen.findByText('Stored locally');
+  const original = NativeBlob.prototype.arrayBuffer;
+  vi.spyOn(NativeBlob.prototype, 'arrayBuffer').mockImplementation(async function () {
+    if (this === blob) { entered.resolve(); await release.promise; }
+    return original.call(this);
+  });
+  const update = vi.spyOn(ctx.store, 'updateDraftAssets');
+  await click('Prepare images'); await entered.promise;
+  const writesBeforeAbort = update.mock.calls.length;
+  if (action === 'cancel') await click('Cancel image preparation');
+  else if (action === 'unmount') view.unmount();
+  else {
+    const current = await ctx.store.getDraft('a');
+    await ctx.store.saveDraft({ ...current, ...(action === 'markdown' ? { markdown: 'new Markdown body' } : { sourceUrl: 'https://example.org/new-source' }) });
+    await view.rerender({ draft: await ctx.store.getDraft('a') });
+  }
+  expect(signal.aborted).toBe(true);
+  release.resolve(); await finished.promise; await new Promise(resolve => setTimeout(resolve, 20));
+  expect(update.mock.calls.length - writesBeforeAbort).toBe(0);
+  const after = await ctx.store.getAssets('a');
+  expect(after.find(row => row.id === prior[0].id)).toEqual(prior[0]);
+  expect(after.find(row => row.normalizedUrl === b)).toMatchObject({ blob: null, descriptor: { status: 'pending' } });
+  if (action !== 'unmount') {
+    expect(screen.queryByText('Image preparation finished. Review each image below.')).toBeNull();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry images / grant access' }).disabled).toBe(false));
+  }
+});
 
 it('requests current form hosts synchronously before flush, commits bytes before readiness, and reopens cached without fetching', async () => {
   const gate = deferred(), order = [];
@@ -188,8 +229,8 @@ it('retains committed images on cancel and unmount', async () => {
   }) });
   await click('Prepare images');
   await waitFor(() => expect(signal).toBeTruthy());
-  // Acquisition batches settle together; seed a prior committed checkpoint to
-  // exercise cancellation retaining bytes independently of the in-flight batch.
+  // The quick image checkpoints independently of its pending sibling. Cancelling
+  // must not let late callbacks from this operation race the explicit retry.
   await click('Cancel image preparation'); gate.resolve();
   await edit(image(a));
   await click('Retry images / grant access');

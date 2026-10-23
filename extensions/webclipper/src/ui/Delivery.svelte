@@ -1,5 +1,5 @@
 <script>
-  import { untrack, onDestroy } from 'svelte';
+  import { untrack, onMount, onDestroy } from 'svelte';
   import { createDelivery } from '../delivery/stateMachine.js';
   import { isFrozen } from '../storage/drafts.js';
 
@@ -12,6 +12,10 @@
   const frozen = $derived(isFrozen(draft));
   const imagesReady = $derived(imageState?.draftId === draft.id && imageState.markdown === draft.markdown && imageState.ready);
   const descriptions = {
+    interrupted: 'Interrupted or still active in another window. No operation was resumed here. Manually check the saved attempt before retrying its exact ID.',
+    invalid_snapshot: 'Stored attempt metadata is invalid. Keep the draft and download Markdown; no request or cleanup was performed.',
+    invalid_receipt: 'Stored receipt does not match the immutable attempt. Keep the draft; no cleanup was performed.',
+    cleanup_pending: 'Success is saved locally. Manually check to finish local cleanup without a network request.',
     clipper_request_changed: 'Import identity conflict. Keep the immutable draft; inspect the original attempt in IGoNotes.',
     clipper_import_abandoned: 'Server recovery was abandoned. Files may already exist. The local draft is preserved; inspect the destination before a new import.',
     note_conflict: 'The filename already exists. Edit it and explicitly reconfirm the destination for a new attempt.',
@@ -22,6 +26,14 @@
     clipper_recovery_required: 'Server recovery is required. Inspect Web Clipper settings in IGoNotes.',
     git_conflict_pending: 'Resolve the Git conflict in IGoNotes, then check or replay this exact attempt.',
   };
+  onMount(() => {
+    if (!frozen) return;
+    // Read-only observation: never revoke an operation in another open editor,
+    // bump its CAS revision, infer a lease expiry, or contact IGoNotes on mount.
+    void delivery.recoverDraft(draft.id).then(outcome => {
+      if (alive && frozen && !running) notice = `Saved attempt ${outcome.state}. ${descriptions[outcome.code] ?? 'Unresolved snapshot retained. Manually check or retry the exact attempt.'}`;
+    }).catch(() => { if (alive) error = 'Could not read the saved attempt. Keep the draft and reopen the editor.'; });
+  });
   async function run(action) {
     if (running || disabled) return;
     running = true; onBusy?.(true); error = ''; notice = '';

@@ -187,8 +187,11 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
     });
     return opening;
   }
-  async function transaction(mode, work) {
+  const cancellation = () => new DraftStorageError('storage_cancelled', 'Draft transaction was cancelled; previous saved work was preserved.');
+  async function transaction(mode, work, signal) {
+    if (signal?.aborted) throw cancellation();
     const db = await open();
+    if (signal?.aborted) throw cancellation();
     if (stopped) throw stopped;
     return new Promise((resolve, reject) => {
       let tx, result, failure;
@@ -197,15 +200,26 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
         failure ??= error;
         try { tx.abort(); } catch { /* already aborted */ }
       };
-      tx.oncomplete = () => resolve(result);
-      tx.onabort = () => reject(classify(failure ?? tx.error ?? new DOMException('Cancelled', 'AbortError')));
+      const cancel = () => abort(cancellation());
+      const detach = () => signal?.removeEventListener('abort', cancel);
+      // A completed commit is never rolled back. If abort is still possible,
+      // abort() cancels even queued transactions and reverts their pending puts.
+      signal?.addEventListener('abort', cancel, { once: true });
+      tx.oncomplete = () => { detach(); resolve(result); };
+      tx.onabort = () => { detach(); reject(classify(failure ?? tx.error ?? new DOMException('Cancelled', 'AbortError'))); };
       tx.onerror = event => { failure ??= event.target.error; };
       // Only IDB requests and synchronous callbacks inside this critical section.
       const read = (req, next) => {
-        req.onsuccess = () => { try { next(req.result); } catch (error) { abort(error); } };
+        req.onsuccess = () => {
+          if (signal?.aborted) { cancel(); return; }
+          try { next(req.result); } catch (error) { abort(error); }
+        };
         return req;
       };
-      try { work(tx, read, value => { result = value; }); } catch (error) { abort(error); }
+      try {
+        if (signal?.aborted) cancel();
+        else work(tx, read, value => { result = value; });
+      } catch (error) { abort(error); }
     });
   }
   return {
@@ -225,7 +239,7 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
         done(bundle);
       });
     },
-    async updateDraftAssets(id, { expectedMarkdown, expectedAssets, assets = [] }) {
+    async updateDraftAssets(id, { expectedMarkdown, expectedAssets, assets = [], signal }) {
       text(id, 'draft id', true);
       text(expectedMarkdown, 'expected Markdown');
       if (!Array.isArray(expectedAssets) || !Array.isArray(assets)) fail('Expected assets and updates must be arrays.');
@@ -249,7 +263,7 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
             done({ draft: live, assets: [...owned.filter(a => !changed.has(a.id)), ...updates] });
           });
         });
-      });
+      }, signal);
     },
     async saveDraft(input, { assets = [], deleteAssetIds = [], attempt, requireExisting = false, expectedUpdatedAt } = {}) {
       const draft = prepareDraft(input);

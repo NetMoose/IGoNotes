@@ -341,7 +341,7 @@ export function createImageAcquirer({ permissions = globalThis.chrome?.permissio
     }
   }
 
-  async function acquire(urls, { signal } = {}) {
+  async function acquire(urls, { signal, onResult } = {}) {
     const results = new Array(urls.length); const jobs = []; const unique = new Map();
     for (let index = 0; index < urls.length; index++) {
       const url = urls[index];
@@ -356,7 +356,10 @@ export function createImageAcquirer({ permissions = globalThis.chrome?.permissio
     await Promise.all(Array.from({ length: Math.min(3, jobs.length) }, async () => {
       while (next < jobs.length) {
         const job = jobs[next++]; const result = await acquireOne(job.info, signal);
-        for (const { index, url } of job.aliases) results[index] = { ...result, url };
+        for (const { index, url } of job.aliases) {
+          results[index] = { ...result, url };
+          await onResult?.(results[index]);
+        }
       }
     }));
     return results;

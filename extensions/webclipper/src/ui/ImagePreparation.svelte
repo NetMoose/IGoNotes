@@ -83,6 +83,8 @@
       if (previousInput?.body === body && previousInput.source === source && previousInput.id === id && previousInput.lifecycle === lifecycle) return;
       previousInput = { body, source, id, lifecycle };
       controller?.abort();
+      controller = undefined;
+      if (running) { running = false; onBusy?.(false); }
       confirmed = []; selected = []; errors = []; notice = '';
       reading = true;
       // Invalidate earlier reads/preparation, including a late frozen snapshot
@@ -109,14 +111,14 @@
         if (!alive || token !== generation || signal.aborted) return;
         if (!saved) { errors = [{ code: 'save', message: 'Draft changes were not saved. Keep your edits and retry Save before preparing images.' }]; return; }
         const result = await prepareDraftImages(store, draftId, { acquirer, signal,
-          progress: () => { if (alive && token === generation) void readCache(token); } });
-        if (!alive || token !== generation) return;
+          progress: () => { if (alive && token === generation && !signal.aborted) void readCache(token); } });
+        if (!alive || token !== generation || signal.aborted) return;
         errors = [result.persistenceError, result.errorStatusPersistenceError].filter(Boolean).map(error => ({ ...error }));
         await readCache(token);
-        if (!alive || token !== generation) return;
+        if (!alive || token !== generation || signal.aborted) return;
         notice = 'Image preparation finished. Review each image below.';
       } catch (cause) {
-        if (alive && token === generation) errors = [{ code: cause.code ?? 'preparation', message: cause.message }];
+        if (alive && token === generation && !signal.aborted) errors = [{ code: cause.code ?? 'preparation', message: cause.message }];
       } finally {
         if (alive && token === generation) {
           running = false; reading = false; onBusy?.(false); void focusSummary();

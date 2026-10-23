@@ -11,17 +11,20 @@ const errorRecord = error => ({ code: error.code, message: error.message, ...(er
 // never a permission prompt or a capture/worker hook. Results/progress are durable
 // checkpoints, not delivery snapshots: 8.3 must take/revalidate its own snapshot.
 export async function prepareDraftImages(store, draftId, { acquirer, signal, progress } = {}) {
-  let draft = await store.getDraft(draftId), assets = await store.getAssets(draftId);
+  let draft, assets = [];
   const attempted = new Set();
   let refs = [];
+  function checkCancelled() {
+    if (signal?.aborted) throw new DraftStorageError('storage_cancelled', 'Image preparation cancelled. Already stored images are retained.');
+  }
   function checkLive() {
     if (!draft) throw new DraftStorageError('draft_deleted', 'The draft was deleted. Preparation stopped.');
     if (['sending', 'uncertain', 'pending'].includes(draft.status)) throw new DraftStorageError('draft_frozen', 'Resolve the live delivery attempt before preparing images.');
   }
-  checkLive();
 
   async function reconcile(results = []) {
     while (true) {
+      checkCancelled();
       checkLive();
       refs = scanImageReferences(draft.markdown, draft.sourceUrl);
       const groups = new Map();
@@ -37,11 +40,12 @@ export async function prepareDraftImages(store, draftId, { acquirer, signal, pro
         if (row.descriptor.status !== 'ready' || !row.blob) continue;
         try {
           const actual = await inspectImageBlob(row.blob);
+          checkCancelled();
           if (row.size !== actual.size || !fields.every(key => row.descriptor[key] === actual[key])) continue;
           verified.set(row.id, actual);
           const contentKey = `${actual.sha256}:${actual.mediaType}:${actual.extension}`;
           if (!owners.has(contentKey)) owners.set(contentKey, row.id);
-        } catch { /* Corrupt descriptors/bytes cannot be reused as ready. */ }
+        } catch { checkCancelled(); /* Corrupt descriptors/bytes cannot be reused as ready. */ }
       }
       const rows = assets.map(row => {
         const descriptor = { ...row.descriptor, active: false, activeAliases: [] };
@@ -86,8 +90,10 @@ export async function prepareDraftImages(store, draftId, { acquirer, signal, pro
         let actual;
         try {
           actual = await inspectImageBlob(result.blob);
+          checkCancelled();
           if (!fields.every(field => result[field] === actual[field])) throw new Error('descriptor mismatch');
         } catch {
+          checkCancelled();
           row.descriptor = { ...row.descriptor, status: 'error', error: { code: 'invalid_bytes', message: 'Image bytes do not match their verified descriptor. Retry preparation.' } };
           continue;
         }
@@ -104,14 +110,18 @@ export async function prepareDraftImages(store, draftId, { acquirer, signal, pro
           const previous = assets.find(previous => previous.id === row.id);
           return !previous || previous.blob !== row.blob || previous.normalizedUrl !== row.normalizedUrl || JSON.stringify(previous.descriptor) !== JSON.stringify(row.descriptor);
         });
-        const saved = await store.updateDraftAssets(draftId, { expectedMarkdown: draft.markdown, expectedAssets: assets, assets: updates });
+        checkCancelled();
+        const saved = await store.updateDraftAssets(draftId, { expectedMarkdown: draft.markdown, expectedAssets: assets, assets: updates, signal });
         draft = saved.draft; assets = saved.assets;
+        checkCancelled();
         return;
       } catch (error) {
+        checkCancelled();
         if (error.code !== 'markdown_changed') throw error;
         // Reparse outside the transaction. Keep the old expected asset state so
         // a simultaneous manual delete/other preparer cannot resurrect bytes.
         draft = await store.getDraft(draftId);
+        checkCancelled();
       }
     }
   }
@@ -119,34 +129,51 @@ export async function prepareDraftImages(store, draftId, { acquirer, signal, pro
     const active = assets.filter(row => row.descriptor.active);
     const ready = active.every(row => row.descriptor.status === 'ready');
     const ownerIds = new Set(active.filter(row => row.descriptor.status === 'ready').map(row => row.descriptor.canonicalAssetId ?? row.id));
-    return { ok: !persistenceError && ready, markdown: draft.markdown, refs, assets: active,
+    return { ok: !persistenceError && ready, markdown: draft?.markdown, refs, assets: active,
       blobs: assets.filter(row => ownerIds.has(row.id) && row.blob),
       ...(persistenceError ? { persistenceError: errorRecord(persistenceError) } : {}) };
   }
   function notify() {
+    checkCancelled();
     const active = assets.filter(row => row.descriptor.active);
     progress?.({ status: active.every(row => row.descriptor.status === 'ready') ? 'ready' : active.some(row => row.descriptor.status === 'error') ? 'error' : 'pending',
       total: active.length, ready: active.filter(row => row.descriptor.status === 'ready').length });
   }
   try {
+    checkCancelled();
+    draft = await store.getDraft(draftId);
+    checkCancelled();
+    assets = await store.getAssets(draftId);
+    checkCancelled();
     await reconcile();
     notify();
     while (true) {
+      checkCancelled();
       const batch = assets.filter(row => row.descriptor.active && row.descriptor.status !== 'ready' && !attempted.has(sourceKey(row.normalizedUrl))).slice(0, 3);
       if (!batch.length) return current();
-      const urls = batch.map(row => row.normalizedUrl);
-      const results = await acquirer.acquire(urls, { signal });
-      // At most three successful Blob results retained; commit/release each
-      // before acquiring the next batch. No arbitrary reference-count cap.
-      for (let i = 0; i < results.length; i++) {
-        const result = results[i];
-        attempted.add(sourceKey(result.url));
-        await reconcile([result]);
-        results[i] = null;
-        notify();
-      }
+      // Each completion is durable independently of a stalled sibling. Keep
+      // acquisition concurrency three, but serialize reconciliation/CAS so our
+      // own checkpoints cannot race each other or resurrect an older asset row.
+      let checkpoint = Promise.resolve();
+      const completed = new Set();
+      const onResult = result => {
+        checkpoint = checkpoint.then(async () => {
+          if (signal?.aborted) return;
+          if (completed.has(result.url)) return;
+          attempted.add(sourceKey(result.url));
+          await reconcile([result]);
+          completed.add(result.url);
+          notify();
+        });
+        return checkpoint;
+      };
+      const results = await acquirer.acquire(batch.map(row => row.normalizedUrl), { signal, onResult });
+      checkCancelled();
+      // Compatibility with injected acquirers and immediate invalid-source rows.
+      for (const result of results) await onResult(result);
     }
   } catch (error) {
+    if (signal?.aborted || error.code === 'storage_cancelled') return { ...current(), ok: false, cancelled: true };
     if (['draft_deleted', 'draft_frozen', 'assets_changed'].includes(error.code)) throw error;
     if (!(error instanceof DraftStorageError)) throw error;
     // Never claim a failed ready write succeeded. Try a separate tiny error
@@ -155,9 +182,12 @@ export async function prepareDraftImages(store, draftId, { acquirer, signal, pro
     let errorStatusPersistenceError;
     try {
       const failed = assets.filter(row => row.descriptor.active && row.descriptor.status !== 'ready').map(row => ({ ...inputAsset(row), descriptor: { ...row.descriptor, status: 'error', error: { code: 'persistence', message: 'Image preparation could not be saved. Free storage and retry.' } } }));
-      const saved = await store.updateDraftAssets(draftId, { expectedMarkdown: draft.markdown, expectedAssets: assets, assets: failed });
+      checkCancelled();
+      const saved = await store.updateDraftAssets(draftId, { expectedMarkdown: draft.markdown, expectedAssets: assets, assets: failed, signal });
       draft = saved.draft; assets = saved.assets;
+      checkCancelled();
     } catch (secondary) {
+      if (signal?.aborted || secondary.code === 'storage_cancelled') return { ...current(), ok: false, cancelled: true };
       if (['draft_deleted', 'draft_frozen', 'assets_changed'].includes(secondary.code)) throw secondary;
       errorStatusPersistenceError = errorRecord(secondary);
     }
