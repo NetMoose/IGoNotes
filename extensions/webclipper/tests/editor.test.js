@@ -37,6 +37,45 @@ afterEach(() => {
   window.history.replaceState(null, '', '/');
 });
 
+it('mounts connection settings only on demand and preserves unsaved draft edits on close', async () => {
+  const { store } = await setup();
+  const get = vi.fn(async () => ({}));
+  vi.stubGlobal('chrome', { storage: { local: { setAccessLevel: vi.fn(async () => {}), get } } });
+  await opened(store);
+  expect(get).not.toHaveBeenCalled();
+  await edit('Markdown', 'unsaved while connecting');
+  await click('Connection settings');
+  await screen.findByLabelText('Endpoint');
+  await waitFor(() => expect(get).toHaveBeenCalledOnce());
+  await click('Close connection settings');
+  expect(screen.queryByLabelText('Endpoint')).toBeNull();
+  expect(screen.getByLabelText('Markdown').value).toBe('unsaved while connecting');
+  expect(screen.getByRole('status').textContent).toBe('Unsaved changes');
+  expect((await store.getDraft('a')).markdown).toBe('# Body a');
+});
+
+it('clears only local credentials while preserving drafts, stored assets and immutable attempts', async () => {
+  const { store } = await setup();
+  const remove = vi.fn(async () => {});
+  vi.stubGlobal('chrome', { storage: { local: {
+    setAccessLevel: vi.fn(async () => {}), get: vi.fn(async () => ({})), remove,
+  } } });
+  const beforeAssets = await store.getAssets('a');
+  const beforeAttempts = await store.getAttempts('a');
+  await opened(store);
+  await edit('Markdown', 'still unsaved');
+  await click('Connection settings');
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Clear connection' }).disabled).toBe(false));
+  await click('Clear connection');
+  await screen.findByText('Local connection removed. Server token is not revoked.');
+  expect(remove).toHaveBeenCalledWith('clipperConnection');
+  await click('Close connection settings');
+  expect(screen.getByLabelText('Markdown').value).toBe('still unsaved');
+  expect(await store.listDrafts()).toHaveLength(2);
+  expect(await store.getAssets('a')).toEqual(beforeAssets);
+  expect(await store.getAttempts('a')).toEqual(beforeAttempts);
+});
+
 it('edits metadata and Markdown, saves transactionally and reopens without losing assets or attempts', async () => {
   const { store, indexedDB } = await setup();
   const view = await opened(store);

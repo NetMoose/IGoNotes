@@ -1,13 +1,14 @@
 # IGoNotes Web Clipper — local draft editor
 
-Tasks 6.1–6.3: an independently built JavaScript ESM / Svelte 5 / MV3 package
+Tasks 6.1–6.4: an independently built JavaScript ESM / Svelte 5 / MV3 package
 with native IndexedDB storage and a local draft list/editor. The popup opens a
 separate editor tab (also the extension's options page).
 
 > **Available:** list/reopen existing local drafts; edit title, filename and plain
 > Markdown; read source URL and capture time; save, retry, explicitly delete and
-> download the current Markdown. **Planned:** endpoint/token settings (6.4),
-> page capture (7), image acquisition and backend delivery (8).
+> download the current Markdown; manually save/clear connection settings and test
+> the read-only protocol connection. **Planned:** page capture (7), image
+> acquisition and backend delivery (8).
 > A fresh profile truthfully shows an empty list. There is no capture or new-draft
 > button yet; future capture task 7.3 will create drafts and open the editor.
 
@@ -36,7 +37,7 @@ minimum is Chrome/Chromium 120; the actual smoke version below is newer.
 Required hosts are exactly HTTP `127.0.0.1` and `localhost`; match patterns cover
 all ports. IPv6 endpoints are **not supported/advertised** by this scaffold:
 IPv6 match-pattern compatibility with the minimum supported browser has not
-been established. Future endpoint settings must not accept `[::1]` without that
+been established. Endpoint settings do not accept `[::1]` without that
 compatibility check and a corresponding manifest permission. Optional HTTP(S)
 hosts are reserved for later per-origin image consent; none are requested now.
 
@@ -51,7 +52,9 @@ TMPDIR=/tmp/opencode xvfb-run -a npm --prefix extensions/webclipper run smoke
 
 The headed smoke loads the real unpacked extension in a fresh temporary profile
 under `/tmp/opencode` and removes it on exit. It verifies worker registration,
-popup/editor DOM, popup-to-editor navigation, native IndexedDB v1 stores and the
+popup/editor DOM, popup-to-editor navigation, manual connection save/reopen/clear,
+native trusted-only Chrome storage (an isolated content script cannot read it),
+no unsolicited connection requests, native IndexedDB v1 stores and the
 empty editor after reload, real isolated content-file injection
 on a local HTTP fixture, unchanged fixture DOM, and absence of manifest/runtime,
 CSP, module, console and CDP errors. It is a packaging/storage startup check, not the
@@ -96,8 +99,9 @@ Vite 8 and Svelte 5 peer requirements are satisfied. Playwright Core 1.64.1 is
 development-only. `fake-indexeddb` 6.2.6 (Apache-2.0) is an exactly pinned
 development-only IndexedDB test implementation; it is not browser runtime code.
 UI tests use exactly pinned `@testing-library/svelte` 5.4.2,
-`@testing-library/dom` 10.4.2 and `jsdom` 30.1.3. Only `editor.test.js` selects
-jsdom via its file directive; packaging, storage and filename tests retain Node.
+`@testing-library/dom` 10.4.2 and `jsdom` 30.1.3. `editor.test.js` and
+`connection-ui.test.js` select jsdom via file directives; packaging, storage,
+transport and filename tests retain Node.
 
 - `@mozilla/readability` 0.6.0 — Apache-2.0; `new Readability(clone).parse()`
   mutates its input and is **not a sanitizer**.
@@ -151,7 +155,61 @@ dependencies, reports zero vulnerabilities with this lockfile.
 - Markdown is a plain textarea with no HTML preview or external image loading.
   Titles, filenames, paths and metadata are escaped text. The source link is
   enabled only for absolute HTTP(S) URLs without credentials and opens with
-  `noopener noreferrer`. This UI makes no network or Chrome storage/sync calls.
+  `noopener noreferrer`. Draft editing itself makes no network or Chrome storage calls;
+  explicitly opening connection settings mounts the separate trusted settings UI.
+
+## Connection settings and read-only transport (task 6.4)
+
+Open **Connection settings** in the editor, enter the local endpoint and manually
+paste the connection token into the password field. The default endpoint is
+`http://127.0.0.1:8080`; `http://localhost:9123` is an example custom port.
+Only HTTP loopback origins whose canonical host is `127.0.0.1` or `localhost` are
+accepted. Ports must be 1–65535. Credentials (even empty `@`), non-root paths,
+queries, fragments, malformed addresses, remote hosts and IPv6 are rejected before
+any credentialed request. A trailing root slash is normalized away.
+
+- **Save connection** writes the inputs locally; it does not test or contact IGoNotes.
+- **Test connection** explicitly sends a GET to `/api/clipper/v1/info` using the
+  current inputs, including unsaved endpoint/token changes. Success confirms protocol
+  v1 and a valid discovery DTO, not delivery. Changed inputs invalidate a pending
+  check's result. Closing settings cancels the check and drops the component's token.
+- **Clear connection** removes only the local credential settings object, keeping
+  IndexedDB drafts, images and attempts. It does not revoke the token on the server.
+- Opening/closing settings preserves unsaved draft edits. Opening, saving and clearing
+  settings do not trigger network requests. No image permission is requested.
+
+`src/connection/settings.js` exports `DEFAULT_ENDPOINT`, `validateEndpoint`,
+`validateToken`, `ConnectionError` and `createConnectionStore({ chrome })`.
+The store exposes `load()`, `save({ endpoint, token })`, `clear()` and `protect()`.
+`load()` returns credentials only to trusted extension callers. Every get/set/remove
+first awaits `chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })`;
+missing/failed access control fails closed. The worker restricts access on each
+evaluation, install and browser startup as well. No sync/localStorage fallback exists.
+Credentials stay in trusted extension memory and this local storage object, never
+in drafts/attempts, URLs, content-script messages or logs. Storage is profile-local,
+not encrypted credential backup; it is lost when extension/profile data is removed.
+
+`src/connection/transport.js` exports `createTransport({ endpoint, token }, { fetch })`
+and `TransportError`. A factory snapshots the validated endpoint/token. Its only
+methods are `info({ signal }?)`, `bases({ signal }?)` and
+`folders(base, { signal }?)`, restricted to the corresponding `/api/clipper/v1/`
+GET routes with encoded query components. There is no arbitrary URL request API,
+ordinary note/config/admin access, POST, retry or delivery state machine. Future
+task 8 must add typed import operations, native FormData (browser-generated
+Content-Type/boundary) and original-endpoint uncertain-attempt policy.
+
+All requests use Bearer authorization, `credentials: 'omit'`, `redirect: 'error'`
+and `cache: 'no-store'`. A 10-second deadline includes response JSON parsing;
+caller cancellation is a separate error. Redirects have no fallback. Protocol version
+must be exactly numeric `1`; app name/version, all eight byte/count/pixel limits and
+supported image MIME types are checked against the current Go DTO shape. Friendly
+static errors distinguish unavailable, authorization failure, setup required,
+protocol mismatch, invalid response, timeout and cancellation. Native network error
+text and server error bodies are never displayed or retained as error causes.
+
+Chrome storage access-level and Svelte lifecycle APIs were checked with current
+Context7 documentation. This uses native AbortController and signal event listeners
+(supported by Chrome 120), not newer `AbortSignal.any()`/`timeout()` helpers.
 
 UI tests seed real fake-IndexedDB fixtures; delayed/failing adapters exercise
 transaction timing and quota-like failures. Production never seeds example data.
@@ -248,7 +306,7 @@ deep. Unknown top-level record fields are rejected. Auth/settings-like keys
 are rejected recursively in descriptors/manifests. Plain article/Markdown strings
 remain content, not a credential scanner. Callers must never place secrets in
 content fields. No auth credential belongs in these records; trusted local token
-settings are reserved for task 6.4, separately in `chrome.storage.local`, never
+  settings live separately in trusted `chrome.storage.local`, never
 `chrome.storage.sync`.
 
 `saveDraft(draft, { assets = [], deleteAssetIds = [], attempt })` is a full
@@ -302,4 +360,4 @@ Storage is local to this extension origin in this browser profile. It does not
 sync or back up to IGoNotes or the cloud. Uninstalling the extension, deleting
 the profile or clearing extension/browser storage can lose all drafts and Blobs;
 browser eviction is also possible. This is not an archive guarantee. The editor
-can download the current Markdown text; settings and image export are not available.
+can download the current Markdown text; credential and image export are not available.

@@ -59,6 +59,9 @@ test('builds a deterministic, local-only MV3 package with executable standalone 
   }
   // A classic script parser rejects ESM imports/exports; this is the executeScript file contract.
   const content = new Script(text('content-script.js'));
+  // Content entry must never acquire credential storage/transport or any channel
+  // for credentials: no fetch, message listener/sender, URL or logging path.
+  expect(text('content-script.js')).not.toMatch(/clipperConnection|TRUSTED_CONTEXTS|Authorization|chrome\.|fetch\(|console\.|sendMessage|onMessage|connection\//);
   const document = { body: { innerHTML: '<p>unchanged</p>' } };
   const isolated = { document };
   content.runInNewContext(isolated);

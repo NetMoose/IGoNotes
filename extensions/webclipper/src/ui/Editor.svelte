@@ -2,6 +2,7 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import { createDraftStore } from '../storage/drafts.js';
   import { downloadMarkdown, sourceLink } from './markdown-download.js';
+  import ConnectionSettings from './ConnectionSettings.svelte';
 
   let { store: suppliedStore, initialDraftId } = $props();
   // A component owns only the handle it creates, never a caller's handle.
@@ -16,6 +17,7 @@
   let persistedVersion = $state(0);
   let writingVersion = $state(0);
   let error = $state('');
+  let connectionOpen = $state(false);
   let failedAction = $state('');
   let alive = true;
   let pendingSave;
@@ -168,7 +170,11 @@
     <p class="brand">IGoNotes Web Clipper</p>
     <h1>Local draft editor</h1>
     <p>Drafts stay in this browser profile. Save edits locally or download the current Markdown.</p>
+    <button onclick={() => connectionOpen = !connectionOpen} aria-expanded={connectionOpen}>
+      {connectionOpen ? 'Close connection settings' : 'Connection settings'}
+    </button>
   </header>
+  {#if connectionOpen}<ConnectionSettings />{/if}
   <div class="draft-layout">
     <nav aria-label="Local drafts" aria-busy={loading}>
       <h2>Drafts <span class="muted">({drafts.length})</span></h2>

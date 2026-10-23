@@ -10,6 +10,7 @@ let result;
 try {
   browser = await chromium.connectOverCDP(endpoint);
   const context = browser.contexts()[0];
+  context.setDefaultTimeout(5000);
   const inspect = async (page) => {
     page.on('pageerror', (error) => failures.push(error.message));
     page.on('console', (message) => {
@@ -32,6 +33,7 @@ try {
   const id = new URL(worker.url()).host;
   assert.match(id, /^[a-p]{32}$/);
   assert.equal(await worker.evaluate(() => chrome.runtime.onInstalled.hasListeners()), true);
+  assert.equal(await worker.evaluate(() => chrome.runtime.onStartup.hasListeners()), true);
   const workerStatus = await worker.evaluate(async () => ({
     manifest: chrome.runtime.getManifest(),
     script: (await self.registration.active)?.scriptURL,
@@ -53,6 +55,32 @@ try {
   await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
   assert.equal(editor.url(), `chrome-extension://${id}/editor.html`);
   await editor.getByText('No local drafts yet. Page capture is not available yet.', { exact: true }).waitFor();
+
+  // Manual settings DOM: no backend is needed and Test is deliberately not clicked.
+  // Watch for unsolicited requests, including requests from other extension contexts.
+  const connectionRequests = [];
+  context.on('request', request => {
+    if (request.url().includes('/api/clipper/')) connectionRequests.push(request.method());
+  });
+  await editor.getByRole('button', { name: 'Connection settings', exact: true }).click();
+  const endpointInput = editor.getByLabel('Endpoint', { exact: true });
+  const tokenInput = editor.getByLabel('Connection token', { exact: true });
+  await endpointInput.waitFor();
+  await editor.getByRole('button', { name: 'Save connection', exact: true }).waitFor({ state: 'visible' });
+  await endpointInput.fill('http://localhost:9123');
+  assert.equal(await tokenInput.getAttribute('type'), 'password');
+  await tokenInput.fill('smoke-only-opaque-credential');
+  await editor.getByRole('button', { name: 'Save connection', exact: true }).click();
+  await editor.getByText('Connection saved locally. Not tested.', { exact: true }).waitFor();
+  const publicConnection = await worker.evaluate(async () => {
+    const { clipperConnection } = await chrome.storage.local.get('clipperConnection');
+    return { endpoint: clipperConnection?.endpoint, hasToken: Boolean(clipperConnection?.token) };
+  });
+  assert.deepEqual(publicConnection, { endpoint: 'http://localhost:9123', hasToken: true });
+  assert.equal((await editor.locator('body').innerText()).includes('smoke-only-opaque-credential'), false);
+  await editor.getByRole('button', { name: 'Close connection settings', exact: true }).click();
+  await editor.getByRole('button', { name: 'Connection settings', exact: true }).click();
+  await editor.waitForFunction(() => document.querySelector('#connection-endpoint')?.value === 'http://localhost:9123');
   const storage = await editor.evaluate(async () => {
     const db = await new Promise((resolve, reject) => {
       const request = indexedDB.open('igonotes-webclipper', 1);
@@ -92,6 +120,26 @@ try {
   assert.equal(await page.content(), before);
   assert.equal(await page.evaluate(() => typeof globalThis.IGoNotesContentScript), 'undefined');
 
+  const trustedStorageOnly = await worker.evaluate(async tabId => {
+    const [probe] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] }, world: 'ISOLATED',
+      func: async () => {
+        // Test only native Chrome access. No settings import, messages, logging,
+        // DOM mutation or credential return to the page/test process.
+        try { await chrome.storage.local.get('clipperConnection'); return false; }
+        catch { return true; }
+      },
+    });
+    return probe.result;
+  }, tabId);
+  assert.equal(trustedStorageOnly, true);
+  await editor.getByRole('button', { name: 'Connection settings', exact: true }).click();
+  await editor.getByRole('button', { name: 'Clear connection', exact: true }).click();
+  await editor.getByText('Local connection removed. Server token is not revoked.', { exact: true }).waitFor();
+  assert.equal(await worker.evaluate(async () => Object.hasOwn(await chrome.storage.local.get('clipperConnection'), 'clipperConnection')), false);
+  assert.deepEqual(connectionRequests, []);
+  await editor.getByRole('button', { name: 'Close connection settings', exact: true }).click();
+
   // Chromium's extension error registry retains startup/worker/CSP errors that
   // might precede our page CDP attachment. Do not rely solely on console output.
   const extensions = await context.newPage();
@@ -109,6 +157,7 @@ try {
     result: 'PASS', browser: browser.version(), extensionId: id,
     serviceWorker: worker.url(), popup: popup.url(), editor: editor.url(),
     injection: injected, domUnchanged: true, pageGlobalAbsent: true, storage,
+    trustedStorageOnly, manualConnectionSettings: true, unsolicitedConnectionRequests: connectionRequests.length,
     manifestErrors: info.manifestErrors, runtimeErrors: info.runtimeErrors, cdpErrors: failures,
     sandbox: process.env.CLIPPER_SMOKE_NO_SANDBOX !== '1',
   };
