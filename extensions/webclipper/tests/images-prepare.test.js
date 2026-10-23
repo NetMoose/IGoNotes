@@ -3,6 +3,7 @@ import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
 import { createDraftStore } from '../src/storage/drafts.js';
 import { createImageAcquirer } from '../src/images/acquire.js';
 import { prepareDraftImages } from '../src/images/prepare.js';
+import { buildImportSnapshot } from '../src/images/rewrite.js';
 
 const png = Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6Z1sAAAAASUVORK5CYII=', 'base64'));
 const image = url => `![image](${url})`;
@@ -109,18 +110,21 @@ it('never recreates a deleted draft or manually removed assets after fetch', asy
 });
 
 it.each(['sending', 'uncertain', 'pending'])('freezes preparation in live %s status, including status changed during fetch', async status => {
-  const { store } = await setup(); const acq = acquirer();
-  await store.saveDraft({ ...await store.getDraft('d'), status });
-  await expect(prepareDraftImages(store, 'd', { acquirer: acq })).rejects.toMatchObject({ code: 'draft_frozen' });
-  expect(acq.fetch).not.toHaveBeenCalled();
-  await store.saveDraft({ ...await store.getDraft('d'), status: 'draft' });
-  const gate = delayed(acq), pending = prepareDraftImages(store, 'd', { acquirer: gate });
-  await gate.started;
-  await store.saveDraft({ ...await store.getDraft('d'), status });
-  gate.release();
-  await expect(pending).rejects.toMatchObject({ code: 'draft_frozen' });
-  expect((await store.getAssets('d')).every(row => !row.blob)).toBe(true);
-  store.close();
+  for (const duringFetch of [false, true]) {
+    const { store } = await setup(); const acq = acquirer();
+    const gate = delayed(acq);
+    const pending = duringFetch ? prepareDraftImages(store, 'd', { acquirer: gate }) : null;
+    if (duringFetch) await gate.started;
+    await store.updateMetadata('d', { base: 'work', parent: '', destinationRevision: 'revision' });
+    const snapshot = await buildImportSnapshot({ ...await store.readBundle('d'), endpoint: 'http://localhost:8080', importId: '550e8400-e29b-41d4-a716-446655440000', confirmedFallbacks: [{ url: a, reason: 'explicit fixture' }] });
+    await store.beginAttempt('d', snapshot);
+    if (status !== 'sending') await store.transitionOutcome('d', snapshot.importId, { state: status, phase: 'posting' }, { state: 'sending', phase: 'prepared', lifecycleRevision: 0 });
+    if (duringFetch) gate.release();
+    await expect(pending ?? prepareDraftImages(store, 'd', { acquirer: acq })).rejects.toMatchObject({ code: 'draft_frozen' });
+    if (!duringFetch) expect(acq.fetch).not.toHaveBeenCalled();
+    expect((await store.getAssets('d')).every(row => !row.blob)).toBe(true);
+    store.close();
+  }
 });
 
 it('persists fixed acquisition errors while preserving previous ready work', async () => {

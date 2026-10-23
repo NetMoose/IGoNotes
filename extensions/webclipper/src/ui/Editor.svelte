@@ -1,11 +1,12 @@
 <script>
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack, tick } from 'svelte';
   import { createDraftStore } from '../storage/drafts.js';
   import { downloadMarkdown, sourceLink } from './markdown-download.js';
   import ConnectionSettings from './ConnectionSettings.svelte';
   import ImagePreparation from './ImagePreparation.svelte';
+  import Delivery from './Delivery.svelte';
 
-  let { store: suppliedStore, initialDraftId, imageAcquirer, onImageState, resultWarnings = [] } = $props();
+  let { store: suppliedStore, initialDraftId, imageAcquirer, onImageState, resultWarnings = [], deliveryOptions = {} } = $props();
   // A component owns only the handle it creates, never a caller's handle.
   const injectedStore = untrack(() => suppliedStore);
   let store = $state.raw(injectedStore ?? createDraftStore());
@@ -14,7 +15,8 @@
   let loading = $state(true);
   let busy = $state(false);
   let preparingImages = $state(false);
-  const frozen = $derived(['sending', 'uncertain', 'pending'].includes(current?.status));
+  let delivering = $state(false), imageState = $state.raw(null), deliveryResult = $state.raw(null), resultHeading = $state();
+  const frozen = $derived(delivering || ['sending', 'uncertain', 'pending'].includes(current?.status));
   let saving = $state(false);
   let version = $state(0);
   let persistedVersion = $state(0);
@@ -39,6 +41,7 @@
   }
   function clearError() { error = ''; failedAction = ''; }
   function edit(field, value) {
+    if (frozen) return;
     current = { ...current, [field]: value };
     version += 1;
   }
@@ -59,7 +62,7 @@
           const snapshot = $state.snapshot(current);
           const snapshotVersion = version;
           if (alive) writingVersion = snapshotVersion;
-          const saved = await store.saveDraft(snapshot); // assets/attempts deliberately omitted
+          const saved = await store.saveDraft(snapshot, { requireExisting: true, expectedUpdatedAt: snapshot.updatedAt });
           // Even on teardown, drain already-requested edits before closing our handle.
           persistedVersion = snapshotVersion;
           if (alive) {
@@ -101,7 +104,7 @@
   }
 
   async function navigate(id) {
-    if (busy || loading || preparingImages) return;
+    if (busy || loading || preparingImages || delivering) return;
     busy = true;
     try {
       if (!await flush() || !alive) return;
@@ -153,6 +156,21 @@
   function beforeUnload(event) {
     if (dirty || saving) { event.preventDefault(); event.returnValue = ''; }
   }
+  function imageChanged(value) { imageState = value; onImageState?.(value); }
+  function deliveryDraft(saved) {
+    current = saved; version = persistedVersion = 0;
+    drafts = sorted(drafts.map(row => row.id === saved.id ? saved : row));
+  }
+  async function delivered(result) {
+    const id = current.id;
+    deliveryResult = result;
+    current = null; delivering = false; retryLoadId = undefined; version = persistedVersion = 0;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('draft') === id) { url.searchParams.delete('draft'); window.history.replaceState(null, '', url); }
+    // Show success before the list read: even a failed refresh cannot lose it.
+    await tick(); resultHeading?.focus();
+    try { drafts = sorted(await store.listDrafts()); } catch (cause) { report(cause, 'load'); }
+  }
   onMount(() => {
     const requested = initialDraftId ?? new URLSearchParams(window.location.search).get('draft') ?? undefined;
     void load(requested);
@@ -181,10 +199,10 @@
   <div class="draft-layout">
     <nav aria-label="Local drafts" aria-busy={loading}>
       <h2>Drafts <span class="muted">({drafts.length})</span></h2>
-      <button onclick={() => navigate(current?.id ?? retryLoadId)} disabled={busy || loading || preparingImages}>Refresh drafts</button>
+      <button onclick={() => navigate(current?.id ?? retryLoadId)} disabled={busy || loading || preparingImages || delivering}>Refresh drafts</button>
       <ul class="draft-list">
         {#each drafts as row (row.id)}
-          <li><button aria-current={current?.id === row.id ? 'true' : undefined} disabled={busy || loading || preparingImages}
+          <li><button aria-current={current?.id === row.id ? 'true' : undefined} disabled={busy || loading || preparingImages || delivering}
             onclick={() => navigate(row.id)}>{row.title || row.filename}</button></li>
         {/each}
       </ul>
@@ -195,6 +213,17 @@
         <div class="error" role="alert"><p>{error}</p>
           <button onclick={retry} disabled={busy || loading || saving}>Retry</button>
         </div>
+      {/if}
+      {#if deliveryResult}
+        <aside aria-label="Import result" aria-live="polite">
+          <h2 tabindex="-1" bind:this={resultHeading}>Import confirmed</h2>
+          <p>{deliveryResult.base} / {deliveryResult.path}</p>
+          <p>Receipt: {deliveryResult.import_id} · {deliveryResult.revision}</p>
+          {#if deliveryResult.warnings.length}
+            <p>This material is not fully offline / uses external images.</p>
+            <ul>{#each deliveryResult.warnings as reason}<li>{reason}</li>{/each}</ul>
+          {/if}
+        </aside>
       {/if}
       {#if current}
         <div class="editor-actions">
@@ -223,8 +252,12 @@
         <p class="muted">Manual save. Download includes current title/source/time as frontmatter and the Markdown body; image files are not included.</p>
         {#key current.id}
           <ImagePreparation {store} draftId={current.id} markdown={current.markdown} sourceUrl={current.sourceUrl}
-            status={current.status} disabled={busy || loading || saving} flushSave={flush} acquirer={imageAcquirer}
-            onBusy={value => preparingImages = value} onState={onImageState} {resultWarnings} />
+            status={current.status} disabled={busy || loading || saving || delivering} flushSave={flush} acquirer={imageAcquirer}
+            onBusy={value => preparingImages = value} onState={imageChanged} {resultWarnings} />
+          {#key store}
+            <Delivery {store} draft={current} {imageState} flushSave={flush} disabled={busy || loading || saving || preparingImages}
+              onBusy={value => delivering = value} onDraft={deliveryDraft} onSuccess={delivered} options={deliveryOptions} />
+          {/key}
         {/key}
         <button class="danger" onclick={remove} disabled={busy || loading || preparingImages || frozen}>Delete draft</button>
         <p class="muted">Delete permanently removes this draft, its unsaved edits and its stored images from this profile.</p>

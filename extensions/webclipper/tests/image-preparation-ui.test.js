@@ -4,6 +4,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/sv
 import { IDBFactory } from 'fake-indexeddb';
 import { Blob as NativeBlob } from 'node:buffer';
 import { webcrypto } from 'node:crypto';
+import { tick } from 'svelte';
 import { createDraftStore } from '../src/storage/drafts.js';
 import { createImageAcquirer } from '../src/images/acquire.js';
 import { buildImportSnapshot } from '../src/images/rewrite.js';
@@ -243,6 +244,46 @@ it('keeps the mutable editor body intact when another tab edits the persisted dr
   expect(ctx.state().ready).toBe(false);
   expect(ctx.state().confirmedFallbacks).toEqual([]);
   expect(await ctx.store.getDraft('a')).toMatchObject({ markdown: 'external changed body' });
+});
+
+it.each([true, false])('lifecycle rereads ignore late %s frozen cache snapshots and retain authoritative other-window freezes', async initiallyFrozen => {
+  const ctx = await setup({ markdown: 'text only' }); ctx.view.unmount();
+  const other = createDraftStore({ indexedDB: ctx.indexedDB }); handles.push(other);
+  const initial = await ctx.store.getDraft('a');
+  const importId = '550e8400-e29b-41d4-a716-446655440000';
+  const snapshot = await buildImportSnapshot({ ...await other.readBundle('a'), endpoint: 'http://localhost:8080', importId });
+  async function freeze() {
+    await other.beginAttempt('a', snapshot);
+    await other.transitionOutcome('a', importId, { state: 'pending', phase: 'posting' }, { state: 'sending', phase: 'prepared', lifecycleRevision: 0 });
+  }
+  if (initiallyFrozen) await freeze();
+  const gate = deferred(), staleReadReturned = deferred(), freshReads = [deferred(), deferred()];
+  let held = false, freshReadCount = 0;
+  const wrapped = { ...ctx.store, readBundle: async id => {
+    const bundle = await ctx.store.readBundle(id);
+    if (!held) { held = true; await gate.promise; staleReadReturned.resolve(); }
+    else freshReads[freshReadCount++]?.resolve();
+    return bundle;
+  } };
+  const view = render(ImagePreparationHost, { store: wrapped, draft: await other.getDraft('a') });
+  await waitFor(() => expect(held).toBe(true));
+  if (initiallyFrozen) {
+    await other.transitionOutcome('a', importId, { state: 'rejected', phase: 'posting', code: 'note_conflict' }, { state: 'pending', phase: 'posting', lifecycleRevision: 1 });
+    await view.rerender({ draft: await other.getDraft('a') });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Future send predicate' }).disabled).toBe(false));
+  } else {
+    await freeze();
+    await view.rerender({ draft: await other.getDraft('a') });
+    await freshReads[0].promise; await tick();
+    // A stale parent still saying draft cannot override the persisted pending row.
+    await view.rerender({ draft: initial });
+    await freshReads[1].promise; await tick();
+  }
+  gate.resolve();
+  // Drain the superseded async read before checking both the action and readiness.
+  await staleReadReturned.promise; await tick();
+  expect(screen.getByRole('button', { name: 'Prepare images', exact: true }).disabled).toBe(!initiallyFrozen);
+  expect(screen.getByRole('button', { name: 'Future send predicate' }).disabled).toBe(!initiallyFrozen);
 });
 
 it('drops late view completion if cancelled during the final cache read', async () => {

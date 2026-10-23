@@ -73,15 +73,20 @@
       if (alive && token === generation && read === cacheRead) errors = [...errors, { code: cause.code ?? 'storage', message: cause.message }];
     } finally { if (alive && token === generation && read === cacheRead) reading = false; }
   }
-  // Local reads only. Editing/mounting never prompts or acquires bytes.
+  // Local reads only. Lifecycle changes also need an authoritative reread: a
+  // definitive rejection can unlock the same body after a cached uncertain read.
+  // Keep cachedStatus until that read succeeds so a stale parent's editable
+  // status cannot override a freeze observed in another editor's persisted row.
   $effect(() => {
-    const body = markdown, source = sourceUrl, id = draftId;
+    const body = markdown, source = sourceUrl, id = draftId, lifecycle = status;
     untrack(() => {
-      if (previousInput?.body === body && previousInput.source === source && previousInput.id === id) return;
-      previousInput = { body, source, id };
+      if (previousInput?.body === body && previousInput.source === source && previousInput.id === id && previousInput.lifecycle === lifecycle) return;
+      previousInput = { body, source, id, lifecycle };
       controller?.abort();
       confirmed = []; selected = []; errors = []; notice = '';
       reading = true;
+      // Invalidate earlier reads/preparation, including a late frozen snapshot
+      // after rejection or a late editable snapshot after another handle freezes.
       void readCache(++generation);
     });
   });
@@ -182,7 +187,7 @@
       <ul>{#each resultWarnings as reason}<li>{reason}</li>{/each}</ul>
     </aside>
   {/if}
-  <p class="muted">External choices start unchecked and require separate confirmation. Reconfirm after editing Markdown, retrying preparation or reopening the editor. Delivery is planned in task 8.5.</p>
+  <p class="muted">External choices start unchecked and require separate confirmation. Reconfirm after editing Markdown, retrying preparation or reopening the editor. Use Send to IGoNotes below for manual delivery.</p>
 </section>
 
 <style>

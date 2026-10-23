@@ -10,10 +10,109 @@ separate editor tab (also the extension's options page).
 > the read-only protocol connection; capture Article/Selection as converted Markdown,
 > commit a local draft, and open it in a separate editor tab; suggest a portable
 > filename and export safe YAML frontmatter; explicitly Prepare/Retry images,
-> review durable local bytes/errors and separately confirm external references (8.4).
-> **Module-only (8.3):** token-range Markdown rewriting and immutable import snapshots.
-> **Planned (8.5):** extension delivery/state machine and send UI. Capture itself
+> review durable local bytes/errors and separately confirm external references;
+> explicitly select/confirm a base and existing folder, Send, and manually Check or
+> replay the same immutable attempt after an uncertain result (8.5). Capture itself
 > leaves image URLs pending without downloading bytes. A fresh profile has no drafts.
+
+## Manual foreground delivery (task 8.5)
+
+1. Save the endpoint/token in **Connection settings**. Saving does no network IO.
+2. Prepare images or separately confirm eligible external references. Unacknowledged
+   image errors block Send. Text-only drafts need no acquisition.
+3. Click **Load destinations** (GET info/bases), explicitly select **Destination base**,
+   then select an existing **Destination folder**, including `(root)` if intended.
+   Neither selector defaults to the first/current base or folder. Click **Confirm
+   destination**; this atomically merges base/parent/revision into the current draft.
+4. Click **Send**. The editor freezes immediately, flushes edits, checks protocol and
+   current folders/revision, builds a fresh snapshot, and durably persists/freezes
+   the attempt before POST. A changed/missing destination requires explicit loading
+   and reconfirmation; it is never silently refreshed or replaced.
+5. A matching receipt confirms the historical base/path, full formatted Markdown
+   SHA-256 revision and exact ordered warning strings. Only then is the terminal
+   result persisted and this draft's owned rows atomically removed. The result view
+   and literal external-image warnings remain visible after cleanup.
+
+Offline preflight keeps the editable draft without a POST attempt. Once persisted,
+timeout, disconnect, 5xx, malformed replies and mismatching receipts retain the ID,
+manifest, revision and image bytes. **Check attempt** only reads status. **Check /
+retry exact attempt** reads status first and only on unknown ID replays the exact
+saved payload with its original ID, endpoint and revision. Unknown GET does not
+prove no concurrent POST exists. There is no automatic POST on mount, reconnect,
+connection save or online events. A replacement token may be used at the original
+endpoint; a different endpoint is refused until the original address is restored.
+
+Known payload/destination/filename rejections unlock the preserved draft, invalidate
+destination confirmation and require a fresh ID after explicit reconfirmation.
+Rejected old attempts are never replayed. `clipper_import_abandoned` additionally
+warns that files may already exist. Pending/recovery-required and Git conflict hold
+the immutable attempt. The Git gate is conservatively treated as pending even when
+the server journals it as rejected. `clipper_request_changed` is a sticky identity
+conflict: keep it frozen, inspect the server record, and never automatically reissue.
+The current persisted hold cannot be cleared by auth, rejection, or even a matching
+success receipt: storage refuses transitions, another POST, and cleanup of that ID.
+If local receipt persistence/cleanup fails, keep the frozen draft; manual Check can
+recover the receipt or finish already-confirmed local cleanup without a new ID.
+
+`src/delivery/stateMachine.js` exports `createDelivery` with explicit
+`loadDestinations`, `loadFolders`, `confirmDestination`, `send`, `check`, `retry`.
+`Delivery.svelte` consumes the parent's current draft, store, image readiness and
+flush hook. Native IDB v1 is unchanged: optional `draft.activeAttemptId` and attempt
+`state`, `phase` (`prepared`/`posting`), `lifecycleRevision`, `code`, `result` are
+additive JSON metadata.
+Manifest/digest/endpoint/asset IDs are immutable; lifecycle fields are separate.
+`beginAttempt` compares the exact preparation state atomically and freezes **all**
+mutation APIs. Referenced frozen persisted Blobs are rehashed outside transactions
+before each POST; FormData uses only that persisted manifest and verified MIME/bytes.
+No duplicate 50 MiB Blob journal is needed. `transitionOutcome` compares active ID,
+state, phase and lifecycle revision; `finishSuccess` removes only matching owned
+rows after receipt commit and an exact terminal-revision check.
+Editor saves use `requireExisting` plus `expectedUpdatedAt` CAS, preventing stale
+tabs from resurrecting a successfully removed draft or overwriting newer metadata.
+
+`beginAttempt` starts `lifecycleRevision` at **0**. Every accepted transition,
+including identical state/phase/code, atomically checks and increments it inside the
+IDB RW transaction. Wall-clock timestamps are not a lifecycle CAS. The expected
+`{state, phase, lifecycleRevision}` is required; callers cannot set the next revision
+in an outcome. `finishSuccess(draftId, attemptId, expectedRevision)` also checks the
+current frozen owner and confirmed terminal result. Persisted `request_changed` is
+checked inside storage, even if the caller supplies the latest revision. This
+prevents cross-window ABA from delayed GET rejection/auth/success responses.
+
+On CAS conflict a controller rereads the authoritative bundle and emits a
+`readOnly: true` hold with `observedState`/`lifecycleRevision`; it never reapplies the
+stale outcome using a refreshed revision or sends another POST automatically.
+For legacy **v1 lifecycle rows with an absent revision field only**, the caller
+explicitly supplies `lifecycleRevision: null` as a one-use absence-CAS token; the
+first successful transition writes revision **1**. `attemptLifecycleRevision(row)`
+validates lifecycle metadata and returns this compatibility token. RO reads do not
+rewrite rows. Stored null, fractional, negative, nonnumeric or unsafe revisions
+are invalid, not legacy defaults. MAX_SAFE_INTEGER is readable; increment beyond
+it fails atomically and keeps the frozen attempt. Generic historical snapshots
+without lifecycle metadata remain untouched. No database-version/schema migration,
+manifest/digest/endpoint/asset rewrite, or duplicate Blob copy is involved.
+
+**Still planned (8.6):** full interrupted preparing/sending restoration and
+cross-instance/browser/server restart acceptance. This foreground delivery smoke
+does not claim that acceptance. The comprehensive image/delivery guide is task 8.7.
+
+Focused headed smoke (Linux, system Chromium; isolated temporary HOME/custom Go
+port, owned-process supervisor cleanup):
+
+```sh
+go build -trimpath -o /tmp/opencode/igonotes-task85 ./cmd/api
+CLIPPER_SMOKE_DELIVERY=1 CLIPPER_SMOKE_GO_BINARY=/tmp/opencode/igonotes-task85 \
+  CLIPPER_SMOKE_TIMEOUT_MS=60000 npm --prefix extensions/webclipper run smoke
+```
+
+On 2026-10-23 Chromium **154.0.8037.97**, native headed MV3 capture of a data GIF →
+Prepare → inactive base/nested folder → Confirm → Send passed against the real Go
+backend. The proxy forwards the second POST, truncates its receipt after headers
+(avoiding Chromium's transparent empty-connection retransmit), and manual GET
+resolves uncertainty without another POST/file. Receipt ID/hash, note/asset bytes,
+relative paths, unchanged active base/index, and indexing after an explicit switch
+are checked. This uses data images/fixture host access; **no native permission
+dialog/manual prompt acceptance is claimed**. Full browser matrix remains task 9.
 
 ## Explicit image preparation UI (task 8.4)
 
@@ -55,8 +154,8 @@ Editor exposes `imageAcquirer`, `onImageState` and `resultWarnings` for its pare
 confirmedFallbacks, warnings, preparationErrors}`; acknowledgements are exact
 `{url, reason}` pairs. Parent ownership of selection/store is preserved. This is an
 image-readiness predicate only, not a send implementation or full protocol preflight.
-Task **8.5** must flush, atomically `readBundle`, freshly call `buildImportSnapshot`
-with current acknowledgements, CAS/freeze and persist the immutable attempt before
+Delivery **8.5** flushes, atomically `readBundle`s, freshly calls `buildImportSnapshot`
+with current acknowledgements, CAS/freezes and persists the immutable attempt before
 POST. A pending attempt replays its retained manifest, not newly collected consents.
 `tests/helpers/ImagePreparationHost.svelte` demonstrates a disabled future-send
 predicate without implementing delivery.
@@ -105,7 +204,7 @@ Local capture/edit/download needs neither IGoNotes running nor a token or
 **Test connection**. Capture makes no backend or image requests and reads no
 connection credentials. Capture leaves image URLs as pending metadata (`blob: null`),
 not acquired images. Only explicit editor **Prepare images** or **Retry images / grant
-access** requests image permissions/acquisition; delivery remains planned in 8.5.
+access** requests image permissions/acquisition; delivery uses the separate Send action.
 The plain textarea does not load previews. Exported Markdown may still
 reference external HTTP(S) images/links: opening links or rendering the export
 elsewhere can access the network as a separate user action. This is not yet a
@@ -120,7 +219,7 @@ and implement the exact ordered-array UTF-8 digest contract in `docs/api.md`.
 All vectors in `testdata/clipper/manifest-digests.json` are shared with Go tests.
 Asset IDs sort by binary ASCII; external-image order remains significant.
 
-Future trusted delivery callers can prepare a snapshot like this:
+Trusted delivery callers prepare a snapshot like this:
 
 ```js
 // Flush the editor and finish explicit image preparation first.
@@ -153,9 +252,9 @@ The preparation fingerprint is SHA-256 of `JSON.stringify(preparationState)`:
 the exact original draft plus saved asset IDs, source URLs, descriptors, stored
 sizes and actual Blob sizes, sorted by ASCII ID. It includes inactive rows so
 their deletion/replacement can invalidate preparation. It is a **CAS precondition,
-not a persisted journal or freeze**. Task 8.5 must atomically compare a fresh
-all-store read with this state, preserve referenced owner IDs/bytes, persist the
-attempt and freeze edits **before** POST. Replay must reuse the stored manifest,
+not a persisted journal or freeze**. Delivery 8.5 atomically compares a fresh
+all-store read with this state, preserves referenced owner IDs/bytes, persists the
+attempt and freezes edits **before** POST. Replay reuses the stored manifest,
 digest, endpoint, ID and revision. Building a snapshot here persists nothing.
 
 Inline rewriting replaces only micromark's destination-string token span in the
@@ -203,8 +302,8 @@ applies: unsafe schemes, private/loopback literal sources and unsupported data
 images cannot be authorized by a fallback acknowledgement or a fabricated URL.
 Remove/replace those body items, or prepare supported data images locally.
 
-The explicit acknowledgement UI (8.4) is available; durable manual delivery/replay
-remains planned (8.5–8.6).
+The explicit acknowledgement UI and foreground manual delivery/replay are available;
+full interrupted-lifecycle restoration acceptance remains planned (8.6).
 
 ### Capture failures and supported sources
 
@@ -246,7 +345,8 @@ remains planned (8.5–8.6).
 
 ### Optional: configure and test the IGoNotes connection
 
-This is separate from local capture; the extension send UI is still planned.
+This is separate from local capture; the manual Send UI uses the saved connection
+after explicit destination selection and confirmation (see task 8.5 above).
 
 1. Run IGoNotes **on the same computer**, finish its first-run base setup and keep
    it running. Default: `http://127.0.0.1:8080`. For a custom port, for example:
@@ -283,8 +383,8 @@ converts the source to Markdown and saves it locally before opening the editor.
 **Saved locally** confirms the IndexedDB transaction completed; closing the popup
 then keeps the draft. No IGoNotes connection is needed for capture. Drafts can be
 edited, manually saved and downloaded with **Download Markdown**. Image preparation
-is available only through explicit editor Prepare/Retry; the send UI remains planned
-for task 8.5. The HTTP backend,
+is available only through explicit editor Prepare/Retry; the Send UI explicitly
+confirms a destination and persists an immutable attempt. The HTTP backend,
 including image import/status and recovery, is already implemented; see the
 canonical [server API documentation](../../docs/api.md#web-clipper-v1--discovery-и-http-import-доступны).
 
@@ -349,7 +449,7 @@ been established. Endpoint settings do not accept `[::1]` without that
 compatibility check and a corresponding manifest permission. Optional HTTP(S)
 hosts allow the acquisition API to request individual image hosts. Capture itself
 never acquires images or requests image permissions; only explicit editor
-Prepare/Retry calls the permission/acquisition API. Delivery remains planned in 8.5.
+Prepare/Retry calls the permission/acquisition API. Delivery is a separate manual action.
 
 ## Image acquisition API (task 8.1 — standalone module)
 
@@ -602,9 +702,8 @@ concurrent title edits are retained. Missing drafts (`draft_deleted`), changed
 asset state (`assets_changed`, including manual removal) and live draft statuses
 `sending`, `uncertain`, `pending` (`draft_frozen`) stop preparation without
 resurrecting or overwriting their bytes. Historical append-only attempts do not
-freeze the draft forever: task 8.5 owns transitions out of live statuses and must
-coordinate immutable attempt ownership, all editor mutations and explicit deletion.
-This guard applies to preparation, not a new general delivery state machine.
+freeze the draft forever: the delivery state machine owns transitions out of live
+statuses and coordinates immutable ownership, all mutations and explicit deletion.
 
 ### Pure Markdown image scanner
 
@@ -646,7 +745,8 @@ IGoNotes process. It also exercises actual Editor Prepare/Retry with data/HTTP,
 unsaved-body flush, 404, separate external confirmation and consent reset on reload.
 The native test uses developerPrivate pregrant and verifies click user activation;
 it does not claim manual acceptance of Chrome's real permission prompt.
-Delivery acceptance remains tasks 8.5/9.1.
+The focused real-backend foreground delivery smoke is described above; full
+restart/browser-matrix acceptance remains tasks 8.6/9.1/9.2.
 
 ## Packaging smoke
 
@@ -988,7 +1088,7 @@ An empty final stem falls back to `clip`. It is not a collision guarantee: backe
 `409 note_conflict` still requires the user to choose another filename.
 
 Editing title, saving or reopening never regenerates the user's filename. Manual
-invalid filenames can remain local; future delivery preflight (8.5) must reject
+invalid filenames can remain local; delivery preflight (8.5) rejects
 them, not silently sanitize the wire value. Download alone sanitizes the current
 filename with the same proposer, leaving the stored/input filename unchanged.
 `downloadMarkdown(note, filename)` uses the shared formatter for both editor and
@@ -1070,12 +1170,12 @@ not encrypted credential backup; it is lost when extension/profile data is remov
 
 `src/connection/transport.js` exports `createTransport({ endpoint, token }, { fetch })`
 and `TransportError`. A factory snapshots the validated endpoint/token. Its only
-methods are `info({ signal }?)`, `bases({ signal }?)` and
+discovery methods are `info({ signal }?)`, `bases({ signal }?)` and
 `folders(base, { signal }?)`, restricted to the corresponding `/api/clipper/v1/`
-GET routes with encoded query components. There is no arbitrary URL request API,
-ordinary note/config/admin access, POST, retry or delivery state machine. Future
-task 8 must add typed import operations, native FormData (browser-generated
-Content-Type/boundary) and original-endpoint uncertain-attempt policy.
+GET routes with encoded query components. Task 8.5 adds only `postImport(FormData,
+{ signal }?)` and `importStatus(id, { signal }?)` for v1 imports. FormData uses a
+browser-generated Content-Type/boundary. There is no arbitrary URL request API or
+ordinary note/config/admin access. Delivery owns original-endpoint/replay policy.
 
 All requests use Bearer authorization, `credentials: 'omit'`, `redirect: 'error'`
 and `cache: 'no-store'`. A 10-second deadline includes response JSON parsing;
@@ -1131,7 +1231,8 @@ synchronous computation, avoiding auto-commit across network/crypto awaits.
 
 - `drafts`, key `id`: required `id`, `title`, `filename`, `markdown`, `sourceUrl`,
   `capturedAt`, `base` (string/null), `parent` (string, root is `''`),
-  `destinationRevision` (string/null), `status`; storage sets ISO `createdAt` and
+  `destinationRevision` (string/null), `status` (`draft`/`sending`/`uncertain`/`pending`),
+  optional `activeAttemptId` (UUID-v4/null); storage sets ISO `createdAt` and
   `updatedAt`, preserving the original creation time on update. Incoming timestamp
   fields may be round-tripped but cannot override those stored values.
 - `assets`, compound key `[draftId, id]`, nonunique `draftId` ownership index:
@@ -1139,7 +1240,7 @@ synchronous computation, avoiding auto-commit across network/crypto awaits.
   Required `id`, `normalizedUrl`, JSON-object `descriptor`, `blob` (Blob/null).
   `size` is always derived from `blob.size` (zero for null), ignoring caller size.
   Null supports metadata-only image acquisition records for future callers.
-- `attempts`, compound key `[draftId, id]`, nonunique `draftId` index: append-only
+- `attempts`, compound key `[draftId, id]`, nonunique `draftId` index: immutable payload
   `{ draftId, id, createdAt, manifest, deliverySnapshot }`. Caller supplies an
   object-shaped JSON `manifest` and
   `deliverySnapshot: { endpoint, assetIds, digest }`. `endpoint` is an HTTP(S)
@@ -1147,7 +1248,9 @@ synchronous computation, avoiding auto-commit across network/crypto awaits.
   trailing slash. `assetIds` is a unique array of draft-local asset IDs; `digest`
   is a nonempty string. This is persistence shape validation, not protocol/digest
   verification or endpoint authorization. A duplicate attempt ID aborts the
-  entire save instead of replacing the snapshot.
+  entire save instead of replacing the snapshot. Delivery-created attempts additionally
+  have separate validated mutable lifecycle `state`, `phase`, `lifecycleRevision`,
+  optional `code`/`result`; legacy absence handling is described above.
 
 Asset `normalizedUrl` has its own source contract, separate from page URLs and
 attempt endpoints. HTTP(S) asset sources are normalized as before, without URL
@@ -1197,15 +1300,12 @@ content fields. No auth credential belongs in these records; trusted local token
 metadata replacement plus explicit asset upserts/deletions and optional attempt
 append, all atomic. Omitted assets are retained. Duplicate/conflicting asset
 updates are invalid. Attempts own **metadata snapshots**, referencing assets in
-the same draft; they do not duplicate Blob bytes. Future task 8.5 callers must
-build the immutable manifest/delivery snapshot, verify references, and preserve
-the referenced Blob IDs/bytes (no overwrite/deletion while replay is needed).
-The assets-only preparation CAS and live-status guard are described above.
-This module implements no delivery state machine, general editor/attempt freezing,
-network replay or automatic cleanup after success.
-Concurrent metadata edits across tabs are last-committed-write-wins; this editor
-serializes its own writes only. Future task 8 will coordinate editing restrictions
-for pending/uncertain delivery. Returned values are structured clones, not live records.
+the same draft; they do not duplicate Blob bytes. All mutation APIs inspect the
+persisted live status and reject changes/deletion while frozen, including stale
+full-metadata saves. `beginAttempt`, `transitionOutcome`, `finishSuccess` and atomic
+`updateMetadata` are described above. Generic editable saves remain upserts for
+capture; UI updates require an existing row and use `expectedUpdatedAt` CAS.
+Returned values are structured clones, not live records. IDB never awaits crypto.
 
 The v1 upgrade creates missing stores/indexes without deleting existing stores
 or records. Opening/reopening never runs garbage collection or `deleteDatabase`.

@@ -83,7 +83,7 @@ describe('restricted transport', () => {
     const settings = { endpoint: 'http://localhost:9123', token };
     const api = createTransport(settings, { fetch });
     settings.endpoint = 'http://example.org'; settings.token = 'changed';
-    expect(Object.keys(api).sort()).toEqual(['bases', 'folders', 'info']);
+    expect(Object.keys(api).sort()).toEqual(['bases', 'folders', 'importStatus', 'info', 'postImport']);
     await api.info(); await api.bases(); await api.folders('a&b');
     expect(fetch.mock.calls.map(([url]) => url)).toEqual([
       'http://localhost:9123/api/clipper/v1/info', 'http://localhost:9123/api/clipper/v1/bases',

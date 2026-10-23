@@ -3,6 +3,7 @@ import { cpSync, mkdtempSync, readFileSync, copyFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
+import { deliveryFixture } from './smoke-delivery-fixture.js';
 
 // Linux-only supervisor: Chromium and the worker each have a private process
 // group created by us. Never search for or signal the user's browser processes.
@@ -17,10 +18,13 @@ const startedAt = performance.now();
 const cleanupStepMs = 2000;
 const dist = resolve(import.meta.dirname, '../dist');
 const imageMode = process.env.CLIPPER_SMOKE_IMAGES === '1';
+const deliveryMode = process.env.CLIPPER_SMOKE_DELIVERY === '1';
+if (deliveryMode && !process.env.CLIPPER_SMOKE_GO_BINARY) throw Error('CLIPPER_SMOKE_GO_BINARY must name the current Go build');
 const imageRequests = [];
 let profile;
 let browser;
 let worker;
+let backend, delivery;
 let endpoint;
 let fixtureURL;
 let result;
@@ -34,6 +38,7 @@ const fixture = readFileSync(new URL('../tests/fixtures/article.html', import.me
   .replace(/<img[^>]*>/, '<img src="/baseline.png" data-src="/lazy-never-request.png" alt="Current"><img src="/placeholder.gif" data-src="/conversion-never-request.png" alt="Lazy">')
   .replace('</article>', `${readFileSync(new URL('../tests/fixtures/conversion.html', import.meta.url), 'utf8')}${readFileSync(new URL('../tests/fixtures/conversion-adjacent.html', import.meta.url), 'utf8')}<iframe src="/baseline-frame">discard frame</iframe><style>.smoke-resource { background-image: url(/baseline-css.png) }</style><p class="smoke-resource">CSS baseline</p><form>PRIVATE_FORM<input value="PRIVATE_VALUE"></form></article>`);
 const server = createServer((request, response) => {
+  if (deliveryMode) { delivery.handle(request, response); return; }
   if (imageMode) {
     if (request.url === '/log') {
       response.writeHead(200, { 'Content-Type': 'application/json' });
@@ -131,6 +136,7 @@ async function run() {
   // Allocate synchronously so a deadline cannot race an unfinished mkdtemp and
   // create an unrecorded directory after cleanup has already inspected profile.
   profile = mkdtempSync(join(process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode', 'clipper-profile-'));
+  if (deliveryMode) delivery = await deliveryFixture(profile, owned, child => { backend = child; });
   let extensionPath = dist;
   if (imageMode) {
     // Test-only copy: exercise the unconnected image APIs in a real extension
@@ -173,8 +179,9 @@ async function run() {
     await stalled;
   }
   await ready;
-  worker = owned(process.execPath, [resolve(import.meta.dirname, fault ? 'smoke-fault-worker.js' : imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL, extensionPath], {
+  worker = owned(process.execPath, [resolve(import.meta.dirname, fault ? 'smoke-fault-worker.js' : deliveryMode ? 'smoke-delivery-worker.js' : imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL, extensionPath], {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    ...(deliveryMode ? { env: { ...process.env, CLIPPER_SMOKE_BACKEND: delivery.endpoint, CLIPPER_SMOKE_HOME: delivery.home, CLIPPER_SMOKE_SECRET: delivery.secret } } : {}),
   });
   console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, workerPid: worker.pid, fixtureURL })}`);
   let exit;
@@ -210,6 +217,7 @@ try {
   const cleanup = await Promise.allSettled([
     closeOwnedBrowser(),
     terminate(worker),
+    terminate(backend),
     bounded(new Promise((resolve, reject) => {
       server.closeAllConnections();
       if (!server.listening) return resolve();

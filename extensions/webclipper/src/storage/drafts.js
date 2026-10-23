@@ -5,6 +5,7 @@ const STORES = ['drafts', 'assets', 'attempts'];
 // Enough for a 10 MiB image even when every byte is percent-encoded, plus
 // its header. This is a metadata bound, separate from actual Blob usage.
 const MAX_ASSET_SOURCE_LENGTH = 32 * 1024 ** 2;
+const attemptID = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 
 export class DraftStorageError extends Error {
   constructor(code, message, cause) {
@@ -79,14 +80,43 @@ function json(value, depth = 0) {
   return result;
 }
 function prepareDraft(input) {
-  shape(input, ['id', 'title', 'filename', 'markdown', 'sourceUrl', 'capturedAt', 'base', 'parent', 'destinationRevision', 'status', 'createdAt', 'updatedAt'], 'draft');
+  shape(input, ['id', 'title', 'filename', 'markdown', 'sourceUrl', 'capturedAt', 'base', 'parent', 'destinationRevision', 'status', 'createdAt', 'updatedAt', 'activeAttemptId'], 'draft');
   const result = {};
   for (const name of ['id', 'title', 'filename', 'markdown', 'parent', 'status']) result[name] = text(input[name], name, ['id', 'filename', 'status'].includes(name));
+  if (!['draft', 'sending', 'uncertain', 'pending'].includes(result.status)) fail('Invalid draft status.');
   result.sourceUrl = url(input.sourceUrl);
   result.capturedAt = timestamp(input.capturedAt, 'capturedAt');
   for (const name of ['base', 'destinationRevision']) result[name] = input[name] === null ? null : text(input[name], name);
   for (const name of ['createdAt', 'updatedAt']) if (input[name] !== undefined) timestamp(input[name], name);
+  if (input.activeAttemptId !== undefined) {
+    if (input.activeAttemptId !== null && !attemptID(input.activeAttemptId)) fail('Invalid active attempt ID.');
+    result.activeAttemptId = input.activeAttemptId;
+  }
   return result;
+}
+export const isFrozen = draft => ['sending', 'uncertain', 'pending'].includes(draft?.status);
+function validateLifecycleRevision(value) {
+  if (value !== null && (!Number.isSafeInteger(value) || value < 0)) fail('Invalid lifecycle revision.');
+}
+// Explicit compatibility token: null means the field is ABSENT in a legacy v1
+// lifecycle row, not a stored null/invalid number. Reads never rewrite history.
+export function attemptLifecycleRevision(attempt) {
+  if (!['sending', 'uncertain', 'pending', 'rejected', 'succeeded'].includes(attempt?.state) || !['prepared', 'posting'].includes(attempt?.phase)) fail('Invalid persisted delivery lifecycle.');
+  if (!Object.hasOwn(attempt, 'lifecycleRevision')) return null;
+  if (attempt.lifecycleRevision === null) fail('Invalid persisted lifecycle revision.');
+  validateLifecycleRevision(attempt.lifecycleRevision);
+  return attempt.lifecycleRevision;
+}
+function checkIdentityHold(attempt) {
+  if (attempt.code === 'clipper_request_changed') throw new DraftStorageError('identity_conflict', 'This import has a persisted identity conflict. Keep its immutable draft and inspect the original import in IGoNotes.');
+}
+function editable(draft) {
+  if (!draft) throw new DraftStorageError('draft_deleted', 'The draft was deleted. Reload the draft list.');
+  if (isFrozen(draft)) throw new DraftStorageError('draft_frozen', 'Resolve the live delivery attempt before changing or deleting this draft.');
+}
+const nextUpdatedAt = previous => new Date(Math.max(Date.now(), Date.parse(previous?.updatedAt ?? '') + 1 || 0)).toISOString();
+function preparationState(draft, assets) {
+  return { draft, assets: assets.map(a => ({ id: a.id, normalizedUrl: a.normalizedUrl, size: a.size, descriptor: a.descriptor, blobSize: a.blob?.size ?? null })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0) };
 }
 function prepareAsset(input, draftId) {
   shape(input, ['id', 'normalizedUrl', 'descriptor', 'blob', 'size'], 'asset');
@@ -206,7 +236,7 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
         const assetStore = tx.objectStore('assets');
         read(tx.objectStore('drafts').get(id), live => {
           if (!live) throw new DraftStorageError('draft_deleted', 'The draft was deleted. Preparation stopped.');
-          if (['sending', 'uncertain', 'pending'].includes(live.status)) throw new DraftStorageError('draft_frozen', 'Resolve the live delivery attempt before preparing images.');
+           editable(live);
           if (live.markdown !== expectedMarkdown) throw new DraftStorageError('markdown_changed', 'Markdown changed. Recompute image references.');
           read(assetStore.getAll(), all => {
             const owned = all.filter(a => a.draftId === id);
@@ -221,7 +251,7 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
         });
       });
     },
-    async saveDraft(input, { assets = [], deleteAssetIds = [], attempt } = {}) {
+    async saveDraft(input, { assets = [], deleteAssetIds = [], attempt, requireExisting = false, expectedUpdatedAt } = {}) {
       const draft = prepareDraft(input);
       if (!Array.isArray(assets) || !Array.isArray(deleteAssetIds)) fail('Asset updates must be arrays.');
       const updates = assets.map(value => prepareAsset(value, draft.id));
@@ -232,13 +262,17 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
         const drafts = tx.objectStore('drafts'), assetStore = tx.objectStore('assets');
         // All global count/usage reads and mutations share the same all-store RW
         // transaction, so distinct tabs/handles serialize in IndexedDB itself.
-        read(drafts.get(draft.id), previous => read(drafts.count(), count => read(assetStore.getAll(), allAssets => {
+         read(drafts.get(draft.id), previous => read(drafts.count(), count => read(assetStore.getAll(), allAssets => {
+           if (previous) editable(previous);
+           else if (requireExisting) editable(previous);
+           if (expectedUpdatedAt !== undefined && previous?.updatedAt !== expectedUpdatedAt) throw new DraftStorageError('draft_changed', 'Another editor changed this draft. Reload before editing.');
+           if (isFrozen(draft) || draft.activeAttemptId) fail('Only beginAttempt may freeze a draft.');
           if (!previous && count >= maxDrafts) throw new DraftStorageError('draft_limit', `Maximum ${maxDrafts} drafts reached. Manually delete an unwanted draft and retry.`);
           const changed = new Set([...updates.map(a => a.id), ...removals]);
           let bytes = allAssets.reduce((sum, a) => sum + (a.draftId === draft.id && changed.has(a.id) ? 0 : a.blob?.size ?? 0), 0);
           bytes += updates.reduce((sum, a) => sum + a.size, 0);
           if (bytes > maxBlobBytes) throw new DraftStorageError('blob_limit', `Draft images exceed the ${maxBlobBytes}-byte application limit. Manually remove unwanted images or drafts and retry.`);
-          const now = new Date().toISOString();
+           const now = nextUpdatedAt(previous);
           const saved = { ...draft, createdAt: previous?.createdAt ?? now, updatedAt: now };
           for (const id of removals) assetStore.delete([draft.id, id]);
           for (const value of updates) assetStore.put(value);
@@ -250,7 +284,8 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
     },
     async deleteDraft(id) {
       text(id, 'draft id', true);
-      return transaction('readwrite', (tx, read) => {
+      return transaction('readwrite', (tx, read) => read(tx.objectStore('drafts').get(id), live => {
+        if (live) editable(live);
         tx.objectStore('drafts').delete(id);
         for (const name of ['assets', 'attempts']) {
           const store = tx.objectStore(name);
@@ -258,7 +293,93 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
             for (const key of keys) store.delete(key);
           });
         }
-      });
+      }));
+    },
+    async updateMetadata(id, input) {
+      text(id, 'draft id', true);
+      shape(input, ['base', 'parent', 'destinationRevision'], 'destination');
+      const fields = { base: text(input.base, 'base', true), parent: text(input.parent, 'parent'), destinationRevision: text(input.destinationRevision, 'destination revision', true) };
+      return transaction('readwrite', (tx, read, done) => read(tx.objectStore('drafts').get(id), live => {
+        editable(live);
+        const saved = { ...live, ...fields, updatedAt: nextUpdatedAt(live) };
+        tx.objectStore('drafts').put(saved); done(saved);
+      }));
+    },
+    async beginAttempt(id, snapshot) {
+      text(id, 'draft id', true);
+      // Detach before opening the transaction. No hashing or asynchronous work in RW.
+      const expected = structuredClone(snapshot.preparationState);
+      const attempt = prepareAttempt({ id: snapshot.importId, createdAt: new Date().toISOString(), manifest: snapshot.manifest,
+        deliverySnapshot: { endpoint: snapshot.endpoint, assetIds: snapshot.manifest.assets.map(a => a.id), digest: snapshot.digest } }, id);
+      if (!attemptID(attempt.id) || attempt.manifest.import_id !== attempt.id || !/^[0-9a-f]{64}$/.test(attempt.deliverySnapshot.digest)) fail('Invalid immutable attempt identity/digest.');
+      attempt.state = 'sending'; attempt.phase = 'prepared'; attempt.lifecycleRevision = 0;
+      return transaction('readwrite', (tx, read, done) => read(tx.objectStore('drafts').get(id), live => {
+        editable(live);
+        read(tx.objectStore('assets').index('draftId').getAll(id), assets => {
+          if (JSON.stringify(preparationState(live, assets)) !== JSON.stringify(expected)) throw new DraftStorageError('preparation_changed', 'Draft or images changed. Prepare and confirm again.');
+          tx.objectStore('attempts').add(attempt);
+          tx.objectStore('drafts').put({ ...live, status: 'sending', activeAttemptId: attempt.id });
+          done(attempt);
+        });
+      }));
+    },
+    async transitionOutcome(id, attemptId, input, expected) {
+      text(id, 'draft id', true); text(attemptId, 'attempt id', true);
+      shape(input, ['state', 'phase', 'code', 'result'], 'outcome');
+      shape(expected, ['state', 'phase', 'lifecycleRevision'], 'expected lifecycle');
+      if (!['sending', 'uncertain', 'pending'].includes(expected.state) || !['prepared', 'posting'].includes(expected.phase)) fail('Expected lifecycle is required.');
+      validateLifecycleRevision(expected.lifecycleRevision);
+      const compare = { state: expected.state, phase: expected.phase, lifecycleRevision: expected.lifecycleRevision };
+      const outcome = json(input);
+      if (!['sending', 'uncertain', 'pending', 'rejected', 'succeeded'].includes(outcome.state) || !['prepared', 'posting'].includes(outcome.phase)) fail('Invalid delivery lifecycle.');
+      if (outcome.code !== undefined) text(outcome.code, 'outcome code', true);
+      if (outcome.state === 'succeeded' && !outcome.result) fail('Missing terminal result.');
+      if (outcome.result !== undefined) {
+        shape(outcome.result, ['import_id', 'base', 'path', 'revision', 'warnings'], 'receipt');
+        const r = outcome.result;
+        if (outcome.state !== 'succeeded' || r.import_id !== attemptId || !/^sha256:[0-9a-f]{64}$/.test(r.revision) || !Array.isArray(r.warnings) || !r.warnings.every(s => typeof s === 'string')) fail('Invalid terminal receipt.');
+        text(r.base, 'receipt base', true); text(r.path, 'receipt path', true);
+      }
+      return transaction('readwrite', (tx, read, done) => read(tx.objectStore('drafts').get(id), live => {
+        read(tx.objectStore('attempts').get([id, attemptId]), attempt => {
+          if (!live || live.activeAttemptId !== attemptId || !isFrozen(live) || !attempt) throw new DraftStorageError('attempt_changed', 'Delivery ownership changed. Reload before checking again.');
+          const revision = attemptLifecycleRevision(attempt);
+          // Authority is the CURRENT row inside this RW transaction. Even a
+          // caller with the latest revision cannot clear a sticky identity hold,
+          // convert it to success, unlock the draft, or begin another POST.
+          checkIdentityHold(attempt);
+          if (['rejected', 'succeeded'].includes(attempt.state) ||
+             attempt.state !== compare.state || attempt.phase !== compare.phase || revision !== compare.lifecycleRevision ||
+             (attempt.phase === 'posting' && outcome.phase !== 'posting') ||
+             (outcome.state === 'rejected' && attempt.phase === 'prepared' && outcome.code !== 'prepare_again')) throw new DraftStorageError('attempt_changed', 'Delivery state changed. Reload before checking again.');
+          if (revision === Number.MAX_SAFE_INTEGER) throw new DraftStorageError('lifecycle_exhausted', 'Delivery lifecycle revision is exhausted. Keep this frozen attempt for inspection.');
+          // Increment for EVERY transition, including identical state/phase/code.
+          // Legacy absence upgrades atomically from its explicit null CAS to 1.
+          const saved = { ...attempt, ...outcome, lifecycleRevision: (revision ?? 0) + 1 };
+          tx.objectStore('attempts').put(saved);
+          tx.objectStore('drafts').put({ ...live, status: outcome.state === 'rejected' ? 'draft' : outcome.state === 'succeeded' ? 'uncertain' : outcome.state,
+            activeAttemptId: outcome.state === 'rejected' ? null : attemptId,
+            destinationRevision: outcome.state === 'rejected' ? null : live.destinationRevision });
+          done(saved);
+        });
+      }));
+    },
+    async finishSuccess(id, attemptId, expectedRevision) {
+      text(id, 'draft id', true); text(attemptId, 'attempt id', true);
+      validateLifecycleRevision(expectedRevision);
+      return transaction('readwrite', (tx, read) => read(tx.objectStore('drafts').get(id), live => {
+        read(tx.objectStore('attempts').get([id, attemptId]), attempt => {
+          if (!live || live.activeAttemptId !== attemptId || !isFrozen(live) || !attempt) throw new DraftStorageError('attempt_changed', 'Confirmed ownership is required before cleanup.');
+          const revision = attemptLifecycleRevision(attempt);
+          checkIdentityHold(attempt);
+          if (attempt.state !== 'succeeded' || !attempt.result || revision !== expectedRevision) throw new DraftStorageError('attempt_changed', 'Confirmed result and its exact lifecycle revision are required before cleanup.');
+          tx.objectStore('drafts').delete(id);
+          for (const name of ['assets', 'attempts']) {
+            const rows = tx.objectStore(name);
+            read(rows.index('draftId').getAllKeys(id), keys => { for (const key of keys) rows.delete(key); });
+          }
+        });
+      }));
     },
     close() {
       stopped = new DraftStorageError('storage_closed', 'Draft store is closed. Create a new store instance to reopen it.');
