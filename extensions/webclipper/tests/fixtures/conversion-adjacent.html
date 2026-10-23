@@ -1,0 +1,11 @@
+<h2>Adjacent code safety</h2>
+<p>Adjacent HTML: <code>a</code><code>`</code><code>&lt;img src=x onerror=bad()&gt;</code></p>
+<p>Adjacent link: <code>a</code><code>`</code><code>[x](javascript:bad())</code></p>
+<p>Adjacent wrappers: <span><code>a</code></span><em><span></span></em><x-wrap><code>`</code></x-wrap><a href="javascript:bad()"><code>&lt;img src=x onerror=bad()&gt;</code></a></p>
+<p>Adjacent spaces: <code> </code><span></span><code>``</code><code> a </code></p>
+<p>Adjacent blank formatting: <code>a</code><strong><em><code> </code></em></strong><code>`</code><code>&lt;img src=x onerror=bad()&gt;</code></p>
+<p>Adjacent emphasis: <code>a</code><em><code>`</code></em><code>x`</code></p>
+<p>Adjacent strong: <code>a</code><strong><code>`</code></strong><code>x`</code></p>
+<p>Adjacent nested: <code>左``</code><strong><em><code>`世界`</code></em></strong><code>右```</code></p>
+<p>Adjacent parent: alpha<em><strong><code> ` </code></strong></em>尾</p>
+<table><tr><th>Boundary test</th></tr><tr><td>Adjacent table: <code>a</code><code>`</code><code>&lt;img src=x onerror=bad()&gt;[x](javascript:bad())</code></td></tr><tr><td>Adjacent table emphasis: <code>a</code><em><strong><code>`</code></strong></em><code>x`</code></td></tr></table>

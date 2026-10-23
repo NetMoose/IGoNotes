@@ -25,6 +25,12 @@ function unchanged(doc, run) {
   }
 }
 describe('extractPage', () => {
+  it('preserves recognized code-language classes through Readability for conversion', () => {
+    const doc = page();
+    doc.querySelector('article').insertAdjacentHTML('beforeend', fixture('conversion'));
+    const result = unchanged(doc, () => extractPage(doc, 'article'));
+    expect(result.html).toContain('class="language-js"');
+  });
   it('extracts Readability article on a clone, with metadata and image hints, without changing DOM/selection', () => {
     const doc = page(); select(doc, doc.querySelector('h1'));
     Object.defineProperty(doc.querySelector('img'), 'currentSrc', { value: 'https://example.test/retina.png' });

@@ -1,4 +1,4 @@
-# IGoNotes Web Clipper — extraction preview and local draft editor
+# IGoNotes Web Clipper — extraction, conversion and local draft editor
 
 An independently built JavaScript ESM / Svelte 5 / MV3 package
 with native IndexedDB storage and a local draft list/editor. The popup opens a
@@ -7,8 +7,9 @@ separate editor tab (also the extension's options page).
 > **Available:** list/reopen existing local drafts; edit title, filename and plain
 > Markdown; read source URL and capture time; save, retry, explicitly delete and
 > download the current Markdown; manually save/clear connection settings and test
-> the read-only protocol connection; extract Article/Selection previews (7.1).
-> **Planned:** safe Markdown conversion (7.2), capture-to-durable-draft workflow
+> the read-only protocol connection; extract Article/Selection previews (7.1);
+> isolated safe Markdown conversion API (7.2).
+> **Planned:** capture-to-durable-draft workflow
 > (7.3), image acquisition and the extension send UI (8).
 > Preview extraction does **not** create or save a draft. A fresh profile shows an
 > empty draft list; task 7.3 will create drafts and open the editor.
@@ -66,7 +67,7 @@ planned in task 9.2.
 The popup offers **Article** and **Selection** extraction previews and the editor
 link. Results are explicitly **not saved** and disappear on closing the popup.
 Existing drafts can be edited, manually saved and downloaded with **Download
-Markdown**. Conversion and durable capture are planned for tasks 7.2/7.3; image
+Markdown**. Conversion is ready as an isolated API; durable capture is planned for 7.3; image
 acquisition and the send UI are planned for task 8. The HTTP backend,
 including image import/status and recovery, is already implemented; see the
 canonical [server API documentation](../../docs/api.md#web-clipper-v1--discovery-и-http-import-доступны).
@@ -147,8 +148,9 @@ native trusted-only Chrome storage (an isolated content script cannot read it),
 no unsolicited connection requests, native IndexedDB v1 stores and the
 empty editor after reload, real popup Article/Selection extraction (including
 repeated injection) on a local HTTP article fixture, unchanged fixture DOM,
-selection boundaries and scroll, and absence of manifest/runtime, CSP, module,
-console and CDP errors. It covers packaging/storage startup and task 7.1 capture,
+selection boundaries and scroll, article/selection Markdown conversion with zero
+new conversion-induced requests after the live-page resource baseline, and absence
+of manifest/runtime, CSP, module, console and CDP errors. It covers packaging/storage startup and tasks 7.1–7.2,
 not the full capture/backend acceptance suite planned for task 9.1. Browser DNS is restricted
 to loopback and background networking is disabled.
 
@@ -187,7 +189,10 @@ All direct dependencies are exactly pinned: Svelte 5.56.4, Svelte Vite plugin
 7.2.0, Vite 8.3.5 and Vitest 4.1.12. The extension uses the same tooling majors
 as `web/`, with independently selected patched Vite/Vitest versions. The plugin's
 Vite 8 and Svelte 5 peer requirements are satisfied. Playwright Core 1.64.1 is
-development-only. `fake-indexeddb` 6.2.6 (Apache-2.0) is an exactly pinned
+development-only. Marked 18.0.6, marked-highlight 2.2.4 and highlight.js 11.11.1
+(MIT/BSD-3-Clause), independently pinned here to match the app's parser/highlight
+configuration, are test-only for adversarial rendering assertions; no renderer is
+bundled in the extension. `fake-indexeddb` 6.2.6 (Apache-2.0) is an exactly pinned
 development-only IndexedDB test implementation; it is not browser runtime code.
 UI tests use exactly pinned `@testing-library/svelte` 5.4.2,
 `@testing-library/dom` 10.4.2 and `jsdom` 30.1.3. `editor.test.js` and
@@ -203,8 +208,10 @@ transport and filename tests retain Node.
 APIs were checked against official Readability/Turndown documentation via
 Context7 and the installed package documentation. Vite's Context7 request timed
 out; its official build-options documentation was used instead.
-Upstream package license texts were inspected. Readability 0.6.0 now runs in
-isolated capture; Turndown/GFM remain reserved for task 7.2 conversion.
+Upstream package license texts were inspected. Readability 0.6.0 and Turndown/GFM
+run in the isolated content bundle. Current Turndown rule/escape/plugin APIs were
+checked with Context7 and the installed GFM source; Marked's Context7 request timed
+out, so its official usage documentation was checked for the test-only parser.
 
 Each build generates `dist/THIRD_PARTY_NOTICES.txt`, copies direct runtime
 dependency LICENSE/NOTICE files verbatim to `dist/LICENSES/`, includes the full
@@ -221,8 +228,8 @@ On a normal HTTP(S) page, open the extension action and click **Article** or
 runs only after the explicit mode click, in main frame `[0]`, `world: 'ISOLATED'`.
 No mandatory all-sites permission, background capture or tab watcher is added.
 The popup displays only escaped title and text character count, never page HTML.
-It says **Not saved: preview only**: no draft, Markdown, image download or delivery
-is created; closing the popup loses the result. No IGoNotes connection is needed.
+It says **Not saved: preview only**: this popup path creates no draft, Markdown,
+image download or delivery; closing the popup loses the result. No IGoNotes connection is needed.
 
 - Article uses `new Readability(document.cloneNode(true)).parse()`. An empty or
   failed result asks the user to select content and choose Selection explicitly;
@@ -238,10 +245,11 @@ is created; closing the popup loses the result. No IGoNotes connection is needed
 `src/capture/extract.js` exports synchronous `extractPage(document, mode)`;
 `mode` is exactly `'article' | 'selection'`. Its JSON-serializable result is
 `{ mode, title, html, text, baseURI, sourceUrl, capturedAt }` with UTC ISO time.
-**HTML and metadata are untrusted. Readability is not a sanitizer.** Task 7.2 must
-sanitize/normalize before conversion; no raw HTML is rendered or stored here.
+**HTML and metadata are untrusted. Readability is not a sanitizer.** The separate
+converter sanitizes/normalizes before conversion; no raw HTML is rendered or stored here.
 Cloned images retain raw lazy/srcset attrs and a `data-igonotes-current-src`
-runtime hint for conversion. All hints/URLs require validation in 7.2.
+runtime hint for conversion. The converter validates all hints/URLs. Recognized
+syntax-language classes are preserved through Readability for safe normalization.
 
 `src/capture/browser.js` exports `captureActiveTab(mode, { chrome }?)` for trusted
 popup/future worker coordination. It snapshots the active tab ID/URL at action
@@ -249,13 +257,78 @@ time, injects the classic bundle then calls its isolated extractor with mode/URL
 arguments; frame/document IDs and the final tab URL detect navigation. The
 stateless IIFE installs no listeners or page-world bridge. It accesses no settings,
 credentials, storage or network. `CaptureError.code` is a stable fixed-message
-error contract. Task 7.3 owns worker sender/message validation, safe conversion,
+error contract. Task 7.3 owns worker sender/message validation, conversion coordination,
 transaction-complete draft persistence and opening the editor after that save.
 
 Verified with unit/fixture tests and headed, sandboxed Chromium 154.0.8037.97 via
 Xvfb. The smoke drives the real popup capture code on a localhost fixture; declared
 localhost host permission supplies its automation grant, rather than simulating
 a production `activeTab` user grant. Full Chrome/platform acceptance remains 9.2.
+
+## Safe Markdown conversion API (task 7.2)
+
+`src/capture/convert.js` exports synchronous `convertCapture(capture, { document })`.
+It accepts the raw `extractPage` result and uses only the supplied document's inert
+HTML implementation. It returns JSON data
+`{ mode, title, markdown, images, sourceUrl, capturedAt }`, without raw HTML.
+Source URL identity and capture timestamp pass through unchanged after validation;
+title remains plain metadata (frontmatter/filename generation belongs to 7.4).
+
+- Untrusted HTML is parsed only in an inert template and rebuilt with a controlled
+  HTML/attribute allowlist in its inactive owner document. Nothing is attached to
+  the page; image/frame/CSS loading and custom-element constructors are not activated.
+  Scripts, styles, forms/controls, active media and foreign namespaces are dropped;
+  ordinary unknown wrappers preserve safe children. A direct list checkbox may
+  become an inert GFM task marker; control values are never copied.
+- Links resolve against captured `baseURI`, accepting only HTTP(S) without URL
+  credentials. Unsupported links unwrap to text and unsupported images to alt text.
+  Images prefer real currentSrc hints over lazy/srcset alternatives and recognized
+  placeholders. Without currentSrc, lazy candidates precede responsive candidates
+  (largest descriptor first) and src. Approved raster data URL shapes are retained,
+  but bytes are not decoded or claimed acquired. `images` is a unique source URL
+  list for future acquisition, not a download result. No image requests occur.
+- Turndown/GFM preserve Unicode, headings, lists, quotes, ordinary tables and code.
+  Headerless tables get an empty header row; nested/complex tables containing block
+  code or literal code pipes flatten to Markdown blocks, retaining data and literal
+  code rather than falling back to raw HTML. Prose and attribute escaping prevent
+  HTML/Markdown breakout. Code stays literal, with delimiters longer than any
+  contained backtick run and normalized syntax-language hints. Turndown's isolated
+  `preformattedCode` option preserves inline-code whitespace before custom rules
+  run; code-span padding preserves original edge spaces, including all-space code.
+  Multiline inline code uses a fence rather than normalizing newlines to spaces;
+  surrounding inline formatting/links unwrap when they cannot enclose that block.
+  Adjacent inline-code payloads coalesce in the inert rebuilt DOM, including across
+  transparent/empty and whitespace-only formatting wrappers, before one delimiter is selected for the combined
+  literal text. This prevents neighboring backtick fences from joining and exposing
+  code as HTML or Markdown links, without adding visible separators or comments.
+  Nonblank emphasis/strong wrappers retain their formatting. Neighboring separate
+  code runs use different fence lengths (at most one extra backtick) so Marked's
+  emphasis mask cannot mistake a closing fence plus the next opening fence for a
+  span. Controlled inert payload attributes survive Turndown clones and prevent
+  code-edge whitespace from being duplicated outside formatting. At direct prose/
+  formatted-code boundaries, only the adjacent prose character may be spelled as
+  a CommonMark numeric entity to satisfy delimiter flanking without changing text
+  or inserting separators. These internal attributes never come from source HTML.
+- Empty conversion throws `CaptureError('conversion_empty')`; conversion/resource
+  failures use fixed `conversion_failed` messages. There is no extraction-text or
+  whole-page fallback and no additional content-size truncation. The future caller
+  must enforce the final protocol Markdown byte limit.
+
+The standalone isolated IIFE additionally exposes
+`IGoNotesContentScript.captureMarkdown(mode, expectedUrl)`, with the same
+`{ ok: true, value } | { ok: false, code }` envelope and page-URL check as `capture`.
+This fixed method combines extraction and conversion for task 7.3. The current
+popup still uses the raw extraction preview and clearly reports **not saved**.
+No sender, storage, backend, token or arbitrary-fetch functionality is added.
+
+Verification: converter fixtures and test-only Marked rendering cover hostile
+HTML/namespaces, entity/control-character schemes, attribute breakout, lazy images,
+headerless/nested tables and code-fence/adjacent-code attacks. The test renderer
+matches the app's Marked + marked-highlight + highlight.js configuration. Headed sandboxed Chromium
+**154.0.8037.97** via Xvfb passed both modes with zero new conversion requests,
+unchanged source DOM/selection/scroll, and no CSP/runtime/CDP errors. Both modes'
+hostile adjacent-code output is also actually rendered in a separate browser page,
+checking literal text, absence of injected elements/events and zero new requests.
 
 ## Local editor behavior (task 6.3)
 

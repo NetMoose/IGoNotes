@@ -75,6 +75,11 @@ test('builds a deterministic, local-only MV3 package with executable standalone 
   const first = isolated.IGoNotesContentScript.capture('article', document.URL);
   expect(first.ok).toBe(true);
   expect(first.value.text).toContain('Scientists observe');
+  const converted = isolated.IGoNotesContentScript.captureMarkdown('article', document.URL);
+  expect(converted.ok).toBe(true);
+  expect(converted.value.markdown).toContain('## Наблюдения');
+  expect(converted.value).not.toHaveProperty('html');
+  expect(isolated.IGoNotesContentScript.captureMarkdown('article', 'https://changed.test/')).toEqual({ ok: false, code: 'page_changed' });
   expect(isolated.IGoNotesContentScript.capture('selection', document.URL)).toEqual({ ok: false, code: 'selection_empty' });
   expect(isolated.IGoNotesContentScript.capture('article', 'https://changed.test/')).toEqual({ ok: false, code: 'page_changed' });
   content.runInNewContext(isolated);
@@ -89,6 +94,8 @@ test('builds a deterministic, local-only MV3 package with executable standalone 
   expect(text('LICENSES/turndown-LICENSE')).toContain('Permission is hereby granted');
   expect(text('LICENSES/turndown-plugin-gfm-LICENSE')).toContain('Permission is hereby granted');
   expect(text('LICENSES/svelte-LICENSE.md')).toContain('Permission is hereby granted');
+  expect(text('LICENSES/bundled-content.md')).toContain('turndown');
+  expect(text('LICENSES/bundled-content.md')).toContain('turndown-plugin-gfm');
   const second = join(temporary, 'second');
   build(second);
   for (const path of files(out)) {

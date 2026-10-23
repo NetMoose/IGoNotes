@@ -20,10 +20,23 @@ let result;
 let failure;
 let browserLog = '';
 const stopped = new AbortController();
-// Real article fixture, with remote resource hints removed for offline smoke.
+// All resources are local. Live-page baseline requests are allowed; conversion
+// must not activate lazy image URLs, copied CSS/frames or any other resource.
 const fixture = readFileSync(new URL('../tests/fixtures/article.html', import.meta.url), 'utf8')
-  .replace(/<base[^>]*>/, '').replace(/<img[^>]*>/, '');
-const server = createServer((_request, response) => {
+  .replace(/<base[^>]*>/, '')
+  .replace(/<img[^>]*>/, '<img src="/baseline.png" data-src="/lazy-never-request.png" alt="Current"><img src="/placeholder.gif" data-src="/conversion-never-request.png" alt="Lazy">')
+  .replace('</article>', `${readFileSync(new URL('../tests/fixtures/conversion.html', import.meta.url), 'utf8')}${readFileSync(new URL('../tests/fixtures/conversion-adjacent.html', import.meta.url), 'utf8')}<iframe src="/baseline-frame">discard frame</iframe><style>.smoke-resource { background-image: url(/baseline-css.png) }</style><p class="smoke-resource">CSS baseline</p><form>PRIVATE_FORM<input value="PRIVATE_VALUE"></form></article>`);
+const server = createServer((request, response) => {
+  if (request.url !== '/') {
+    if (/\.(png|gif)$/.test(request.url)) {
+      response.writeHead(200, { 'Content-Type': 'image/gif' });
+      response.end(Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64'));
+    } else {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<p>Local resource baseline</p>');
+    }
+    return;
+  }
   response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   response.end(fixture);
 });

@@ -6,6 +6,8 @@ const messages = {
   article_empty: 'Could not extract an article. You can select content and choose Selection.',
   page_changed: 'The active page changed. Open the popup on the source page and try again.',
   capture_failed: 'Could not capture the active page. Check page access and try again.',
+  conversion_empty: 'No supported content remains after conversion. Select content and try again.',
+  conversion_failed: 'Could not safely convert the captured content. Select a smaller fragment and try again.',
 };
 
 export class CaptureError extends Error {

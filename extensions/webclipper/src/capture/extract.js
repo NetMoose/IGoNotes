@@ -26,7 +26,12 @@ export function extractPage(document, mode) {
     if (mode === 'article') {
       const clone = document.cloneNode(true);
       preserveImageHints([...document.querySelectorAll('img')], clone);
-      const article = new Readability(clone).parse();
+      // Readability normally strips these before the converter can normalize
+      // them. Preserve only syntax hints; all classes remain untrusted input.
+      const classesToPreserve = [...new Set([...clone.querySelectorAll('pre, code, div')]
+        .flatMap(node => [...node.classList])
+        .filter(name => /^(?:language-|lang-|highlight-(?:source|text)-)[a-zA-Z0-9_+-]+$/.test(name)))];
+      const article = new Readability(clone, { classesToPreserve }).parse();
       if (!article?.content?.trim() || !article.textContent?.trim()) throw new CaptureError('article_empty');
       title = article.title || title;
       html = article.content;

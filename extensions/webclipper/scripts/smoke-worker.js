@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
+import { marked } from '../tests/helpers/app-markdown.js';
 
 // The supervisor owns Chromium, the profile and fixture. Even a stuck evaluate
 // or close here cannot block the supervisor's deadline and independent cleanup.
@@ -102,6 +103,7 @@ try {
   const page = await context.newPage();
   await inspect(page);
   await page.goto(fixtureURL);
+  await page.waitForLoadState('networkidle');
   await page.evaluate(() => {
     const range = document.createRange();
     range.selectNodeContents(document.querySelector('article'));
@@ -131,7 +133,83 @@ try {
     return { frames: results.map(result => result.frameId), extractor: results[0].result };
   }, tabId);
   assert.deepEqual(injected, { frames: [0], extractor: 'function' });
+  const conversionRequests = [];
+  const recordConversionRequest = request => conversionRequests.push(request.url());
+  context.on('request', recordConversionRequest);
+  const conversions = await worker.evaluate(async ({ tabId, url }) => {
+    const values = [];
+    for (const mode of ['selection', 'article']) {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] }, world: 'ISOLATED',
+        args: [mode, url], func: (mode, url) => globalThis.IGoNotesContentScript.captureMarkdown(mode, url),
+      });
+      values.push(result.result);
+    }
+    return values;
+  }, { tabId, url: page.url() });
+  const renderPage = await context.newPage();
+  await inspect(renderPage);
+  for (const conversion of conversions) {
+    assert.equal(conversion.ok, true);
+    assert.match(conversion.value.markdown, /## Наблюдения/);
+    assert.match(conversion.value.markdown, /\| Name \| Value \|/);
+    assert.match(conversion.value.markdown, /`````js\nconst html = '<img onerror="bad\(\)">';/);
+    assert.ok(marked.parse(conversion.value.markdown).includes('Spacing <code>a  b</code>; edges <code> a </code>; blank <code>   </code>.'));
+    assert.ok(conversion.value.markdown.includes('```\nfirst  line\n second\n```'));
+    assert.ok(conversion.value.images.includes(`${fixtureURL}conversion-never-request.png`));
+    assert.ok(conversion.value.images.includes(`${fixtureURL}baseline.png`));
+    assert.equal(Object.hasOwn(conversion.value, 'html'), false);
+    assert.doesNotMatch(conversion.value.markdown, /PRIVATE_|<iframe|<style/);
+    // Render the code-only hostile fixture with the app's actual Marked +
+    // highlight configuration in Chromium, not just a string/source assertion.
+    // Exclude the earlier legitimate article images from this render probe.
+    const start = conversion.value.markdown.indexOf('## Adjacent code safety');
+    assert.ok(start >= 0);
+    await renderPage.setContent(marked.parse(conversion.value.markdown.slice(start)));
+    const rendered = await renderPage.evaluate(() => ({
+      paragraphs: [...document.querySelectorAll('p')].filter(p => p.textContent.startsWith('Adjacent')).map(p => ({
+        text: p.textContent, code: [...p.querySelectorAll('code')].map(code => code.textContent).join(''),
+      })),
+      cell: document.querySelector('td')?.textContent,
+      cellCode: document.querySelector('td code')?.textContent,
+      formatting: [...document.querySelectorAll('p, td')].filter(element => element.querySelector('em, strong')).map(element => ({
+        text: element.textContent,
+        em: [...element.querySelectorAll('em')].map(node => node.textContent),
+        strong: [...element.querySelectorAll('strong')].map(node => node.textContent),
+      })),
+      injected: Boolean(document.querySelector('img, a, script, svg, iframe, math')),
+      eventAttributes: [...document.querySelectorAll('*')].flatMap(element => [...element.attributes].map(attr => attr.name)).filter(name => /^on/i.test(name)),
+    }));
+    assert.equal(rendered.injected, false);
+    assert.deepEqual(rendered.eventAttributes, []);
+    assert.deepEqual(rendered.paragraphs, [
+      { text: 'Adjacent HTML: a`<img src=x onerror=bad()>', code: 'a`<img src=x onerror=bad()>' },
+      { text: 'Adjacent link: a`[x](javascript:bad())', code: 'a`[x](javascript:bad())' },
+      { text: 'Adjacent wrappers: a`<img src=x onerror=bad()>', code: 'a`<img src=x onerror=bad()>' },
+      { text: 'Adjacent spaces:  `` a ', code: ' `` a ' },
+      { text: 'Adjacent blank formatting: a `<img src=x onerror=bad()>', code: 'a `<img src=x onerror=bad()>' },
+      { text: 'Adjacent emphasis: a`x`', code: 'a`x`' },
+      { text: 'Adjacent strong: a`x`', code: 'a`x`' },
+      { text: 'Adjacent nested: 左```世界`右```', code: '左```世界`右```' },
+      { text: 'Adjacent parent: alpha ` 尾', code: ' ` ' },
+    ]);
+    assert.deepEqual(rendered.formatting, [
+      { text: 'Adjacent emphasis: a`x`', em: ['`'], strong: [] },
+      { text: 'Adjacent strong: a`x`', em: [], strong: ['`'] },
+      { text: 'Adjacent nested: 左```世界`右```', em: ['`世界`'], strong: ['`世界`'] },
+      { text: 'Adjacent parent: alpha ` 尾', em: [' ` '], strong: [' ` '] },
+      { text: 'Adjacent table emphasis: a`x`', em: ['`'], strong: ['`'] },
+    ]);
+    assert.equal(rendered.cell, 'Adjacent table: a`<img src=x onerror=bad()>[x](javascript:bad())');
+    assert.equal(rendered.cellCode, 'a`<img src=x onerror=bad()>[x](javascript:bad())');
+  }
+  // Resource activation is asynchronous; include the actual render probes too.
+  await renderPage.waitForTimeout(300);
+  context.off('request', recordConversionRequest);
+  await renderPage.close();
+  assert.deepEqual(conversionRequests, [], 'conversion must initiate zero new requests after the live-page baseline');
   assert.equal(await page.content(), before);
+  assert.deepEqual(await page.evaluate(() => ({ text: getSelection().toString(), start: getSelection().getRangeAt(0).startOffset, end: getSelection().getRangeAt(0).endOffset, x: scrollX, y: scrollY })), selectionBefore);
   assert.equal(await page.evaluate(() => typeof globalThis.IGoNotesContentScript), 'undefined');
 
   const trustedStorageOnly = await worker.evaluate(async tabId => {
@@ -171,6 +249,8 @@ try {
     result: 'PASS', browser: browser.version(), extensionId: id,
     serviceWorker: worker.url(), popup: popup.url(), editor: editor.url(),
     injection: injected, domUnchanged: true, pageGlobalAbsent: true, storage,
+    markdownConversion: true, conversionRequests: conversionRequests.length,
+    adjacentCodeRenderedSafely: true,
     trustedStorageOnly, manualConnectionSettings: true, unsolicitedConnectionRequests: connectionRequests.length,
     manifestErrors: info.manifestErrors, runtimeErrors: info.runtimeErrors, cdpErrors: failures,
     sandbox: process.env.CLIPPER_SMOKE_NO_SANDBOX !== '1',
