@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
@@ -20,9 +20,11 @@ let result;
 let failure;
 let browserLog = '';
 const stopped = new AbortController();
-const fixture = '<!doctype html><title>Local fixture</title><main><h1>Unchanged page</h1><p>Local smoke only.</p></main>';
+// Real article fixture, with remote resource hints removed for offline smoke.
+const fixture = readFileSync(new URL('../tests/fixtures/article.html', import.meta.url), 'utf8')
+  .replace(/<base[^>]*>/, '').replace(/<img[^>]*>/, '');
 const server = createServer((_request, response) => {
-  response.writeHead(200, { 'Content-Type': 'text/html' });
+  response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   response.end(fixture);
 });
 

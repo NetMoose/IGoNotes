@@ -3,6 +3,7 @@ import { resolve, dirname, join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { Script } from 'node:vm';
+import { JSDOM } from 'jsdom';
 import { afterAll, expect, test } from 'vitest';
 
 const root = resolve(import.meta.dirname, '..');
@@ -60,13 +61,25 @@ test('builds a deterministic, local-only MV3 package with executable standalone 
   // A classic script parser rejects ESM imports/exports; this is the executeScript file contract.
   const content = new Script(text('content-script.js'));
   // Content entry must never acquire credential storage/transport or any channel
-  // for credentials: no fetch, message listener/sender, URL or logging path.
-  expect(text('content-script.js')).not.toMatch(/clipperConnection|TRUSTED_CONTEXTS|Authorization|chrome\.|fetch\(|console\.|sendMessage|onMessage|connection\//);
-  const document = { body: { innerHTML: '<p>unchanged</p>' } };
-  const isolated = { document };
+  // for credentials: no fetch, message listener/sender or settings path.
+  // Readability bundles a debug-only console.log branch. Our source must not log,
+  // and executing actual extraction below traps any runtime logging/access.
+  expect(text('content-script.js')).not.toMatch(/clipperConnection|TRUSTED_CONTEXTS|Authorization|chrome\.|fetch\(|sendMessage|onMessage|connection\//);
+  expect(readFileSync(join(root, 'src/capture/extract.js'), 'utf8')).not.toMatch(/console\.|debug\s*:\s*true/);
+  const document = new JSDOM(readFileSync(join(root, 'tests/fixtures/article.html'), 'utf8'), { url: 'https://example.test/article' }).window.document;
+  const before = document.documentElement.outerHTML;
+  const trap = () => { throw new Error('Forbidden ambient access'); };
+  const isolated = { document, URL, console: new Proxy({}, { get: trap }) };
+  for (const name of ['chrome', 'fetch', 'postMessage', 'addEventListener']) Object.defineProperty(isolated, name, { get: trap });
   content.runInNewContext(isolated);
-  expect(isolated.IGoNotesContentScript).toEqual({ status: 'scaffold', captureAvailable: false });
-  expect(document.body.innerHTML).toBe('<p>unchanged</p>');
+  const first = isolated.IGoNotesContentScript.capture('article', document.URL);
+  expect(first.ok).toBe(true);
+  expect(first.value.text).toContain('Scientists observe');
+  expect(isolated.IGoNotesContentScript.capture('selection', document.URL)).toEqual({ ok: false, code: 'selection_empty' });
+  expect(isolated.IGoNotesContentScript.capture('article', 'https://changed.test/')).toEqual({ ok: false, code: 'page_changed' });
+  content.runInNewContext(isolated);
+  expect(isolated.IGoNotesContentScript.capture('article', document.URL).value.html).toBe(first.value.html);
+  expect(document.documentElement.outerHTML).toBe(before);
   const notices = text('THIRD_PARTY_NOTICES.txt');
   for (const name of ['@mozilla/readability', 'turndown', 'turndown-plugin-gfm', 'svelte']) {
     expect(notices).toContain(name);

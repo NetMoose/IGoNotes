@@ -53,7 +53,7 @@
 
 ## 7. Page capture and Markdown conversion
 
-- [ ] 7.1 Реализовать action popup и isolated main-frame capture в `src/capture/`: Readability на clone и selection Range, без изменения страницы и автоматической подмены режима. Проверка: HTML fixtures на статью/выделение, пустой Readability result, отсутствие selection и restricted URL; snapshots исходного DOM совпадают до/после.
+- [x] 7.1 Реализовать action popup и isolated main-frame capture в `src/capture/`: Readability на clone и selection Range, без изменения страницы и автоматической подмены режима. Проверка: HTML fixtures на статью/выделение, пустой Readability result, отсутствие selection и restricted URL; snapshots исходного DOM совпадают до/после.
 - [ ] 7.2 Реализовать DOM allowlist/URL normalization и Turndown/GFM conversion в `src/capture/convert.js`; сохранить currentSrc/lazy-loaded источники, Unicode, таблицы/код/цитаты/списки. Проверка: Vitest fixtures с base URI, dangerous schemes, scripts/forms/events и неизвестными тегами дают ожидаемый безопасный Markdown.
 - [ ] 7.3 Соединить capture -> persisted draft -> editor tab через typed-by-schema messages без externally_connectable и произвольного fetch; валидировать sender/response. Проверка: неизвестные команды/поддельный sender отклоняются; закрытие popup после подтверждённого capture не теряет draft.
 - [ ] 7.4 Добавить безопасную сборку frontmatter и предложенного filename отдельно от title. Проверка: Go/JS fixtures с кавычками, переводами строки, кириллицей, emoji и URL query не создают дополнительные YAML keys и проходят server validation.

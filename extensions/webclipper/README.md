@@ -1,4 +1,4 @@
-# IGoNotes Web Clipper — local draft editor
+# IGoNotes Web Clipper — extraction preview and local draft editor
 
 An independently built JavaScript ESM / Svelte 5 / MV3 package
 with native IndexedDB storage and a local draft list/editor. The popup opens a
@@ -7,10 +7,11 @@ separate editor tab (also the extension's options page).
 > **Available:** list/reopen existing local drafts; edit title, filename and plain
 > Markdown; read source URL and capture time; save, retry, explicitly delete and
 > download the current Markdown; manually save/clear connection settings and test
-> the read-only protocol connection. **Planned:** page capture (7), image
-> acquisition and the extension send UI (8).
-> A fresh profile truthfully shows an empty list. There is no capture or new-draft
-> button yet; future capture task 7.3 will create drafts and open the editor.
+> the read-only protocol connection; extract Article/Selection previews (7.1).
+> **Planned:** safe Markdown conversion (7.2), capture-to-durable-draft workflow
+> (7.3), image acquisition and the extension send UI (8).
+> Preview extraction does **not** create or save a draft. A fresh profile shows an
+> empty draft list; task 7.3 will create drafts and open the editor.
 
 ## Quickstart: build, Load unpacked and connect
 
@@ -62,10 +63,11 @@ planned in task 9.2.
    credentials; it neither revokes the server connection nor deletes drafts.
    To revoke access, use **Отозвать** in the app's **Настройки → Веб-клиппер**.
 
-The popup only opens the editor; it has no capture buttons. A fresh installation
-has an empty draft list and no new-draft button. Existing drafts can be edited,
-manually saved and downloaded with **Download Markdown**. Capture is planned for
-task 7; image acquisition and the send UI are planned for task 8. The HTTP backend,
+The popup offers **Article** and **Selection** extraction previews and the editor
+link. Results are explicitly **not saved** and disappear on closing the popup.
+Existing drafts can be edited, manually saved and downloaded with **Download
+Markdown**. Conversion and durable capture are planned for tasks 7.2/7.3; image
+acquisition and the send UI are planned for task 8. The HTTP backend,
 including image import/status and recovery, is already implemented; see the
 canonical [server API documentation](../../docs/api.md#web-clipper-v1--discovery-и-http-import-доступны).
 
@@ -117,8 +119,8 @@ for tasks 7–9.
 
 `vite.config.js` builds local ESM worker and UI entries with relative asset
 paths. `vite.content.config.js` runs separately, emitting one classic IIFE
-`content-script.js` with no shared imports, ready for future isolated-world
-`scripting.executeScript({ files })` use. There are no persistent content scripts,
+`content-script.js` with no shared imports, used by isolated-world
+`scripting.executeScript({ files })` capture. There are no persistent content scripts,
 remote scripts, inline executable scripts or eval permissions. The declared
 minimum is Chrome/Chromium 120; the actual smoke version below is newer.
 
@@ -143,10 +145,11 @@ under `/tmp/opencode` and removes it on exit. It verifies worker registration,
 popup/editor DOM, popup-to-editor navigation, manual connection save/reopen/clear,
 native trusted-only Chrome storage (an isolated content script cannot read it),
 no unsolicited connection requests, native IndexedDB v1 stores and the
-empty editor after reload, real isolated content-file injection
-on a local HTTP fixture, unchanged fixture DOM, and absence of manifest/runtime,
-CSP, module, console and CDP errors. It is a packaging/storage startup check, not the
-capture/backend acceptance suite planned for task 9.1. Browser DNS is restricted
+empty editor after reload, real popup Article/Selection extraction (including
+repeated injection) on a local HTTP article fixture, unchanged fixture DOM,
+selection boundaries and scroll, and absence of manifest/runtime, CSP, module,
+console and CDP errors. It covers packaging/storage startup and task 7.1 capture,
+not the full capture/backend acceptance suite planned for task 9.1. Browser DNS is restricted
 to loopback and background networking is disabled.
 
 The Linux supervisor owns Chromium and a separate Playwright check worker in
@@ -200,8 +203,8 @@ transport and filename tests retain Node.
 APIs were checked against official Readability/Turndown documentation via
 Context7 and the installed package documentation. Vite's Context7 request timed
 out; its official build-options documentation was used instead.
-Upstream package license texts were inspected. These extraction dependencies
-are reserved for later capture tasks, not exposed as working capture features.
+Upstream package license texts were inspected. Readability 0.6.0 now runs in
+isolated capture; Turndown/GFM remain reserved for task 7.2 conversion.
 
 Each build generates `dist/THIRD_PARTY_NOTICES.txt`, copies direct runtime
 dependency LICENSE/NOTICE files verbatim to `dist/LICENSES/`, includes the full
@@ -210,6 +213,49 @@ transitive code. Ship the whole `dist` directory, including these notices.
 
 The full `npm --prefix extensions/webclipper audit`, including development
 dependencies, reports zero vulnerabilities with this lockfile.
+
+## Extraction preview API (task 7.1)
+
+On a normal HTTP(S) page, open the extension action and click **Article** or
+**Selection**. Opening the action grants temporary `activeTab` access; extraction
+runs only after the explicit mode click, in main frame `[0]`, `world: 'ISOLATED'`.
+No mandatory all-sites permission, background capture or tab watcher is added.
+The popup displays only escaped title and text character count, never page HTML.
+It says **Not saved: preview only**: no draft, Markdown, image download or delivery
+is created; closing the popup loses the result. No IGoNotes connection is needed.
+
+- Article uses `new Readability(document.cloneNode(true)).parse()`. An empty or
+  failed result asks the user to select content and choose Selection explicitly;
+  there is no automatic mode/full-DOM fallback.
+- Selection clones only the main document's noncollapsed Range, preserving rich
+  fragments and image-only selections. Empty/whitespace/foreign-frame selections
+  fail clearly. Neither mode changes live DOM, selection, scroll or styles.
+- HTTP(S) sources with URL credentials, browser/extension pages, file URLs, PDF
+  and other non-HTML documents are unsupported. No iframe/shadow DOM capture or
+  paywall bypass is provided. Restricted-page/permission/navigation errors show
+  fixed friendly messages, without native stacks, page HTML or private URLs.
+
+`src/capture/extract.js` exports synchronous `extractPage(document, mode)`;
+`mode` is exactly `'article' | 'selection'`. Its JSON-serializable result is
+`{ mode, title, html, text, baseURI, sourceUrl, capturedAt }` with UTC ISO time.
+**HTML and metadata are untrusted. Readability is not a sanitizer.** Task 7.2 must
+sanitize/normalize before conversion; no raw HTML is rendered or stored here.
+Cloned images retain raw lazy/srcset attrs and a `data-igonotes-current-src`
+runtime hint for conversion. All hints/URLs require validation in 7.2.
+
+`src/capture/browser.js` exports `captureActiveTab(mode, { chrome }?)` for trusted
+popup/future worker coordination. It snapshots the active tab ID/URL at action
+time, injects the classic bundle then calls its isolated extractor with mode/URL
+arguments; frame/document IDs and the final tab URL detect navigation. The
+stateless IIFE installs no listeners or page-world bridge. It accesses no settings,
+credentials, storage or network. `CaptureError.code` is a stable fixed-message
+error contract. Task 7.3 owns worker sender/message validation, safe conversion,
+transaction-complete draft persistence and opening the editor after that save.
+
+Verified with unit/fixture tests and headed, sandboxed Chromium 154.0.8037.97 via
+Xvfb. The smoke drives the real popup capture code on a localhost fixture; declared
+localhost host permission supplies its automation grant, rather than simulating
+a production `activeTab` user grant. Full Chrome/platform acceptance remains 9.2.
 
 ## Local editor behavior (task 6.3)
 

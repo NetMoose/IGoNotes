@@ -45,7 +45,9 @@ try {
   await inspect(popup);
   await popup.goto(`chrome-extension://${id}/popup.html`);
   await popup.getByRole('heading', { name: 'IGoNotes Web Clipper', exact: true }).waitFor();
-  assert.match(await popup.locator('main').innerText(), /capture is not available yet/);
+  await popup.getByRole('button', { name: 'Article', exact: true }).waitFor();
+  await popup.getByRole('button', { name: 'Selection', exact: true }).waitFor();
+  assert.match(await popup.locator('main').innerText(), /Not saved: preview only/);
   // Exercise the actual popup link and inspect the new editor before it loads.
   const editorPromise = context.waitForEvent('page');
   const navigation = popup.getByRole('link', { name: 'Open draft editor' }).click();
@@ -54,7 +56,7 @@ try {
   await navigation;
   await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
   assert.equal(editor.url(), `chrome-extension://${id}/editor.html`);
-  await editor.getByText('No local drafts yet. Page capture is not available yet.', { exact: true }).waitFor();
+  await editor.getByText('No local drafts yet. Extraction previews are not saved.', { exact: true }).waitFor();
 
   // Manual settings DOM: no backend is needed and Test is deliberately not clicked.
   // Watch for unsolicited requests, including requests from other extension contexts.
@@ -95,28 +97,40 @@ try {
   // Also load the editor afresh with CDP enabled before navigation, catching startup errors.
   await editor.reload();
   await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
-  await editor.getByText('No local drafts yet. Page capture is not available yet.', { exact: true }).waitFor();
+  await editor.getByText('No local drafts yet. Extraction previews are not saved.', { exact: true }).waitFor();
 
   const page = await context.newPage();
   await inspect(page);
   await page.goto(fixtureURL);
+  await page.evaluate(() => {
+    const range = document.createRange();
+    range.selectNodeContents(document.querySelector('article'));
+    const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+  });
   const before = await page.content();
+  const selectionBefore = await page.evaluate(() => ({ text: getSelection().toString(), start: getSelection().getRangeAt(0).startOffset, end: getSelection().getRangeAt(0).endOffset, x: scrollX, y: scrollY }));
   const tabId = await worker.evaluate(async (url) => {
     const tabs = await chrome.tabs.query({});
     return tabs.find((tab) => tab.url === url)?.id;
   }, page.url());
   assert.ok(Number.isInteger(tabId), 'local fixture tab found');
-  const injected = await worker.evaluate(async (tabId) => {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [0] }, world: 'ISOLATED', files: ['content-script.js'],
-    });
-    const [probe] = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [0] }, world: 'ISOLATED',
-      func: () => globalThis.IGoNotesContentScript,
-    });
-    return { frames: results.map((result) => result.frameId), scaffold: probe.result };
+  // A real action popup does not become an active tab. This test popup is an
+  // extension tab, so click its DOM without focusing it, leaving the fixture
+  // active. Production captureActiveTab performs the real query/injection/call;
+  // localhost host permission supplies the grant in this automation only.
+  await page.bringToFront();
+  for (const mode of ['Article', 'Selection', 'Article']) {
+    await popup.evaluate(name => [...document.querySelectorAll('button')].find(button => button.textContent === name).click(), mode);
+    await popup.getByRole('status').getByText(/text characters extracted/).waitFor();
+    assert.match(await popup.getByRole('status').innerText(), /Лес и наука/);
+    assert.equal(await page.content(), before);
+    assert.deepEqual(await page.evaluate(() => ({ text: getSelection().toString(), start: getSelection().getRangeAt(0).startOffset, end: getSelection().getRangeAt(0).endOffset, x: scrollX, y: scrollY })), selectionBefore);
+  }
+  const injected = await worker.evaluate(async tabId => {
+    const results = await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED', func: () => typeof globalThis.IGoNotesContentScript.capture });
+    return { frames: results.map(result => result.frameId), extractor: results[0].result };
   }, tabId);
-  assert.deepEqual(injected, { frames: [0], scaffold: { status: 'scaffold', captureAvailable: false } });
+  assert.deepEqual(injected, { frames: [0], extractor: 'function' });
   assert.equal(await page.content(), before);
   assert.equal(await page.evaluate(() => typeof globalThis.IGoNotesContentScript), 'undefined');
 
