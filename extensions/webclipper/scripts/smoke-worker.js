@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { marked } from '../tests/helpers/app-markdown.js';
+import { formatNote } from '../src/markdown/note.js';
 
 // The supervisor owns Chromium, the profile and fixture. Even a stuck evaluate
 // or close here cannot block the supervisor's deadline and independent cleanup.
@@ -157,7 +158,7 @@ try {
     assert.match(body, /\| Name \| Value \|/);
     assert.doesNotMatch(body, /PRIVATE_|<iframe|<style/);
     assert.equal(await capturedEditor.getByLabel('Title', { exact: true }).inputValue(), 'Лес и наука 🌲');
-    assert.equal(await capturedEditor.getByLabel('Filename', { exact: true }).inputValue(), 'clip.md');
+    assert.equal(await capturedEditor.getByLabel('Filename', { exact: true }).inputValue(), 'Лес и наука 🌲.md');
     await capturedEditor.getByRole('link', { name: fixtureURL, exact: true }).waitFor();
     const editorURL = new URL(capturedEditor.url());
     assert.equal(editorURL.pathname, '/editor.html');
@@ -170,6 +171,24 @@ try {
     assert.equal(await capturedEditor.getByLabel('Markdown', { exact: true }).inputValue(), body);
     await capturedEditor.getByRole('link', { name: fixtureURL, exact: true }).waitFor();
     await capturedEditor.getByRole('status').getByText('Saved locally', { exact: true }).waitFor();
+    // Real Blob download uses unsaved metadata/body, without rewriting the
+    // user's filename or persisting generated frontmatter into the body.
+    await capturedEditor.getByLabel('Filename', { exact: true }).fill('manual.md');
+    await capturedEditor.getByLabel('Title', { exact: true }).fill('<b>Unsaved "title" 🌲</b>');
+    await capturedEditor.getByLabel('Markdown', { exact: true }).fill(body + '\nUnsaved body');
+    const downloadPromise = capturedEditor.waitForEvent('download');
+    await capturedEditor.getByRole('button', { name: 'Download Markdown', exact: true }).click();
+    const download = await downloadPromise;
+    assert.equal(download.suggestedFilename(), 'manual.md');
+    const stream = await download.createReadStream();
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const capturedAt = await capturedEditor.locator('.metadata dd').last().innerText();
+    assert.equal(Buffer.concat(chunks).toString('utf8'), formatNote({ title: '<b>Unsaved "title" 🌲</b>', sourceUrl: fixtureURL, capturedAt, markdown: body + '\nUnsaved body' }));
+    assert.equal(await capturedEditor.getByLabel('Filename', { exact: true }).inputValue(), 'manual.md');
+    await capturedEditor.reload();
+    await capturedEditor.getByLabel('Markdown', { exact: true }).waitFor();
+    assert.equal(await capturedEditor.getByLabel('Markdown', { exact: true }).inputValue(), body);
     await capturedEditor.close();
     assert.equal(await page.content(), before);
     assert.deepEqual(await page.evaluate(() => ({ text: getSelection().toString(), start: getSelection().getRangeAt(0).startOffset, end: getSelection().getRangeAt(0).endOffset, x: scrollX, y: scrollY })), selectionBefore);
@@ -304,6 +323,7 @@ try {
     serviceWorker: worker.url(), popup: popup.url(), editor: editor.url(),
     injection: injected, domUnchanged: true, pageGlobalAbsent: true, storage,
     durableCapture: ['Article', 'Selection'], popupClosedAndEditorReloaded: true,
+    proposedCaptureFilename: true, unsavedFrontmatterDownload: true, manualFilenameIndependent: true,
     captureRequests: captureRequests.length, captureCredentialReads,
     markdownConversion: true, conversionRequests: conversionRequests.length,
     adjacentCodeRenderedSafely: true,

@@ -102,6 +102,19 @@ it('edits metadata and Markdown, saves transactionally and reopens without losin
   expect(document.querySelector('script, img, b')).toBeNull();
   expect(globalThis.executed).toBeUndefined();
 });
+it('keeps a manually chosen invalid filename through title edits, save and reopen', async () => {
+  const { store } = await setup();
+  const view = await opened(store);
+  await edit('Filename', '../manual:choice.MD');
+  await edit('Title', 'A completely different title');
+  await click('Save');
+  await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Saved locally'));
+  expect((await store.getDraft('a')).filename).toBe('../manual:choice.MD');
+  expect((await store.getDraft('a')).markdown).toBe('# Body a');
+  view.unmount();
+  await opened(store);
+  expect(screen.getByLabelText('Filename').value).toBe('../manual:choice.MD');
+});
 
 it('keeps new typing dirty while an older save completes, then serially persists the latest text', async () => {
   const { store } = await setup();
@@ -170,6 +183,7 @@ it('downloads current unsaved Markdown on quota failure with a safe filename and
   await opened({ ...store, saveDraft: async () => { throw new Error('Storage full'); } });
   await edit('Markdown', '<img src="https://external.invalid/pixel" onerror="executed=true">');
   await edit('Filename', '../../unsafe.html');
+  await edit('Title', '<b>Changed "title" 🌲</b>');
   await click('Save');
   await screen.findByRole('alert');
   let blob;
@@ -178,14 +192,16 @@ it('downloads current unsaved Markdown on quota failure with a safe filename and
     static revokeObjectURL = vi.fn();
   });
   const download = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function () {
-    expect(this.download).toBe('unsafe.html.md');
+    expect(this.download).toBe('_.._unsafe.html.md');
     expect(this.href).toBe('blob:local-download');
   });
   await click('Download Markdown');
   expect(download).toHaveBeenCalledOnce();
   expect(blob.type).toBe('text/markdown;charset=utf-8');
   const text = await new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsText(blob); });
-  expect(text).toBe(screen.getByLabelText('Markdown').value);
+  expect(text).toBe('---\ntitle: "<b>Changed \\"title\\" 🌲</b>"\nsource: "https://example.org/article?q=1"\nclipped_at: "2026-10-23T10:00:00Z"\n---\n\n' + screen.getByLabelText('Markdown').value);
+  expect(screen.getByLabelText('Filename').value).toBe('../../unsafe.html');
+  expect((await store.getDraft('a')).filename).toBe('a.md');
   await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:local-download'));
   expect(document.querySelector('img')).toBeNull();
 });

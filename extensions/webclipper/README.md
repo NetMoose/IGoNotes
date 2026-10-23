@@ -8,8 +8,9 @@ separate editor tab (also the extension's options page).
 > Markdown; read source URL and capture time; save, retry, explicitly delete and
 > download the current Markdown; manually save/clear connection settings and test
 > the read-only protocol connection; capture Article/Selection as converted Markdown,
-> commit a local draft, and open it in a separate editor tab (7.1–7.3).
-> **Planned:** safe frontmatter/filename formatting (7.4), image acquisition and
+> commit a local draft, and open it in a separate editor tab; suggest a portable
+> filename and export safe YAML frontmatter (7.1–7.4).
+> **Planned:** image acquisition and
 > the extension send UI (8). Captured image URLs are pending metadata only; no image
 > bytes are downloaded. A fresh profile has no drafts until the first capture.
 
@@ -77,7 +78,7 @@ canonical [server API documentation](../../docs/api.md#web-clipper-v1--discovery
 Drafts/images/attempts live in this extension's **IndexedDB** in this browser
 profile. Endpoint/token live separately in trusted-only **chrome.storage.local**,
 not browser sync. Neither store is a backup or synchronized with IGoNotes.
-**Download Markdown** exports only the current Markdown text, not all drafts or
+**Download Markdown** exports current metadata frontmatter and Markdown body, not all drafts or
 an offline archive with all images. Uninstalling the extension, deleting the
 browser profile or clearing its storage can lose drafts, images and credentials;
 browser eviction is also possible. **Clear connection** keeps drafts and images.
@@ -152,7 +153,9 @@ the selected editor with the exact saved body/source, unchanged fixture DOM,
 selection boundaries and scroll, article/selection Markdown conversion with zero
 new conversion-induced requests after the live-page resource baseline, and absence
 of manifest/runtime, CSP, module, console and CDP errors. Capture makes zero image/backend
-requests and zero worker connection-storage reads. It covers packaging/storage startup and tasks 7.1–7.3,
+requests and zero worker connection-storage reads. It also checks proposed filenames
+and actual Blob downloads of unsaved title/body edits with an independent manual filename.
+It covers packaging/storage startup and tasks 7.1–7.4,
 not the full capture/backend acceptance suite planned for task 9.1. Browser DNS is restricted
 to loopback and background networking is disabled.
 
@@ -196,6 +199,8 @@ development-only. Marked 18.0.6, marked-highlight 2.2.4 and highlight.js 11.11.1
 configuration, are test-only for adversarial rendering assertions; no renderer is
 bundled in the extension. `fake-indexeddb` 6.2.6 (Apache-2.0) is an exactly pinned
 development-only IndexedDB test implementation; it is not browser runtime code.
+`yaml` 2.9.1 (ISC) is a pinned development-only independent YAML 1.2 parser for
+frontmatter assertions. It is not bundled or included in runtime license notices.
 UI tests use exactly pinned `@testing-library/svelte` 5.4.2,
 `@testing-library/dom` 10.4.2 and `jsdom` 30.1.3. `editor.test.js` and
 `connection-ui.test.js` select jsdom via file directives; packaging, storage,
@@ -274,7 +279,7 @@ It accepts the raw `extractPage` result and uses only the supplied document's in
 HTML implementation. It returns JSON data
 `{ mode, title, markdown, images, sourceUrl, capturedAt }`, without raw HTML.
 Source URL identity and capture timestamp pass through unchanged after validation;
-title remains plain metadata (frontmatter/filename generation belongs to 7.4).
+title remains literal metadata; the shared note formatter below handles export.
 
 - Untrusted HTML is parsed only in an inert template and rebuilt with a controlled
   HTML/attribute allowlist in its inactive owner document. Nothing is attached to
@@ -355,9 +360,9 @@ Order: await trusted-storage protection (without loading credentials) → query 
 active HTTP(S) source → isolated frame-0 `captureMarkdown(mode, expectedUrl)` with
 document-ID/final-URL checks → real IndexedDB transaction **complete** → open
 `editor.html?draft=<encoded-id>` → acknowledge. The editor URL contains only the
-ID. The stored draft has `filename: 'clip.md'`, `base: null`, `parent: ''`,
+ID. The stored draft has `filename: proposeFilename(title)`, `base: null`, `parent: ''`,
 `destinationRevision: null`, `status: 'draft'`, plus title/body/source/time.
-Source/time remain captured metadata; no YAML frontmatter is generated yet (7.4).
+Title/source/time remain separate from the Markdown body in storage.
 Unique image URLs are stored atomically as assets with generated ID,
 `descriptor: { status: 'pending' }`, and `blob: null`, never acquired image bytes.
 
@@ -373,7 +378,7 @@ Quota/transaction failures and the 50-draft limit never evict old work or open a
 editor for the unsaved capture. The trusted popup receives only the safe current
 Markdown/metadata, says **Not saved**, and offers **Download current Markdown** plus
 manual space management through the draft list. Closing it loses unsaved material.
-Download exports the body only, not metadata or image bytes. A 5 MiB limit failure
+Download exports metadata frontmatter and body, without image bytes. A 5 MiB limit failure
 similarly keeps the current material downloadable and asks for a smaller selection.
 No capture success is claimed until durable persistence succeeds.
 
@@ -385,6 +390,68 @@ matches the app's Marked + marked-highlight + highlight.js configuration. Headed
 unchanged source DOM/selection/scroll, and no CSP/runtime/CDP errors. Both modes'
 hostile adjacent-code output is also actually rendered in a separate browser page,
 checking literal text, absence of injected elements/events and zero new requests.
+
+## Note formatting API (task 7.4)
+
+`src/markdown/note.js` is pure shared runtime code with no YAML dependency:
+
+```js
+proposeFilename('Лес: наука 🌲.MD'); // 'Лес_ наука 🌲.md'
+formatNote({
+  title: 'Лес: наука 🌲.MD',
+  sourceUrl: 'https://example.org/article?q=1&lang=ru#section',
+  capturedAt: '2026-10-23T12:00:00Z',
+  markdown: '# Body\r\nNo final newline',
+});
+// ---
+// title: "Лес: наука 🌲.MD"
+// source: "https://example.org/article?q=1&lang=ru#section"
+// clipped_at: "2026-10-23T12:00:00Z"
+// ---
+//
+// followed by the EXACT body bytes represented above
+```
+
+`formatNote({ title, sourceUrl, capturedAt, markdown })` returns exactly
+`---\ntitle: <quoted>\nsource: <quoted>\nclipped_at: <quoted>\n---\n\n` plus
+the untouched body. It never parses/removes a body's own `---`, changes CRLF or
+adds a final newline. Scalars use JSON double quoting compatible with YAML 1.2,
+with explicit Unicode NEL/LS/PS, C1 and YAML-disallowed character escapes. Title
+is preserved exactly, including literal HTML-looking data; HTML escaping belongs
+to the backend preview. Source remains the original credential-free HTTP(S) URL,
+including query/fragment spelling; capture time remains a quoted string with
+UTC RFC3339 `Z` and up to nine fractional digits. Invalid Unicode, URL or timestamp
+throws an explicit `Invalid note …` error; capture validates metadata before saving.
+`validateNoteMetadata({ title, sourceUrl, capturedAt })` shares that validation with
+the strict worker/popup schemas without assembling a body or reading credentials.
+
+`proposeFilename(title)` runs only when initially creating a captured draft. It
+normalizes the filename to NFC (never title), replaces separators, Windows-invalid
+characters and Unicode controls/format/line separators, trims dot/space edges,
+avoids Windows device aliases including `CONIN$`/`CONOUT$` and superscript COM/LPT
+variants, and appends one lowercase `.md` suffix (`.MD` is normalized). Empty titles
+fall back to `clip.md`. The component is at most 255 UTF-8 bytes including suffix,
+truncated only between code points.
+Device-name protection runs after final truncation and trailing dot/space trimming;
+if `_` is needed, one byte is reserved and the protected component is re-bounded.
+An empty final stem falls back to `clip`. It is not a collision guarantee: backend
+`409 note_conflict` still requires the user to choose another filename.
+
+Editing title, saving or reopening never regenerates the user's filename. Manual
+invalid filenames can remain local; future delivery preflight (8.5) must reject
+them, not silently sanitize the wire value. Download alone sanitizes the current
+filename with the same proposer, leaving the stored/input filename unchanged.
+`downloadMarkdown(note, filename)` uses the shared formatter for both editor and
+popup quota fallback, exporting current unsaved metadata/body rather than old DB
+values. No frontmatter is persisted into the draft body. Future 8.3 upload
+snapshots should use this same formatter with `source_url`/`captured_at` also on
+the wire; `ClipperManifest` has no new title field.
+
+Shared fixtures in `testdata/clipper/note-format.json` assert exact filename/full
+Markdown in JS, parse exactly `title`, `source`, `clipped_at` as equal YAML 1.2
+string scalars using dev-only `yaml`, and pass Go manifest validation/strict wire
+decode with byte-exact content. They cover quotes, newlines, Unicode, URL queries,
+HTML-looking title data, a body's own frontmatter and a 255-byte emoji filename.
 
 ## Local editor behavior (task 6.3)
 
@@ -410,11 +477,10 @@ checking literal text, absence of injected elements/events and zero new requests
   Storage/list/read/delete errors are shown with **Retry**. Storage retries reopen
   a component-owned handle so a cached open failure or terminal connection can
   recover without discarding in-memory edits; injected handles stay caller-owned.
-- **Download Markdown** uses the current textarea text, even if saving failed.
-  It is raw Markdown only: title/source/time remain separate metadata, no YAML
-  frontmatter is generated (planned for 7.4), and images are not packaged/exported.
+- **Download Markdown** uses current metadata and textarea text, even if saving failed.
+  It prepends safe title/source/time YAML frontmatter; images are not packaged/exported.
   The download uses a local Blob URL, a sanitized basename ending in `.md` (or
-  `draft.md` fallback) and revokes the object URL after use.
+  `clip.md` fallback) and revokes the object URL after use.
 - Markdown is a plain textarea with no HTML preview or external image loading.
   Titles, filenames, paths and metadata are escaped text. The source link is
   enabled only for absolute HTTP(S) URLs without credentials and opens with

@@ -3,6 +3,7 @@
   import { captureMessage, captureResponse, captureFailureMessage, manualOpenDraftEditor } from '../capture/messages.js';
   import { CaptureError } from '../capture/errors.js';
   import { downloadMarkdown } from './markdown-download.js';
+  import { proposeFilename } from '../markdown/note.js';
 
   let { capture = captureMessage, openEditor = manualOpenDraftEditor, download = downloadMarkdown } = $props();
   let loading = $state(false);
@@ -42,7 +43,7 @@
     finally { if (!disposed) loading = false; }
   }
   function downloadCurrent() {
-    try { download(unsaved.markdown, 'clip.md'); }
+    try { download($state.snapshot(unsaved), proposeFilename(unsaved.title)); }
     catch { error = 'Download failed. Keep this popup open and try downloading again.'; }
   }
 </script>
@@ -61,7 +62,7 @@
     <p>Not saved: closing this popup loses the current material. Download it before closing or capturing again.</p>
     <p>{unsaved.title}</p>
     <button onclick={downloadCurrent}>Download current Markdown</button>
-    <p>Download contains the Markdown body only, without metadata or image files.</p>
+    <p>Download includes title/source/time as frontmatter and the Markdown body, without image files.</p>
   {/if}
   <a href="./editor.html" target="_blank" rel="noopener">Open draft editor</a>
 </main>

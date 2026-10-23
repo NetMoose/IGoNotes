@@ -1,4 +1,5 @@
 import { CaptureError, validateMode, validateSourceUrl } from './errors.js';
+import { validateNoteMetadata } from '../markdown/note.js';
 
 const storageCodes = ['draft_limit', 'blob_limit', 'storage_quota', 'storage_cancelled', 'storage_unavailable', 'storage_blocked', 'storage_version_changed', 'storage_closed', 'storage_conflict', 'storage_error'];
 const codes = ['invalid_request', 'too_large', ...storageCodes];
@@ -12,7 +13,7 @@ const text = value => typeof value === 'string' && value.isWellFormed() && !valu
 function metadata(value) {
   if (!text(value.title) || !text(value.markdown) || !value.markdown.trim() || !text(value.sourceUrl) ||
       !text(value.capturedAt) || !Number.isFinite(Date.parse(value.capturedAt))) invalid();
-  validateSourceUrl(value.sourceUrl);
+  try { validateNoteMetadata(value); } catch { invalid(); }
   return { title: value.title, markdown: value.markdown, sourceUrl: value.sourceUrl, capturedAt: value.capturedAt };
 }
 function imageSource(value) {

@@ -142,7 +142,7 @@
   }
   function download() {
     try {
-      downloadMarkdown(current.markdown, current.filename);
+      downloadMarkdown($state.snapshot(current), current.filename);
       if (failedAction === 'download') clearError();
     }
     catch (cause) { report(cause, 'download'); }
@@ -217,7 +217,7 @@
           <textarea id="draft-markdown" rows="20" spellcheck="false" value={current.markdown}
             oninput={event => edit('markdown', event.currentTarget.value)}></textarea>
         </fieldset>
-        <p class="muted">Manual save. Download includes the current Markdown text only; metadata and image files are separate.</p>
+        <p class="muted">Manual save. Download includes current title/source/time as frontmatter and the Markdown body; image files are not included.</p>
         <button class="danger" onclick={remove} disabled={busy || loading}>Delete draft</button>
         <p class="muted">Delete permanently removes this draft, its unsaved edits and its stored images from this profile.</p>
       {:else if !loading && !error && drafts.length === 0}

@@ -1,10 +1,29 @@
 // @vitest-environment jsdom
 import { afterEach, it, expect, vi } from 'vitest';
+import { parseDocument } from 'yaml';
 import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
 import Popup from '../src/ui/Popup.svelte';
 import { CaptureError } from '../src/capture/errors.js';
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+it('quota download exports safe real YAML headers and the untouched unsaved body', async () => {
+  const unsaved = { title: '"---: injected 🌲', sourceUrl: 'https://example.test/?x=1&y=2#fragment', capturedAt: '2026-10-23T00:00:00Z', markdown: '---\r\nuser: body\r\n---' };
+  let blob;
+  vi.stubGlobal('URL', class extends URL {
+    static createObjectURL(value) { blob = value; return 'blob:download'; }
+    static revokeObjectURL = vi.fn();
+  });
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+  render(Popup, { capture: async () => ({ ok: false, code: 'storage_quota', unsaved }) });
+  await fireEvent.click(screen.getByRole('button', { name: 'Article', exact: true }));
+  await screen.findByText(/Not saved.*closing.*loses/i);
+  await fireEvent.click(screen.getByRole('button', { name: 'Download current Markdown' }));
+  const text = await new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsText(blob); });
+  const end = text.indexOf('\n---\n\n', 4);
+  expect(parseDocument(text.slice(4, end)).toJS()).toEqual({ title: unsaved.title, source: unsaved.sourceUrl, clipped_at: unsaved.capturedAt });
+  expect(text.slice(end + 6)).toBe(unsaved.markdown);
+  expect(screen.queryByText(/Saved locally/)).toBeNull();
+});
 it.each(['Article', 'Selection'])('requests explicit %s once while busy and acknowledges only persisted draft', async mode => {
   let resolve; const capture = vi.fn(() => new Promise(yes => { resolve = yes; }));
   render(Popup, { capture }); expect(capture).not.toHaveBeenCalled();
@@ -58,7 +77,7 @@ it.each(['storage_quota', 'draft_limit'])('%s explicitly keeps unsaved material 
   expect(screen.queryByText(/Saved locally/)).toBeNull();
   expect(screen.getByRole('link', { name: 'Open draft editor' })).toBeTruthy();
   await fireEvent.click(screen.getByRole('button', { name: 'Download current Markdown' }));
-  expect(download).toHaveBeenCalledExactlyOnceWith(unsaved.markdown, 'clip.md');
+  expect(download).toHaveBeenCalledExactlyOnceWith(unsaved, '_img src=x_.md');
   expect(document.querySelector('main img, main script')).toBeNull();
 });
 it.each([{}, { ok: true, draftId: 'id', editorOpened: true, html: '<script>bad</script>' }, { ok: false, code: 'secret native message' }])('rejects malformed worker response without presenting saved', async response => {

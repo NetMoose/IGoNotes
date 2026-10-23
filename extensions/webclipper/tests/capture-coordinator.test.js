@@ -36,7 +36,7 @@ it('registers synchronously, protects before capture, commits before opening edi
   expect(s.capture).toHaveBeenCalledExactlyOnceWith('article', { chrome: s.chrome });
   expect(s.chrome.tabs.create).toHaveBeenCalledExactlyOnceWith({ url: `chrome-extension://own/editor.html?draft=${encodeURIComponent(response.draftId)}` });
   const reopened = createDraftStore({ indexedDB: s.indexedDB });
-  expect(await reopened.getDraft(response.draftId)).toMatchObject({ title: value.title, filename: 'clip.md', markdown: value.markdown, sourceUrl: value.sourceUrl, capturedAt: value.capturedAt, base: null, parent: '', destinationRevision: null, status: 'draft' });
+  expect(await reopened.getDraft(response.draftId)).toMatchObject({ title: value.title, filename: 'Title.md', markdown: value.markdown, sourceUrl: value.sourceUrl, capturedAt: value.capturedAt, base: null, parent: '', destinationRevision: null, status: 'draft' });
   const assets = await reopened.getAssets(response.draftId);
   expect(assets).toHaveLength(1);
   expect(assets[0]).toMatchObject({ id: expect.any(String), normalizedUrl: value.images[0], descriptor: { status: 'pending' }, blob: null });
@@ -64,7 +64,7 @@ it('accepts only the exact own popup URL when Chrome includes extension-tab/fram
   const s = setup();
   expect(await s.send(request, { ...sender, frameId: 0, tab: { id: 20, url: sender.url } }).response).toMatchObject({ ok: true, editorOpened: true });
 });
-it.each([null, { ...value, html: '<script>bad</script>' }, { ...value, token: 'secret' }, { ...value, markdown: '' }, { ...value, images: [{ url: 'https://x.test/' }] }, { ...value, images: ['javascript:bad()'] }, { ...value, mode: 'selection' }])('rejects malformed converter payload before persistence', async payload => {
+it.each([null, { ...value, capturedAt: '2026-02-30T12:00:00Z' }, { ...value, capturedAt: '2026-10-23T12:00:00+00:00' }, { ...value, sourceUrl: 'https://example.test/?q=%0a' }, { ...value, html: '<script>bad</script>' }, { ...value, token: 'secret' }, { ...value, markdown: '' }, { ...value, images: [{ url: 'https://x.test/' }] }, { ...value, images: ['javascript:bad()'] }, { ...value, mode: 'selection' }])('rejects malformed converter payload before persistence', async payload => {
   const s = setup(); s.capture.mockResolvedValue(payload);
   expect(await s.send().response).toEqual({ ok: false, code: 'capture_failed' });
   expect(s.createStore).not.toHaveBeenCalled(); expect(s.chrome.tabs.create).not.toHaveBeenCalled();

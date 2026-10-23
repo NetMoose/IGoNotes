@@ -1,5 +1,6 @@
 import { captureActiveMarkdownTab } from './browser.js';
 import { createDraftStore } from '../storage/drafts.js';
+import { proposeFilename } from '../markdown/note.js';
 import { captureRequest, popupSender, convertedCapture, failureCode, draftEditorUrl, MAX_MARKDOWN_BYTES } from './messages.js';
 
 // This module never reads settings/credentials or performs fetch. Every capture
@@ -17,7 +18,7 @@ export function registerCaptureCoordinator({ chrome = globalThis.chrome, protect
       const assets = [...new Set(result.images)].map(normalizedUrl => ({ id: crypto.randomUUID(), normalizedUrl, descriptor: { status: 'pending' }, blob: null }));
       const store = createStore();
       try {
-        await store.saveDraft({ id, ...material, filename: 'clip.md', base: null, parent: '', destinationRevision: null, status: 'draft' }, { assets });
+        await store.saveDraft({ id, ...material, filename: proposeFilename(title), base: null, parent: '', destinationRevision: null, status: 'draft' }, { assets });
       } finally { store.close(); }
       // Commit is definitive. Tab/channel errors cannot turn it into a capture
       // failure, delete the draft, or trigger a second capture/save.
