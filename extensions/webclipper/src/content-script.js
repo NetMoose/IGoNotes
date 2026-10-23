@@ -18,8 +18,7 @@ export default {
   capture(mode, expectedUrl) {
     return capture(mode, expectedUrl, false);
   },
-  // Fixed data-only entry for the future durable capture coordinator (7.3).
-  // The popup continues using the explicitly unsaved extraction preview above.
+  // Fixed data-only entry for the durable worker capture coordinator.
   captureMarkdown(mode, expectedUrl) {
     return capture(mode, expectedUrl, true);
   },

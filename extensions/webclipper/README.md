@@ -1,4 +1,4 @@
-# IGoNotes Web Clipper — extraction, conversion and local draft editor
+# IGoNotes Web Clipper — durable Markdown capture and local draft editor
 
 An independently built JavaScript ESM / Svelte 5 / MV3 package
 with native IndexedDB storage and a local draft list/editor. The popup opens a
@@ -7,12 +7,11 @@ separate editor tab (also the extension's options page).
 > **Available:** list/reopen existing local drafts; edit title, filename and plain
 > Markdown; read source URL and capture time; save, retry, explicitly delete and
 > download the current Markdown; manually save/clear connection settings and test
-> the read-only protocol connection; extract Article/Selection previews (7.1);
-> isolated safe Markdown conversion API (7.2).
-> **Planned:** capture-to-durable-draft workflow
-> (7.3), image acquisition and the extension send UI (8).
-> Preview extraction does **not** create or save a draft. A fresh profile shows an
-> empty draft list; task 7.3 will create drafts and open the editor.
+> the read-only protocol connection; capture Article/Selection as converted Markdown,
+> commit a local draft, and open it in a separate editor tab (7.1–7.3).
+> **Planned:** safe frontmatter/filename formatting (7.4), image acquisition and
+> the extension send UI (8). Captured image URLs are pending metadata only; no image
+> bytes are downloaded. A fresh profile has no drafts until the first capture.
 
 ## Quickstart: build, Load unpacked and connect
 
@@ -64,10 +63,11 @@ planned in task 9.2.
    credentials; it neither revokes the server connection nor deletes drafts.
    To revoke access, use **Отозвать** in the app's **Настройки → Веб-клиппер**.
 
-The popup offers **Article** and **Selection** extraction previews and the editor
-link. Results are explicitly **not saved** and disappear on closing the popup.
-Existing drafts can be edited, manually saved and downloaded with **Download
-Markdown**. Conversion is ready as an isolated API; durable capture is planned for 7.3; image
+The popup offers **Article** and **Selection** capture and the editor link. Capture
+converts the source to Markdown and saves it locally before opening the editor.
+**Saved locally** confirms the IndexedDB transaction completed; closing the popup
+then keeps the draft. No IGoNotes connection is needed for capture. Drafts can be
+edited, manually saved and downloaded with **Download Markdown**. Image
 acquisition and the send UI are planned for task 8. The HTTP backend,
 including image import/status and recovery, is already implemented; see the
 canonical [server API documentation](../../docs/api.md#web-clipper-v1--discovery-и-http-import-доступны).
@@ -146,11 +146,13 @@ under `/tmp/opencode` and removes it on exit. It verifies worker registration,
 popup/editor DOM, popup-to-editor navigation, manual connection save/reopen/clear,
 native trusted-only Chrome storage (an isolated content script cannot read it),
 no unsolicited connection requests, native IndexedDB v1 stores and the
-empty editor after reload, real popup Article/Selection extraction (including
-repeated injection) on a local HTTP article fixture, unchanged fixture DOM,
+empty editor after reload, real popup Article/Selection capture to persisted drafts
+on a local HTTP article fixture, closing each popup after confirmation and reloading
+the selected editor with the exact saved body/source, unchanged fixture DOM,
 selection boundaries and scroll, article/selection Markdown conversion with zero
 new conversion-induced requests after the live-page resource baseline, and absence
-of manifest/runtime, CSP, module, console and CDP errors. It covers packaging/storage startup and tasks 7.1–7.2,
+of manifest/runtime, CSP, module, console and CDP errors. Capture makes zero image/backend
+requests and zero worker connection-storage reads. It covers packaging/storage startup and tasks 7.1–7.3,
 not the full capture/backend acceptance suite planned for task 9.1. Browser DNS is restricted
 to loopback and background networking is disabled.
 
@@ -221,15 +223,15 @@ transitive code. Ship the whole `dist` directory, including these notices.
 The full `npm --prefix extensions/webclipper audit`, including development
 dependencies, reports zero vulnerabilities with this lockfile.
 
-## Extraction preview API (task 7.1)
+## Extraction API (task 7.1)
 
 On a normal HTTP(S) page, open the extension action and click **Article** or
 **Selection**. Opening the action grants temporary `activeTab` access; extraction
 runs only after the explicit mode click, in main frame `[0]`, `world: 'ISOLATED'`.
 No mandatory all-sites permission, background capture or tab watcher is added.
-The popup displays only escaped title and text character count, never page HTML.
-It says **Not saved: preview only**: this popup path creates no draft, Markdown,
-image download or delivery; closing the popup loses the result. No IGoNotes connection is needed.
+The popup sends only the chosen mode to the worker; page HTML never enters the
+popup or draft store. The worker's durable capture pipeline is described below.
+No IGoNotes connection is needed.
 
 - Article uses `new Readability(document.cloneNode(true)).parse()`. An empty or
   failed result asks the user to select content and choose Selection explicitly;
@@ -251,14 +253,14 @@ Cloned images retain raw lazy/srcset attrs and a `data-igonotes-current-src`
 runtime hint for conversion. The converter validates all hints/URLs. Recognized
 syntax-language classes are preserved through Readability for safe normalization.
 
-`src/capture/browser.js` exports `captureActiveTab(mode, { chrome }?)` for trusted
-popup/future worker coordination. It snapshots the active tab ID/URL at action
+`src/capture/browser.js` retains `captureActiveTab(mode, { chrome }?)` as a raw
+extraction helper and exports `captureActiveMarkdownTab(mode, { chrome }?)` for
+the worker. Each snapshots the active tab ID/URL at action
 time, injects the classic bundle then calls its isolated extractor with mode/URL
 arguments; frame/document IDs and the final tab URL detect navigation. The
 stateless IIFE installs no listeners or page-world bridge. It accesses no settings,
 credentials, storage or network. `CaptureError.code` is a stable fixed-message
-error contract. Task 7.3 owns worker sender/message validation, conversion coordination,
-transaction-complete draft persistence and opening the editor after that save.
+error contract. The popup uses the worker message API, not the raw extraction helper.
 
 Verified with unit/fixture tests and headed, sandboxed Chromium 154.0.8037.97 via
 Xvfb. The smoke drives the real popup capture code on a localhost fixture; declared
@@ -311,15 +313,69 @@ title remains plain metadata (frontmatter/filename generation belongs to 7.4).
   or inserting separators. These internal attributes never come from source HTML.
 - Empty conversion throws `CaptureError('conversion_empty')`; conversion/resource
   failures use fixed `conversion_failed` messages. There is no extraction-text or
-  whole-page fallback and no additional content-size truncation. The future caller
-  must enforce the final protocol Markdown byte limit.
+  whole-page fallback and no additional content-size truncation. The worker enforces
+  the final protocol Markdown byte limit of 5 MiB UTF-8 without truncating work.
 
 The standalone isolated IIFE additionally exposes
 `IGoNotesContentScript.captureMarkdown(mode, expectedUrl)`, with the same
 `{ ok: true, value } | { ok: false, code }` envelope and page-URL check as `capture`.
-This fixed method combines extraction and conversion for task 7.3. The current
-popup still uses the raw extraction preview and clearly reports **not saved**.
-No sender, storage, backend, token or arbitrary-fetch functionality is added.
+This fixed method combines extraction and conversion for the worker. The isolated
+bundle adds no listeners, storage, backend, token or arbitrary-fetch functionality.
+
+## Durable capture message API (task 7.3)
+
+`src/capture/coordinator.js` registers `runtime.onMessage` synchronously on every
+worker evaluation. Chrome 120 compatibility uses literal `return true` with
+`sendResponse`, not a Promise-returning listener. Only the exact own `popup.html`
+URL, matching runtime ID and extension origin are accepted. Subframes, source-page
+content scripts (even with the same runtime ID), other extension pages and popup
+URLs with query/fragment are rejected. Native extension-tab sender metadata is
+accepted only for frame 0 and the exact own popup tab URL.
+
+Schemas are defined and validated in `src/capture/messages.js`:
+
+```js
+// Exactly these keys, no URLs, scripts, settings, token or proxy options:
+{ type: 'capture', mode: 'article' /* or 'selection' */ }
+// Durable success, with no captured text/HTML in the acknowledgement:
+{ ok: true, draftId: 'random-uuid', editorOpened: true /* or false */ }
+// Fixed allowlisted code, never native exception text:
+{ ok: false, code: 'article_empty' }
+// Only after a valid capture that cannot be stored (or exceeds 5 MiB):
+{ ok: false, code: 'storage_quota', unsaved: { title, markdown, sourceUrl, capturedAt } }
+```
+
+Unknown commands/extra keys are rejected before storage, injection or tab operations.
+The capture result is strict plain JSON with exactly `mode`, `title`, `markdown`,
+`images` (URL strings), `sourceUrl`, `capturedAt`; malformed results fail before
+persistence, with no raw-HTML/text fallback. Both worker and popup validate responses.
+There is no external/page message listener, `externally_connectable` or fetch proxy.
+
+Order: await trusted-storage protection (without loading credentials) → query the
+active HTTP(S) source → isolated frame-0 `captureMarkdown(mode, expectedUrl)` with
+document-ID/final-URL checks → real IndexedDB transaction **complete** → open
+`editor.html?draft=<encoded-id>` → acknowledge. The editor URL contains only the
+ID. The stored draft has `filename: 'clip.md'`, `base: null`, `parent: ''`,
+`destinationRevision: null`, `status: 'draft'`, plus title/body/source/time.
+Source/time remain captured metadata; no YAML frontmatter is generated yet (7.4).
+Unique image URLs are stored atomically as assets with generated ID,
+`descriptor: { status: 'pending' }`, and `blob: null`, never acquired image bytes.
+
+The worker owns the operation and closes only its own store handle after the
+transaction settles. Closing/unmounting the popup cannot cancel a committed save;
+a closed response channel does not delete or re-create it. Worker restart opens
+the same database. Busy popup buttons prevent double-click captures and late
+callbacks do not update destroyed UI. If tab opening fails after commit, success
+still reports `editorOpened: false`: **Open saved draft** uses the same ID without
+re-capturing. **Open draft editor** also offers the existing draft list.
+
+Quota/transaction failures and the 50-draft limit never evict old work or open an
+editor for the unsaved capture. The trusted popup receives only the safe current
+Markdown/metadata, says **Not saved**, and offers **Download current Markdown** plus
+manual space management through the draft list. Closing it loses unsaved material.
+Download exports the body only, not metadata or image bytes. A 5 MiB limit failure
+similarly keeps the current material downloadable and asks for a smaller selection.
+No capture success is claimed until durable persistence succeeds.
 
 Verification: converter fixtures and test-only Marked rendering cover hostile
 HTML/namespaces, entity/control-character schemes, attribute breakout, lazy images,

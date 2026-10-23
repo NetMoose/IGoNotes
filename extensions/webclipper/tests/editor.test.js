@@ -199,7 +199,7 @@ it('shows truthful empty state and loading/storage errors with retry', async () 
   gate.reject(new Error('Storage unavailable'));
   await screen.findByRole('alert');
   await click('Retry');
-  await screen.findByText('No local drafts yet. Extraction previews are not saved.');
+  await screen.findByText('No local drafts yet. Capture an Article or Selection from the popup.');
   expect(screen.queryByLabelText('Markdown')).toBeNull();
   expect(screen.queryByRole('button', { name: /capture/i })).toBeNull();
 });

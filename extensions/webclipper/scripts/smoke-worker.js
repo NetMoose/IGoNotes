@@ -48,7 +48,7 @@ try {
   await popup.getByRole('heading', { name: 'IGoNotes Web Clipper', exact: true }).waitFor();
   await popup.getByRole('button', { name: 'Article', exact: true }).waitFor();
   await popup.getByRole('button', { name: 'Selection', exact: true }).waitFor();
-  assert.match(await popup.locator('main').innerText(), /Not saved: preview only/);
+  assert.match(await popup.locator('main').innerText(), /local Markdown draft/);
   // Exercise the actual popup link and inspect the new editor before it loads.
   const editorPromise = context.waitForEvent('page');
   const navigation = popup.getByRole('link', { name: 'Open draft editor' }).click();
@@ -57,7 +57,7 @@ try {
   await navigation;
   await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
   assert.equal(editor.url(), `chrome-extension://${id}/editor.html`);
-  await editor.getByText('No local drafts yet. Extraction previews are not saved.', { exact: true }).waitFor();
+  await editor.getByText('No local drafts yet. Capture an Article or Selection from the popup.', { exact: true }).waitFor();
 
   // Manual settings DOM: no backend is needed and Test is deliberately not clicked.
   // Watch for unsolicited requests, including requests from other extension contexts.
@@ -98,7 +98,7 @@ try {
   // Also load the editor afresh with CDP enabled before navigation, catching startup errors.
   await editor.reload();
   await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
-  await editor.getByText('No local drafts yet. Extraction previews are not saved.', { exact: true }).waitFor();
+  await editor.getByText('No local drafts yet. Capture an Article or Selection from the popup.', { exact: true }).waitFor();
 
   const page = await context.newPage();
   await inspect(page);
@@ -118,16 +118,70 @@ try {
   assert.ok(Number.isInteger(tabId), 'local fixture tab found');
   // A real action popup does not become an active tab. This test popup is an
   // extension tab, so click its DOM without focusing it, leaving the fixture
-  // active. Production captureActiveTab performs the real query/injection/call;
+  // active. Production worker capture performs the real query/injection/call;
   // localhost host permission supplies the grant in this automation only.
-  await page.bringToFront();
-  for (const mode of ['Article', 'Selection', 'Article']) {
-    await popup.evaluate(name => [...document.querySelectorAll('button')].find(button => button.textContent === name).click(), mode);
-    await popup.getByRole('status').getByText(/text characters extracted/).waitFor();
-    assert.match(await popup.getByRole('status').innerText(), /Лес и наука/);
+  const captureRequests = [];
+  const recordCaptureRequest = request => {
+    if (!request.url().startsWith(`chrome-extension://${id}/`)) captureRequests.push(request.url());
+  };
+  // Guard the actual worker API during capture, separately from settings tests.
+  await worker.evaluate(() => {
+    globalThis.smokeStorageGet = chrome.storage.local.get;
+    globalThis.smokeCaptureCredentialReads = 0;
+    chrome.storage.local.get = () => { globalThis.smokeCaptureCredentialReads++; throw new Error('Capture must not read connection settings'); };
+    chrome.runtime.onMessage.addListener((_message, sender) => { globalThis.smokeCaptureSender = sender; });
+  });
+  context.on('request', recordCaptureRequest);
+  const capturedDrafts = [];
+  for (const mode of ['Article', 'Selection']) {
+    const capturePopup = await context.newPage();
+    await inspect(capturePopup);
+    await capturePopup.goto(`chrome-extension://${id}/popup.html`);
+    await capturePopup.getByRole('button', { name: mode, exact: true }).waitFor();
+    await page.bringToFront();
+    const nextEditor = context.waitForEvent('page').catch(error => error);
+    await capturePopup.evaluate(name => [...document.querySelectorAll('button')].find(button => button.textContent === name).click(), mode);
+    await capturePopup.waitForFunction(() => document.querySelector('main')?.getAttribute('aria-busy') === 'false');
+    if (!(await capturePopup.getByRole('status').innerText()).includes('Saved locally')) {
+      throw new Error(`Capture failed: ${await capturePopup.locator('main').innerText()}; sender=${JSON.stringify(await worker.evaluate(() => globalThis.smokeCaptureSender))}`);
+    }
+    const capturedEditor = await nextEditor;
+    if (capturedEditor instanceof Error) throw capturedEditor;
+    await inspect(capturedEditor);
+    await capturePopup.getByRole('status').getByText(/Saved locally/).waitFor();
+    assert.match(await capturePopup.getByRole('status').innerText(), /editor opened/);
+    await capturePopup.close(); // confirmed capture survives popup destruction
+    await capturedEditor.getByLabel('Markdown', { exact: true }).waitFor();
+    const body = await capturedEditor.getByLabel('Markdown', { exact: true }).inputValue();
+    assert.match(body, /## Наблюдения/);
+    assert.match(body, /\| Name \| Value \|/);
+    assert.doesNotMatch(body, /PRIVATE_|<iframe|<style/);
+    assert.equal(await capturedEditor.getByLabel('Title', { exact: true }).inputValue(), 'Лес и наука 🌲');
+    assert.equal(await capturedEditor.getByLabel('Filename', { exact: true }).inputValue(), 'clip.md');
+    await capturedEditor.getByRole('link', { name: fixtureURL, exact: true }).waitFor();
+    const editorURL = new URL(capturedEditor.url());
+    assert.equal(editorURL.pathname, '/editor.html');
+    assert.equal([...editorURL.searchParams].length, 1);
+    const draftId = editorURL.searchParams.get('draft');
+    assert.match(draftId, /^[0-9a-f-]{36}$/);
+    capturedDrafts.push(draftId);
+    await capturedEditor.reload();
+    await capturedEditor.getByLabel('Markdown', { exact: true }).waitFor();
+    assert.equal(await capturedEditor.getByLabel('Markdown', { exact: true }).inputValue(), body);
+    await capturedEditor.getByRole('link', { name: fixtureURL, exact: true }).waitFor();
+    await capturedEditor.getByRole('status').getByText('Saved locally', { exact: true }).waitFor();
+    await capturedEditor.close();
     assert.equal(await page.content(), before);
     assert.deepEqual(await page.evaluate(() => ({ text: getSelection().toString(), start: getSelection().getRangeAt(0).startOffset, end: getSelection().getRangeAt(0).endOffset, x: scrollX, y: scrollY })), selectionBefore);
   }
+  context.off('request', recordCaptureRequest);
+  assert.deepEqual(captureRequests, [], 'capture/persistence/editor must not request images or backend');
+  assert.equal(new Set(capturedDrafts).size, 2);
+  const captureCredentialReads = await worker.evaluate(() => {
+    chrome.storage.local.get = globalThis.smokeStorageGet;
+    return globalThis.smokeCaptureCredentialReads;
+  });
+  assert.equal(captureCredentialReads, 0);
   const injected = await worker.evaluate(async tabId => {
     const results = await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED', func: () => typeof globalThis.IGoNotesContentScript.capture });
     return { frames: results.map(result => result.frameId), extractor: results[0].result };
@@ -249,6 +303,8 @@ try {
     result: 'PASS', browser: browser.version(), extensionId: id,
     serviceWorker: worker.url(), popup: popup.url(), editor: editor.url(),
     injection: injected, domUnchanged: true, pageGlobalAbsent: true, storage,
+    durableCapture: ['Article', 'Selection'], popupClosedAndEditorReloaded: true,
+    captureRequests: captureRequests.length, captureCredentialReads,
     markdownConversion: true, conversionRequests: conversionRequests.length,
     adjacentCodeRenderedSafely: true,
     trustedStorageOnly, manualConnectionSettings: true, unsolicitedConnectionRequests: connectionRequests.length,

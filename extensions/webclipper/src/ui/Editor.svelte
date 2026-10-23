@@ -221,7 +221,7 @@
         <button class="danger" onclick={remove} disabled={busy || loading}>Delete draft</button>
         <p class="muted">Delete permanently removes this draft, its unsaved edits and its stored images from this profile.</p>
       {:else if !loading && !error && drafts.length === 0}
-        <p>No local drafts yet. Extraction previews are not saved.</p>
+        <p>No local drafts yet. Capture an Article or Selection from the popup.</p>
       {/if}
     </section>
   </div>
