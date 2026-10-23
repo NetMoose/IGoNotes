@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, copyFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
@@ -11,6 +11,8 @@ const timeoutMs = Number(process.env.CLIPPER_SMOKE_TIMEOUT_MS ?? 30000);
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('Invalid CLIPPER_SMOKE_TIMEOUT_MS');
 const cleanupStepMs = 2000;
 const dist = resolve(import.meta.dirname, '../dist');
+const imageMode = process.env.CLIPPER_SMOKE_IMAGES === '1';
+const imageRequests = [];
 let profile;
 let browser;
 let worker;
@@ -27,6 +29,17 @@ const fixture = readFileSync(new URL('../tests/fixtures/article.html', import.me
   .replace(/<img[^>]*>/, '<img src="/baseline.png" data-src="/lazy-never-request.png" alt="Current"><img src="/placeholder.gif" data-src="/conversion-never-request.png" alt="Lazy">')
   .replace('</article>', `${readFileSync(new URL('../tests/fixtures/conversion.html', import.meta.url), 'utf8')}${readFileSync(new URL('../tests/fixtures/conversion-adjacent.html', import.meta.url), 'utf8')}<iframe src="/baseline-frame">discard frame</iframe><style>.smoke-resource { background-image: url(/baseline-css.png) }</style><p class="smoke-resource">CSS baseline</p><form>PRIVATE_FORM<input value="PRIVATE_VALUE"></form></article>`);
 const server = createServer((request, response) => {
+  if (imageMode) {
+    if (request.url === '/log') {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify(imageRequests)); return;
+    }
+    imageRequests.push({ path: request.url, host: request.headers.host, authorization: !!request.headers.authorization, cookie: !!request.headers.cookie });
+    if (request.url === '/redirect') { response.writeHead(302, { Location: `http://cdn.example.test:${server.address().port}/must-not-follow` }); response.end(); return; }
+    if (request.url === '/missing') { response.writeHead(404); response.end(); return; }
+    response.writeHead(200, { 'Content-Type': 'image/gif', 'Set-Cookie': 'imagehost=private; Path=/' });
+    response.end(Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64')); return;
+  }
   if (request.url !== '/') {
     if (/\.(png|gif)$/.test(request.url)) {
       response.writeHead(200, { 'Content-Type': 'image/gif' });
@@ -108,18 +121,27 @@ async function run() {
   // Allocate synchronously so a deadline cannot race an unfinished mkdtemp and
   // create an unrecorded directory after cleanup has already inspected profile.
   profile = mkdtempSync(join(process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode', 'clipper-profile-'));
+  let extensionPath = dist;
+  if (imageMode) {
+    // Test-only copy: exercise the unconnected 8.1 ESM in a real extension
+    // context, without adding an entry point or acquisition UI to the package.
+    extensionPath = join(profile, 'extension-under-test');
+    cpSync(dist, extensionPath, { recursive: true });
+    copyFileSync(resolve(import.meta.dirname, '../src/images/acquire.js'), join(extensionPath, 'acquire-under-test.js'));
+  }
   stopped.signal.throwIfAborted();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
   });
-  fixtureURL = `http://127.0.0.1:${server.address().port}/`;
+  fixtureURL = `http://${imageMode ? 'images.example.test' : '127.0.0.1'}:${server.address().port}/`;
   browser = owned(process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', [
     `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
-    `--disable-extensions-except=${dist}`, `--load-extension=${dist}`,
+    `--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`,
     '--disable-background-networking', '--disable-component-update', '--disable-sync',
     '--no-first-run', '--no-default-browser-check',
-    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1',
+    imageMode ? '--host-resolver-rules=MAP images.example.test 127.0.0.1, MAP cdn.example.test 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1' : '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1',
+    ...(imageMode ? ['--no-proxy-server'] : []),
     ...(process.env.CLIPPER_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []),
     'about:blank',
   ]);
@@ -140,7 +162,7 @@ async function run() {
     await new Promise(() => {});
   }
   await ready;
-  worker = owned(process.execPath, [resolve(import.meta.dirname, 'smoke-worker.js'), endpoint, fixtureURL], {
+  worker = owned(process.execPath, [resolve(import.meta.dirname, imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL], {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
   });
   console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, workerPid: worker.pid, fixtureURL })}`);

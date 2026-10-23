@@ -10,7 +10,8 @@ separate editor tab (also the extension's options page).
 > the read-only protocol connection; capture Article/Selection as converted Markdown,
 > commit a local draft, and open it in a separate editor tab; suggest a portable
 > filename and export safe YAML frontmatter. Tasks 1–7 are implemented/documented.
-> **Planned:** image acquisition and
+> **Module-only (8.1):** explicit image acquisition API and tests, not wired to capture/editor.
+> **Planned:** image persistence/preparation UI and
 > the extension send UI (8). Captured image URLs are pending metadata only; no image
 > bytes are downloaded. A fresh profile has no drafts until the first capture.
 
@@ -203,7 +204,165 @@ all ports. IPv6 endpoints are **not supported/advertised** by this scaffold:
 IPv6 match-pattern compatibility with the minimum supported browser has not
 been established. Endpoint settings do not accept `[::1]` without that
 compatibility check and a corresponding manifest permission. Optional HTTP(S)
-hosts are reserved for later per-origin image consent; none are requested now.
+hosts allow the standalone acquisition API to request individual image hosts.
+The current capture/editor UI does not call it or request image permissions.
+
+## Image acquisition API (task 8.1 — standalone module)
+
+`src/images/acquire.js` exports `createImageAcquirer(options?)`. It has no imports,
+connection/settings/token access, storage writes, message listener, content-script
+proxy, background activity, automatic retry or preview creation. Instantiating it
+does not request permission or download anything. Capture/worker/editor are not
+wired to this module yet; captured images remain pending metadata in the current UI.
+
+```js
+const images = createImageAcquirer({ limits: info.limits }); // optional protocol limits
+// Future 8.4 trusted-editor Prepare/Retry button handler:
+button.onclick = async () => {
+  // Use the already available source list. This invokes permissions.request()
+  // synchronously, BEFORE the first await, contains(), storage or network call.
+  const access = await images.requestAccessFromUserGesture(urls);
+  // Display denial/platform failure. Never retry by broadening permissions.
+  if (!access.ok) return showAccessError(access.error);
+  const results = await images.acquire(urls, { signal: controller.signal });
+  // 8.2 must persist successful Blob + descriptor in a completed transaction
+  // before the UI claims saved/ready. Every failed result must remain visible.
+};
+```
+
+These are illustrative future caller functions, not an existing UI. Only call
+`requestAccessFromUserGesture(urls)` directly on the user-handler stack: do not
+await `permissions.contains`, a draft read, or another operation beforehand.
+It synchronously validates the sources and deduplicates exact host patterns, then
+calls native `chrome.permissions.request({ origins })`; it returns a Promise of
+`{ ok, origins, error? }` (invalid sources can fail before origins are available).
+Data sources require no permission. Invalid mixed input requests no hosts.
+Requested patterns have a specific HTTP/HTTPS scheme and exact hostname, never
+`<all_urls>`, wildcard hosts or subdomains. Chrome host patterns cover **all ports**
+of that scheme/host; they cannot enforce an individual origin's port. Public IPv6
+image literals pass source validation, but unsupported platform match-pattern
+requests/queries fail visibly with `permission`; no policy expansion follows.
+This does not change the separate IPv4/localhost-only backend endpoint contract.
+
+`acquire(urls, { signal }?)` checks `permissions.contains` for each unique HTTP(S)
+source and **never prompts**. Each batch runs at most three workers (including
+permission wait, fetch, body read and hash). Concurrent batches are caller-owned;
+future UI should serialize Prepare/Retry. Results preserve input order and every
+input entry, including duplicate/failed aliases:
+
+- Success: `{ ok: true, url, normalizedUrl, blob, sha256, mediaType, extension, size }`.
+  `blob` contains exact original bytes, no re-encoding. `sha256` is bare lowercase
+  WebCrypto SHA-256 hex; `extension` is `png | jpg | gif | webp`, `mediaType` is the
+  corresponding verified signature MIME, and `size` is actual byte length.
+- Failure: `{ ok: false, url, normalizedUrl?, error: { code, message, status? } }`.
+  Fixed codes: `permission`, `http` (numeric HTTP `status`), `redirect`, `network`,
+  `timeout`, `cancel`, `unsafe`, `unsupported`, `mimeMismatch`, `tooLarge`.
+  Native exception details/response bodies are not exposed. Invalid input may lack
+  `normalizedUrl`. There are no silently dropped failures or external fallbacks.
+
+HTTP(S) sources normalize via `URL` and discard only their fragments; every original
+`url` alias remains in the result for later mapping. Data source keys retain their
+**exact original spelling**, including case/percent escapes. Within one batch,
+normalized-URL duplicates share acquisition; byte deduplication/storage are 8.2.
+
+### Source, fetch and byte policy
+
+- HTTP(S) without URL credentials only; unsafe schemes, `blob:`, localhost and
+  `.localhost` (also trailing-dot forms), private/loopback/unspecified/link-local
+  IPv4/IPv6 literals, IPv6 ULA and private IPv4-mapped/compatible literals are
+  rejected before permission/fetch. IPv4 checks use the canonical URL hostname,
+  catching short, integer, hexadecimal and octal aliases. Shared-address IPv4,
+  multicast and reserved high IPv4 literals/IPv6 multicast are also rejected.
+  **This is literal-address screening, not DNS-rebinding defense.** Named hosts
+  are not resolved/classified by the module; the test fixture deliberately maps
+  an ordinary public name to loopback through a pinned test resolver.
+- Requests have no caller-supplied headers, Authorization or Cookie. They use
+  `credentials: 'omit'`, `redirect: 'error'`, `cache: 'no-store'` and
+  `referrerPolicy: 'no-referrer'`. There is no no-cors/credentialed fallback.
+  Cookie-protected images can fail; explicit manual replacement/fallback belongs
+  to 8.4. Every redirect is blocked **before following**, including same-origin
+  and CDN redirects. Replace with a direct URL and explicitly grant its host.
+  Native Fetch reports blocked redirects and ordinary network failures as the
+  same opaque rejection: `network` explicitly mentions both. `redirect` is used
+  only when a response exposes a redirect; no follow-up probe attempts to classify it.
+- Default per-image cap: **10 MiB**. Content-Length is an early check, not trusted
+  accounting: streamed bytes are capped even for missing/lying lengths and a
+  single oversized chunk. No whole-response `arrayBuffer()` precedes the cap.
+  Received bytes are immediately copied into 64 KiB slabs (at most 160 parts
+  at the default cap), not retained as one entry per network chunk; empty chunks
+  retain nothing. Each asynchronous wait removes its own abort subscription when
+  settled, and periodic task yields let deadlines/caller cancellation run even
+  during immediately resolved tiny/empty reads. Fragmentation adds no data cap.
+  Oversize, timeout and caller abort cancel the reader and abort fetch, including
+  a hanging body. A default **10-second** per-image deadline covers permission
+  query, network/body and asynchronous hash; it is configurable as `timeoutMs`.
+- Only PNG/JPEG/GIF/WebP data URI shapes approved by storage/conversion are
+  accepted: base64 (padded or valid unpadded final group), or ASCII with `%HH`
+  octets. No extra MIME parameters, whitespace, malformed escapes, fragments or
+  SVG. Source length is at most **32 MiB ASCII characters**, enough for a complete
+  10 MiB percent-encoded image. Decoded size is computed **before** byte-buffer
+  allocation/`atob`, then capped by the same image byte limit; no fetch is made.
+
+### Client validation boundary and future integration
+
+The module checks actual signatures and structural preflight for static PNG,
+JPEG, WebP and GIF (including animated GIF). Absent/octet-stream HTTP MIME can be
+inferred from bytes; another declared MIME must match or gives `mimeMismatch`.
+APNG and animated WebP give `unsupported`. Preflight enforces **40,000,000 pixels**
+per image/canvas/frame, **100 GIF frames**, and **200,000,000 GIF frame pixels** in
+total, walking **all** GIF frames/subblocks before any preview/pixel allocation.
+It checks bounded container framing and dimensions, not PNG CRC/inflate, JPEG
+entropy, GIF LZW or WebP full decode. It uses no ImageDecoder/createImageBitmap
+dependency and allocates no decoded pixel buffers; successful acquisition is
+**not full server validation or durable ready status**. The server remains
+authoritative for strict container integrity and full decoding of all GIF frames.
+The protocol's `asset_bytes`, `image_pixels`, `gif_frames`, `gif_total_pixels`
+limits may tighten these defaults via `limits`; invalid nonpositive/noninteger
+limits throw at factory creation. Aggregate asset/count/upload quotas belong to
+8.2/8.3/8.5, not this individual-image module.
+
+Future **8.2** should persist exact Blobs/hash/descriptors/errors and alias mappings
+transactionally, handle quotas and byte deduplication, and only then show saved
+success. **8.3** owns Markdown parsing/rewriting and immutable manifests. **8.4**
+must supply explicit Prepare/Retry and per-host consent actions, keep failures
+visible, and require explicit external-fallback confirmation. Neither capture nor
+worker should start downloads automatically. **8.5** owns manual delivery.
+
+Verification: `tests/images-acquire.test.js` covers gesture timing, grant/denial,
+platform failure, URL/data policy, all four format signatures/MIME mismatches,
+pixel/frame budgets, bounded streams, cancellation, concurrency/aliases, and
+credential-free real Fetch with blocked redirect/404 fixtures. On Linux:
+
+```sh
+TMPDIR=/tmp/opencode xvfb-run -a npm --prefix extensions/webclipper run smoke:images
+```
+
+`tests/images-acquire-bounds.test.js` also runs isolated `--expose-gc` probes while
+the body is still open: heap growth from 1,000 to 100,000 one-byte reads is checked
+with a generous runtime-noise allowance, for fresh and reused source arrays.
+It checks byte/hash preservation across every stride of the small PNG fixture
+and 64 KiB boundaries of a 100,000-byte image, removable abort listeners, and
+deadline/abort of microtask-only empty/tiny streams whose source `cancel()` hangs.
+The parent bounds each child independently so a starved timer cannot hang tests.
+For a reproducible retained-memory report (byte values, no exact-V8-size assertion):
+
+```sh
+node --expose-gc extensions/webclipper/tests/helpers/images-acquire-probe.js heap-fresh
+node --expose-gc extensions/webclipper/tests/helpers/images-acquire-probe.js heap-reused
+```
+
+The headed acquisition smoke uses a temporary test-only copy of the built extension
+plus the standalone source ESM; it does not add an acquisition entry point to `dist`.
+Sandboxed Chromium **154.0.8037.97** passed native missing/pregranted/revoked host
+checks, a real trusted click calling native request on an already granted host,
+actual `images.example.test` network requests via pinned loopback DNS, GIF bytes/hash,
+blocked redirect (target never requested), 404, and omission of a real preseeded
+image-host cookie and Authorization. Its trusted setup uses `chrome.developerPrivate`
+from `chrome://extensions` only inside the temporary test profile. **Real browser
+permission prompt grant/denial was not manually tested**; denial/platform failure
+are unit-tested. The existing supervisor bounds launch/evaluation/cleanup, stops
+owned processes, closes the server and removes the temporary profile. Packaging
+smoke remains separate and still verifies capture makes zero image/backend requests.
 
 ## Packaging smoke
 
@@ -643,8 +802,9 @@ await store.deleteDraft('draft-1'); // explicit, atomic deletion of owned rows
 store.close(); // terminal for this instance; create another instance to reopen
 ```
 
-The example's `imageBlob` is a caller-prepared native Blob. Downloading, hashing,
-image validation and manifest building belong to later tasks. Prepare asynchronous
+The example's `imageBlob` is a caller-prepared native Blob. The standalone 8.1
+acquirer can prepare bytes/hash outside storage; the persistence adapter (8.2)
+and manifest building (8.3) remain pending. Prepare asynchronous
 work **before** saving: transaction callbacks issue only IndexedDB requests and
 synchronous computation, avoiding auto-commit across network/crypto awaits.
 
@@ -692,8 +852,9 @@ sources every character is ASCII; this is a metadata bound, not an image quota.
 Blob usage is still calculated solely from actual `Blob.size`, regardless of the
 source length, encoding or caller-supplied size. Duplicate encoded metadata adds
 browser storage overhead outside the 250 MiB Blob cap. Storage checks source
-representation only: task 8.1 must decode and validate actual image bytes, MIME,
-signature and image limits before treating an asset as acquired. No decoder or
+representation only: the standalone task-8.1 acquisition module checks decoded
+bytes, MIME, signatures and structural budgets before acquisition success; it is
+not yet wired into persistence/UI. No decoder or
 network logic is implemented here. Page `sourceUrl` remains HTTP(S)-only, and
 attempt endpoints retain their separate origin-only validation.
 
