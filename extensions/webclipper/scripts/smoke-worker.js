@@ -28,10 +28,6 @@ try {
     await cdp.send('Runtime.enable');
   };
   const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker', { timeout: 15000 });
-  if (process.env.CLIPPER_SMOKE_FAULT === 'hang-evaluate') {
-    console.log('SMOKE_FAULT_REACHED hang-evaluate');
-    await worker.evaluate(() => new Promise(() => {}));
-  }
   const id = new URL(worker.url()).host;
   assert.match(id, /^[a-p]{32}$/);
   assert.equal(await worker.evaluate(() => chrome.runtime.onInstalled.hasListeners()), true);
@@ -332,14 +328,6 @@ try {
     sandbox: process.env.CLIPPER_SMOKE_NO_SANDBOX !== '1',
   };
 } finally {
-  if (process.env.CLIPPER_SMOKE_FAULT === 'close-fail') {
-    console.log('SMOKE_FAULT_REACHED close-fail');
-    throw new Error('Injected browser.close failure');
-  }
-  if (process.env.CLIPPER_SMOKE_FAULT === 'close-hang') {
-    console.log('SMOKE_FAULT_REACHED close-hang');
-    await new Promise(() => {});
-  }
   await browser?.close();
 }
 process.send(result);

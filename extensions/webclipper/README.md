@@ -10,8 +10,8 @@ separate editor tab (also the extension's options page).
 > the read-only protocol connection; capture Article/Selection as converted Markdown,
 > commit a local draft, and open it in a separate editor tab; suggest a portable
 > filename and export safe YAML frontmatter. Tasks 1–7 are implemented/documented.
-> **Module-only (8.1):** explicit image acquisition API and tests, not wired to capture/editor.
-> **Planned:** image persistence/preparation UI and
+> **Module-only (8.1–8.2):** explicit image acquisition, durable preparation and Markdown reference scanning APIs/tests, not wired to capture/editor.
+> **Planned:** image preparation/permission UI and
 > the extension send UI (8). Captured image URLs are pending metadata only; no image
 > bytes are downloaded. A fresh profile has no drafts until the first capture.
 
@@ -224,9 +224,12 @@ button.onclick = async () => {
   const access = await images.requestAccessFromUserGesture(urls);
   // Display denial/platform failure. Never retry by broadening permissions.
   if (!access.ok) return showAccessError(access.error);
-  const results = await images.acquire(urls, { signal: controller.signal });
-  // 8.2 must persist successful Blob + descriptor in a completed transaction
-  // before the UI claims saved/ready. Every failed result must remain visible.
+  await flushEditorEdits();
+  const prepared = await prepareDraftImages(store, draftId, {
+    acquirer: images, signal: controller.signal, progress: showCommittedProgress,
+  });
+  // Inspect prepared.ok, per-image errors and persistenceError before showing
+  // success. This is local preparation, not a delivery snapshot or a send action.
 };
 ```
 
@@ -263,7 +266,7 @@ input entry, including duplicate/failed aliases:
 HTTP(S) sources normalize via `URL` and discard only their fragments; every original
 `url` alias remains in the result for later mapping. Data source keys retain their
 **exact original spelling**, including case/percent escapes. Within one batch,
-normalized-URL duplicates share acquisition; byte deduplication/storage are 8.2.
+normalized-URL duplicates share acquisition; the 8.2 adapter below also deduplicates bytes across batches and cached images.
 
 ### Source, fetch and byte policy
 
@@ -319,11 +322,10 @@ authoritative for strict container integrity and full decoding of all GIF frames
 The protocol's `asset_bytes`, `image_pixels`, `gif_frames`, `gif_total_pixels`
 limits may tighten these defaults via `limits`; invalid nonpositive/noninteger
 limits throw at factory creation. Aggregate asset/count/upload quotas belong to
-8.2/8.3/8.5, not this individual-image module.
+8.3/8.5, not this individual-image module; the 8.2 adapter enforces the local storage cap.
 
-Future **8.2** should persist exact Blobs/hash/descriptors/errors and alias mappings
-transactionally, handle quotas and byte deduplication, and only then show saved
-success. **8.3** owns Markdown parsing/rewriting and immutable manifests. **8.4**
+**8.2** persists exact Blobs/hash/descriptors/errors and alias mappings
+transactionally through the standalone API below. **8.3** owns destination rewriting and immutable manifests, reusing the 8.2 parser. **8.4**
 must supply explicit Prepare/Retry and per-host consent actions, keep failures
 visible, and require explicit external-fallback confirmation. Neither capture nor
 worker should start downloads automatically. **8.5** owns manual delivery.
@@ -351,8 +353,10 @@ node --expose-gc extensions/webclipper/tests/helpers/images-acquire-probe.js hea
 node --expose-gc extensions/webclipper/tests/helpers/images-acquire-probe.js heap-reused
 ```
 
-The headed acquisition smoke uses a temporary test-only copy of the built extension
-plus the standalone source ESM; it does not add an acquisition entry point to `dist`.
+The headed image smoke uses a temporary test-only copy of the built extension
+plus the standalone acquisition ESM and a bundled preparation test module (all
+relative/bare imports resolved with the production Vite configuration). It does
+not add image entry points or UI to production `dist`.
 Sandboxed Chromium **154.0.8037.97** passed native missing/pregranted/revoked host
 checks, a real trusted click calling native request on an already granted host,
 actual `images.example.test` network requests via pinned loopback DNS, GIF bytes/hash,
@@ -363,6 +367,138 @@ permission prompt grant/denial was not manually tested**; denial/platform failur
 are unit-tested. The existing supervisor bounds launch/evaluation/cleanup, stops
 owned processes, closes the server and removes the temporary profile. Packaging
 smoke remains separate and still verifies capture makes zero image/backend requests.
+
+## Durable image preparation API (task 8.2 — standalone adapter)
+
+`src/images/prepare.js` exports
+`prepareDraftImages(store, draftId, { acquirer, signal?, progress? })`.
+The caller must **flush unsaved editor edits first** and serialize its Prepare/Retry
+actions. Preparation reads the **current persisted Markdown body**, not capture's
+DOM image list. It never changes/serializes that body, title, filename, destination,
+draft status, timestamps or attempt history. There is no connection/token access,
+permission prompt, automatic capture/worker/UI download, delivery or fallback.
+The current textarea editor still only saves text; task **8.4** must supply the
+explicit user-gesture permission and preparation UI.
+
+The resolved result contains:
+
+- `ok`: all active images are committed ready and no persistence failure occurred.
+- `markdown`: the exact persisted body used for this checkpoint.
+- `refs`: ordered scanner results for each actual Markdown image occurrence.
+- `assets`: **only active** source mappings, including explicit per-image errors.
+- `blobs`: unique canonical owner rows needed by those ready active mappings. An
+  owner may have an inactive original URL if another active URL uses its bytes.
+- `persistenceError?: { code, message }`: preparation could not be saved. A small
+  error-status checkpoint is attempted separately; if it also fails,
+  `errorStatusPersistenceError` reports that failure. Neither failure claims ready.
+
+`progress({ status: 'pending' | 'ready' | 'error', total, ready })` runs **only
+after transaction complete**, never on acquisition or request success. It reports
+a committed checkpoint, not a promise that the editor will never be changed again.
+Source failures retain the acquirer's fixed `code/message/status?` (permission,
+HTTP, timeout, cancellation, etc.); unsafe edited sources are explicit errors
+without permission queries/fetch. Descriptor/byte mismatch gives `invalid_bytes`.
+Storage failure can persist a per-image `persistence` status while reporting the
+separate storage code. Fix sources/storage or grant access and call Prepare again;
+there is no automatic retry or silent external fallback.
+
+### Asset mapping, ownership and lifetime
+
+Existing captured pending IDs are reused when their normalized source still
+matches. Each source row has `normalizedUrl` and a JSON descriptor:
+
+```js
+{
+  status: 'pending' /* or 'ready' / 'error' */,
+  active: true,
+  aliases: ['https://cdn.example/a.png#figure', 'HTTPS://CDN.example:443/a.png#figure'],
+  activeAliases: [/* decoded/resolved destinations present in this body */],
+  // Ready only:
+  sha256: 'bare-lowercase-hex', mediaType: 'image/png', extension: 'png', size: 123,
+  canonicalAssetId: 'draft-local-owner-id',
+  // Error only:
+  // error: { code, message, status? }
+}
+```
+
+HTTP(S) URL keys use acquisition normalization (including fragment removal);
+**all original decoded and resolved aliases**, including fragment/case/port
+variants, are retained for future rewriting. Data URLs retain exact spelling.
+Different URLs with the same SHA-256 **and verified MIME/extension** share one
+physical Blob per draft, including across batches and cached rows. The owner has
+the real Blob and its real nonzero physical row `size`. An alias row has
+`blob: null`, physical row `size: 0`, descriptor `canonicalAssetId` pointing to
+the owner, and descriptor `size` describing the canonical bytes. It is not a fake
+zero-byte ready owner. Quota accounting counts the physical Blob once.
+
+Cache reuse verifies actual Blob size, hash, signature/structural preflight and
+descriptor MIME/extension. Valid committed bytes work offline after source page
+closure, server unavailability or host-permission revocation, with **no acquirer
+call**. Full server integrity validation remains authoritative. Acquisition runs
+in batches of at most three; results are committed/released before the next
+batch, without retaining all downloaded byte buffers or decoding pixels. There
+is no arbitrary URL-count cap: many references/URLs may share one unique asset.
+The local **250 MiB** Blob cap is enforced transactionally; the server's unique
+asset/count/50 MiB upload preflight belongs to 8.3/8.5. No data is silently evicted.
+
+Removed sources are absent from returned `refs/assets`, and unused owners are
+absent from returned `blobs`. Old unreferenced rows/Blobs may remain as evidence;
+preparation performs no automatic deletion. **Never build a snapshot by sending
+all `getAssets()` rows or by trusting an old `active` flag after text edits.**
+Task 8.3 must re-evaluate the current body and use its active mapping/canonical-byte
+closure for the immutable snapshot; preparation results alone are not that snapshot.
+
+`store.updateDraftAssets(id, { expectedMarkdown, expectedAssets, assets })` is the
+minimal assets-only CAS. It reads the latest draft and global asset usage inside
+one all-store readwrite transaction, retains all latest metadata/attempts, checks
+the expected body and asset state, then commits upserts atomically. All parsing,
+fetch and crypto happens **outside** that transaction. Concurrent body changes
+cause preparation to reparse/re-evaluate and skip results for removed URLs;
+concurrent title edits are retained. Missing drafts (`draft_deleted`), changed
+asset state (`assets_changed`, including manual removal) and live draft statuses
+`sending`, `uncertain`, `pending` (`draft_frozen`) stop preparation without
+resurrecting or overwriting their bytes. Historical append-only attempts do not
+freeze the draft forever: task 8.5 owns transitions out of live statuses and must
+coordinate immutable attempt ownership, all editor mutations and explicit deletion.
+This guard applies to preparation, not a new general delivery state machine.
+
+### Pure Markdown image scanner
+
+`src/images/references.js` exports synchronous
+`scanImageReferences(markdown, sourceUrl)`. The exactly pinned MIT packages
+`mdast-util-from-markdown` **2.1.0**, `mdast-util-gfm` **3.1.0** and
+`micromark-extension-gfm` **3.0.0** parse CommonMark/GFM without DOM/network.
+`decode-named-character-reference` **1.3.0** is also pinned so build/test resolution
+can explicitly alias its pure default/worker entry rather than the DOM-based
+browser optimization, without changing Svelte's browser conditions. No dependency
+is imported from `web/node_modules`.
+
+Results include `url` (resolved against sourceUrl), `destination` (Markdown escape/
+entity-decoded spelling), `kind` (`inline`, `full`, `collapsed`, `shortcut`), alt,
+title and original `position` (UTF-16 offsets, line/column, including CRLF). Reference
+images also include identifier and definition URL/title/position. First matching
+definitions and CommonMark whitespace/case folding apply. Undefined references
+are plaintext, not fetch candidates. Ordinary links, escaped markers, inline code,
+indented code and fences are excluded; GFM tables and images nested in links work.
+Unicode/backtick/escaped-parenthesis destinations retain meaningful original ranges.
+
+**Raw HTML image editing is unsupported by acquisition.** The textarea still
+accepts/saves it as text, but raw HTML nodes are not interpreted or fetched by
+this scanner. Capture's converter emits Markdown images, not raw image HTML.
+There is no new HTML-editing restriction or whole-document serialization.
+For 8.3, shared link/image definitions **must not be rewritten in place**: expand
+the image occurrence inline or copy to an image-only definition, preserving
+ordinary links. The scanner supplies definition/occurrence ranges but does no rewriting.
+
+Verification: `image-references.test.js`, `images-prepare.test.js` and assets-only
+storage tests use real fake-IndexedDB transactions/close/reopen, real acquirer
+bytes, delayed fetches, independent handles, quota failures, live-status freezes,
+deleted drafts/assets, >100 URL aliases, and progress-after-complete checks.
+`images-bundle.test.js` imports a standalone browser ESM bundle without a DOM.
+The headed `smoke:images` additionally checks **native IndexedDB** physical Blob
+deduplication and full extension-page close/reopen after permission revocation,
+with exact cached bytes and zero acquisition calls; it needs no source page or
+IGoNotes process. Full actual image UI/delivery acceptance remains tasks 8.4/8.5/9.1.
 
 ## Packaging smoke
 
@@ -400,13 +536,41 @@ cleanup step has a 2-second bound (the browser also gets up to 500 ms for gracef
 CDP shutdown), followed by up to 2 seconds for profile removal. A failed/hung
 Playwright close cannot skip these steps. Success is printed only after cleanup.
 
-The failure-path regression checks use a 4-second smoke deadline and verify
-nonzero exit, removed profile, refused fixture connection and absent owned
-process groups for hung evaluation, failed/hung close and stalled launch:
+Failure-path regression checks use a **minimal test-only worker**, not the full
+functional suite: it connects to the owned real Chromium session, obtains the
+extension service worker and verifies a native evaluation. An IPC `fault-ready`
+barrier lets the supervisor arm a **1-second fault deadline before authorizing
+injection**. The failed/hung close marker is inside the injected `browser.close()`
+implementation, proving the call actually ran. Stalled launch instead arms the
+phase after creating the owned browser process and fixture, before waiting for CDP.
+
+An independent **10-second overall deadline** bounds all setup/launch/CDP/phase
+work, even if the barrier is never reached. This replaces the old requirement to
+finish an ever-growing full functional suite within four seconds just to reach
+its close fault. The normal packaging/image smokes still execute their **full**
+functional checks with the unchanged default **30-second overall deadline**.
+Cleanup retains the independent bounds described above (at most 4.5 seconds
+across its parallel process/server steps and subsequent profile removal). The
+checker requires completion within overall budget + 6 seconds, checks the phase
+and cleanup bound separately, and has an 18-second outer failsafe which must
+never fire. It verifies exact injected-error/deadline classification, nonzero
+exit, removed profile, refused fixture connection and absent owned process groups.
+
+The checker defaults to **three repetitions of all four modes**. A fifth case per
+repetition deliberately uses a 1-second overall / 10-second fault budget to prove
+the independent overall watchdog still wins. An optional argument selects 1–5
+repetitions (use 3–5 for repeated browser acceptance):
 
 ```sh
 TMPDIR=/tmp/opencode xvfb-run -a node extensions/webclipper/scripts/check-smoke-failures.js
 ```
+
+Verified with **three repetitions** on sandboxed Chromium **154.0.8037.97** via
+Xvfb, including the independent overall-watchdog case. The phase setup and total
+elapsed times, browser version, sandbox flag and cleanup evidence are emitted as
+JSON for every run. Neither a missed injection nor an overall timeout masquerading
+as a close failure is accepted. This checks harness cleanup; actual functional
+coverage remains in the separate full packaging/image smokes.
 
 Fault injection is test-only (`CLIPPER_SMOKE_FAULT`: `hang-evaluate`, `close-fail`,
 `close-hang`, `launch-hang`). Packaging tests also bound each synchronous child
@@ -442,6 +606,10 @@ transport and filename tests retain Node.
 - `turndown` 7.2.4 and `turndown-plugin-gfm` 1.0.2 — MIT;
   `new TurndownService().use(gfm).turndown(input)`.
 - Svelte and the bundled UI runtime dependencies — MIT.
+- `mdast-util-from-markdown` 2.1.0, `mdast-util-gfm` 3.1.0 and
+  `micromark-extension-gfm` 3.0.0, `decode-named-character-reference` 1.3.0 — MIT;
+  standalone 8.2 scanner/preparation modules.
+  Direct LICENSE texts are included even before UI integration bundles this code.
 
 APIs were checked against official Readability/Turndown documentation via
 Context7 and the installed package documentation. Vite's Context7 request timed
@@ -450,6 +618,9 @@ Upstream package license texts were inspected. Readability 0.6.0 and Turndown/GF
 run in the isolated content bundle. Current Turndown rule/escape/plugin APIs were
 checked with Context7 and the installed GFM source; Marked's Context7 request timed
 out, so its official usage documentation was checked for the test-only parser.
+The mdast parsing/position API was checked with Context7; the mdast GFM lookup
+timed out, so the official upstream GFM README confirmed `gfm()` /
+`gfmFromMarkdown()` integration. Parser package license texts were inspected.
 
 Each build generates `dist/THIRD_PARTY_NOTICES.txt`, copies direct runtime
 dependency LICENSE/NOTICE files verbatim to `dist/LICENSES/`, includes the full
@@ -791,7 +962,7 @@ await store.saveDraft({
   base: null, parent: '', destinationRevision: null, status: 'draft',
 }, { assets: [{
   id: 'image-1', normalizedUrl: 'https://example.org/image.png',
-  descriptor: { mime: 'image/png', status: 'ready' }, blob: imageBlob,
+   descriptor: { status: 'pending' }, blob: null,
 }] }); // resolves only after transaction complete, not request success
 const drafts = await store.listDrafts();
 const metadata = await store.getDraft('draft-1'); // undefined if absent
@@ -802,9 +973,8 @@ await store.deleteDraft('draft-1'); // explicit, atomic deletion of owned rows
 store.close(); // terminal for this instance; create another instance to reopen
 ```
 
-The example's `imageBlob` is a caller-prepared native Blob. The standalone 8.1
-acquirer can prepare bytes/hash outside storage; the persistence adapter (8.2)
-and manifest building (8.3) remain pending. Prepare asynchronous
+The example stores a pending source. The standalone 8.2 adapter above owns
+verified bytes/hash/status preparation; manifest building (8.3) remains pending. Prepare asynchronous
 work **before** saving: transaction callbacks issue only IndexedDB requests and
 synchronous computation, avoiding auto-commit across network/crypto awaits.
 
@@ -841,7 +1011,10 @@ and `data:image/webp` sources with a nonempty payload:
   byte escapes (binary octets need not form UTF-8).
 
 The scheme/MIME/base64 marker are case-insensitive; extra MIME parameters,
-fragments, malformed escapes/base64, SVG, text and script schemes are rejected.
+fragments, malformed escapes/base64, SVG, text and script schemes are rejected
+for pending/ready rows. Explicit `status: 'error'` descriptors with an error code
+may retain an unsupported edited source as bounded well-formed text for diagnosis;
+this never authorizes fetching/rendering that source.
 For data sources the **exact input string** is persisted, including case and
 percent-escape spelling, so future acquisition/lookup/rewriting can use the same
 key. There is no synthetic HTTP alias or data URL canonicalization. The source
@@ -854,7 +1027,7 @@ source length, encoding or caller-supplied size. Duplicate encoded metadata adds
 browser storage overhead outside the 250 MiB Blob cap. Storage checks source
 representation only: the standalone task-8.1 acquisition module checks decoded
 bytes, MIME, signatures and structural budgets before acquisition success; it is
-not yet wired into persistence/UI. No decoder or
+used by the standalone persistence adapter, but not wired into UI. No decoder or
 network logic is implemented here. Page `sourceUrl` remains HTTP(S)-only, and
 attempt endpoints retain their separate origin-only validation.
 
@@ -878,8 +1051,9 @@ updates are invalid. Attempts own **metadata snapshots**, referencing assets in
 the same draft; they do not duplicate Blob bytes. Future task 8.5 callers must
 build the immutable manifest/delivery snapshot, verify references, and preserve
 the referenced Blob IDs/bytes (no overwrite/deletion while replay is needed).
-This module implements no delivery state machine, reference freezing, network
-replay, automatic cleanup after success, or concurrency revision protocol.
+The assets-only preparation CAS and live-status guard are described above.
+This module implements no delivery state machine, general editor/attempt freezing,
+network replay or automatic cleanup after success.
 Concurrent metadata edits across tabs are last-committed-write-wins; this editor
 serializes its own writes only. Future task 8 will coordinate editing restrictions
 for pending/uncertain delivery. Returned values are structured clones, not live records.
@@ -910,6 +1084,8 @@ with the native cause retained). Failed transactions roll back metadata, Blob
 updates, removals and attempts together. Browser quota can be smaller than the
 application cap; a quota failure preserves previous saved work. Callers must keep
 unsaved edits and report errors rather than displaying “saved”.
+Assets-only CAS also reports `draft_deleted`, `draft_frozen`, `markdown_changed`
+and `assets_changed`; these do not replace or append metadata/attempts.
 
 There is **no automatic eviction/GC** on open, save or quota failure.
 `deleteDraft(id)` deletes only that draft and asset/attempt rows selected by its

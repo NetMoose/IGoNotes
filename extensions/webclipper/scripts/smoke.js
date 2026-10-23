@@ -9,6 +9,11 @@ import { join, resolve } from 'node:path';
 if (process.platform !== 'linux') throw new Error('This headed smoke supervisor requires Linux/Xvfb');
 const timeoutMs = Number(process.env.CLIPPER_SMOKE_TIMEOUT_MS ?? 30000);
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('Invalid CLIPPER_SMOKE_TIMEOUT_MS');
+const fault = process.env.CLIPPER_SMOKE_FAULT;
+if (fault && !['hang-evaluate', 'close-fail', 'close-hang', 'launch-hang'].includes(fault)) throw new Error('Invalid CLIPPER_SMOKE_FAULT');
+const faultTimeoutMs = Number(process.env.CLIPPER_SMOKE_FAULT_TIMEOUT_MS ?? 1000);
+if (!Number.isSafeInteger(faultTimeoutMs) || faultTimeoutMs <= 0) throw new Error('Invalid CLIPPER_SMOKE_FAULT_TIMEOUT_MS');
+const startedAt = performance.now();
 const cleanupStepMs = 2000;
 const dist = resolve(import.meta.dirname, '../dist');
 const imageMode = process.env.CLIPPER_SMOKE_IMAGES === '1';
@@ -64,6 +69,11 @@ const bounded = async (operation, milliseconds, label) => {
     clearTimeout(timer);
   }
 };
+
+function faultPhase(operation, session = { sessionReady: false }) {
+  console.log(`SMOKE_FAULT_ARMED ${JSON.stringify({ fault, ...session, elapsedMs: Math.round(performance.now() - startedAt), overallTimeoutMs: timeoutMs, faultTimeoutMs })}`);
+  return bounded(operation, faultTimeoutMs, `Smoke fault deadline exceeded (${faultTimeoutMs}ms)`);
+}
 
 function owned(command, args, options = {}) {
   stopped.signal.throwIfAborted();
@@ -123,7 +133,7 @@ async function run() {
   profile = mkdtempSync(join(process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode', 'clipper-profile-'));
   let extensionPath = dist;
   if (imageMode) {
-    // Test-only copy: exercise the unconnected 8.1 ESM in a real extension
+    // Test-only copy: exercise the unconnected image APIs in a real extension
     // context, without adding an entry point or acquisition UI to the package.
     extensionPath = join(profile, 'extension-under-test');
     cpSync(dist, extensionPath, { recursive: true });
@@ -157,17 +167,34 @@ async function run() {
   // stalled, so emergency cleanup still has an independent CDP close endpoint.
   ready.catch(() => {});
   console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, fixtureURL })}`);
-  if (process.env.CLIPPER_SMOKE_FAULT === 'launch-hang') {
+  if (fault === 'launch-hang') {
+    const stalled = faultPhase(new Promise(() => {}));
     console.log('SMOKE_FAULT_REACHED launch-hang');
-    await new Promise(() => {});
+    await stalled;
   }
   await ready;
-  worker = owned(process.execPath, [resolve(import.meta.dirname, imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL], {
+  worker = owned(process.execPath, [resolve(import.meta.dirname, fault ? 'smoke-fault-worker.js' : imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL, extensionPath], {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
   });
   console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, workerPid: worker.pid, fixtureURL })}`);
-  worker.on('message', (message) => { result = message; });
-  const exit = await worker.finished;
+  let exit;
+  if (fault) {
+    exit = await new Promise((resolve, reject) => {
+      let armed = false;
+      worker.on('message', message => {
+        try {
+          if (armed || message?.type !== 'fault-ready' || message.fault !== fault || message.sessionReady !== true || typeof message.browser !== 'string') throw new Error('Invalid smoke fault phase barrier');
+          armed = true;
+          faultPhase(worker.finished, { sessionReady: true, browser: message.browser }).then(resolve, reject);
+          worker.send({ type: 'inject-fault', fault }, error => { if (error) reject(error); });
+        } catch (error) { reject(error); }
+      });
+      worker.finished.then(() => { if (!armed) reject(new Error('Smoke fault worker exited before its phase barrier')); }, reject);
+    });
+  } else {
+    worker.on('message', message => { result = message; });
+    exit = await worker.finished;
+  }
   if (exit.code !== 0 || !result) throw new Error(`Smoke worker failed (${exit.code ?? exit.signal})`);
 }
 

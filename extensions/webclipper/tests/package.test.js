@@ -86,7 +86,7 @@ test('builds a deterministic, local-only MV3 package with executable standalone 
   expect(isolated.IGoNotesContentScript.capture('article', document.URL).value.html).toBe(first.value.html);
   expect(document.documentElement.outerHTML).toBe(before);
   const notices = text('THIRD_PARTY_NOTICES.txt');
-  for (const name of ['@mozilla/readability', 'turndown', 'turndown-plugin-gfm', 'svelte']) {
+  for (const name of ['@mozilla/readability', 'turndown', 'turndown-plugin-gfm', 'svelte', 'decode-named-character-reference', 'mdast-util-from-markdown', 'mdast-util-gfm', 'micromark-extension-gfm']) {
     expect(notices).toContain(name);
   }
   expect(text('LICENSES/mozilla-readability-LICENSE.md')).toContain('Apache License');
@@ -94,6 +94,9 @@ test('builds a deterministic, local-only MV3 package with executable standalone 
   expect(text('LICENSES/turndown-LICENSE')).toContain('Permission is hereby granted');
   expect(text('LICENSES/turndown-plugin-gfm-LICENSE')).toContain('Permission is hereby granted');
   expect(text('LICENSES/svelte-LICENSE.md')).toContain('Permission is hereby granted');
+  for (const name of ['decode-named-character-reference', 'mdast-util-from-markdown', 'mdast-util-gfm', 'micromark-extension-gfm']) {
+    expect(text(`LICENSES/${name}-license`)).toContain('Permission is hereby granted');
+  }
   expect(text('LICENSES/bundled-content.md')).toContain('turndown');
   expect(text('LICENSES/bundled-content.md')).toContain('turndown-plugin-gfm');
   const second = join(temporary, 'second');

@@ -10,6 +10,9 @@ export default defineConfig({
   base: './',
   publicDir: false,
   plugins: [svelte()],
+  // Select only this package's pure (default/worker) entry. A global `worker`
+  // condition would also select Svelte's server runtime in the editor bundle.
+  resolve: { alias: { 'decode-named-character-reference': resolve(root, 'node_modules/decode-named-character-reference/index.js') } },
   build: {
     target: 'chrome120',
     modulePreload: false,

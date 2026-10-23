@@ -92,11 +92,22 @@ function prepareAsset(input, draftId) {
   shape(input, ['id', 'normalizedUrl', 'descriptor', 'blob', 'size'], 'asset');
   const descriptor = json(input.descriptor);
   if (!descriptor || Array.isArray(descriptor) || typeof descriptor !== 'object') fail('Asset descriptor must be a JSON object.');
-  const result = { draftId, id: text(input.id, 'asset id', true), normalizedUrl: assetSource(input.normalizedUrl), descriptor };
+  // Explicit failed edited sources must remain inspectable, even when their URL
+  // scheme is not fetchable. Pending/ready sources keep the strict source schema.
+  const failedSource = descriptor.status === 'error' && typeof descriptor.error?.code === 'string';
+  const normalizedUrl = failedSource ? text(input.normalizedUrl, 'failed asset source', true) : assetSource(input.normalizedUrl);
+  if (normalizedUrl.length > MAX_ASSET_SOURCE_LENGTH) fail('Asset source exceeds metadata limit.');
+  const result = { draftId, id: text(input.id, 'asset id', true), normalizedUrl, descriptor };
   if (input.blob !== null && !(input.blob instanceof Blob)) fail('Asset blob must be a Blob or null.');
   result.blob = input.blob;
   result.size = input.blob?.size ?? 0;
   return result;
+}
+
+// This fingerprint excludes Blob identity (structured clones have new handles).
+// Ready descriptors include hash/type/size; changes invalidate an in-flight CAS.
+function assetState(assets) {
+  return JSON.stringify(assets.map(a => [a.id, a.normalizedUrl, a.descriptor, a.size, a.blob?.size ?? null]).sort((a, b) => a[0].localeCompare(b[0])));
 }
 function prepareAttempt(input, draftId) {
   shape(input, ['id', 'createdAt', 'manifest', 'deliverySnapshot'], 'attempt');
@@ -172,6 +183,32 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
     async getDraft(id) { text(id, 'draft id', true); return transaction('readonly', (tx, read, done) => read(tx.objectStore('drafts').get(id), done)); },
     async getAssets(id) { text(id, 'draft id', true); return transaction('readonly', (tx, read, done) => read(tx.objectStore('assets').index('draftId').getAll(id), done)); },
     async getAttempts(id) { text(id, 'draft id', true); return transaction('readonly', (tx, read, done) => read(tx.objectStore('attempts').index('draftId').getAll(id), done)); },
+    async updateDraftAssets(id, { expectedMarkdown, expectedAssets, assets = [] }) {
+      text(id, 'draft id', true);
+      text(expectedMarkdown, 'expected Markdown');
+      if (!Array.isArray(expectedAssets) || !Array.isArray(assets)) fail('Expected assets and updates must be arrays.');
+      const expected = assetState(expectedAssets);
+      const updates = assets.map(value => prepareAsset(value, id));
+      if (new Set(updates.map(a => a.id)).size !== updates.length) fail('Conflicting asset updates.');
+      return transaction('readwrite', (tx, read, done) => {
+        const assetStore = tx.objectStore('assets');
+        read(tx.objectStore('drafts').get(id), live => {
+          if (!live) throw new DraftStorageError('draft_deleted', 'The draft was deleted. Preparation stopped.');
+          if (['sending', 'uncertain', 'pending'].includes(live.status)) throw new DraftStorageError('draft_frozen', 'Resolve the live delivery attempt before preparing images.');
+          if (live.markdown !== expectedMarkdown) throw new DraftStorageError('markdown_changed', 'Markdown changed. Recompute image references.');
+          read(assetStore.getAll(), all => {
+            const owned = all.filter(a => a.draftId === id);
+            if (assetState(owned) !== expected) throw new DraftStorageError('assets_changed', 'Stored images changed. Restart preparation explicitly.');
+            const changed = new Set(updates.map(a => a.id));
+            const bytes = all.reduce((sum, a) => sum + (a.draftId === id && changed.has(a.id) ? 0 : a.blob?.size ?? 0), 0) + updates.reduce((sum, a) => sum + a.size, 0);
+            if (bytes > maxBlobBytes) throw new DraftStorageError('blob_limit', `Draft images exceed the ${maxBlobBytes}-byte application limit. Manually remove unwanted images or drafts and retry.`);
+            for (const value of updates) assetStore.put(value);
+            // Never replace draft metadata or append/edit attempts here.
+            done({ draft: live, assets: [...owned.filter(a => !changed.has(a.id)), ...updates] });
+          });
+        });
+      });
+    },
     async saveDraft(input, { assets = [], deleteAssetIds = [], attempt } = {}) {
       const draft = prepareDraft(input);
       if (!Array.isArray(assets) || !Array.isArray(deleteAssetIds)) fail('Asset updates must be arrays.');

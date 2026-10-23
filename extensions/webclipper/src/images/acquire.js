@@ -85,6 +85,22 @@ function source(value) {
   return { normalizedUrl: parsed.href, origin: `${parsed.protocol}//${parsed.hostname}/*` };
 }
 
+// Shared normalization/policy for the persistence adapter. Never prompts/fetches.
+export function normalizeImageSource(value) { return source(value).normalizedUrl; }
+
+// Revalidate cached/acquired descriptors outside IndexedDB transactions. A saved
+// status alone is not evidence: check actual size, container/MIME and byte hash.
+// Server full decoding remains authoritative. Only one image buffer at a time.
+export async function inspectImageBlob(blob) {
+  if (!(blob instanceof Blob) || !blob.size) fail('unsupported');
+  if (blob.size > DEFAULT_LIMITS.asset_bytes) fail('tooLarge');
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const [mediaType, extension] = inspect(bytes, DEFAULT_LIMITS);
+  if (blob.type && blob.type !== mediaType) fail('mimeMismatch');
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return { size: blob.size, mediaType, extension, sha256: [...new Uint8Array(digest)].map(n => n.toString(16).padStart(2, '0')).join('') };
+}
+
 function decodeData(info, limit) {
   if (info.size > limit) fail('tooLarge');
   const bytes = new Uint8Array(info.size);

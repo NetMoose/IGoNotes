@@ -272,4 +272,30 @@ describe('local draft storage', () => {
     expect((await store.getDraft('a')).title).toBe('Заметка 🦉');
     store.close();
   });
+
+  it('updates only assets against latest metadata and CAS, preserving attempts and timestamps', async () => {
+    const { store } = setup();
+    await store.saveDraft(draft(), { assets: [asset()], attempt: attempt() });
+    const expectedAssets = await store.getAssets('a');
+    const latest = await store.saveDraft(draft('a', 'latest'));
+    await store.updateDraftAssets('a', { expectedMarkdown: latest.markdown, expectedAssets, assets: [asset('second', 'def')] });
+    expect(await store.getDraft('a')).toEqual(latest);
+    expect(await store.getAttempts('a')).toHaveLength(1);
+    await expect(store.updateDraftAssets('a', { expectedMarkdown: 'old', expectedAssets: [], assets: [] })).rejects.toMatchObject({ code: 'markdown_changed' });
+    await expect(store.updateDraftAssets('a', { expectedMarkdown: latest.markdown, expectedAssets, assets: [] })).rejects.toMatchObject({ code: 'assets_changed' });
+    store.close();
+  });
+
+  it('enforces global assets-only quota across independent handles at the draft cap without replacing metadata', async () => {
+    const indexedDB = new IDBFactory();
+    const options = { indexedDB, limits: { maxDrafts: 2, maxBlobBytes: 3 } };
+    const one = createDraftStore(options), two = createDraftStore(options);
+    await one.saveDraft(draft('a')); await two.saveDraft(draft('b'));
+    const results = await Promise.allSettled(['a', 'b'].map((id, i) => [one, two][i].updateDraftAssets(id, { expectedMarkdown: '# hello', expectedAssets: [], assets: [asset()] })));
+    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.find(r => r.status === 'rejected').reason.code).toBe('blob_limit');
+    expect(await one.listDrafts()).toHaveLength(2);
+    expect([...(await one.getAssets('a')), ...(await two.getAssets('b'))]).toHaveLength(1);
+    one.close(); two.close();
+  });
 });
