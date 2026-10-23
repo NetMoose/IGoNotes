@@ -49,7 +49,7 @@
 - [x] 6.2 Добавить `extensions/webclipper/src/storage/drafts.js` и IndexedDB migration: drafts/assets/attempts, транзакционные Blob+metadata updates, limits 50 drafts/250 MiB, явные quota errors и manual delete. Проверка: fake IndexedDB tests на reopen, rollback неуспешного сохранения, orphan cleanup только явно удалённого draft и сохранность старых черновиков при quota failure.
 - [x] 6.3 Создать editor UI и список черновиков с title/filename/Markdown/source/capture time, индикатором сохранения, состояниями ошибок и Markdown download. Проверка: UI tests на редактирование/reopen/delete/download, несохранённую ошибку и отсутствие исполнения вставленного HTML.
 - [x] 6.4 Добавить настройки endpoint/token в trusted `chrome.storage.local`, loopback validation, protocol check и ограниченный transport module с timeout и запретом redirect для Bearer. Проверка: unit tests на custom port, malformed/remote endpoint, protocol mismatch и отсутствие секрета в content-script messages/URL.
-- [ ] 6.5 Написать `extensions/webclipper/README.md` с build/Load unpacked, secret setup, отдельным editor tab, локальным хранением и потерей данных при удалении профиля; добавить согласованную инструкцию в `docs/user.md` и зеркало. Проверка: чистая установка по инструкции и `go test ./internal/docs -count=1`.
+- [x] 6.5 Написать `extensions/webclipper/README.md` с build/Load unpacked, secret setup, отдельным editor tab, локальным хранением и потерей данных при удалении профиля; добавить согласованную инструкцию в `docs/user.md` и зеркало. Проверка: чистая установка по инструкции и `go test ./internal/docs -count=1`.
 
 ## 7. Page capture and Markdown conversion
 

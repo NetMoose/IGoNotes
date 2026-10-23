@@ -1,6 +1,6 @@
 # IGoNotes Web Clipper — local draft editor
 
-Tasks 6.1–6.4: an independently built JavaScript ESM / Svelte 5 / MV3 package
+An independently built JavaScript ESM / Svelte 5 / MV3 package
 with native IndexedDB storage and a local draft list/editor. The popup opens a
 separate editor tab (also the extension's options page).
 
@@ -8,24 +8,112 @@ separate editor tab (also the extension's options page).
 > Markdown; read source URL and capture time; save, retry, explicitly delete and
 > download the current Markdown; manually save/clear connection settings and test
 > the read-only protocol connection. **Planned:** page capture (7), image
-> acquisition and backend delivery (8).
+> acquisition and the extension send UI (8).
 > A fresh profile truthfully shows an empty list. There is no capture or new-draft
 > button yet; future capture task 7.3 will create drafts and open the editor.
 
-## Build and load
+## Quickstart: build, Load unpacked and connect
 
-From the repository root, with Node.js 24:
+The first delivery is a local source build loaded unpacked, not a Chrome Web Store
+listing or an already published release ZIP. Use desktop Chrome/Chromium. The
+manifest declares a minimum of 120; Linux Chromium 154.0.8037.97 is the browser
+actually checked here. Latest-Chrome/platform compatibility acceptance is still
+planned in task 9.2.
 
-```sh
-node --version
-npm --prefix extensions/webclipper ci
-npm --prefix extensions/webclipper run verify
-```
+1. From your local repository root, check **Node.js 24** before running npm:
 
-Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and
-select `extensions/webclipper/dist`. Open the extension action to see the popup
-and follow **Open draft editor**. Reload the extension after rebuilding.
+   ```sh
+   node --version
+   npm --prefix extensions/webclipper ci
+   npm --prefix extensions/webclipper run verify
+   ```
+
+   `verify` runs tests and builds `dist`; no separate global tooling is required.
+2. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**,
+   and select `extensions/webclipper/dist` (not the repository or `src`). Keep the
+   whole directory, including `LICENSES/` and `THIRD_PARTY_NOTICES.txt`.
+3. Run IGoNotes **on the same computer**, finish its first-run base setup and keep
+   it running. Default: `http://127.0.0.1:8080`. For a custom port, for example:
+
+   ```sh
+   igonotes --port 9000
+   ```
+
+4. In the IGoNotes web app, open **Настройки → Веб-клиппер**, enter
+   **Название подключения**, and click **Создать подключение** once. Manually copy
+   **Секрет подключения**: it is shown only once. If lost, revoke that connection
+   and create a new one. Never paste the token into a URL.
+5. Open the extension action/popup, click **Open draft editor**, then
+   **Connection settings** in the separate editor tab. Enter **Endpoint** (for the
+   example, `http://127.0.0.1:9000`) and paste the secret into **Connection token**.
+   Only HTTP `127.0.0.1` or `localhost`, ports **1–65535**, and the origin/root path
+   are accepted; a trailing `/` is allowed. No non-root path, credentials, query,
+   fragment, HTTPS or remote host. IPv6 is not declared supported and is rejected.
+6. Click **Save connection**. `Connection saved locally. Not tested.` means only
+   local storage was updated: no network request was made. Click **Test connection**
+   explicitly to send `GET /api/clipper/v1/info` with the current inputs (even if
+   unsaved). Success is **Connected: protocol v1 is supported.** This validates
+   discovery, not page delivery. The server must have completed setup and expose
+   compatible protocol v1; a protocol mismatch requires a compatible app/extension
+   update. If unavailable, check that IGoNotes is running and the port is correct;
+   an authorization error requires a valid, unrevoked token.
+7. Close/reopen the editor or reload it, open **Connection settings**, and check
+   that the saved endpoint/token persist. **Clear connection** removes only local
+   credentials; it neither revokes the server connection nor deletes drafts.
+   To revoke access, use **Отозвать** in the app's **Настройки → Веб-клиппер**.
+
+The popup only opens the editor; it has no capture buttons. A fresh installation
+has an empty draft list and no new-draft button. Existing drafts can be edited,
+manually saved and downloaded with **Download Markdown**. Capture is planned for
+task 7; image acquisition and the send UI are planned for task 8. The HTTP backend,
+including image import/status and recovery, is already implemented; see the
+canonical [server API documentation](../../docs/api.md#web-clipper-v1--discovery-и-http-import-доступны).
+
+### Local storage, updates and removal
+
+Drafts/images/attempts live in this extension's **IndexedDB** in this browser
+profile. Endpoint/token live separately in trusted-only **chrome.storage.local**,
+not browser sync. Neither store is a backup or synchronized with IGoNotes.
+**Download Markdown** exports only the current Markdown text, not all drafts or
+an offline archive with all images. Uninstalling the extension, deleting the
+browser profile or clearing its storage can lose drafts, images and credentials;
+browser eviction is also possible. **Clear connection** keeps drafts and images.
+
+After rebuilding, use the extension's **Reload** button at `chrome://extensions`
+and reopen the editor to load the new code. Keep the same `dist` location and
+browser profile for the existing extension storage. A changed unpacked location/
+extension ID or a different profile may give a separate, empty store and require
+entering the endpoint/token again; it does not migrate the old drafts. Download
+needed Markdown before removing an installation/profile.
+
 This package is independent of `web/` and Go embed.
+
+### Clean-install guide acceptance (task 6.5)
+
+Checked on Linux with Node.js **24.20.0** and headed, sandboxed Chromium
+**154.0.8037.97** via Xvfb, after a clean `npm ci` and `run verify` (116 tests
+and a fresh build). A temporary harness loaded that unpacked `dist` into a fresh
+browser profile and launched a Go binary built from the current checkout using
+`--no-browser`, a temporary HOME/config and custom port **36977**. First-run setup
+was completed through the public setup API with a temporary base; connection
+creation and the one-time secret were exercised through the actual app UI,
+**Настройки → Веб-клиппер → Создать подключение**.
+
+The actual **Open draft editor → Connection settings → Save connection → Test
+connection** flow passed: Save made no discovery request; Test displayed
+`Connected: protocol v1 is supported.` and its real GET response contained
+`app_name: IGoNotes`, `protocol_version: 1`, `app_version: dev`. Saved credentials
+survived reload and close/reopen. Clear removed local credentials without network
+requests, kept an explicitly seeded IndexedDB draft across reload, and left the
+same server token authorized and its connection unrevoked. The UI does not display
+the app name/version; those were checked in the discovery response. The separate
+packaging smoke below also passed trusted-only storage isolation with a real
+content script. No secret was logged. Owned processes were stopped, the backend
+port was confirmed closed and temporary HOME/config/profile data were removed.
+This is guide/settings acceptance, not the capture/image/send acceptance planned
+for tasks 7–9.
+
+## Build layout and host permissions
 
 `vite.config.js` builds local ESM worker and UI entries with relative asset
 paths. `vite.content.config.js` runs separately, emitting one classic IIFE
@@ -162,7 +250,7 @@ dependencies, reports zero vulnerabilities with this lockfile.
 
 Open **Connection settings** in the editor, enter the local endpoint and manually
 paste the connection token into the password field. The default endpoint is
-`http://127.0.0.1:8080`; `http://localhost:9123` is an example custom port.
+`http://127.0.0.1:8080`; `http://localhost:9000` is an example custom port.
 Only HTTP loopback origins whose canonical host is `127.0.0.1` or `localhost` are
 accepted. Ports must be 1–65535. Credentials (even empty `@`), non-root paths,
 queries, fragments, malformed addresses, remote hosts and IPv6 are rejected before
