@@ -67,7 +67,7 @@
 - [x] 8.4 Добавить UI списка изображений, retry/permission action и отдельное подтверждение external fallback; отобразить warnings после успеха. Проверка: отправка блокируется при неподтверждённых ошибках, успешные assets локальны, подтверждённые внешние ссылки сохранены, материал не называется полностью автономным.
 - [x] 8.5 Реализовать `src/delivery/` state machine: persist attempt до POST, explicit base/folder+revision, manual send, confirmed success cleanup, uncertain GET/replay того же ID; запретить silent retarget и редактирование uncertain snapshot. Проверка: transport tests для offline, lost response, 5xx, revoke/reconnect, stale destination, note_conflict, pending, changed digest и abandoned recovery.
 - [x] 8.6 Реализовать восстановление interrupted preparing/sending после закрытия editor/worker/browser и повторное подтверждение назначения после restart IGoNotes; смена endpoint не переносит uncertain attempt незаметно. Проверка: persisted-state restart tests и отсутствие автоматического POST при восстановлении связи.
-- [ ] 8.7 Обновить README/user/API docs и зеркала: image formats/limits, cookie-protected/blob limitations, quotas, manual retry, uncertain outcomes и external fallback. Проверка: `npm --prefix extensions/webclipper run verify` и `go test ./internal/docs -count=1`.
+- [x] 8.7 Обновить README/user/API docs и зеркала: image formats/limits, cookie-protected/blob limitations, quotas, manual retry, uncertain outcomes и external fallback. Проверка: `npm --prefix extensions/webclipper run verify` и `go test ./internal/docs -count=1`.
 
 ## 9. Cross-component acceptance and distribution checks
 

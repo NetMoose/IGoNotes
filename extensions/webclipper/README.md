@@ -1,4 +1,4 @@
-# IGoNotes Web Clipper — durable Markdown capture and local draft editor
+# IGoNotes Web Clipper — capture, local images and manual delivery
 
 An independently built JavaScript ESM / Svelte 5 / MV3 package
 with native IndexedDB storage and a local draft list/editor. The popup opens a
@@ -12,10 +12,121 @@ separate editor tab (also the extension's options page).
 > filename and export safe YAML frontmatter; explicitly Prepare/Retry images,
 > review durable local bytes/errors and separately confirm external references;
 > explicitly select/confirm a base and existing folder, Send, and manually Check or
-> replay the same immutable attempt after an uncertain result (8.5). Capture itself
+> replay the same immutable attempt after an uncertain result; recover interrupted
+> preparation/delivery after editor, worker, browser or server restart. Capture itself
 > leaves image URLs pending without downloading bytes. A fresh profile has no drafts.
 
-## Manual foreground delivery (task 8.5)
+## Quickstart: build → capture → prepare → Send
+
+Use desktop Chrome/Chromium and a local source checkout; this is **Load unpacked**,
+not a Web Store listing or a published release ZIP. The manifest declares Chrome
+120 as the minimum; the browser actually tested is Linux Chromium **154.0.8037.97**.
+Official Chrome/platform/manual permission-prompt acceptance remains **9.2**.
+Existing native image smokes use test-only pregranted hosts. Section 9 covers
+remaining verification/CI/distribution, not unavailable capture/image/Send/restart features.
+
+1. From the repository root, check **Node.js 24**, then build:
+
+   ```sh
+   node --version
+   npm --prefix extensions/webclipper ci
+   npm --prefix extensions/webclipper run verify
+   ```
+
+   `verify` runs tests and builds `dist`. At `chrome://extensions` enable
+   **Developer mode**, click **Load unpacked**, select `extensions/webclipper/dist`
+   (not `src` or the repository). Keep `LICENSES/` and `THIRD_PARTY_NOTICES.txt`.
+2. On an HTTP(S) main page, open the popup and click **Article**. Alternatively,
+   select a rich main-document range **before opening the popup**, then click
+   **Selection** (a range containing a real `img` can be image-only). Capture needs
+   neither IGoNotes nor a token. It converts to Markdown without image requests.
+3. Wait for **Saved locally**: the IndexedDB transaction is complete and the editor
+   opens in a separate tab. If opening failed, use **Open saved draft** for the
+   **same ID**, or **Open draft editor** to find it. Repeating capture creates a new draft.
+4. Review **Title**, **Filename**, **Source URL**, **Captured at** (UTC), **Markdown**.
+   Click **Save** for edits; **Unsaved changes** is not durable. Selecting another
+   draft or **Refresh drafts** drains saves and blocks navigation on failure.
+   **Download Markdown** exports safely quoted `title`/`source`/`clipped_at` YAML
+   plus the **current unsaved body**, without images, an archive or a global draft export.
+5. Click **Prepare images**; explicitly grant access if prompted. **Retry images /
+   grant access** retries manually. Requests select exact scheme/host patterns from
+   optional host permissions; Chrome patterns cover **all ports** for that scheme/host.
+   Platform-pattern failure/denial is visible, without broadening access.
+   **Stored locally** confirms committed, verified IndexedDB Blob bytes, not fetch alone.
+   For an eligible HTTP(S) image you choose to keep external, select its individual
+   **Keep external reference**, review the URL/reason list, then separately click
+   **Confirm external references**. A checkbox alone does not unblock readiness.
+6. **Before pairing for delivery**, use a compatible Go app built from this
+   **current checkout**, or another build known to support Web Clipper protocol v1
+   and its connection UI. Do not assume an existing installed/published binary
+   supports these features. Local capture/edit/image preparation does not require
+   a Go build. For reproducible delivery, with **Node.js 24 and Go 1.26+**, run from
+   the repository root on the same computer:
+
+   ```sh
+   node --version
+   go version
+   make all
+   ./builds/igonotes --port 9000
+   ```
+
+   Finish the running app's first-run base setup. Bare `igonotes --port 9000` is
+   appropriate only when the PATH binary is known compatible. In the Go app open **Настройки → Веб-клиппер**,
+   enter **Название подключения**, click **Создать подключение**, copy the one-time
+   **Секрет подключения**. In the extension's **Connection settings**, enter
+   **Endpoint** `http://127.0.0.1:9000` and **Connection token**. Click **Save connection**
+   (local only), then explicitly **Test connection**. Success is
+   `Connected: protocol v1 is supported.` Connection is optional for local work.
+7. Click **Load destinations**, select **Destination base** and an existing
+   **Destination folder**, explicitly `(root)` for the root, then **Confirm destination**.
+   No first/active base or folder is automatically selected; missing folders are not created.
+8. Click **Send** manually. Wait for **Import confirmed** and the matching receipt with historical base/path,
+   full-note SHA-256 revision and ordered warnings. Existing names return
+   `409 note_conflict`, never overwrite. Images use ASCII
+   `assets/images/clip-<import_id>-<sha256>.<ext>` paths; your custom note filename
+   may contain Unicode and is not silently replaced. The body stays literal except
+   managed Markdown image rewrites; source URL/query/fragment stays quoted YAML data.
+9. To find the note in IGoNotes, choose the **original target base** in
+   **Настройки → Базы заметок** and, if needed, use the tree button
+   **Обновить дерево (Синхронизировать с диском)**. Import does **not** switch the
+   active base. Send does **not** Git push: ordinary manual/autosync is separate.
+
+Image policy and quotas are below. Cookie-protected images may fail; no redirects
+(even CDN 302) are followed. Only Markdown AST images are managed; raw HTML `<img>`
+is neither fetched nor rewritten, so readiness is not a whole-document offline guarantee.
+External references may need the network when rendered elsewhere. External choices
+are transient: body/source/lifecycle changes, Retry or reopen/switch reset them;
+title-only edits do not. Valid cached Blobs work after source-page close or permission
+revocation without source requests; partial committed preparation survives browser
+restart, remaining images require manual Prepare. There is no automatic profile backup.
+
+### Formats, budgets and local storage limits
+
+Accepted images: static **PNG/JPEG/WebP**, plus **GIF including every animation
+frame**. APNG, animated WebP, SVG and PDF are unsupported as local assets; an
+eligible HTTP(S) source can instead be kept external with separate URL/reason
+confirmation. Data/unsafe/private/blob sources cannot use that fallback: prepare
+supported data locally or edit/remove the source, never fabricate an acknowledgement URL.
+The current UI also allows an already stored HTTP(S) image to stay external intentionally.
+
+| Budget (inclusive; 1 MiB = 1048576 bytes) | Limit |
+| --- | --- |
+| Full formatted Markdown, including YAML, decoded UTF-8 | 5 MiB |
+| One asset / all assets per import | 10 MiB / 50 MiB |
+| Unique assets per import | 100 |
+| Entire multipart wire body, JSON escaping/MIME/framing included | 64 MiB |
+| One image / GIF canvas / each GIF frame | 40,000,000 pixels |
+| GIF frames / sum of GIF frame pixels | 100 / 200,000,000 |
+| Local drafts / physical stored Blobs across drafts | 50 / 250 MiB |
+
+The local Blob cap excludes metadata/IndexedDB overhead; browser quota can run out
+earlier. No automatic eviction by the extension: download current Markdown, then
+manually remove unwanted **editable** drafts with **Delete draft** or free storage.
+Keep unresolved frozen attempts. Client preflight is structural; full server image
+validation is authoritative. See [server backup/restore](../../docs/user.md#резервная-копия-и-восстановление)
+for a coherent stopped-server backup; it does not back up the extension profile.
+
+## Manual foreground delivery and uncertain outcomes
 
 1. Save the endpoint/token in **Connection settings**. Saving does no network IO.
 2. Prepare images or separately confirm eligible external references. Unacknowledged
@@ -44,6 +155,8 @@ endpoint; a different endpoint is refused until the original address is restored
 
 Known payload/destination/filename rejections unlock the preserved draft, invalidate
 destination confirmation and require a fresh ID after explicit reconfirmation.
+Validated GET `state: rejected`, including a journalled `internal_error`, is a
+confirmed rejection; a raw POST `500 internal_error` is uncertain, not that proof.
 Rejected old attempts are never replayed. `clipper_import_abandoned` additionally
 warns that files may already exist. Pending/recovery-required and Git conflict hold
 the immutable attempt. The Git gate is conservatively treated as pending even when
@@ -53,6 +166,13 @@ The current persisted hold cannot be cleared by auth, rejection, or even a match
 success receipt: storage refuses transitions, another POST, and cleanup of that ID.
 If local receipt persistence/cleanup fails, keep the frozen draft; manual Check can
 recover the receipt or finish already-confirmed local cleanup without a new ID.
+Physical Blobs remain until known success and atomic cleanup. When a matching
+`succeeded` receipt is already persisted, Check validates it and performs **local
+cleanup only**, without HTTP or connection settings, even at a different current
+endpoint. This does not retarget historical publication. Otherwise a changed endpoint
+blocks both GET and POST. Inspect sticky identity conflicts in IGoNotes manually;
+there is no new-ID workaround or automatic unlock from a late cross-window response.
+Server availability alone never starts delivery.
 
 `src/delivery/stateMachine.js` exports `createDelivery` with explicit
 `loadDestinations`, `loadFolders`, `confirmDestination`, `send`, `check`, `retry`.
@@ -135,7 +255,7 @@ not mutate lifecycle metadata or take ownership from another open window.
 
 Only **Saved locally** text and **Stored locally** bytes are promised after close.
 Forced browser close can lose unsaved edits and unfinished image streams; the unload
-warning is not an autosave guarantee. The comprehensive image/delivery guide is 8.7.
+warning is not an autosave guarantee. See the quickstart and image policy in this guide.
 
 Native process-restart smoke (Linux/system Chromium, bounded supervisor; default
 normal smoke remains 30s; explicitly allow 60s/90s for restart runs):
@@ -181,7 +301,7 @@ relative paths, unchanged active base/index, and indexing after an explicit swit
 are checked. This uses data images/fixture host access; **no native permission
 dialog/manual prompt acceptance is claimed**. Full browser matrix remains task 9.
 
-## Explicit image preparation UI (task 8.4)
+## Explicit image preparation UI
 
 In the local editor click **Prepare images** before going offline or closing the
 source page. The button uses current unsaved Markdown URLs, requests only their
@@ -224,58 +344,8 @@ image-readiness predicate only, not a send implementation or full protocol prefl
 Delivery **8.5** flushes, atomically `readBundle`s, freshly calls `buildImportSnapshot`
 with current acknowledgements, CAS/freezes and persists the immutable attempt before
 POST. A pending attempt replays its retained manifest, not newly collected consents.
-`tests/helpers/ImagePreparationHost.svelte` demonstrates a disabled future-send
-predicate without implementing delivery.
-
-## Quickstart: build, Load unpacked and capture locally
-
-The first delivery is a local source build loaded unpacked, not a Chrome Web Store
-listing or an already published release ZIP. Use desktop Chrome/Chromium. The
-manifest declares a minimum of 120; Linux Chromium 154.0.8037.97 is the browser
-actually checked here. Latest-Chrome/platform compatibility acceptance is still
-planned in task 9.2.
-
-1. From your local repository root, check **Node.js 24** before running npm:
-
-   ```sh
-   node --version
-   npm --prefix extensions/webclipper ci
-   npm --prefix extensions/webclipper run verify
-   ```
-
-   `verify` runs tests and builds `dist`; no separate global tooling is required.
-2. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**,
-   and select `extensions/webclipper/dist` (not the repository or `src`). Keep the
-   whole directory, including `LICENSES/` and `THIRD_PARTY_NOTICES.txt`.
-3. Open the source **HTTP(S) main page**. For **Selection**, select a rich range
-   in that page **before opening the popup**; a range containing a real `img`
-   element can be captured, including an image-only selection.
-4. Open the extension popup and explicitly click **Article** or **Selection**.
-   **Article** uses best-effort Readability extraction on a clone, not the whole
-   page DOM. **Selection** uses only the selected main-document range. Capture
-   converts to Markdown, commits a new local draft, then opens its editor tab.
-5. Wait for **Saved locally**. This confirms a completed IndexedDB transaction;
-   closing the popup now loses no saved draft. If the editor tab could not open,
-   use **Open saved draft** to open the **same ID**, or **Open draft editor** to
-   find it in the list. Repeating the entire capture intentionally creates a new
-   draft; it is not a retry of opening the existing one.
-6. In the editor, review **Title**, **Filename**, **Source URL**, **Captured at**
-   (UTC), and **Markdown**. Click **Save** to persist edits; **Unsaved changes**
-   identifies pending edits. Selecting another draft or **Refresh drafts** first
-   saves pending edits and blocks navigation if saving fails. **Download Markdown**
-   exports the full current note (safe metadata frontmatter plus body), including
-   unsaved edits, without image files. Browser close/reload can still lose unsaved
-   edits if its warning is bypassed.
-
-Local capture/edit/download needs neither IGoNotes running nor a token or
-**Test connection**. Capture makes no backend or image requests and reads no
-connection credentials. Capture leaves image URLs as pending metadata (`blob: null`),
-not acquired images. Only explicit editor **Prepare images** or **Retry images / grant
-access** requests image permissions/acquisition; delivery uses the separate Send action.
-The plain textarea does not load previews. Exported Markdown may still
-reference external HTTP(S) images/links: opening links or rendering the export
-elsewhere can access the network as a separate user action. This is not yet a
-fully self-contained offline image archive.
+`tests/helpers/ImagePreparationHost.svelte` isolates the readiness predicate for
+tests; production delivery is integrated separately through `Delivery.svelte`.
 
 ### Immutable image import preparation API (task 8.3)
 
@@ -413,15 +483,24 @@ preparation/delivery restoration (8.6) are available; see the recovery section a
 ### Optional: configure and test the IGoNotes connection
 
 This is separate from local capture; the manual Send UI uses the saved connection
-after explicit destination selection and confirmation (see task 8.5 above).
+after explicit destination selection and confirmation (see the quickstart above).
 
-1. Run IGoNotes **on the same computer**, finish its first-run base setup and keep
-   it running. Default: `http://127.0.0.1:8080`. For a custom port, for example:
+1. **Before creating a connection**, build the Go app from the **current checkout**
+   or use a build known to support Web Clipper protocol v1 and the connection UI.
+   An existing installed/published binary is not sufficient evidence of support.
+   With **Node.js 24 and Go 1.26+**, run from the repository root:
 
    ```sh
-   igonotes --port 9000
+   node --version
+   go version
+   make all
+   ./builds/igonotes --port 9000
    ```
 
+   Keep it running **on the same computer** and finish its first-run base setup.
+   The example endpoint is `http://127.0.0.1:9000` (default port without `--port`:
+   8080). Use bare `igonotes --port 9000` only if that PATH binary is known compatible.
+   These Go build/setup steps are needed for delivery, not local capture or preparation.
 2. In the IGoNotes web app, open **Настройки → Веб-клиппер**, enter
    **Название подключения**, and click **Создать подключение** once. Manually copy
    **Секрет подключения**: it is shown only once. If lost, revoke that connection
@@ -497,8 +576,9 @@ packaging smoke below also passed trusted-only storage isolation with a real
 content script. No secret was logged. Owned processes were stopped, the backend
 port was confirmed closed and temporary HOME/config/profile data were removed.
 This historical task-6.5 run is guide/settings acceptance. Capture/formatting smoke
-coverage from tasks 7.1–7.4 is described below; image/send and full cross-component
-acceptance remain planned for tasks 8–9.
+coverage from tasks 7.1–7.4 is described below. Image/send/restart features and
+focused native smokes are now available above; full cross-component acceptance
+and CI/distribution remain section 9.
 
 ## Build layout and host permissions
 
@@ -561,7 +641,7 @@ This does not change the separate IPv4/localhost-only backend endpoint contract.
 `acquire(urls, { signal }?)` checks `permissions.contains` for each unique HTTP(S)
 source and **never prompts**. Each batch runs at most three workers (including
 permission wait, fetch, body read and hash). Concurrent batches are caller-owned;
-future UI should serialize Prepare/Retry. Results preserve input order and every
+the current UI serializes Prepare/Retry. Results preserve input order and every
 input entry, including duplicate/failed aliases:
 
 - Success: `{ ok: true, url, normalizedUrl, blob, sha256, mediaType, extension, size }`.
@@ -617,7 +697,7 @@ normalized-URL duplicates share acquisition; the 8.2 adapter below also deduplic
   10 MiB percent-encoded image. Decoded size is computed **before** byte-buffer
   allocation/`atob`, then capped by the same image byte limit; no fetch is made.
 
-### Client validation boundary and future integration
+### Client validation boundary
 
 The module checks actual signatures and structural preflight for static PNG,
 JPEG, WebP and GIF (including animated GIF). Absent/octet-stream HTTP MIME can be
@@ -756,7 +836,7 @@ Removed sources are absent from returned `refs/assets`, and unused owners are
 absent from returned `blobs`. Old unreferenced rows/Blobs may remain as evidence;
 preparation performs no automatic deletion. **Never build a snapshot by sending
 all `getAssets()` rows or by trusting an old `active` flag after text edits.**
-Task 8.3 must re-evaluate the current body and use its active mapping/canonical-byte
+The snapshot builder re-evaluates the current body and uses its active mapping/canonical-byte
 closure for the immutable snapshot; preparation results alone are not that snapshot.
 
 `store.updateDraftAssets(id, { expectedMarkdown, expectedAssets, assets })` is the
@@ -942,8 +1022,10 @@ dependency LICENSE/NOTICE files verbatim to `dist/LICENSES/`, includes the full
 Apache-2.0 license, and uses Vite's license inventory for actually bundled
 transitive code. Ship the whole `dist` directory, including these notices.
 
-The full `npm --prefix extensions/webclipper audit`, including development
-dependencies, reports zero vulnerabilities with this lockfile.
+The extension-only `npm --prefix extensions/webclipper audit`, including development
+dependencies, reports zero vulnerabilities with this lockfile. This is not a
+whole-repository audit result: the main `web/` package has **5 known findings**
+pending the task-9.3 work; do not infer zero for it from the extension audit.
 
 ## Extraction API (task 7.1)
 
@@ -1239,7 +1321,7 @@ not encrypted credential backup; it is lost when extension/profile data is remov
 and `TransportError`. A factory snapshots the validated endpoint/token. Its only
 discovery methods are `info({ signal }?)`, `bases({ signal }?)` and
 `folders(base, { signal }?)`, restricted to the corresponding `/api/clipper/v1/`
-GET routes with encoded query components. Task 8.5 adds only `postImport(FormData,
+GET routes with encoded query components. Delivery also uses `postImport(FormData,
 { signal }?)` and `importStatus(id, { signal }?)` for v1 imports. FormData uses a
 browser-generated Content-Type/boundary. There is no arbitrary URL request API or
 ordinary note/config/admin access. Delivery owns original-endpoint/replay policy.
@@ -1346,12 +1428,12 @@ source length, encoding or caller-supplied size. Duplicate encoded metadata adds
 browser storage overhead outside the 250 MiB Blob cap. Storage checks source
 representation only: the standalone task-8.1 acquisition module checks decoded
 bytes, MIME, signatures and structural budgets before acquisition success; it is
-used by the standalone persistence adapter, but not wired into UI. No decoder or
-network logic is implemented here. Page `sourceUrl` remains HTTP(S)-only, and
+used by the persistence adapter through the explicit image UI. No decoder or
+network logic is implemented in storage itself. Page `sourceUrl` remains HTTP(S)-only, and
 attempt endpoints retain their separate origin-only validation.
 
-JavaScript record properties use **camelCase**. The future transport layer must
-explicitly map fields such as `sourceUrl`, `capturedAt` and `destinationRevision`
+JavaScript record properties use **camelCase**. The snapshot builder explicitly
+maps fields such as `sourceUrl`, `capturedAt` and `destinationRevision`
 to the Go wire contract's `source_url`, `captured_at`, `destination_revision`.
 The JSON manifest is caller-prepared wire data; storage never transforms its keys.
 JSON values must be finite, well-formed Unicode, plain JSON, at most 64 levels
