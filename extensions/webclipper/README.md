@@ -9,12 +9,12 @@ separate editor tab (also the extension's options page).
 > download the current Markdown; manually save/clear connection settings and test
 > the read-only protocol connection; capture Article/Selection as converted Markdown,
 > commit a local draft, and open it in a separate editor tab; suggest a portable
-> filename and export safe YAML frontmatter (7.1–7.4).
+> filename and export safe YAML frontmatter. Tasks 1–7 are implemented/documented.
 > **Planned:** image acquisition and
 > the extension send UI (8). Captured image URLs are pending metadata only; no image
 > bytes are downloaded. A fresh profile has no drafts until the first capture.
 
-## Quickstart: build, Load unpacked and connect
+## Quickstart: build, Load unpacked and capture locally
 
 The first delivery is a local source build loaded unpacked, not a Chrome Web Store
 listing or an already published release ZIP. Use desktop Chrome/Chromium. The
@@ -34,24 +34,95 @@ planned in task 9.2.
 2. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**,
    and select `extensions/webclipper/dist` (not the repository or `src`). Keep the
    whole directory, including `LICENSES/` and `THIRD_PARTY_NOTICES.txt`.
-3. Run IGoNotes **on the same computer**, finish its first-run base setup and keep
+3. Open the source **HTTP(S) main page**. For **Selection**, select a rich range
+   in that page **before opening the popup**; a range containing a real `img`
+   element can be captured, including an image-only selection.
+4. Open the extension popup and explicitly click **Article** or **Selection**.
+   **Article** uses best-effort Readability extraction on a clone, not the whole
+   page DOM. **Selection** uses only the selected main-document range. Capture
+   converts to Markdown, commits a new local draft, then opens its editor tab.
+5. Wait for **Saved locally**. This confirms a completed IndexedDB transaction;
+   closing the popup now loses no saved draft. If the editor tab could not open,
+   use **Open saved draft** to open the **same ID**, or **Open draft editor** to
+   find it in the list. Repeating the entire capture intentionally creates a new
+   draft; it is not a retry of opening the existing one.
+6. In the editor, review **Title**, **Filename**, **Source URL**, **Captured at**
+   (UTC), and **Markdown**. Click **Save** to persist edits; **Unsaved changes**
+   identifies pending edits. Selecting another draft or **Refresh drafts** first
+   saves pending edits and blocks navigation if saving fails. **Download Markdown**
+   exports the full current note (safe metadata frontmatter plus body), including
+   unsaved edits, without image files. Browser close/reload can still lose unsaved
+   edits if its warning is bypassed.
+
+Local capture/edit/download needs neither IGoNotes running nor a token or
+**Test connection**. Capture makes no backend or image requests and reads no
+connection credentials. Image URLs are pending metadata (`blob: null`), not
+acquired images; image acquisition and delivery remain task 8. The editor is a
+plain textarea and does not load those images. Exported Markdown may still
+reference external HTTP(S) images/links: opening links or rendering the export
+elsewhere can access the network as a separate user action. This is not yet a
+fully self-contained offline image archive.
+
+### Capture failures and supported sources
+
+- **Article** may fail to identify useful content even on an HTML page. The fixed
+  message is `Could not extract an article. You can select content and choose Selection.`
+  Select content yourself, reopen the popup and explicitly choose **Selection**.
+  There is no automatic mode switch, whole-page DOM fallback or text fallback.
+  Readability is best effort, not a guarantee of detecting every empty article.
+- For an empty/collapsed/whitespace-only or foreign-frame selection, the message
+  is `Select non-empty content in the main page, then try Selection again.`
+  A real image in the cloned range is allowed even without text; unsupported
+  content can still leave nothing after conversion. That reports
+  `No supported content remains after conversion. Select content and try again.`
+  Conversion failure asks for a smaller fragment, without saving a partial draft.
+- Only HTTP(S) HTML/XHTML main documents without URL credentials are supported.
+  No PDF, iframe (including cross-origin iframe), screenshot, canvas or shadow-DOM
+  extraction, and no paywall bypass is provided. `chrome://`, `file://` and
+  extension URLs report `Only HTTP(S) pages without URL credentials can be captured.`
+  An accessible PDF/non-HTML document reports `PDF and non-HTML documents are not supported.`
+  If the browser blocks injection (including its PDF viewer), the fixed message
+  can instead be `Could not capture the active page. Check page access and try again.`
+  These errors do not switch modes or expose native error details.
+- Navigation during capture reports
+  `The active page changed. Open the popup on the source page and try again.`
+  Return to the intended source and explicitly capture again. Literal HTML/script
+  examples in code remain code, not executable scripts; actual script elements
+  are discarded during safe conversion.
+- A quota/transaction failure or the **50-draft limit** preserves old work with no
+  automatic eviction. **Not saved** means the current material is only in the
+  popup: **keep it open until Download current Markdown has downloaded the file**.
+  If download fails, keep it open and try downloading again. Capture buttons are
+  disabled while this unsaved material is present. The download includes current
+  metadata as exactly three safely quoted YAML keys (`title`, `source`,
+  `clipped_at`) plus the Markdown body, without image files. Manage old drafts
+  manually through **Open draft editor**; that does not save the failed capture.
+  Markdown exceeding **5 MiB UTF-8** likewise remains downloadable, without
+  truncation, and asks for a smaller selection. After securing the download,
+  reopen the popup on the source to make a new capture.
+
+### Optional: configure and test the IGoNotes connection
+
+This is separate from local capture; the extension send UI is still planned.
+
+1. Run IGoNotes **on the same computer**, finish its first-run base setup and keep
    it running. Default: `http://127.0.0.1:8080`. For a custom port, for example:
 
    ```sh
    igonotes --port 9000
    ```
 
-4. In the IGoNotes web app, open **Настройки → Веб-клиппер**, enter
+2. In the IGoNotes web app, open **Настройки → Веб-клиппер**, enter
    **Название подключения**, and click **Создать подключение** once. Manually copy
    **Секрет подключения**: it is shown only once. If lost, revoke that connection
    and create a new one. Never paste the token into a URL.
-5. Open the extension action/popup, click **Open draft editor**, then
+3. Open the extension action/popup, click **Open draft editor**, then
    **Connection settings** in the separate editor tab. Enter **Endpoint** (for the
    example, `http://127.0.0.1:9000`) and paste the secret into **Connection token**.
    Only HTTP `127.0.0.1` or `localhost`, ports **1–65535**, and the origin/root path
    are accepted; a trailing `/` is allowed. No non-root path, credentials, query,
    fragment, HTTPS or remote host. IPv6 is not declared supported and is rejected.
-6. Click **Save connection**. `Connection saved locally. Not tested.` means only
+4. Click **Save connection**. `Connection saved locally. Not tested.` means only
    local storage was updated: no network request was made. Click **Test connection**
    explicitly to send `GET /api/clipper/v1/info` with the current inputs (even if
    unsaved). Success is **Connected: protocol v1 is supported.** This validates
@@ -59,7 +130,7 @@ planned in task 9.2.
    compatible protocol v1; a protocol mismatch requires a compatible app/extension
    update. If unavailable, check that IGoNotes is running and the port is correct;
    an authorization error requires a valid, unrevoked token.
-7. Close/reopen the editor or reload it, open **Connection settings**, and check
+5. Close/reopen the editor or reload it, open **Connection settings**, and check
    that the saved endpoint/token persist. **Clear connection** removes only local
    credentials; it neither revokes the server connection nor deletes drafts.
    To revoke access, use **Отозвать** in the app's **Настройки → Веб-клиппер**.
@@ -114,8 +185,9 @@ the app name/version; those were checked in the discovery response. The separate
 packaging smoke below also passed trusted-only storage isolation with a real
 content script. No secret was logged. Owned processes were stopped, the backend
 port was confirmed closed and temporary HOME/config/profile data were removed.
-This is guide/settings acceptance, not the capture/image/send acceptance planned
-for tasks 7–9.
+This historical task-6.5 run is guide/settings acceptance. Capture/formatting smoke
+coverage from tasks 7.1–7.4 is described below; image/send and full cross-component
+acceptance remain planned for tasks 8–9.
 
 ## Build layout and host permissions
 
