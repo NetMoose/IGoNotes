@@ -1,9 +1,11 @@
 # IGoNotes Web Clipper scaffold
 
-Task 6.1 only: an independently built JavaScript ESM / Svelte 5 / MV3 package.
+Tasks 6.1–6.2: an independently built JavaScript ESM / Svelte 5 / MV3 package
+with a tested native IndexedDB storage module.
 The popup opens a separate editor scaffold tab (also the extension's options
-page). Capture, persistent drafts, editing, endpoint/token configuration, images
-and delivery are not implemented. No data is saved or sent by this scaffold.
+page). Capture, draft editor/list UI, endpoint/token configuration, image
+acquisition and delivery are not implemented. The scaffold UI does not call the
+storage module and saves/sends no data yet.
 
 ## Build and load
 
@@ -86,7 +88,8 @@ All direct dependencies are exactly pinned: Svelte 5.56.4, Svelte Vite plugin
 7.2.0, Vite 8.3.5 and Vitest 4.1.12. The extension uses the same tooling majors
 as `web/`, with independently selected patched Vite/Vitest versions. The plugin's
 Vite 8 and Svelte 5 peer requirements are satisfied. Playwright Core 1.64.1 is
-development-only.
+development-only. `fake-indexeddb` 6.2.6 (Apache-2.0) is an exactly pinned
+development-only IndexedDB test implementation; it is not browser runtime code.
 
 - `@mozilla/readability` 0.6.0 — Apache-2.0; `new Readability(clone).parse()`
   mutates its input and is **not a sanitizer**.
@@ -107,3 +110,150 @@ transitive code. Ship the whole `dist` directory, including these notices.
 
 The full `npm --prefix extensions/webclipper audit`, including development
 dependencies, reports zero vulnerabilities with this lockfile.
+
+## Local draft storage API (task 6.2)
+
+`src/storage/drafts.js` exports `createDraftStore`, `DraftStorageError`,
+`MAX_DRAFTS` (50) and `MAX_BLOB_BYTES` (250 × 1024²). It uses native IndexedDB,
+without Chrome APIs, network requests, Node buffers or a runtime dependency.
+Worker and editor callers can each keep one instance; independent handles/tabs
+share the same database. There is no JavaScript-global lock.
+
+```js
+import { createDraftStore } from './storage/drafts.js';
+const store = createDraftStore(); // lazy open, database igonotes-webclipper v1
+await store.saveDraft({
+  id: 'draft-1', title: 'Example', filename: 'example.md', markdown: '# Example',
+  sourceUrl: 'https://example.org/article', capturedAt: new Date().toISOString(),
+  base: null, parent: '', destinationRevision: null, status: 'draft',
+}, { assets: [{
+  id: 'image-1', normalizedUrl: 'https://example.org/image.png',
+  descriptor: { mime: 'image/png', status: 'ready' }, blob: imageBlob,
+}] }); // resolves only after transaction complete, not request success
+const drafts = await store.listDrafts();
+const metadata = await store.getDraft('draft-1'); // undefined if absent
+const assets = await store.getAssets('draft-1');
+const attempts = await store.getAttempts('draft-1');
+await store.saveDraft({ ...metadata, title: 'Edited' }); // keeps all assets/attempts
+await store.deleteDraft('draft-1'); // explicit, atomic deletion of owned rows
+store.close(); // terminal for this instance; create another instance to reopen
+```
+
+The example's `imageBlob` is a caller-prepared native Blob. Downloading, hashing,
+image validation and manifest building belong to later tasks. Prepare asynchronous
+work **before** saving: transaction callbacks issue only IndexedDB requests and
+synchronous computation, avoiding auto-commit across network/crypto awaits.
+
+### Version 1 schema and ownership
+
+- `drafts`, key `id`: required `id`, `title`, `filename`, `markdown`, `sourceUrl`,
+  `capturedAt`, `base` (string/null), `parent` (string, root is `''`),
+  `destinationRevision` (string/null), `status`; storage sets ISO `createdAt` and
+  `updatedAt`, preserving the original creation time on update. Incoming timestamp
+  fields may be round-tripped but cannot override those stored values.
+- `assets`, compound key `[draftId, id]`, nonunique `draftId` ownership index:
+  `draftId` is assigned from the saved draft, never from caller asset metadata.
+  Required `id`, `normalizedUrl`, JSON-object `descriptor`, `blob` (Blob/null).
+  `size` is always derived from `blob.size` (zero for null), ignoring caller size.
+  Null supports metadata-only image acquisition records for future callers.
+- `attempts`, compound key `[draftId, id]`, nonunique `draftId` index: append-only
+  `{ draftId, id, createdAt, manifest, deliverySnapshot }`. Caller supplies an
+  object-shaped JSON `manifest` and
+  `deliverySnapshot: { endpoint, assetIds, digest }`. `endpoint` is an HTTP(S)
+  origin without credentials, path, query or fragment; it is normalized with a
+  trailing slash. `assetIds` is a unique array of draft-local asset IDs; `digest`
+  is a nonempty string. This is persistence shape validation, not protocol/digest
+  verification or endpoint authorization. A duplicate attempt ID aborts the
+  entire save instead of replacing the snapshot.
+
+Asset `normalizedUrl` has its own source contract, separate from page URLs and
+attempt endpoints. HTTP(S) asset sources are normalized as before, without URL
+credentials. It also accepts `data:image/png`, `data:image/jpeg`, `data:image/gif`
+and `data:image/webp` sources with a nonempty payload:
+
+- `data:<approved MIME>;base64,<payload>` uses the standard base64 alphabet,
+  conventional padding or an unpadded final group; whitespace is rejected.
+- `data:<approved MIME>,<payload>` uses URL-safe ASCII and/or complete `%HH`
+  byte escapes (binary octets need not form UTF-8).
+
+The scheme/MIME/base64 marker are case-insensitive; extra MIME parameters,
+fragments, malformed escapes/base64, SVG, text and script schemes are rejected.
+For data sources the **exact input string** is persisted, including case and
+percent-escape spelling, so future acquisition/lookup/rewriting can use the same
+key. There is no synthetic HTTP alias or data URL canonicalization. The source
+string is bounded at **32 × 1024² characters**, enough for a protocol-sized
+10 MiB image even with every byte percent-encoded. Oversized sources fail with
+`invalid_data` without truncation or changes to saved work. For supported data
+sources every character is ASCII; this is a metadata bound, not an image quota.
+Blob usage is still calculated solely from actual `Blob.size`, regardless of the
+source length, encoding or caller-supplied size. Duplicate encoded metadata adds
+browser storage overhead outside the 250 MiB Blob cap. Storage checks source
+representation only: task 8.1 must decode and validate actual image bytes, MIME,
+signature and image limits before treating an asset as acquired. No decoder or
+network logic is implemented here. Page `sourceUrl` remains HTTP(S)-only, and
+attempt endpoints retain their separate origin-only validation.
+
+JavaScript record properties use **camelCase**. The future transport layer must
+explicitly map fields such as `sourceUrl`, `capturedAt` and `destinationRevision`
+to the Go wire contract's `source_url`, `captured_at`, `destination_revision`.
+The JSON manifest is caller-prepared wire data; storage never transforms its keys.
+JSON values must be finite, well-formed Unicode, plain JSON, at most 64 levels
+deep. Unknown top-level record fields are rejected. Auth/settings-like keys
+(token, secret, password, authorization, credentials, cookies, headers, endpoint)
+are rejected recursively in descriptors/manifests. Plain article/Markdown strings
+remain content, not a credential scanner. Callers must never place secrets in
+content fields. No auth credential belongs in these records; trusted local token
+settings are reserved for task 6.4, separately in `chrome.storage.local`, never
+`chrome.storage.sync`.
+
+`saveDraft(draft, { assets = [], deleteAssetIds = [], attempt })` is a full
+metadata replacement plus explicit asset upserts/deletions and optional attempt
+append, all atomic. Omitted assets are retained. Duplicate/conflicting asset
+updates are invalid. Attempts own **metadata snapshots**, referencing assets in
+the same draft; they do not duplicate Blob bytes. Future task 8.5 callers must
+build the immutable manifest/delivery snapshot, verify references, and preserve
+the referenced Blob IDs/bytes (no overwrite/deletion while replay is needed).
+This module implements no delivery state machine, reference freezing, network
+replay, automatic cleanup after success, or concurrency revision protocol.
+Concurrent metadata edits are last-committed-write-wins; future UI must coordinate
+editing when needed. Returned values are structured clones, not live records.
+
+The v1 upgrade creates missing stores/indexes without deleting existing stores
+or records. Opening/reopening never runs garbage collection or `deleteDatabase`.
+Future schema versions must add explicit nondestructive upgrade steps. A blocked
+upgrade reports an error; a late-opened handle is closed. A `versionchange`
+closes the connection and requires reopening the editor. Calling `close()` stops
+new operations; already-started native transactions may finish normally.
+
+### Quota, failures and manual deletion
+
+All saves/deletions use one readwrite transaction spanning **all three stores**.
+Global draft count and Blob usage checks occur in that same transaction as the
+writes, serializing even two independent tabs/instances. Updating an existing
+draft is allowed at 50 drafts. Blob usage counts all asset rows, including
+orphans, using actual Blob sizes and exact replacement/deletion deltas. The
+250 MiB cap is Blob payload only, not a promise about metadata/index overhead
+or available browser storage. Tests inject smaller caps through
+`createDraftStore({ indexedDB, name, limits: { maxDrafts, maxBlobBytes } })`.
+
+Errors have a stable `.code` and actionable `.message`: `invalid_data`,
+`draft_limit`, `blob_limit`, `storage_quota` (native `QuotaExceededError`),
+`storage_conflict`, `storage_cancelled`, `storage_unavailable`, `storage_blocked`,
+`storage_version_changed`, `storage_closed`, or `storage_error` (other failures,
+with the native cause retained). Failed transactions roll back metadata, Blob
+updates, removals and attempts together. Browser quota can be smaller than the
+application cap; a quota failure preserves previous saved work. Callers must keep
+unsaved edits and report errors rather than displaying “saved”.
+
+There is **no automatic eviction/GC** on open, save or quota failure.
+`deleteDraft(id)` deletes only that draft and asset/attempt rows selected by its
+ownership index, including orphan rows if its metadata is already missing.
+Identical asset/attempt IDs in another draft cannot cause cross-draft deletion.
+`deleteAssetIds` also permits deliberate image removal within a save. No API
+silently deletes unrelated work to make space.
+
+Storage is local to this extension origin in this browser profile. It does not
+sync or back up to IGoNotes or the cloud. Uninstalling the extension, deleting
+the profile or clearing extension/browser storage can lose all drafts and Blobs;
+browser eviction is also possible. This is not an archive guarantee. Markdown
+download/export UI and settings are future tasks, not available in this scaffold.
