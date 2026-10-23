@@ -261,7 +261,8 @@ it('ignores late async completions after unmount and does not close an injected 
 
 it('renders unsafe source metadata literally without a script link', async () => {
   const value = { ...draft(), sourceUrl: 'javascript:alert(1)', capturedAt: '<img src=x onerror=alert(1)>' };
-  await opened({ listDrafts: async () => [value], getDraft: async () => value });
+  await opened({ listDrafts: async () => [value], getDraft: async () => value,
+    readBundle: async () => ({ draft: value, assets: [], attempts: [] }) });
   expect(screen.getByText(value.sourceUrl)).toBeTruthy();
   expect(screen.getByText(value.capturedAt)).toBeTruthy();
   expect(screen.queryByRole('link')).toBeNull();

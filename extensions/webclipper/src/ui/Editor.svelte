@@ -3,15 +3,18 @@
   import { createDraftStore } from '../storage/drafts.js';
   import { downloadMarkdown, sourceLink } from './markdown-download.js';
   import ConnectionSettings from './ConnectionSettings.svelte';
+  import ImagePreparation from './ImagePreparation.svelte';
 
-  let { store: suppliedStore, initialDraftId } = $props();
+  let { store: suppliedStore, initialDraftId, imageAcquirer, onImageState, resultWarnings = [] } = $props();
   // A component owns only the handle it creates, never a caller's handle.
   const injectedStore = untrack(() => suppliedStore);
-  let store = injectedStore ?? createDraftStore();
+  let store = $state.raw(injectedStore ?? createDraftStore());
   let drafts = $state([]);
   let current = $state(null);
   let loading = $state(true);
   let busy = $state(false);
+  let preparingImages = $state(false);
+  const frozen = $derived(['sending', 'uncertain', 'pending'].includes(current?.status));
   let saving = $state(false);
   let version = $state(0);
   let persistedVersion = $state(0);
@@ -98,7 +101,7 @@
   }
 
   async function navigate(id) {
-    if (busy || loading) return;
+    if (busy || loading || preparingImages) return;
     busy = true;
     try {
       if (!await flush() || !alive) return;
@@ -109,7 +112,7 @@
   }
 
   async function remove() {
-    if (!current || busy || loading) return;
+    if (!current || busy || loading || preparingImages || frozen) return;
     busy = true;
     clearError();
     try {
@@ -178,10 +181,10 @@
   <div class="draft-layout">
     <nav aria-label="Local drafts" aria-busy={loading}>
       <h2>Drafts <span class="muted">({drafts.length})</span></h2>
-      <button onclick={() => navigate(current?.id ?? retryLoadId)} disabled={busy || loading}>Refresh drafts</button>
+      <button onclick={() => navigate(current?.id ?? retryLoadId)} disabled={busy || loading || preparingImages}>Refresh drafts</button>
       <ul class="draft-list">
         {#each drafts as row (row.id)}
-          <li><button aria-current={current?.id === row.id ? 'true' : undefined} disabled={busy || loading}
+          <li><button aria-current={current?.id === row.id ? 'true' : undefined} disabled={busy || loading || preparingImages}
             onclick={() => navigate(row.id)}>{row.title || row.filename}</button></li>
         {/each}
       </ul>
@@ -196,10 +199,10 @@
       {#if current}
         <div class="editor-actions">
           <p role="status" aria-live="polite">{status}</p>
-          <button class="primary" onclick={flush} disabled={!dirty || saving || busy || loading}>Save</button>
+          <button class="primary" onclick={flush} disabled={!dirty || saving || busy || loading || preparingImages || frozen}>Save</button>
           <button onclick={download}>Download Markdown</button>
         </div>
-        <fieldset disabled={busy || loading}>
+        <fieldset disabled={busy || loading || preparingImages || frozen}>
           <legend class="sr-only">Draft content</legend>
           <label for="draft-title">Title</label>
           <input id="draft-title" value={current.title} oninput={event => edit('title', event.currentTarget.value)} />
@@ -218,7 +221,12 @@
             oninput={event => edit('markdown', event.currentTarget.value)}></textarea>
         </fieldset>
         <p class="muted">Manual save. Download includes current title/source/time as frontmatter and the Markdown body; image files are not included.</p>
-        <button class="danger" onclick={remove} disabled={busy || loading}>Delete draft</button>
+        {#key current.id}
+          <ImagePreparation {store} draftId={current.id} markdown={current.markdown} sourceUrl={current.sourceUrl}
+            status={current.status} disabled={busy || loading || saving} flushSave={flush} acquirer={imageAcquirer}
+            onBusy={value => preparingImages = value} onState={onImageState} {resultWarnings} />
+        {/key}
+        <button class="danger" onclick={remove} disabled={busy || loading || preparingImages || frozen}>Delete draft</button>
         <p class="muted">Delete permanently removes this draft, its unsaved edits and its stored images from this profile.</p>
       {:else if !loading && !error && drafts.length === 0}
         <p>No local drafts yet. Capture an Article or Selection from the popup.</p>

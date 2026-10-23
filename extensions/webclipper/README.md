@@ -9,13 +9,57 @@ separate editor tab (also the extension's options page).
 > download the current Markdown; manually save/clear connection settings and test
 > the read-only protocol connection; capture Article/Selection as converted Markdown,
 > commit a local draft, and open it in a separate editor tab; suggest a portable
-> filename and export safe YAML frontmatter. Tasks 1–7 are implemented/documented.
-> **Module-only (8.1–8.3):** explicit image acquisition, durable preparation,
-> token-range Markdown image rewriting and immutable import snapshot APIs/tests,
-> not wired to capture/editor.
-> **Planned:** image preparation/permission UI and
-> the extension send UI (8). Captured image URLs are pending metadata only; no image
-> bytes are downloaded. A fresh profile has no drafts until the first capture.
+> filename and export safe YAML frontmatter; explicitly Prepare/Retry images,
+> review durable local bytes/errors and separately confirm external references (8.4).
+> **Module-only (8.3):** token-range Markdown rewriting and immutable import snapshots.
+> **Planned (8.5):** extension delivery/state machine and send UI. Capture itself
+> leaves image URLs pending without downloading bytes. A fresh profile has no drafts.
+
+## Explicit image preparation UI (task 8.4)
+
+In the local editor click **Prepare images** before going offline or closing the
+source page. The button uses current unsaved Markdown URLs, requests only their
+eligible exact HTTP(S) hosts synchronously in the click gesture, then flushes edits
+and prepares the persisted body. Save failures preserve form text and prevent
+acquisition. **Retry images / grant access** explicitly retries the current URLs;
+neither mount, typing, capture, worker nor connection settings acquire images.
+Supported data images are decoded locally without host permissions or fetch.
+
+The list displays literal URL, MIME, byte size and **Pending**, **Failed**,
+**Stored locally**, or **External confirmed**. Stored counts require committed
+IndexedDB Blobs and verified canonical aliases, never just fetch success. Errors,
+including persistence/quota failures, remain visible. There are no remote image
+elements or thumbnail/pixel decodes. Editing/switching is disabled during preparation;
+**Cancel image preparation** aborts network and retains already committed bytes.
+Reopening reads/verifies cached bytes without acquisition or source-page access.
+Live `sending`/`uncertain`/`pending` drafts allow cache viewing but no preparation
+or consent changes.
+
+Every eligible HTTP(S) external fallback starts unchecked. Select individual
+**Keep external reference** checkboxes, review the listed exact URLs/reasons, then
+click the separate **Confirm external references** action. Selection alone does
+not unblock readiness. Unsafe/private/blob/unsupported data sources require editing
+or removal if they cannot be stored. A ready HTTP image may explicitly stay external
+to reduce a future upload budget. External material is labelled **not fully offline /
+uses external images**; `resultWarnings` accepts the actual HTTP success/receipt
+`warnings: string[]` and displays each literal reason, preserving order and duplicates,
+separately from structured preparation warnings. Markdown/source changes and retry reset choices; title-only edits
+preserve them. Choices are deliberately in-memory: reopening/switching requires fresh
+confirmation. This does not modify any immutable persisted attempt.
+
+`src/ui/ImagePreparation.svelte` is the reusable child integrated by `Editor.svelte`.
+It accepts `store`, `draftId`, current `markdown`/`sourceUrl`/`status`, `disabled`,
+`flushSave`, optional `acquirer`, `onBusy`, `onState`, and `resultWarnings`.
+Editor exposes `imageAcquirer`, `onImageState` and `resultWarnings` for its parent.
+`onState` receives detached, deeply frozen `{draftId, markdown, ready,
+confirmedFallbacks, warnings, preparationErrors}`; acknowledgements are exact
+`{url, reason}` pairs. Parent ownership of selection/store is preserved. This is an
+image-readiness predicate only, not a send implementation or full protocol preflight.
+Task **8.5** must flush, atomically `readBundle`, freshly call `buildImportSnapshot`
+with current acknowledgements, CAS/freeze and persist the immutable attempt before
+POST. A pending attempt replays its retained manifest, not newly collected consents.
+`tests/helpers/ImagePreparationHost.svelte` demonstrates a disabled future-send
+predicate without implementing delivery.
 
 ## Quickstart: build, Load unpacked and capture locally
 
@@ -59,9 +103,10 @@ planned in task 9.2.
 
 Local capture/edit/download needs neither IGoNotes running nor a token or
 **Test connection**. Capture makes no backend or image requests and reads no
-connection credentials. Image URLs are pending metadata (`blob: null`), not
-acquired images; image acquisition and delivery remain task 8. The editor is a
-plain textarea and does not load those images. Exported Markdown may still
+connection credentials. Capture leaves image URLs as pending metadata (`blob: null`),
+not acquired images. Only explicit editor **Prepare images** or **Retry images / grant
+access** requests image permissions/acquisition; delivery remains planned in 8.5.
+The plain textarea does not load previews. Exported Markdown may still
 reference external HTTP(S) images/links: opening links or rendering the export
 elsewhere can access the network as a separate user action. This is not yet a
 fully self-contained offline image archive.
@@ -158,8 +203,8 @@ applies: unsafe schemes, private/loopback literal sources and unsupported data
 images cannot be authorized by a fallback acknowledgement or a fabricated URL.
 Remove/replace those body items, or prepare supported data images locally.
 
-This API is ready for the explicit acknowledgement UI (8.4) and durable manual
-delivery/replay lifecycle (8.5–8.6); those phases remain planned.
+The explicit acknowledgement UI (8.4) is available; durable manual delivery/replay
+remains planned (8.5–8.6).
 
 ### Capture failures and supported sources
 
@@ -237,8 +282,9 @@ The popup offers **Article** and **Selection** capture and the editor link. Capt
 converts the source to Markdown and saves it locally before opening the editor.
 **Saved locally** confirms the IndexedDB transaction completed; closing the popup
 then keeps the draft. No IGoNotes connection is needed for capture. Drafts can be
-edited, manually saved and downloaded with **Download Markdown**. Image
-acquisition and the send UI are planned for task 8. The HTTP backend,
+edited, manually saved and downloaded with **Download Markdown**. Image preparation
+is available only through explicit editor Prepare/Retry; the send UI remains planned
+for task 8.5. The HTTP backend,
 including image import/status and recovery, is already implemented; see the
 canonical [server API documentation](../../docs/api.md#web-clipper-v1--discovery-и-http-import-доступны).
 
@@ -301,27 +347,28 @@ all ports. IPv6 endpoints are **not supported/advertised** by this scaffold:
 IPv6 match-pattern compatibility with the minimum supported browser has not
 been established. Endpoint settings do not accept `[::1]` without that
 compatibility check and a corresponding manifest permission. Optional HTTP(S)
-hosts allow the standalone acquisition API to request individual image hosts.
-The current capture/editor UI does not call it or request image permissions.
+hosts allow the acquisition API to request individual image hosts. Capture itself
+never acquires images or requests image permissions; only explicit editor
+Prepare/Retry calls the permission/acquisition API. Delivery remains planned in 8.5.
 
 ## Image acquisition API (task 8.1 — standalone module)
 
 `src/images/acquire.js` exports `createImageAcquirer(options?)`. It has no imports,
 connection/settings/token access, storage writes, message listener, content-script
 proxy, background activity, automatic retry or preview creation. Instantiating it
-does not request permission or download anything. Capture/worker/editor are not
-wired to this module yet; captured images remain pending metadata in the current UI.
+does not request permission or download anything. The editor uses this module only
+on explicit Prepare/Retry; capture and worker leave images pending.
 
 ```js
 const images = createImageAcquirer({ limits: info.limits }); // optional protocol limits
-// Future 8.4 trusted-editor Prepare/Retry button handler:
+// Simplified trusted-editor Prepare/Retry button handler:
 button.onclick = async () => {
   // Use the already available source list. This invokes permissions.request()
   // synchronously, BEFORE the first await, contains(), storage or network call.
-  const access = await images.requestAccessFromUserGesture(urls);
-  // Display denial/platform failure. Never retry by broadening permissions.
-  if (!access.ok) return showAccessError(access.error);
-  await flushEditorEdits();
+  const access = images.requestAccessFromUserGesture(currentEligibleFormURLs());
+  const saved = await flushEditorEdits();
+  await access;
+  if (!saved) return; // preserve unsaved contents; never acquire on save failure
   const prepared = await prepareDraftImages(store, draftId, {
     acquirer: images, signal: controller.signal, progress: showCommittedProgress,
   });
@@ -330,7 +377,7 @@ button.onclick = async () => {
 };
 ```
 
-These are illustrative future caller functions, not an existing UI. Only call
+These are illustrative caller functions; the actual UI is described above. Only call
 `requestAccessFromUserGesture(urls)` directly on the user-handler stack: do not
 await `permissions.contains`, a draft read, or another operation beforehand.
 It synchronously validates the sources and deduplicates exact host patterns, then
@@ -379,8 +426,8 @@ normalized-URL duplicates share acquisition; the 8.2 adapter below also deduplic
 - Requests have no caller-supplied headers, Authorization or Cookie. They use
   `credentials: 'omit'`, `redirect: 'error'`, `cache: 'no-store'` and
   `referrerPolicy: 'no-referrer'`. There is no no-cors/credentialed fallback.
-  Cookie-protected images can fail; explicit manual replacement/fallback belongs
-  to 8.4. Every redirect is blocked **before following**, including same-origin
+  Cookie-protected images can fail; the editor offers explicit replacement/fallback
+  confirmation. Every redirect is blocked **before following**, including same-origin
   and CDN redirects. Replace with a direct URL and explicitly grant its host.
   Native Fetch reports blocked redirects and ordinary network failures as the
   same opaque rejection: `network` explicitly mentions both. `redirect` is used
@@ -423,8 +470,8 @@ limits throw at factory creation. Aggregate asset/count/upload quotas belong to
 
 **8.2** persists exact Blobs/hash/descriptors/errors and alias mappings
 transactionally through the standalone API below. **8.3** owns destination rewriting and immutable manifests, reusing the 8.2 parser. **8.4**
-must supply explicit Prepare/Retry and per-host consent actions, keep failures
-visible, and require explicit external-fallback confirmation. Neither capture nor
+supplies explicit Prepare/Retry and per-host consent actions, keeps failures
+visible, and requires separate external-fallback confirmation. Neither capture nor
 worker should start downloads automatically. **8.5** owns manual delivery.
 
 Verification: `tests/images-acquire.test.js` covers gesture timing, grant/denial,
@@ -474,8 +521,8 @@ actions. Preparation reads the **current persisted Markdown body**, not capture'
 DOM image list. It never changes/serializes that body, title, filename, destination,
 draft status, timestamps or attempt history. There is no connection/token access,
 permission prompt, automatic capture/worker/UI download, delivery or fallback.
-The current textarea editor still only saves text; task **8.4** must supply the
-explicit user-gesture permission and preparation UI.
+The textarea editor integrates this adapter through the explicit user-gesture
+permission and preparation child described in task **8.4** above.
 
 The resolved result contains:
 
@@ -595,7 +642,11 @@ deleted drafts/assets, >100 URL aliases, and progress-after-complete checks.
 The headed `smoke:images` additionally checks **native IndexedDB** physical Blob
 deduplication and full extension-page close/reopen after permission revocation,
 with exact cached bytes and zero acquisition calls; it needs no source page or
-IGoNotes process. Full actual image UI/delivery acceptance remains tasks 8.4/8.5/9.1.
+IGoNotes process. It also exercises actual Editor Prepare/Retry with data/HTTP,
+unsaved-body flush, 404, separate external confirmation and consent reset on reload.
+The native test uses developerPrivate pregrant and verifies click user activation;
+it does not claim manual acceptance of Chrome's real permission prompt.
+Delivery acceptance remains tasks 8.5/9.1.
 
 ## Packaging smoke
 
