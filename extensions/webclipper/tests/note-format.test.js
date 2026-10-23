@@ -5,6 +5,11 @@ import { formatNote, proposeFilename } from '../src/markdown/note.js';
 
 const fixtures = JSON.parse(readFileSync(new URL('../../../testdata/clipper/note-format.json', import.meta.url), 'utf8'));
 const input = fixtures[0].input;
+const paths = JSON.parse(readFileSync(new URL('../../../testdata/clipper/portable-paths.json', import.meta.url), 'utf8'));
+it.each(paths.filter(f => f.proposal))('$name proposes the shared Go-valid portable filename without changing title', ({ proposal }) => {
+  expect(proposeFilename(proposal.title)).toBe(proposal.filename);
+  assertYaml(formatNote({ ...input, title: proposal.title }), { ...input, title: proposal.title });
+});
 function assertYaml(note, metadata) {
   const end = note.indexOf('\n---\n\n', 4);
   const doc = parseDocument(note.slice(4, end), { version: '1.2' });

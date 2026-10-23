@@ -1,3 +1,5 @@
+import { isWindowsDeviceName } from './portable-paths.js';
+
 const encoder = new TextEncoder();
 const validText = value => typeof value === 'string' && value.isWellFormed();
 const invalid = field => { throw new TypeError(`Invalid note ${field}.`); };
@@ -57,7 +59,7 @@ export function proposeFilename(title) {
   // after both; reserve a byte for '_' even for a full-length CON.ext… name.
   // The protected stem starts with '_', so a second truncation cannot expose
   // another alias or empty stem. No retry loop is needed.
-  if (/^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³]) *(?:\.|$)/i.test(finalStem)) {
+  if (isWindowsDeviceName(finalStem)) {
     finalStem = '_' + boundedStem(finalStem, 251);
   }
   return finalStem + '.md';

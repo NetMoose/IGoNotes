@@ -109,9 +109,37 @@ const offline = await reopened.evaluate(async () => {
   return { ok: result.ok, count: result.assets.length, bytes };
 });
 assert.deepEqual(offline, { ok: true, count: 2, bytes: [...expectedBytes] });
+const snapshot = await reopened.evaluate(async () => {
+  const { createDraftStore, buildImportSnapshot, manifestDigest } = await import('./prepare-under-test.js');
+  const store = createDraftStore({ name: 'smoke-image-preparation' });
+  const draft = await store.getDraft('offline');
+  await store.saveDraft({ ...draft, base: 'work', parent: 'research/articles', destinationRevision: 'retained-revision' });
+  const bundle = await store.readBundle('offline');
+  const built = await buildImportSnapshot({ ...bundle, endpoint: 'http://localhost:8080/', importId: '550e8400-e29b-41d4-a716-446655440000', confirmedFallbacks: [] });
+  const saved = await store.readBundle('offline');
+  const result = { endpoint: built.endpoint, markdown: built.manifest.markdown, assetCount: built.manifest.assets.length,
+    digestMatches: built.digest === await manifestDigest(built.manifest), fingerprint: built.preparationFingerprint,
+    frozen: Object.isFrozen(built.manifest.assets[0]) && Object.isFrozen(built.assetBlobs) && Object.isFrozen(built.sourceAliases[0]),
+    blobBytes: [...new Uint8Array(await Object.values(built.assetBlobs)[0].arrayBuffer())],
+    unchanged: saved.draft.markdown === draft.markdown && saved.attempts.length === 0,
+    aliases: built.sourceAliases.length, autonomous: built.autonomous };
+  store.close();
+  return result;
+});
+assert.equal(snapshot.endpoint, 'http://localhost:8080');
+assert.equal(snapshot.assetCount, 1);
+assert.equal(snapshot.aliases, 2);
+assert.equal(snapshot.digestMatches, true);
+assert.match(snapshot.fingerprint, /^[0-9a-f]{64}$/);
+assert.equal(snapshot.frozen, true);
+assert.equal(snapshot.unchanged, true);
+assert.equal(snapshot.autonomous, true);
+assert.deepEqual(snapshot.blobBytes, [...expectedBytes]);
+assert.equal(snapshot.markdown.split(`../../assets/images/clip-550e8400-e29b-41d4-a716-446655440000-${results[0].sha256}.gif`).length, 3);
+assert.ok(snapshot.markdown.endsWith('`![literal](https://never.example/x)`'));
 const after = await (await fetch(`${nativeLogURL}log`)).json();
 assert.deepEqual(after.map(x => x.path).sort(), ['/missing', '/ok', '/ok', '/redirect', '/same-bytes']);
 assert.ok(after.every(x => !x.authorization && !x.cookie));
 assert.deepEqual(failures, []);
-process.send?.({ ok: true, acquisition: 'native ESM, missing/granted/revoked optional host, gesture request on pregrant, exact bytes/hash, redirect blocked, 404, cookie omission', preparation: 'native IndexedDB Blob/hash/status, physical byte deduplication, editor close/reopen after permission revocation with zero acquisition calls', permissionBoundary: 'trusted developerPrivate pregrant; real permission prompt grant/denial NOT manually tested', browser: browser.version() });
+process.send?.({ ok: true, acquisition: 'native ESM, missing/granted/revoked optional host, gesture request on pregrant, exact bytes/hash, redirect blocked, 404, cookie omission', preparation: 'native IndexedDB Blob/hash/status, physical byte deduplication, editor close/reopen after permission revocation with zero acquisition calls', snapshot: 'native ESM, atomic bundle, nested destinations, immutable manifest/Blobs, matching digest, no source fetch or store mutation', permissionBoundary: 'trusted developerPrivate pregrant; real permission prompt grant/denial NOT manually tested', browser: browser.version() });
 await browser.close();

@@ -10,7 +10,9 @@ separate editor tab (also the extension's options page).
 > the read-only protocol connection; capture Article/Selection as converted Markdown,
 > commit a local draft, and open it in a separate editor tab; suggest a portable
 > filename and export safe YAML frontmatter. Tasks 1–7 are implemented/documented.
-> **Module-only (8.1–8.2):** explicit image acquisition, durable preparation and Markdown reference scanning APIs/tests, not wired to capture/editor.
+> **Module-only (8.1–8.3):** explicit image acquisition, durable preparation,
+> token-range Markdown image rewriting and immutable import snapshot APIs/tests,
+> not wired to capture/editor.
 > **Planned:** image preparation/permission UI and
 > the extension send UI (8). Captured image URLs are pending metadata only; no image
 > bytes are downloaded. A fresh profile has no drafts until the first capture.
@@ -63,6 +65,101 @@ plain textarea and does not load those images. Exported Markdown may still
 reference external HTTP(S) images/links: opening links or rendering the export
 elsewhere can access the network as a separate user action. This is not yet a
 fully self-contained offline image archive.
+
+### Immutable image import preparation API (task 8.3)
+
+`src/images/rewrite.js` exports browser-native ESM functions
+`buildImportSnapshot`, `canonicalManifest`, and `manifestDigest`. The last two
+validate protocol v1 metadata, reject unknown/missing fields and coercible values,
+and implement the exact ordered-array UTF-8 digest contract in `docs/api.md`.
+All vectors in `testdata/clipper/manifest-digests.json` are shared with Go tests.
+Asset IDs sort by binary ASCII; external-image order remains significant.
+
+Future trusted delivery callers can prepare a snapshot like this:
+
+```js
+// Flush the editor and finish explicit image preparation first.
+const { draft, assets } = await store.readBundle(draftId);
+// Generate a UUID v4 ONCE for a new attempt; retain it for every replay.
+const snapshot = await buildImportSnapshot({
+  draft, assets, endpoint, importId,
+  confirmedFallbacks: [{ url: 'https://example.org/unavailable.png', reason: 'permission_denied' }],
+});
+```
+
+`readBundle(id)` reads `{ draft, assets, attempts }` at one all-store readonly
+IndexedDB point. The builder receives detached current metadata and immutable
+Blob handles; it clones metadata before its first asynchronous hash. It performs
+no source acquisition, permission request, network access or storage write, and
+never accepts/returns a token. Pass all asset rows, including inactive canonical
+owners needed by active aliases. Active references are rescanned from the exact
+persisted body, rather than trusting a previous `active` flag or reference list.
+
+The returned snapshot contains the normalized loopback `endpoint`, original
+`importId`, known-fields-only `manifest`, bare SHA-256 `digest`, `assetBlobs`
+(an ID-keyed frozen record of Blob handles), `sourceAliases` (one entry per
+occurrence, including decoded original destination, resolved source URL and chosen
+asset ID), `originalDraft`, `preparationState`, `preparationFingerprint`,
+`autonomous`, and public `{ url, reason }` `warnings`. JSON records/arrays are
+deeply frozen; no mutable byte arrays escape. Endpoint or draft changes cannot
+retarget this snapshot. The original editable Markdown is preserved separately.
+
+The preparation fingerprint is SHA-256 of `JSON.stringify(preparationState)`:
+the exact original draft plus saved asset IDs, source URLs, descriptors, stored
+sizes and actual Blob sizes, sorted by ASCII ID. It includes inactive rows so
+their deletion/replacement can invalidate preparation. It is a **CAS precondition,
+not a persisted journal or freeze**. Task 8.5 must atomically compare a fresh
+all-store read with this state, preserve referenced owner IDs/bytes, persist the
+attempt and freeze edits **before** POST. Replay must reuse the stored manifest,
+digest, endpoint, ID and revision. Building a snapshot here persists nothing.
+
+Inline rewriting replaces only micromark's destination-string token span in the
+existing mdast/GFM parse. It retains original alt/title spelling, escapes,
+whitespace, angle delimiters, Unicode and CRLF outside that span. Full, collapsed
+and shortcut image references become local inline image occurrences, preserving
+the raw label and decoded title meaning. Entity-produced title line breaks,
+tabs and Unicode line separators are serialized as character references so
+blank lines cannot terminate an image or normalize its decoded title. Original
+ampersands (including entity-looking literal text), quotes and backslashes are
+escaped without introducing HTML. Their definitions and ordinary links
+remain literal. Code, plain URL text and undefined image references are unchanged.
+Raw HTML images are **unmanaged**: the scanner excludes them, and this API neither
+fetches nor promises offline handling for them. There is no whole-body Markdown
+serialization or regex-based closing-parenthesis search.
+
+Local destinations are relative to the selected parent:
+`assets/images/clip-<importId>-<sha256>.<verifiedext>` at root, or for example
+`../../assets/images/...` in `research/articles`. JPEG uses **`jpg`**, matching Go.
+Canonical aliases and equal verified bytes yield one descriptor/Blob. Cached
+bytes are rechecked for actual size, hash, MIME, extension and structural image
+budgets; dangling/chained/cyclic aliases cannot stand in for bytes. Preflight
+validates portable `.md` filenames without changing manually chosen spelling,
+visible relative parent folders (root allowed; dot-folders and `assets` excluded),
+the **final formatted** Markdown's 5 MiB UTF-8 limit, 100 unique assets,
+10 MiB per asset and 50 MiB total. The existing formatter adds exactly the three
+agreed YAML keys; the rewritten body is otherwise literal. Full server decoding,
+pixel validation and current destination identity/existence remain authoritative.
+The shared `src/markdown/portable-paths.js` helper also protects suggested
+filenames using Go-compatible device-stem uppercase rules (including dotless
+`ı`), with ASCII-space-only stem trimming. Folder visibility uses simple Unicode
+folding instead: `aſsets` is excluded but `aßets` is not. Shared Go/JS path and
+proposal cases live in `testdata/clipper/portable-paths.json`; note titles are
+preserved exactly regardless of filename protection.
+
+An unavailable active HTTP(S) image blocks preparation unless its **current exact
+resolved URL** has a separate nonempty reason acknowledgement. Stale, duplicate
+or irrelevant acknowledgements are rejected. Acknowledged relative edits become
+absolute HTTP(S) destinations for portability. Explicit external intent can also
+exclude an available image from a batch to meet its budget; its bytes are then
+absent from `assetBlobs` and `manifest.assets`. Repeated occurrences share one
+external descriptor, in first-occurrence order. Such snapshots have
+`autonomous: false` and matching warnings. The acquisition URL policy still
+applies: unsafe schemes, private/loopback literal sources and unsupported data
+images cannot be authorized by a fallback acknowledgement or a fabricated URL.
+Remove/replace those body items, or prepare supported data images locally.
+
+This API is ready for the explicit acknowledgement UI (8.4) and durable manual
+delivery/replay lifecycle (8.5–8.6); those phases remain planned.
 
 ### Capture failures and supported sources
 
@@ -845,8 +942,8 @@ them, not silently sanitize the wire value. Download alone sanitizes the current
 filename with the same proposer, leaving the stored/input filename unchanged.
 `downloadMarkdown(note, filename)` uses the shared formatter for both editor and
 popup quota fallback, exporting current unsaved metadata/body rather than old DB
-values. No frontmatter is persisted into the draft body. Future 8.3 upload
-snapshots should use this same formatter with `source_url`/`captured_at` also on
+values. No frontmatter is persisted into the draft body. The 8.3 upload
+snapshot builder uses this same formatter with `source_url`/`captured_at` also on
 the wire; `ClipperManifest` has no new title field.
 
 Shared fixtures in `testdata/clipper/note-format.json` assert exact filename/full
@@ -974,7 +1071,8 @@ store.close(); // terminal for this instance; create another instance to reopen
 ```
 
 The example stores a pending source. The standalone 8.2 adapter above owns
-verified bytes/hash/status preparation; manifest building (8.3) remains pending. Prepare asynchronous
+verified bytes/hash/status preparation; immutable manifest building is provided by
+the standalone 8.3 API above. Prepare asynchronous
 work **before** saving: transaction callbacks issue only IndexedDB requests and
 synchronous computation, avoiding auto-commit across network/crypto awaits.
 

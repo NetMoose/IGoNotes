@@ -12,6 +12,24 @@ function setup(options = {}) {
 function request(req) { return new Promise((resolve, reject) => { req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error); }); }
 
 describe('local draft storage', () => {
+  it('reads one detached all-store bundle before or after an interleaved atomic write', async () => {
+    const { store } = setup();
+    await store.saveDraft(draft(), { assets: [asset()], attempt: attempt() });
+    await store.saveDraft(draft('other'), { assets: [asset('unrelated')] });
+    const [bundle] = await Promise.all([
+      store.readBundle('a'),
+      store.saveDraft(draft('a', 'new'), { assets: [asset('image', 'new bytes')], attempt: attempt('new') }),
+    ]);
+    const old = bundle.draft.title === 'Заметка 🦉';
+    expect(bundle.assets).toHaveLength(1);
+    expect(await bundle.assets[0].blob.text()).toBe(old ? 'abc' : 'new bytes');
+    expect(bundle.attempts).toHaveLength(old ? 1 : 2);
+    bundle.draft.title = 'mutated read';
+    expect((await store.getDraft('a')).title).toBe('new');
+    expect(await store.readBundle('missing')).toEqual({ draft: undefined, assets: [], attempts: [] });
+    store.close();
+  });
+
   it('uses production application caps', () => {
     expect(MAX_DRAFTS).toBe(50);
     expect(MAX_BLOB_BYTES).toBe(250 * 1024 ** 2);

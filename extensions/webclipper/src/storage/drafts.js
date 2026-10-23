@@ -183,6 +183,18 @@ export function createDraftStore({ indexedDB = globalThis.indexedDB, name = 'igo
     async getDraft(id) { text(id, 'draft id', true); return transaction('readonly', (tx, read, done) => read(tx.objectStore('drafts').get(id), done)); },
     async getAssets(id) { text(id, 'draft id', true); return transaction('readonly', (tx, read, done) => read(tx.objectStore('assets').index('draftId').getAll(id), done)); },
     async getAttempts(id) { text(id, 'draft id', true); return transaction('readonly', (tx, read, done) => read(tx.objectStore('attempts').index('draftId').getAll(id), done)); },
+    async readBundle(id) {
+      text(id, 'draft id', true);
+      // One all-store RO point, serialized against saveDraft/updateDraftAssets.
+      // No hashing/await in the transaction; returned Blobs are immutable handles.
+      return transaction('readonly', (tx, read, done) => {
+        const bundle = {};
+        read(tx.objectStore('drafts').get(id), value => { bundle.draft = value; });
+        read(tx.objectStore('assets').index('draftId').getAll(id), value => { bundle.assets = value; });
+        read(tx.objectStore('attempts').index('draftId').getAll(id), value => { bundle.attempts = value; });
+        done(bundle);
+      });
+    },
     async updateDraftAssets(id, { expectedMarkdown, expectedAssets, assets = [] }) {
       text(id, 'draft id', true);
       text(expectedMarkdown, 'expected Markdown');
