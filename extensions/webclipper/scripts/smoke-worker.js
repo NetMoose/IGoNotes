@@ -46,16 +46,28 @@ try {
   assert.match(await popup.locator('main').innerText(), /capture is not available yet/);
   // Exercise the actual popup link and inspect the new editor before it loads.
   const editorPromise = context.waitForEvent('page');
-  const navigation = popup.getByRole('link', { name: 'Open editor scaffold' }).click();
+  const navigation = popup.getByRole('link', { name: 'Open draft editor' }).click();
   const editor = await editorPromise;
   await inspect(editor);
   await navigation;
-  await editor.getByRole('heading', { name: 'Web Clipper editor scaffold', exact: true }).waitFor();
+  await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
   assert.equal(editor.url(), `chrome-extension://${id}/editor.html`);
-  assert.match(await editor.locator('main').innerText(), /not available in this scaffold/);
+  await editor.getByText('No local drafts yet. Page capture is not available yet.', { exact: true }).waitFor();
+  const storage = await editor.evaluate(async () => {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('igonotes-webclipper', 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const result = { version: db.version, stores: [...db.objectStoreNames] };
+    db.close();
+    return result;
+  });
+  assert.deepEqual(storage, { version: 1, stores: ['assets', 'attempts', 'drafts'] });
   // Also load the editor afresh with CDP enabled before navigation, catching startup errors.
   await editor.reload();
-  await editor.getByRole('heading', { name: 'Web Clipper editor scaffold', exact: true }).waitFor();
+  await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
+  await editor.getByText('No local drafts yet. Page capture is not available yet.', { exact: true }).waitFor();
 
   const page = await context.newPage();
   await inspect(page);
@@ -96,7 +108,7 @@ try {
   result = {
     result: 'PASS', browser: browser.version(), extensionId: id,
     serviceWorker: worker.url(), popup: popup.url(), editor: editor.url(),
-    injection: injected, domUnchanged: true, pageGlobalAbsent: true,
+    injection: injected, domUnchanged: true, pageGlobalAbsent: true, storage,
     manifestErrors: info.manifestErrors, runtimeErrors: info.runtimeErrors, cdpErrors: failures,
     sandbox: process.env.CLIPPER_SMOKE_NO_SANDBOX !== '1',
   };

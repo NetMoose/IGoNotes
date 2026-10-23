@@ -1,5 +1,5 @@
 <main class="popup">
   <h1>IGoNotes Web Clipper</h1>
-  <p>Development scaffold. Page capture is not available yet.</p>
-  <a href="./editor.html" target="_blank" rel="noopener">Open editor scaffold</a>
+  <p>Page capture is not available yet. You can edit existing local drafts.</p>
+  <a href="./editor.html" target="_blank" rel="noopener">Open draft editor</a>
 </main>

@@ -1,11 +1,15 @@
-# IGoNotes Web Clipper scaffold
+# IGoNotes Web Clipper — local draft editor
 
-Tasks 6.1–6.2: an independently built JavaScript ESM / Svelte 5 / MV3 package
-with a tested native IndexedDB storage module.
-The popup opens a separate editor scaffold tab (also the extension's options
-page). Capture, draft editor/list UI, endpoint/token configuration, image
-acquisition and delivery are not implemented. The scaffold UI does not call the
-storage module and saves/sends no data yet.
+Tasks 6.1–6.3: an independently built JavaScript ESM / Svelte 5 / MV3 package
+with native IndexedDB storage and a local draft list/editor. The popup opens a
+separate editor tab (also the extension's options page).
+
+> **Available:** list/reopen existing local drafts; edit title, filename and plain
+> Markdown; read source URL and capture time; save, retry, explicitly delete and
+> download the current Markdown. **Planned:** endpoint/token settings (6.4),
+> page capture (7), image acquisition and backend delivery (8).
+> A fresh profile truthfully shows an empty list. There is no capture or new-draft
+> button yet; future capture task 7.3 will create drafts and open the editor.
 
 ## Build and load
 
@@ -19,7 +23,7 @@ npm --prefix extensions/webclipper run verify
 
 Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and
 select `extensions/webclipper/dist`. Open the extension action to see the popup
-and follow **Open editor scaffold**. Reload the extension after rebuilding.
+and follow **Open draft editor**. Reload the extension after rebuilding.
 This package is independent of `web/` and Go embed.
 
 `vite.config.js` builds local ESM worker and UI entries with relative asset
@@ -47,9 +51,10 @@ TMPDIR=/tmp/opencode xvfb-run -a npm --prefix extensions/webclipper run smoke
 
 The headed smoke loads the real unpacked extension in a fresh temporary profile
 under `/tmp/opencode` and removes it on exit. It verifies worker registration,
-popup/editor DOM, popup-to-editor navigation, real isolated content-file injection
+popup/editor DOM, popup-to-editor navigation, native IndexedDB v1 stores and the
+empty editor after reload, real isolated content-file injection
 on a local HTTP fixture, unchanged fixture DOM, and absence of manifest/runtime,
-CSP, module, console and CDP errors. It is a scaffold packaging check, not the
+CSP, module, console and CDP errors. It is a packaging/storage startup check, not the
 capture/backend acceptance suite planned for task 9.1. Browser DNS is restricted
 to loopback and background networking is disabled.
 
@@ -90,6 +95,9 @@ as `web/`, with independently selected patched Vite/Vitest versions. The plugin'
 Vite 8 and Svelte 5 peer requirements are satisfied. Playwright Core 1.64.1 is
 development-only. `fake-indexeddb` 6.2.6 (Apache-2.0) is an exactly pinned
 development-only IndexedDB test implementation; it is not browser runtime code.
+UI tests use exactly pinned `@testing-library/svelte` 5.4.2,
+`@testing-library/dom` 10.4.2 and `jsdom` 30.1.3. Only `editor.test.js` selects
+jsdom via its file directive; packaging, storage and filename tests retain Node.
 
 - `@mozilla/readability` 0.6.0 — Apache-2.0; `new Readability(clone).parse()`
   mutates its input and is **not a sanitizer**.
@@ -110,6 +118,43 @@ transitive code. Ship the whole `dist` directory, including these notices.
 
 The full `npm --prefix extensions/webclipper audit`, including development
 dependencies, reports zero vulnerabilities with this lockfile.
+
+## Local editor behavior (task 6.3)
+
+- `editor.html?draft=<id>` selects only an existing draft ID. A missing ID shows
+  an error and requires explicit selection; it never silently opens a different
+  draft. No content, token or source URL is read from query parameters.
+- Without `draft`, startup selects the most recently updated draft, breaking
+  equal-time ties by ID. Selection stays in memory; it does not rewrite the URL.
+  A fresh browser reload applies that same URL/default rule.
+- **Save is manual.** The indicator distinguishes unsaved edits, saving,
+  transaction-complete local save and a failed save. Edits made during a save
+  remain unsaved until a subsequent serialized transaction completes. Only
+  metadata is updated; stored images and immutable attempt snapshots are retained.
+- Selecting a draft or **Refresh drafts** first drains pending edits. A failed
+  save blocks that transition and keeps the current text editable, retryable and
+  downloadable. Refresh preserves the selected ID. Browser reload/close warns
+  while work is unsaved or saving; forced close can still lose unsaved work.
+  In-flight saves drain before a component-owned handle is closed on teardown;
+  no late completion updates an unmounted UI. Injected handles remain caller-owned.
+- **Delete draft** is an explicit permanent action on the selected draft, its
+  unsaved edits and its owned stored images/attempts. It waits for any pending
+  save, does not need a successful new save, and leaves other drafts intact.
+  Storage/list/read/delete errors are shown with **Retry**. Storage retries reopen
+  a component-owned handle so a cached open failure or terminal connection can
+  recover without discarding in-memory edits; injected handles stay caller-owned.
+- **Download Markdown** uses the current textarea text, even if saving failed.
+  It is raw Markdown only: title/source/time remain separate metadata, no YAML
+  frontmatter is generated (planned for 7.4), and images are not packaged/exported.
+  The download uses a local Blob URL, a sanitized basename ending in `.md` (or
+  `draft.md` fallback) and revokes the object URL after use.
+- Markdown is a plain textarea with no HTML preview or external image loading.
+  Titles, filenames, paths and metadata are escaped text. The source link is
+  enabled only for absolute HTTP(S) URLs without credentials and opens with
+  `noopener noreferrer`. This UI makes no network or Chrome storage/sync calls.
+
+UI tests seed real fake-IndexedDB fixtures; delayed/failing adapters exercise
+transaction timing and quota-like failures. Production never seeds example data.
 
 ## Local draft storage API (task 6.2)
 
@@ -215,8 +260,9 @@ build the immutable manifest/delivery snapshot, verify references, and preserve
 the referenced Blob IDs/bytes (no overwrite/deletion while replay is needed).
 This module implements no delivery state machine, reference freezing, network
 replay, automatic cleanup after success, or concurrency revision protocol.
-Concurrent metadata edits are last-committed-write-wins; future UI must coordinate
-editing when needed. Returned values are structured clones, not live records.
+Concurrent metadata edits across tabs are last-committed-write-wins; this editor
+serializes its own writes only. Future task 8 will coordinate editing restrictions
+for pending/uncertain delivery. Returned values are structured clones, not live records.
 
 The v1 upgrade creates missing stores/indexes without deleting existing stores
 or records. Opening/reopening never runs garbage collection or `deleteDatabase`.
@@ -255,5 +301,5 @@ silently deletes unrelated work to make space.
 Storage is local to this extension origin in this browser profile. It does not
 sync or back up to IGoNotes or the cloud. Uninstalling the extension, deleting
 the profile or clearing extension/browser storage can lose all drafts and Blobs;
-browser eviction is also possible. This is not an archive guarantee. Markdown
-download/export UI and settings are future tasks, not available in this scaffold.
+browser eviction is also possible. This is not an archive guarantee. The editor
+can download the current Markdown text; settings and image export are not available.
