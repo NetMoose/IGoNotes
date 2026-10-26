@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { chromium } from 'playwright-core';
 import { build } from 'vite';
 import { resolve } from 'node:path';
+import { fenceNetwork } from '../tests/browser/network.js';
 
 // Owned/deadline-bounded by smoke.js, including CDP launch and cleanup.
 const [endpoint, fixtureURL, extensionPath] = process.argv.slice(2);
@@ -20,6 +21,7 @@ const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('servic
 const id = new URL(worker.url()).host;
 const editor = await context.newPage();
 const failures = [];
+await fenceNetwork(context, failures);
 editor.on('pageerror', error => failures.push(error.message));
 await editor.goto(`chrome-extension://${id}/editor.html`);
 await editor.getByRole('heading', { name: 'Local draft editor', exact: true }).waitFor();
@@ -199,5 +201,9 @@ const after = await (await fetch(`${nativeLogURL}log`)).json();
 assert.deepEqual(after.map(x => x.path).sort(), ['/missing', '/missing', '/ok', '/ok', '/redirect', '/same-bytes', '/ui-ok']);
 assert.ok(after.every(x => !x.authorization && !x.cookie));
 assert.deepEqual(failures, []);
-process.send?.({ ok: true, acquisition: 'native ESM, missing/granted/revoked optional host, gesture request on pregrant, exact bytes/hash, redirect blocked, 404, cookie omission', preparation: 'actual Editor Prepare/Retry, data and HTTP, flush unsaved body, native IDB canonical Blob, 404 status, separate external confirmation, reload resets consent; native module offline reopen', snapshot: 'native ESM, atomic bundle, nested destinations, immutable manifest/Blobs, matching digest, no source fetch or store mutation', permissionBoundary: 'trusted developerPrivate pregrant; actual Editor click user gesture verified; real permission prompt grant/denial NOT manually tested', browser: browser.version() });
+process.send?.({ ok: true, browser: browser.version(), nativeImageAcquisition: true, offlineCachedBytes: true, revokedPermission: true, cookieAndBearerOmitted: true,
+  acquisition: 'native ESM, missing/granted/revoked optional host, gesture request on pregrant, exact bytes/hash, redirect blocked, 404, cookie omission',
+  preparation: 'actual Editor Prepare/Retry, data and HTTP, flush unsaved body, native IDB canonical Blob, 404 status, separate external confirmation, reload resets consent; native module offline reopen',
+  snapshot: 'native ESM, atomic bundle, nested destinations, immutable manifest/Blobs, matching digest, no source fetch or store mutation',
+  permissionBoundary: 'trusted developerPrivate pregrant; actual Editor click user gesture verified; real permission prompt grant/denial NOT manually tested' });
 await browser.close();

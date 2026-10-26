@@ -155,7 +155,51 @@ Acquirer поддерживает awaited `onResult` для отдельных �
 
 Cancellation проверяется после async read/Blob verification, перед каждым checkpoint/CAS retry и progress callback. Только assets-only `updateDraftAssets(id, {expectedMarkdown, expectedAssets, assets, signal?})` принимает опциональный AbortSignal, не сериализуемый в JSON. До открытия IDB transaction проверяется abort; queued/in-flight transaction отменяется и откатывает pending puts, пока abort ещё возможен. Уже закоммиченные до abort checkpoints остаются. `prepareDraftImages` возвращает `ok: false, cancelled: true` без persistence-error checkpoint, перезаписи прежних statuses/errors или позднего ready progress; смена Markdown/source и unmount отменяют тот же signal и освобождают busy-состояние. Regression tests управляемо останавливают настоящие Blob reads/digest и fake-IDB queued/put/commit boundaries, проверяя также сохранность прежнего partial-ready изображения.
 
-`scripts/smoke-restart-worker.js` под общим owned-process supervisor `scripts/smoke.js` выполняет реальные Browser.close/relaunch с одним профилем и SIGKILL/start Go с прежними HOME/config/DB/base roots и endpoint. `CLIPPER_SMOKE_RESTART=1`, явный `CLIPPER_SMOKE_TIMEOUT_MS=90000` (обычный default 30000 неизменен), текущий `CLIPPER_SMOKE_GO_BINARY`; команда в README расширения. Проверяются partial data-image+HTTP stream, отсутствие auto GET/POST/acquisition, удержанный после durable server success ответ при client posting, неизменность ID/manifest/bytes, manual receipt GET после обоих restart, warnings/paths/hashes/no duplicates, ноль запросов на другой endpoint, online/offline, Target.closeTarget worker и capture wake, destination reconfirm до fresh POST. На 2026-10-23 Chromium 154.0.8037.97 PASS; optional hosts test-only pregranted в каждой сессии, permission dialog/manual browser matrix не заявлены.
+`scripts/smoke-restart-worker.js` под общим owned-process supervisor `scripts/smoke.js` выполняет реальные Browser.close/relaunch с одним профилем и SIGKILL/start Go с прежними HOME/config/DB/base roots и endpoint. `CLIPPER_SMOKE_RESTART=1`, явный `CLIPPER_SMOKE_TIMEOUT_MS=120000` (обычный default 30000 неизменен), текущий `CLIPPER_SMOKE_GO_BINARY`; команда в README расширения. Проверяются partial data-image+HTTP stream, отсутствие auto GET/POST/acquisition, offline reopen после закрытия source и отзыва permission, удержанный после durable server success ответ при client posting, неизменность ID/manifest/bytes, transient unknown GET и manual exact same-ID POST после обоих restart с историческим receipt, warnings/paths/hashes/inode/no duplicates, ноль запросов на другой endpoint, Target.closeTarget worker и capture wake, destination reconfirm до fresh POST. Optional hosts test-only pregranted в каждой сессии, permission dialog/manual browser matrix не заявлены.
+
+### Локальная browser suite Web Clipper (9.1)
+
+Из корня проекта при Node.js 24 и Go 1.26+, с заранее установленными Linux Chromium
+и Xvfb (если нет `DISPLAY`):
+
+```sh
+node --version
+npm --prefix web ci
+npm --prefix web run build
+npm --prefix extensions/webclipper ci
+npm --prefix extensions/webclipper run test:browser
+```
+
+`pretest:browser` запускает extension `verify` и свежую сборку `dist`. Runner
+`extensions/webclipper/tests/browser/run.js` проверяет наличие `web/dist`, собирает
+текущий `./cmd/api` с `GOPROXY=off`/`GOSUMDB=off` в temp и переиспользует существующие
+normal/images/delivery/restart workers. HOME/config/SQLite/private staging отделены
+от двух баз. Все HTTP fixtures локальны, public-shaped `.test` hosts DNS-mapped на
+loopback; остальные DNS запрещены, неожиданные запросы проваливают проверку.
+Browser routing/interception и отключение web-security/cookies не используются.
+Runner владеет Xvfb при отсутствии `DISPLAY`, задаёт per-mode/overall deadlines,
+проверяет все пять phase-barrier fault cases и выходит nonzero при любой ошибке.
+Общий `tests/browser/ownership.js` синхронно регистрирует private PID/PG/start identity,
+profile inode и listener в приватном scoped JSONL journal с run nonce, наследуемом
+suite/checker/supervisor. Async owned spawn регистрирует ребёнка до ожидания;
+standalone checker сам очищает ресурсы при прежнем external timeout 18s, а suite
+читает тот же journal, если checker/supervisor SIGSTOP'ed и stdout не передан.
+Cleanup независимо останавливает allocator groups, закрывает Chromium через CDP,
+убивает только свои группы, проверяет TCP listener и удаляет inode-verified profiles;
+подменённый профиль защищён также от удаления через suite parent. Итоговый timeout
+остаётся FAIL. Отдельный `check-outer-failsafes.js 3` проверяет оба watchdog boundary
+на настоящем Chromium; команды и negative-only probe описаны в browser README.
+JSON `tests/browser/results.json` содержит OS/browser version, per-case результат и
+только redacted native method/Origin/Sec-Fetch-*/boolean Bearer/status; без source,
+токена, bodies или приватных HOME/profile paths. Привилегированный extension fetch
+может не посылать OPTIONS: это записывается как наблюдение. Отдельно проверяются
+явный extension-Origin OPTIONS 204 и настоящий hostile web preflight 403 без POST
+или публикации, known-GET recovery, exact historical POST после unknown GET и
+реальный SPA preview nested image через `/api/raw` с совпадающими байтами.
+Prerequisites устанавливаются до запуска; runtime не скачивает packages/browser.
+Полная матрица, controls и отдельная инструкция manual prompts —
+`extensions/webclipper/tests/browser/README.md`; официальный Chrome/manual PASS и
+будущий `acceptance.md` относятся к 9.2, CI-интеграция — к 9.3.
 
 Worker синхронно регистрирует capture listener, совместимый с Chrome 120 (`return true`/`sendResponse`), и принимает только строгую команду `{type: 'capture', mode: 'article'|'selection'}` от точных runtime ID/origin/URL собственного popup. Content-script sender и неизвестные поля отклоняются до побочных эффектов. Порядок: защита trusted storage без чтения секрета → isolated frame-0 captureMarkdown с document-ID/URL-проверками → валидация converted JSON → завершение транзакции IndexedDB → новая вкладка `editor.html?draft=<encoded-id>` → минимальный ack `{ok: true, draftId, editorOpened}`. Raw HTML не сохраняется; image URL записывается только как pending metadata с `blob: null`. Закрытие popup/канала после commit не отменяет сохранение; ошибка tabs.create оставляет durable success с ручным открытием того же ID. При quota/лимите 50 черновиков/ошибке транзакции popup получает строгий unsaved Markdown/metadata envelope и предлагает скачать текущий текст либо вручную освободить место, явно не обещая сохранение. Полные схемы и проверки описаны в `extensions/webclipper/README.md`.
 

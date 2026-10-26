@@ -18,6 +18,23 @@ separate editor tab (also the extension's options page).
 
 ## Quickstart: build → capture → prepare → Send
 
+For the reproducible **task-9.1 automated browser suite**, see
+[`tests/browser/README.md`](tests/browser/README.md): from the repository root,
+check Node.js 24, run `npm --prefix web ci` and `npm --prefix web run build`, then
+`npm --prefix extensions/webclipper ci` and
+`npm --prefix extensions/webclipper run test:browser`. The last command first
+runs extension `verify` to produce fresh `dist`, builds the current Go server,
+and runs normal/images/delivery/restart plus five supervisor faults. Linux system
+Chromium and Xvfb (if `DISPLAY` is absent), Go 1.26+ and cached modules/toolchain
+are prerequisites. It does not download packages/browsers during browser execution.
+The redacted `tests/browser/results.json` is generated per run, with per-case
+results and observed native headers. Manual permission cases and future official
+Chrome acceptance are documented separately there and are **not** automatic PASS.
+The shared private ownership journal preserves cleanup across a stopped/killed
+supervisor or checker without relying on buffered stdout. Separate real-Chromium
+outer-failsafe regressions and their three-repeat commands are documented in that
+browser README; `outer-results.json` records their cleanup evidence.
+
 Use desktop Chrome/Chromium and a local source checkout; this is **Load unpacked**,
 not a Web Store listing or a published release ZIP. The manifest declares Chrome
 120 as the minimum; the browser actually tested is Linux Chromium **154.0.8037.97**.
@@ -275,8 +292,9 @@ the same HOME/config/SQLite/base roots and endpoint. This is not page.reload evi
 `scripts/smoke-restart-worker.js` checks data-image ready bytes beside an interrupted
 HTTP stream, no automatic acquisition/GET/POST on reopen, manual missing-image-only
 preparation, a completed backend receipt held before client outcome persistence,
-unchanged posting snapshot after both restarts, manual GET cleanup with original
-ID/warnings/paths/hashes and no duplicate files, zero requests at a changed endpoint,
+unchanged posting snapshot after both restarts, transient unknown GET followed by
+manual exact same-ID POST returning the historical receipt/warnings/paths/hashes
+without replacing the note inode or duplicating files, zero requests at a changed endpoint,
 online/offline events, actual worker Target.closeTarget followed by popup capture
 wake, and explicit destination reconfirmation before a fresh Send after Go restart.
 The supervisor logs old/new PIDs and cleans owned groups/profiles/listeners.

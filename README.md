@@ -103,6 +103,26 @@ make test-git
 
 Полный [пользовательский гид](docs/user.md#веб-клиппер-подключения-браузера), [README расширения](extensions/webclipper/README.md) с модульными API, лицензиями и smoke-командами и [контракт API](docs/api.md#web-clipper-v1--discovery-и-http-import-доступны).
 
+Автоматическая межкомпонентная проверка (Linux, установленный Chromium, Xvfb при
+отсутствии `DISPLAY`; Node.js 24, Go 1.26+):
+
+```sh
+node --version
+npm --prefix web ci
+npm --prefix web run build
+npm --prefix extensions/webclipper ci
+npm --prefix extensions/webclipper run test:browser
+```
+
+`test:browser` сначала выполняет extension `verify` со свежим `dist`, затем собирает
+Go из текущего checkout и запускает четыре native MV3 режима и пять fault-проверок
+на локальных HTTP fixtures. JSON-отчёт: `extensions/webclipper/tests/browser/results.json`.
+Зависимости и браузер устанавливаются заранее; во время browser suite загрузок нет.
+Watchdog cleanup использует общий приватный журнал владения процессами: detached
+группы и профили удаляются и при остановке supervisor/checker без передачи stdout.
+[Матрица, переменные окружения и отдельные manual-сценарии](extensions/webclipper/tests/browser/README.md).
+Официальный Chrome и настоящие permission prompts относятся к отдельной приёмке 9.2.
+
 ## Git-синхронизация
 
 Git необязателен для обычных локальных баз. Для синхронизации нужен системный Git 2.28 или новее, заранее настроенная неинтерактивная авторизация через SSH-agent, credential helper или Git config и Git identity (`user.name`, `user.email`). IGoNotes не хранит HTTPS-токены и SSH-ключи и не запрашивает пароль в терминале.

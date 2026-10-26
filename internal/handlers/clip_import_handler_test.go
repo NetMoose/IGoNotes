@@ -171,6 +171,15 @@ func TestClipImportHTTPReceiptLostResponseConcurrentRotationRestart(t *testing.T
 			var original string
 			count := 0
 			for w := range responses {
+				if w.Code == http.StatusAccepted {
+					assertPendingImportResponse(t, w)
+					// All creators have finished. A pending duplicate must now resolve
+					// to the same terminal receipt, never become a second publication.
+					w = importRequest(f.router, "POST", importsPath, f.created.Secret, ct, bytes.NewReader(body))
+					if w.Code != 200 {
+						t.Fatalf("pending replay: %d %s", w.Code, w.Body)
+					}
+				}
 				if w.Code != 200 && w.Code != 201 {
 					t.Fatalf("duplicate: %d %s", w.Code, w.Body)
 				}
@@ -202,6 +211,10 @@ func TestClipImportHTTPReceiptLostResponseConcurrentRotationRestart(t *testing.T
 			data, err := os.ReadFile(filepath.Join(root, m.Filename))
 			if err != nil || string(data) != m.Markdown {
 				t.Fatalf("note: %q %v", data, err)
+			}
+			before, err := os.Stat(filepath.Join(root, m.Filename))
+			if err != nil {
+				t.Fatal(err)
 			}
 			if f.notes.GetBasePath() != f.active {
 				t.Fatal("switched active base")
@@ -236,11 +249,140 @@ func TestClipImportHTTPReceiptLostResponseConcurrentRotationRestart(t *testing.T
 			if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil || w.Code != 200 || status.State != model.ClipperImportSucceeded {
 				t.Fatalf("status: %d %s", w.Code, w.Body)
 			}
+			terminal, _ := json.Marshal(status.Result)
+			if string(terminal) != strings.TrimSpace(original) {
+				t.Fatal("GET changed terminal receipt")
+			}
+			after, err := os.Stat(filepath.Join(root, m.Filename))
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatal("replay replaced note inode", err)
+			}
+			replayed, err := os.ReadFile(filepath.Join(root, m.Filename))
+			if err != nil || !bytes.Equal(data, replayed) {
+				t.Fatal("replay changed note bytes", err)
+			}
+			files, err := os.ReadDir(root)
+			if err != nil || len(files) != 1 {
+				t.Fatal("duplicate files", files, err)
+			}
 			entries, _ := filepath.Glob(filepath.Join(f.staging, "clip-import-*"))
 			if len(entries) != 0 {
 				t.Fatalf("staging leaked: %v", entries)
 			}
 		})
+	}
+}
+
+// Only the test store is intercepted: the real Claim commits before the creator
+// waits, making a duplicate's early journal lookup return pending deterministically.
+type importClaimBarrier struct {
+	service.ClipImportStore
+	claimed chan struct{}
+	release chan struct{}
+}
+
+func assertPendingImportResponse(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	assertDiscoveryError(t, w, 202, "clipper_import_pending")
+	var pending model.APIError
+	if err := json.Unmarshal(w.Body.Bytes(), &pending); err != nil || pending.Message != "Clipper import pending" || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("malformed pending response", err)
+	}
+}
+
+func (s *importClaimBarrier) Claim(ctx context.Context, r repository.ClipImportRecord) (repository.ClipImportRecord, bool, error) {
+	record, created, err := s.ClipImportStore.Claim(ctx, r)
+	if err == nil && created {
+		close(s.claimed)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return record, created, ctx.Err()
+		}
+	}
+	return record, created, err
+}
+
+func TestClipImportHTTPConcurrentPendingAfterClaimResolvesExactReceipt(t *testing.T) {
+	f := newImportHTTPFixture(t)
+	m := f.manifest(t, "target")
+	body, ct := importMultipart(t, m)
+	store := &importClaimBarrier{ClipImportStore: repository.NewClipImportRepository(f.db), claimed: make(chan struct{}), release: make(chan struct{})}
+	var release sync.Once
+	defer release.Do(func() { close(store.release) })
+	imports, err := service.NewClipImportService(f.settings, f.dest, f.notes, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pin staging before the creator takes settings.mu. This test-only provider
+	// allows the duplicate HTTP upload to reach lookup while Claim is held.
+	staging, err := f.settings.OpenPrivateStagingRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging.Close()
+	h, err := NewClipImportHandler(imports, importRootProviderFunc(func() (*os.Root, error) { return os.OpenRoot(f.staging) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := http.NewServeMux()
+	RegisterClipImportRoutes(router, h, f.connections, discoverySetup(true))
+	creator := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		creator <- importRequest(router, "POST", importsPath, f.created.Secret, ct, bytes.NewReader(body))
+	}()
+	select {
+	case <-store.claimed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("creator did not reach committed claim")
+	}
+	duplicate := importRequest(router, "POST", importsPath, f.created.Secret, ct, bytes.NewReader(body))
+	assertPendingImportResponse(t, duplicate)
+	if files, err := os.ReadDir(f.target); err != nil || len(files) != 0 {
+		t.Fatal("published before claim released", files, err)
+	}
+	release.Do(func() { close(store.release) })
+	var created *httptest.ResponseRecorder
+	select {
+	case created = <-creator:
+	case <-time.After(5 * time.Second):
+		t.Fatal("creator did not complete")
+	}
+	if created.Code != 201 {
+		t.Fatalf("creator: %d %s", created.Code, created.Body)
+	}
+	path := filepath.Join(f.target, m.Filename)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePayload, err := os.ReadFile(path)
+	if err != nil || string(beforePayload) != m.Markdown {
+		t.Fatal("creator payload differs", err)
+	}
+	w := importRequest(router, "GET", importsPath+"?id="+m.ImportID, f.created.Secret, "", nil)
+	var status model.ClipperImportStatusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil || w.Code != 200 || status.State != model.ClipperImportSucceeded {
+		t.Fatal("pending did not resolve", w.Code, w.Body, err)
+	}
+	terminal, _ := json.Marshal(status.Result)
+	if string(terminal) != strings.TrimSpace(created.Body.String()) {
+		t.Fatal("GET receipt differs")
+	}
+	w = importRequest(router, "POST", importsPath, f.created.Secret, ct, bytes.NewReader(body))
+	if w.Code != 200 || w.Body.String() != created.Body.String() {
+		t.Fatal("exact replay changed receipt", w.Code, w.Body)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatal("replay replaced inode", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(data, beforePayload) {
+		t.Fatal("replay changed payload", err)
+	}
+	if files, err := os.ReadDir(f.target); err != nil || len(files) != 1 {
+		t.Fatal("duplicate publication", files, err)
 	}
 }
 

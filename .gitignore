@@ -34,3 +34,6 @@ main
 
 # Build directory
 builds/
+extensions/webclipper/tests/browser/results.json
+extensions/webclipper/tests/browser/outer-results.json
+extensions/webclipper/tests/browser/profile-results.json

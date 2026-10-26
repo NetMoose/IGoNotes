@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, copyFileSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { cpSync, readFileSync, copyFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
-import { deliveryFixture } from './smoke-delivery-fixture.js';
+import { deliveryFixture } from '../tests/browser/delivery-fixture.js';
+import { openOwnership } from '../tests/browser/ownership.js';
 
 // Linux-only supervisor: Chromium and the worker each have a private process
 // group created by us. Never search for or signal the user's browser processes.
@@ -32,6 +32,10 @@ let result;
 let failure;
 let browserLog = '';
 const stopped = new AbortController();
+const registry = openOwnership(process.env, process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode');
+// A direct caller may pass the registry's global scope. Local cleanup must own
+// only this invocation, never its caller's command groups or sibling resources.
+const ownership = openOwnership({ ...registry.env, CLIPPER_RESOURCE_SCOPE: registry.newScope() });
 // All resources are local. Live-page baseline requests are allowed; conversion
 // must not activate lazy image URLs, copied CSS/frames or any other resource.
 const fixture = readFileSync(new URL('../tests/fixtures/article.html', import.meta.url), 'utf8')
@@ -83,7 +87,10 @@ function faultPhase(operation, session = { sessionReady: false }) {
 
 function owned(command, args, options = {}) {
   stopped.signal.throwIfAborted();
-  const child = spawn(command, args, { detached: true, stdio: ['ignore', 'ignore', 'pipe'], ...options });
+  const { resourceRole = 'backend', ...spawnOptions } = options;
+  const child = spawn(command, args, { detached: true, stdio: ['ignore', 'ignore', 'pipe'], ...spawnOptions,
+    env: { ...process.env, ...spawnOptions.env, ...ownership.env } });
+  ownership.recordProcess(child, resourceRole, ownership.scope, resourceRole === 'browser' ? profile : undefined);
   child.finished = new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => resolve({ code, signal }));
@@ -141,11 +148,11 @@ async function launchBrowser() {
     `--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`,
     '--disable-background-networking', '--disable-component-update', '--disable-sync',
     '--no-first-run', '--no-default-browser-check',
-    imageMode || restartMode ? '--host-resolver-rules=MAP images.example.test 127.0.0.1, MAP cdn.example.test 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1' : '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1',
-    ...(imageMode || restartMode ? ['--no-proxy-server'] : []),
+    '--host-resolver-rules=MAP images.example.test 127.0.0.1, MAP cdn.example.test 127.0.0.1, MAP hostile.example.test 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1',
+    '--no-proxy-server',
     ...(process.env.CLIPPER_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []),
     'about:blank',
-  ]);
+  ], { resourceRole: 'browser' });
   const launched = browser;
   const ready = new Promise((resolve, reject) => {
     launched.stderr.on('data', chunk => {
@@ -156,7 +163,7 @@ async function launchBrowser() {
     launched.finished.then(() => reject(new Error(`Chromium exited before smoke finished:\n${browserLog}`)), reject);
   });
   ready.catch(() => {});
-  console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, fixtureURL })}`);
+  console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, backendPid: backend?.pid, fixtureURL })}`);
   if (fault === 'launch-hang') {
     const stalled = faultPhase(new Promise(() => {}));
     console.log('SMOKE_FAULT_REACHED launch-hang'); await stalled;
@@ -167,7 +174,7 @@ async function launchBrowser() {
 async function run() {
   // Allocate synchronously so a deadline cannot race an unfinished mkdtemp and
   // create an unrecorded directory after cleanup has already inspected profile.
-  profile = mkdtempSync(join(process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode', 'clipper-profile-'));
+  profile = ownership.temporary(process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode', 'clipper-profile-');
   if (deliveryMode) delivery = await deliveryFixture(profile, owned, child => { backend = child; });
   if (imageMode) {
     // Test-only copy: exercise the unconnected image APIs in a real extension
@@ -181,13 +188,15 @@ async function run() {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
   });
+  ownership.recordListener(server.address().port);
   fixtureURL = `http://${imageMode ? 'images.example.test' : '127.0.0.1'}:${server.address().port}/`;
   await launchBrowser();
   worker = owned(process.execPath, [resolve(import.meta.dirname, fault ? 'smoke-fault-worker.js' : restartMode ? 'smoke-restart-worker.js' : deliveryMode ? 'smoke-delivery-worker.js' : imageMode ? 'smoke-images-worker.js' : 'smoke-worker.js'), endpoint, fixtureURL, extensionPath], {
+    resourceRole: 'worker',
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     ...(deliveryMode ? { env: { ...process.env, CLIPPER_SMOKE_BACKEND: delivery.endpoint, CLIPPER_SMOKE_HOME: delivery.home, CLIPPER_SMOKE_SECRET: delivery.secret } } : {}),
   });
-  console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, workerPid: worker.pid, fixtureURL })}`);
+  console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, workerPid: worker.pid, backendPid: backend?.pid, fixtureURL })}`);
   let exit;
   if (fault) {
     exit = await new Promise((resolve, reject) => {
@@ -212,6 +221,7 @@ async function run() {
           } else if (message.command === 'restart-go') {
             const oldPid = backend.pid; await terminate(backend); await delivery.restart();
             console.log(`SMOKE_GO_RESTART ${JSON.stringify({ oldPid, newPid: backend.pid, endpoint: delivery.endpoint, home: delivery.home })}`);
+            console.log(`SMOKE_RESOURCES ${JSON.stringify({ profile, browserPid: browser.pid, workerPid: worker.pid, backendPid: backend.pid, fixtureURL })}`);
           } else throw Error('Unknown restart command');
           worker.send({ command: message.command, endpoint });
         })().catch(error => { failure = error; signalGroup(worker, 'SIGKILL'); });
@@ -241,21 +251,31 @@ try {
       server.close((error) => error ? reject(error) : resolve());
     }), cleanupStepMs, 'Fixture server close timed out'),
   ]);
-  // Remove only our mkdtemp directory, after processes have stopped writing to it.
-  const removed = await Promise.allSettled([
-    bounded(profile ? rm(profile, { recursive: true, force: true }) : Promise.resolve(), cleanupStepMs, 'Profile removal timed out'),
-  ]);
-  for (const step of [...cleanup, ...removed]) {
+  for (const step of cleanup) {
     if (step.status === 'rejected') {
       console.error(`Smoke cleanup failed: ${step.reason}`);
       failure ??= step.reason;
     }
   }
-  if ([...cleanup, ...removed].every((step) => step.status === 'fulfilled')) {
-    console.log('SMOKE_CLEANUP {"profileRemoved":true,"serverClosed":true,"processesStopped":true}');
+  // Every deletion, including ordinary/inherited cleanup, uses the same pinned
+  // identity checks as outer fallback. No path-based rm is allowed here.
+  try {
+    const recovered = await ownership.cleanup();
+    console.log(`SMOKE_OWNERSHIP_CLEANUP ${JSON.stringify(recovered)}`);
+    if (recovered.errors.length) {
+      console.error('Smoke ownership cleanup failed');
+      failure ??= Error('Smoke ownership cleanup failed');
+    } else if (cleanup.every(step => step.status === 'fulfilled')) {
+      console.log('SMOKE_CLEANUP {"profileRemoved":true,"serverClosed":true,"processesStopped":true}');
+    }
+  } catch { console.error('Smoke ownership cleanup failed'); failure ??= Error('Smoke ownership cleanup failed'); }
+  // Inherited registries stay with their caller; disposal is also identity-
+  // checked and cannot remove an unresolved nested profile through an ancestor.
+  if (registry.owner) {
+    try { await registry.dispose(); } catch { failure ??= Error('Smoke ownership journal disposal failed'); }
   }
 }
 if (failure) console.error(failure.message);
-else console.log(JSON.stringify(result, null, 2));
+else { console.log(JSON.stringify(result, null, 2)); console.log(`BROWSER_EVIDENCE ${JSON.stringify(result)}`); }
 // No lingering IPC/CDP handles can keep the supervisor alive after cleanup.
 process.exit(failure ? 1 : 0);

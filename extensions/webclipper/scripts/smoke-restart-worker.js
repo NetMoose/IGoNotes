@@ -1,18 +1,21 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { chromium } from 'playwright-core';
+import { fenceNetwork } from '../tests/browser/network.js';
+import { openOwnership } from '../tests/browser/ownership.js';
 
 // This process survives actual Chromium exits; the outer supervisor owns every
-// browser/backend process group and a single overall deadline (use 90000ms).
+// browser/backend process group and a single overall deadline (use 120000ms).
 let [endpoint, fixtureURL] = process.argv.slice(2);
 let browser, context, extensionId, popup, source;
 const failures = [], browserVersions = [];
 let wrongRequests = 0;
 const wrong = createServer((req, res) => { wrongRequests++; res.end('wrong server'); });
 await new Promise(resolve => wrong.listen(0, '127.0.0.1', resolve));
+if (process.env.CLIPPER_RESOURCE_DIRECTORY) openOwnership().recordListener(wrong.address().port);
 const wrongEndpoint = `http://127.0.0.1:${wrong.address().port}`;
 const stats = async () => (await fetch(`${fixtureURL}stats`)).json();
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -23,6 +26,7 @@ async function command(command) {
 async function connect() {
   browser = await chromium.connectOverCDP(endpoint); browserVersions.push(browser.version());
   context = browser.contexts()[0]; context.setDefaultTimeout(7000);
+  await fenceNetwork(context, failures);
   context.on('page', page => page.on('pageerror', e => failures.push(e.message)));
   const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker');
   extensionId = new URL(worker.url()).host;
@@ -104,10 +108,26 @@ try {
   assert.equal((await stats()).imageRequests, 2, 'only the missing image is fetched');
   const ready = await bundle(editor, draftId);
   assert.deepEqual(ready.assets.find(a => a.id === partial.assets.find(a => a.blob).id).blob, partial.assets.find(a => a.blob).blob);
+  await source?.close(); source = undefined;
+  assert.equal(context.pages().some(p => p.url() === fixtureURL), false, 'capture source is closed after actual browser restart');
+  const permissions = await context.newPage(); await permissions.goto('chrome://extensions');
+  await permissions.evaluate(async id => {
+    await chrome.developerPrivate.removeHostPermission(id, 'http://images.example.test/*');
+  }, extensionId);
+  await permissions.close();
+  assert.equal(await editor.evaluate(() => chrome.permissions.contains({ origins: ['http://images.example.test/*'] })), false);
+  const cachedRequests = (await stats()).imageRequests;
+  await context.setOffline(true);
+  await editor.close(); editor = await reopen(draftId);
+  await editor.getByText(/2 \/ 2 stored locally/).waitFor();
+  assert.deepEqual(await bundle(editor, draftId), ready, 'captured Markdown and cached bytes survive offline reopen with source closed and permission revoked');
+  await context.setOffline(false);
+  assert.equal((await stats()).imageRequests, cachedRequests);
+  await pregrantImages();
   // Also retain a warning in the historical receipt after process restart.
   const external = `http://cdn.example.test:${new URL(fixtureURL).port}/missing.gif`;
   await editor.getByLabel('Markdown', { exact: true }).fill(`${ready.drafts.markdown}\n![external](${external})`);
-  await editor.getByRole('button', { name: 'Retry images / grant access', exact: true }).click();
+  await editor.getByRole('button', { name: 'Prepare images', exact: true }).click();
   await editor.getByText('Image preparation finished. Review each image below.', { exact: true }).waitFor();
   await editor.getByLabel(`Keep external reference: ${external}`, { exact: true }).check();
   await editor.getByRole('button', { name: 'Confirm external references', exact: true }).click();
@@ -130,8 +150,16 @@ try {
   await editor.getByText(/Restore its original connection address/).waitFor();
   assert.equal(wrongRequests, 0, 'old identity/token must never reach another endpoint');
   await saveConnection(editor, fixtureURL.slice(0, -1));
-  await editor.getByRole('button', { name: 'Check attempt', exact: true }).click();
+  const publishedPath = join(process.env.CLIPPER_SMOKE_HOME, 'bases/inactive/research/articles', attempt.manifest.filename);
+  const beforeReplay = statSync(publishedPath);
+  await fetch(`${fixtureURL}arm-unknown`);
+  await editor.getByRole('button', { name: 'Check / retry exact attempt', exact: true }).click();
   await editor.getByRole('heading', { name: 'Import confirmed', exact: true }).waitFor();
+  assert.equal(statSync(publishedPath).ino, beforeReplay.ino, 'historical replay must preserve publication inode');
+  const replayed = await stats();
+  assert.equal(replayed.posts, 2); assert.equal(replayed.gets, 1);
+  assert.deepEqual(replayed.receipts[1], completed.receipts[0], 'same-ID POST after unknown GET returns exact historical receipt');
+  assert.deepEqual(replayed.outcomes.map(o => o.status), [201, 200]);
   assert.deepEqual(await bundle(editor, draftId), { drafts: undefined, assets: [], attempts: [] });
   const receipt = completed.receipts[0]; assert.equal(receipt.import_id, attempt.id);
   assert.deepEqual(receipt.warnings, attempt.manifest.external_images.map(e => e.reason)); assert.equal(receipt.warnings.length, 1);
@@ -160,15 +188,15 @@ try {
   await command('restart-go');
   await fresh.getByRole('button', { name: 'Send', exact: true }).click();
   await fresh.getByText(/explicitly confirm the destination again/).waitFor();
-  assert.equal((await stats()).posts, 1);
+  assert.equal((await stats()).posts, 2);
   assert.equal((await bundle(fresh, freshId)).drafts.destinationRevision, old.drafts.destinationRevision);
   await confirm(fresh);
   assert.notEqual((await bundle(fresh, freshId)).drafts.destinationRevision, old.drafts.destinationRevision);
   await fresh.getByRole('button', { name: 'Send', exact: true }).click();
   await fresh.getByRole('heading', { name: 'Import confirmed', exact: true }).waitFor();
-  const final = await stats(); assert.equal(final.posts, 2); assert.equal(final.gets, 1); assert.deepEqual(failures, []);
+  const final = await stats(); assert.equal(final.posts, 3); assert.equal(final.gets, 1); assert.deepEqual(failures, []);
   process.send({ result: 'PASS', browserVersions, browserProcessRestarts: 2, goProcessRestarts: 2, sameBrowserProfile: true,
-    partialPreparationDurable: true, pendingOnlyManualFetch: true, noAutoPOSTorGET: true, heldCompletedReceiptRecoveredAfterBothRestarts: true,
+    offlineCapturedDraft: true, partialPreparationDurable: true, pendingOnlyManualFetch: true, noAutoPOSTorGET: true, historicalExactPOSTReplay: true, heldCompletedReceiptRecoveredAfterBothRestarts: true,
     originalIDManifestBlobsPreserved: true, warningsPathsHashesPreserved: true, noDuplicateFiles: true, wrongEndpointRequests: wrongRequests,
     workerTargetTerminatedAndCaptureWoke: true, oldDestinationRequiresExplicitReconfirm: true, posts: final.posts, gets: final.gets, nativePermissionDialogTested: false });
 } catch (error) {

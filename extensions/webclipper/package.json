@@ -11,6 +11,8 @@
     "test": "vitest run",
     "test:ci": "vitest run --reporter=default",
     "verify": "npm run test:ci && npm run build",
+    "pretest:browser": "npm run verify",
+    "test:browser": "node tests/browser/run.js",
     "smoke": "node scripts/smoke.js",
     "smoke:images": "CLIPPER_SMOKE_IMAGES=1 node scripts/smoke.js"
   },

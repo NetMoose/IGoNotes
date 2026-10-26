@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { marked } from '../tests/helpers/app-markdown.js';
 import { formatNote } from '../src/markdown/note.js';
+import { fenceNetwork } from '../tests/browser/network.js';
 
 // The supervisor owns Chromium, the profile and fixture. Even a stuck evaluate
 // or close here cannot block the supervisor's deadline and independent cleanup.
@@ -12,6 +13,7 @@ let result;
 try {
   browser = await chromium.connectOverCDP(endpoint);
   const context = browser.contexts()[0];
+  await fenceNetwork(context, failures);
   context.setDefaultTimeout(5000);
   const inspect = async (page) => {
     page.on('pageerror', (error) => failures.push(error.message));
@@ -317,7 +319,7 @@ try {
   result = {
     result: 'PASS', browser: browser.version(), extensionId: id,
     serviceWorker: worker.url(), popup: popup.url(), editor: editor.url(),
-    injection: injected, domUnchanged: true, pageGlobalAbsent: true, storage,
+    injection: injected, domUnchanged: true, selectionUnchanged: true, pageGlobalAbsent: true, storage,
     durableCapture: ['Article', 'Selection'], popupClosedAndEditorReloaded: true,
     proposedCaptureFilename: true, unsavedFrontmatterDownload: true, manualFilenameIndependent: true,
     captureRequests: captureRequests.length, captureCredentialReads,
