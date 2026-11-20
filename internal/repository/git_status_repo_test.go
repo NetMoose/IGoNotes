@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -10,6 +12,76 @@ import (
 
 	"IGoNotes/internal/model"
 )
+
+func TestGitStatusReadsWaitForWriterAndRespectCancellation(t *testing.T) {
+	for _, operation := range []string{"get", "list"} {
+		for _, canceled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%v", operation, canceled), func(t *testing.T) {
+				repo, db := openTestGitStatusRepository(t)
+				defer db.Close()
+				want := model.GitStatus{Base: "target", RepositoryPath: "/notes/target", State: model.GitStateReady}
+				if err := repo.Upsert(t.Context(), want); err != nil {
+					t.Fatal(err)
+				}
+				locker, err := db.Conn(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer locker.Close()
+				if _, err := locker.ExecContext(t.Context(), "BEGIN EXCLUSIVE"); err != nil {
+					t.Fatal(err)
+				}
+				defer locker.ExecContext(context.Background(), "ROLLBACK")
+				if _, err := locker.ExecContext(t.Context(), "UPDATE git_status SET state='conflict'"); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				result := make(chan error, 1)
+				go func() {
+					var rows []model.GitStatus
+					var err error
+					if operation == "get" {
+						var row model.GitStatus
+						var found bool
+						row, found, err = repo.Get(ctx, want.RepositoryPath)
+						if err == nil && !found {
+							err = errors.New("status missing")
+						}
+						rows = []model.GitStatus{row}
+					} else {
+						rows, err = repo.List(ctx)
+					}
+					if err == nil && (len(rows) != 1 || rows[0].State != model.GitStateConflict) {
+						err = errors.New("did not observe committed conflict")
+					}
+					result <- err
+				}()
+				select {
+				case err := <-result:
+					t.Fatalf("status returned before writer release/cancel: %v", err)
+				case <-time.After(50 * time.Millisecond):
+				}
+				if canceled {
+					cancel()
+				} else if _, err := locker.ExecContext(t.Context(), "COMMIT"); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err := <-result:
+					if canceled && !errors.Is(err, context.Canceled) {
+						t.Fatalf("cancellation: %v", err)
+					}
+					if !canceled && err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("status read did not finish")
+				}
+			})
+		}
+	}
+}
 
 func TestGitStatusRepositoryRoundTripCompleteStatus(t *testing.T) {
 	repo, db := openTestGitStatusRepository(t)

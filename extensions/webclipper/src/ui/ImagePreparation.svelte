@@ -168,7 +168,7 @@
         <p>MIME: {row.mediaType ?? 'unknown'} · Bytes: {row.size ?? 'unknown'}</p>
         {#if row.error}<p class="error">{row.error.code}{row.error.status ? ` (${row.error.status})` : ''}: {row.error.message}</p>{/if}
         {#if row.eligible}
-          <label><input type="checkbox" aria-label={`Keep external reference: ${row.url}`}
+          <label class="checkbox-label"><input type="checkbox" aria-label={`Keep external reference: ${row.url}`}
             checked={selected.includes(row.url) || confirmed.some(ack => ack.url === row.url)} disabled={running || disabled || frozen}
             onchange={event => choose(row.url, event.currentTarget.checked)} /> Keep external reference</label>
         {:else if !row.local}<p>Edit or remove this source if it cannot be stored; external fallback is not allowed.</p>{/if}

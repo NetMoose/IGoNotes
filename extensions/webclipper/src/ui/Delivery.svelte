@@ -100,10 +100,14 @@
         <option value="/">Choose a folder</option>
         {#each listing.folders as path}<option value={path}>{path || '(root)'}</option>{/each}
       </select>
-      <button onclick={() => run(confirm)} disabled={running || disabled || folder === '/'}>Confirm destination</button>
     {/if}
+    <div class="editor-actions">
+      {#if listing}
+        <button onclick={() => run(confirm)} disabled={running || disabled || folder === '/'}>Confirm destination</button>
+      {/if}
+      <button class="primary" onclick={() => run(() => deliver('send'))} disabled={running || disabled || !confirmed || !imagesReady}>Send</button>
+    </div>
     {#if confirmed}<p>{confirmed}</p>{/if}
-    <button class="primary" onclick={() => run(() => deliver('send'))} disabled={running || disabled || !confirmed || !imagesReady}>Send</button>
   {:else}
     <p>Immutable attempt: {draft.activeAttemptId ?? 'unresolved'}. Destination: {draft.base} / {draft.parent || '(root)'}. Keep its draft and images until a matching receipt is confirmed.</p>
     <button onclick={() => run(() => deliver('check'))} disabled={running || disabled}>Check attempt</button>

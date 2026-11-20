@@ -1,3 +1,4 @@
+import { extensionWorker } from '../tests/browser/extension-worker.js';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -11,7 +12,7 @@ let browser;
 try {
   browser = await chromium.connectOverCDP(endpoint);
   const context = browser.contexts()[0]; context.setDefaultTimeout(7000);
-  const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker');
+  const worker = await extensionWorker(context);
   const id = new URL(worker.url()).host;
   const failures = [], requests = [];
   await fenceNetwork(context, failures);

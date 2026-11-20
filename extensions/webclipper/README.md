@@ -36,7 +36,7 @@ outer-failsafe regressions and their three-repeat commands are documented in tha
 browser README; `outer-results.json` records their cleanup evidence.
 
 Use desktop Chrome/Chromium and a local source checkout; this is **Load unpacked**,
-not a Web Store listing or a published release ZIP. The manifest declares Chrome
+not a Web Store listing. A release ZIP can be extracted and loaded the same way. The manifest declares Chrome
 120 as the minimum; the browser actually tested is Linux Chromium **154.0.8037.97**.
 Official Chrome/platform/manual permission-prompt acceptance remains **9.2**.
 Existing native image smokes use test-only pregranted hosts. Section 9 covers
@@ -1042,8 +1042,8 @@ transitive code. Ship the whole `dist` directory, including these notices.
 
 The extension-only `npm --prefix extensions/webclipper audit`, including development
 dependencies, reports zero vulnerabilities with this lockfile. This is not a
-whole-repository audit result: the main `web/` package has **5 known findings**
-pending the task-9.3 work; do not infer zero for it from the extension audit.
+whole-repository audit result: the main `web/` package is audited separately. Task 9.3 updates its vulnerable
+toolchain dependencies; see the current verification report for fresh results.
 
 ## Extraction API (task 7.1)
 
@@ -1515,3 +1515,30 @@ sync or back up to IGoNotes or the cloud. Uninstalling the extension, deleting
 the profile or clearing extension/browser storage can lose all drafts and Blobs;
 browser eviction is also possible. This is not an archive guarantee. The editor
 can download the current Markdown text; credential and image export are not available.
+
+
+## Standalone ZIP and CI
+
+From the repository root, with Node 24 and Python 3:
+
+```sh
+make clipper-verify
+make clipper-package
+```
+
+The archive is `builds/igonotes-webclipper.zip`, with `manifest.json` at its root.
+Extract it into a persistent directory and select that directory in Load unpacked.
+For an existing installation, update its directory and use Reload; uninstalling
+removes local drafts. Python uses only the standard library. ZIP metadata/order
+are fixed, and packaging verifies every archived file against dist.
+
+CI installs the Chromium associated with the locked Playwright dependency before
+running tests (the suite itself never downloads a browser). CI and release run
+`verify`, package/extract the ZIP, and test that extracted extension against the
+current Go checkout. Disposable CI explicitly disables the browser sandbox;
+normal desktop acceptance does not. The extension stays outside Go embed.
+Releases include `igonotes-webclipper-<tag>.zip` in the verified checksums.
+
+Manual results supplied by the user are recorded in
+[`manual-results-2026-11-20.md`](tests/browser/manual-results-2026-11-20.md).
+Historical automatic evidence is in [`acceptance.md`](tests/browser/acceptance.md).

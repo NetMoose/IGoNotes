@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "IGoNotes Web Clipper",
   "version": "0.0.0",
-  "description": "Development scaffold for the IGoNotes Web Clipper.",
+  "description": "Capture articles and selections as local Markdown drafts and import them into IGoNotes.",
   "minimum_chrome_version": "120",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],

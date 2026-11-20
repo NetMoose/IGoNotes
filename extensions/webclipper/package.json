@@ -10,11 +10,13 @@
     "build": "node scripts/build.js",
     "test": "vitest run",
     "test:ci": "vitest run --reporter=default",
-    "verify": "npm run test:ci && npm run build",
+    "verify": "npm run test:ci && npm run test:package && npm run build",
     "pretest:browser": "npm run verify",
     "test:browser": "node tests/browser/run.js",
     "smoke": "node scripts/smoke.js",
-    "smoke:images": "CLIPPER_SMOKE_IMAGES=1 node scripts/smoke.js"
+    "smoke:images": "CLIPPER_SMOKE_IMAGES=1 node scripts/smoke.js",
+    "test:package": "python3 -m unittest discover -s tests -p test_package.py",
+    "package": "npm run build && python3 scripts/package.py"
   },
   "dependencies": {
     "@mozilla/readability": "0.6.0",

@@ -145,7 +145,7 @@ Delivery использует только trusted connection store и typed tra
 
 Lifecycle revision начинается с 0 и проверяется/увеличивается в IDB RW при каждом переходе, включая неизменные state/phase/code: timestamps не защищают от ABA. Expected `{state, phase, lifecycleRevision}` обязателен. Только отсутствие поля у legacy v1 lifecycle row сопоставляется явному expected null; первый переход атомарно записывает 1, без изменения immutable payload/history и без schema migration. Stored null/дробные/отрицательные/нечисловые/unsafe значения отклоняются; после MAX_SAFE_INTEGER дальнейший переход не пишет overflow и сохраняет frozen attempt. При CAS-конфликте контроллер перечитывает актуальный bundle и возвращает readOnly hold с observedState/revision, не повторяя stale outcome с новой версией. Текущий persisted `clipper_request_changed` отдельно проверяется **внутри storage**: даже latest revision, auth/rejection или matching success не разрешают снять hold, начать POST, конвертировать его в succeeded или выполнить cleanup.
 
-Timeout/network/5xx/malformed/mismatched receipt сохраняют uncertain; auth/setup удерживают ID до reconnect на исходный endpoint, новый токен допустим. Только ручной retry выполняет GET, затем exact same-ID POST при unknown; неизвестный GET 400 не доказывает отсутствия конкурентной публикации. Pending/recovery_required удерживают snapshot. Git gate консервативно представлен как pending, даже при server journal rejected. request_changed — sticky identity conflict, не разрешение новой попытки. Definite payload/destination/note_conflict rejection либо валидный GET rejected (включая journal `internal_error`, в отличие от сырого POST 500) разблокирует draft с обязательным новым подтверждением и ID; abandoned сохраняет предупреждение о возможных файлах/дубликате. Mount/connection save/online/доступность сервера не вызывают GET/POST/acquisition. Восстановление interrupted preparing/sending доступно; полный workflow, image policy и quotas — в [пользовательском руководстве](user.md#веб-клиппер-подключения-браузера) и `extensions/webclipper/README.md` репозитория. Focused headed smoke с native IDB, настоящим Go/custom port/temp HOME и lost-response proxy находится в `scripts/smoke-delivery-*.js`; команда и границы проверки описаны в README расширения, без заявления manual permission prompt PASS. Остались проверки/CI/distribution раздела 9; это не план реализации уже доступного Send.
+Timeout/network/5xx/malformed/mismatched receipt сохраняют uncertain; auth/setup удерживают ID до reconnect на исходный endpoint, новый токен допустим. Только ручной retry выполняет GET, затем exact same-ID POST при unknown; неизвестный GET 400 не доказывает отсутствия конкурентной публикации. Pending/recovery_required удерживают snapshot. Git gate консервативно представлен как pending, даже при server journal rejected. request_changed — sticky identity conflict, не разрешение новой попытки. Definite payload/destination/note_conflict rejection либо валидный GET rejected (включая journal `internal_error`, в отличие от сырого POST 500) разблокирует draft с обязательным новым подтверждением и ID; abandoned сохраняет предупреждение о возможных файлах/дубликате. Mount/connection save/online/доступность сервера не вызывают GET/POST/acquisition. Восстановление interrupted preparing/sending доступно; полный workflow, image policy и quotas — в [пользовательском руководстве](user.md#веб-клиппер-подключения-браузера) и `extensions/webclipper/README.md` репозитория. Focused headed smoke с native IDB, настоящим Go/custom port/temp HOME и lost-response proxy находится в `scripts/smoke-delivery-*.js`; команда и границы проверки описаны в README расширения, без заявления manual permission prompt PASS. Приёмка и интеграция CI описаны ниже; Send доступен в текущей реализации.
 
 `createDelivery().recoverDraft(id)` делает atomic `readBundle` и локальную валидацию lifecycle/endpoint/manifest ID/canonical digest/asset IDs. Результат — readOnly classification с observedState/phase/revision, без HTTP, settings reads, lifecycle write или cleanup. `sending/prepared` и `sending/posting` показываются как interrupted/uncertain; это view-only hold, не присвоение полномочий и не lease. Другой открытый контроллер сохраняет свой CAS; legacy отсутствие revision остаётся отсутствием, sticky request_changed не снимается. Manual Check валидирует эти метаданные перед GET или локальной terminal cleanup; последняя допускается только для точного совпадающего persisted receipt и текущей terminal CAS revision, без resend. Malformed данные сохраняются fail-closed. Endpoint проверяется до создания transport, включая GET: ID/секрет не попадают на новый сервер. Preflight новой Send после restart требует явного повторного Confirm вместо обновления process-local revision; исторический success lookup сервера по ID/digest по-прежнему предшествует старой revision.
 
@@ -198,8 +198,8 @@ JSON `tests/browser/results.json` содержит OS/browser version, per-case 
 реальный SPA preview nested image через `/api/raw` с совпадающими байтами.
 Prerequisites устанавливаются до запуска; runtime не скачивает packages/browser.
 Полная матрица, controls и отдельная инструкция manual prompts —
-`extensions/webclipper/tests/browser/README.md`; официальный Chrome/manual PASS и
-будущий `acceptance.md` относятся к 9.2, CI-интеграция — к 9.3.
+`extensions/webclipper/tests/browser/README.md`. Результаты headed Chrome/Chromium
+и ручной приёмки записаны в `acceptance.md` и `manual-results-2026-11-20.md`.
 
 Worker синхронно регистрирует capture listener, совместимый с Chrome 120 (`return true`/`sendResponse`), и принимает только строгую команду `{type: 'capture', mode: 'article'|'selection'}` от точных runtime ID/origin/URL собственного popup. Content-script sender и неизвестные поля отклоняются до побочных эффектов. Порядок: защита trusted storage без чтения секрета → isolated frame-0 captureMarkdown с document-ID/URL-проверками → валидация converted JSON → завершение транзакции IndexedDB → новая вкладка `editor.html?draft=<encoded-id>` → минимальный ack `{ok: true, draftId, editorOpened}`. Raw HTML не сохраняется; image URL записывается только как pending metadata с `blob: null`. Закрытие popup/канала после commit не отменяет сохранение; ошибка tabs.create оставляет durable success с ручным открытием того же ID. При quota/лимите 50 черновиков/ошибке транзакции popup получает строгий unsaved Markdown/metadata envelope и предлагает скачать текущий текст либо вручную освободить место, явно не обещая сохранение. Полные схемы и проверки описаны в `extensions/webclipper/README.md`.
 
@@ -377,4 +377,31 @@ Git API использует системный Git 2.28+, поэтому для
 
 CI выполняет native Git integration на трех ОС: Linux, macOS и Windows, с обязательным `IGONOTES_REQUIRE_GIT_INTEGRATION=1`, полным Go suite и повторными process-tree/two-device тестами. Отдельная Linux job запускает race/vet/build и шесть cross-build комбинаций Linux/Windows/macOS × amd64/arm64 (`CGO_ENABLED=0`). Кросс-компиляция проверяет сборку, а native jobs — выполнение платформенного кода.
 
-Release запускается тегом `v*`. Job `build` имеет только `contents: read`, выполняет frontend/Go/race/vet проверки и собирает шесть архивов с checksums. Только job `publish` имеет `contents: write`: получает уже проверенные artifacts, проверяет точные шесть архивов и checksums и публикует release. В `publish` нет checkout или сборки исходного кода.
+Release запускается тегом `v*`. Job `build` имеет только `contents: read`, выполняет frontend/Go/race/vet проверки и собирает шесть архивов бинарников и отдельный ZIP расширения с checksums. Только job `publish` имеет `contents: write`: получает уже проверенные artifacts, проверяет точные семь архивов и checksums и публикует release. В `publish` нет checkout или сборки исходного кода.
+
+
+### Проверки и отдельный архив Web Clipper
+
+Расширение не входит в Go embed. Node.js 24 и Python 3 обязательны для его
+проверки и упаковки; используется стандартный `zipfile`, без Python-зависимостей.
+`make clipper-verify` устанавливает lockfile и запускает JS/Python-тесты и сборку.
+`make clipper-browser` дополнительно собирает frontend и выполняет локальный
+Chromium/Go suite. Для него нужны установленный Chromium и Xvfb; браузер не
+скачивается самим suite. `make clipper-package` создаёт
+`builds/igonotes-webclipper.zip`; manifest лежит в корне архива. Распакуйте архив
+в постоянную папку и выберите её через Load unpacked. Не удаляйте расширение для
+обновления: Reload сохраняет данные профиля, удаление расширения удаляет черновики.
+
+В CI отдельная job `webclipper` устанавливает Chromium закреплённой версией
+Playwright из lockfile и системные зависимости, проверяет пакет, распаковывает ZIP
+и запускает suite с `CLIPPER_SMOKE_EXTENSION_PATH`. На одноразовом CI runner
+явно задан `CLIPPER_SMOKE_NO_SANDBOX=1`; это ограничение CI, не требование продукта.
+Ручная приёмка и отдельные headed-запуски проверяют обычный sandboxed браузер.
+Release выполняет те же проверки в read-only job `build` до передачи artifacts
+в `publish`. Архив расширения называется `igonotes-webclipper-<tag>.zip` и включён
+в общий `checksums.txt`. Права `publish` не расширены.
+
+Frontend audit: совместимые обновления в lockfile и целевой override
+`@tailwindcss/typography -> postcss-selector-parser 6.1.5` устраняют закреплённую
+у typography уязвимую версию 6.0.10, сохраняя major 6. Override можно убрать,
+когда typography обновит собственный диапазон.

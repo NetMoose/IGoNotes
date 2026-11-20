@@ -13,6 +13,24 @@ function preserveImageHints(originals, clonedRoot) {
   });
 }
 
+// Range.cloneContents() in a live ownerDocument can activate cloned images.
+// Preserve exact text/node offsets, but perform the clone in a detached document.
+function inertSelection(document, range) {
+  const clone = document.cloneNode(true);
+  function counterpart(node) {
+    const indices = [];
+    while (node !== document) {
+      indices.push(Array.prototype.indexOf.call(node.parentNode.childNodes, node));
+      node = node.parentNode;
+    }
+    return indices.reverse().reduce((parent, index) => parent.childNodes[index], clone);
+  }
+  const copiedRange = clone.createRange();
+  copiedRange.setStart(counterpart(range.startContainer), range.startOffset);
+  copiedRange.setEnd(counterpart(range.endContainer), range.endOffset);
+  return copiedRange.cloneContents();
+}
+
 /** Extract only. html/baseURI/image hints are UNTRUSTED, never render or persist
  * as a draft before the separate conversion/sanitization step (task 7.2). */
 export function extractPage(document, mode) {
@@ -42,7 +60,7 @@ export function extractPage(document, mode) {
       const range = selection.getRangeAt(0);
       if (range.collapsed || range.startContainer.ownerDocument !== document || range.endContainer.ownerDocument !== document ||
           !document.contains(range.startContainer) || !document.contains(range.endContainer)) throw new CaptureError('selection_empty');
-      const fragment = range.cloneContents();
+      const fragment = inertSelection(document, range);
       const images = [...document.querySelectorAll('img')].filter(image => range.intersectsNode(image));
       preserveImageHints(images, fragment);
       const container = document.implementation.createHTMLDocument('').createElement('div');

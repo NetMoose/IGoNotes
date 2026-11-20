@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { cpSync, readFileSync, copyFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { deliveryFixture } from '../tests/browser/delivery-fixture.js';
 import { openOwnership } from '../tests/browser/ownership.js';
 
@@ -16,7 +17,9 @@ const faultTimeoutMs = Number(process.env.CLIPPER_SMOKE_FAULT_TIMEOUT_MS ?? 1000
 if (!Number.isSafeInteger(faultTimeoutMs) || faultTimeoutMs <= 0) throw new Error('Invalid CLIPPER_SMOKE_FAULT_TIMEOUT_MS');
 const startedAt = performance.now();
 const cleanupStepMs = 2000;
-const dist = resolve(import.meta.dirname, '../dist');
+const dist = process.env.CLIPPER_SMOKE_EXTENSION_PATH
+  ? resolve(process.env.CLIPPER_SMOKE_EXTENSION_PATH)
+  : resolve(import.meta.dirname, '../dist');
 const imageMode = process.env.CLIPPER_SMOKE_IMAGES === '1';
 const restartMode = process.env.CLIPPER_SMOKE_RESTART === '1';
 const deliveryMode = process.env.CLIPPER_SMOKE_DELIVERY === '1' || restartMode;
@@ -32,7 +35,7 @@ let result;
 let failure;
 let browserLog = '';
 const stopped = new AbortController();
-const registry = openOwnership(process.env, process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode');
+const registry = openOwnership(process.env, process.env.CLIPPER_SMOKE_TMP ?? tmpdir());
 // A direct caller may pass the registry's global scope. Local cleanup must own
 // only this invocation, never its caller's command groups or sibling resources.
 const ownership = openOwnership({ ...registry.env, CLIPPER_RESOURCE_SCOPE: registry.newScope() });
@@ -174,7 +177,7 @@ async function launchBrowser() {
 async function run() {
   // Allocate synchronously so a deadline cannot race an unfinished mkdtemp and
   // create an unrecorded directory after cleanup has already inspected profile.
-  profile = ownership.temporary(process.env.CLIPPER_SMOKE_TMP ?? '/tmp/opencode', 'clipper-profile-');
+  profile = ownership.temporary(process.env.CLIPPER_SMOKE_TMP ?? tmpdir(), 'clipper-profile-');
   if (deliveryMode) delivery = await deliveryFixture(profile, owned, child => { backend = child; });
   if (imageMode) {
     // Test-only copy: exercise the unconnected image APIs in a real extension

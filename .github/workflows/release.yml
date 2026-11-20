@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -48,6 +48,30 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Prepare Go modules for offline browser fixtures
+        run: go mod download
+      - name: Install extension dependencies
+        run: npm --prefix extensions/webclipper ci
+      - name: Audit extension dependencies
+        run: npm --prefix extensions/webclipper audit --audit-level=high
+      - name: Verify extension and build standalone dist
+        run: npm --prefix extensions/webclipper run verify
+      - name: Install CI Chromium and system dependencies
+        run: node extensions/webclipper/node_modules/playwright-core/cli.js install --with-deps chromium
+      - name: Package and test the extracted extension
+        shell: bash
+        env:
+          # Disposable CI runner: headed acceptance with sandbox is recorded separately.
+          CLIPPER_SMOKE_NO_SANDBOX: '1'
+        run: |
+          set -euo pipefail
+          python3 extensions/webclipper/scripts/package.py "$RUNNER_TEMP/webclipper.zip"
+          mkdir "$RUNNER_TEMP/webclipper-unpacked"
+          python3 -m zipfile -e "$RUNNER_TEMP/webclipper.zip" "$RUNNER_TEMP/webclipper-unpacked"
+          export CLIPPER_SMOKE_EXTENSION_PATH="$RUNNER_TEMP/webclipper-unpacked"
+          export CHROMIUM_PATH="$(node -e "process.stdout.write(require('./extensions/webclipper/node_modules/playwright-core').chromium.executablePath())")"
+          npm --prefix extensions/webclipper run test:browser
 
       - name: Native Git version
         run: git --version
@@ -96,6 +120,8 @@ jobs:
           build_tar darwin amd64
           build_tar darwin arm64
 
+          python3 extensions/webclipper/scripts/package.py "release/igonotes-webclipper-${VERSION}.zip"
+
           cd release
           sha256sum ./*.tar.gz ./*.zip > checksums.txt
 
@@ -129,9 +155,19 @@ jobs:
           set -euo pipefail
           cd release
           archives=(./*.tar.gz ./*.zip)
-          [[ "${#archives[@]}" -eq 6 ]]
-          [[ "$(wc -l < checksums.txt)" -eq 6 ]]
-          # Verify the exact six expected archives, including their names.
+          [[ "${#archives[@]}" -eq 7 ]]
+          [[ "$(wc -l < checksums.txt)" -eq 7 ]]
+          # Verify the six binaries and the separately tested extension archive.
+          expected=(
+            "./igonotes-${GITHUB_REF_NAME}-darwin-amd64.tar.gz"
+            "./igonotes-${GITHUB_REF_NAME}-darwin-arm64.tar.gz"
+            "./igonotes-${GITHUB_REF_NAME}-linux-amd64.tar.gz"
+            "./igonotes-${GITHUB_REF_NAME}-linux-arm64.tar.gz"
+            "./igonotes-${GITHUB_REF_NAME}-windows-amd64.zip"
+            "./igonotes-${GITHUB_REF_NAME}-windows-arm64.zip"
+            "./igonotes-webclipper-${GITHUB_REF_NAME}.zip"
+          )
+          for archive in "${expected[@]}"; do [[ -f "$archive" ]]; done
           sha256sum "${archives[@]}" > expected-checksums.txt
           cmp checksums.txt expected-checksums.txt
           sha256sum --check checksums.txt

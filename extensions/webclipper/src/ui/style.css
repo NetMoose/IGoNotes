@@ -26,11 +26,13 @@ button[aria-current="true"] { border-color: #174db2; background: #eaf0fc; font-w
 button.primary { background: #174db2; color: white; }
 button.primary:hover:not(:disabled) { background: #103c8d; }
 button.danger { color: #9b1c1c; border-color: #9b1c1c; }
-.editor-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .7rem; margin-bottom: 1rem; }
+.editor-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .7rem; margin-block: 1rem; }
 .editor-actions [role="status"] { margin: 0 auto 0 0; font-weight: 650; }
 fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 label { display: block; font-weight: 650; margin: .8rem 0 .3rem; }
 input, textarea { box-sizing: border-box; width: 100%; border: 1px solid #9baabd; border-radius: .4rem; background: white; color: inherit; padding: .6rem; }
+input[type="checkbox"] { width: auto; padding: 0; margin: 0; flex: none; }
+.checkbox-label { display: flex; align-items: center; gap: .5rem; }
 textarea { resize: vertical; min-height: 16rem; font-family: ui-monospace, monospace; line-height: 1.5; tab-size: 2; }
 .metadata { font-size: .9rem; overflow-wrap: anywhere; }
 .metadata dt { font-weight: 650; }

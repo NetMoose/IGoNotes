@@ -3,7 +3,7 @@
 ## Reproduce automated checks
 
 From the repository root, install build/runtime prerequisites **before** testing:
-Node.js **24**, Go **1.26+** (including a cached toolchain/modules), Linux system
+Node.js **24**, Python **3**, Go **1.26+** (including a cached toolchain/modules), Linux system
 Chromium, and Xvfb when no `DISPLAY` is available. No browser is downloaded.
 
 ```sh
@@ -42,6 +42,7 @@ Controls (all optional):
 
 | Variable | Meaning |
 | --- | --- |
+| `CLIPPER_SMOKE_EXTENSION_PATH` | Optional extracted package directory; defaults to this checkout’s dist |
 | `CHROMIUM_PATH` | Browser executable (default `/usr/bin/chromium`) |
 | `CLIPPER_BROWSER_TMP` | Existing parent for suite temp files (fallback `CLIPPER_SMOKE_TMP`, then OS temp) |
 | `CLIPPER_BROWSER_REPORT` | JSON output filename; parent must exist |
@@ -180,17 +181,33 @@ staging/setup providers. Duplicate HTTP POST must return the well-formed pending
 202, then creator 201, GET succeeded and exact POST 200 with the same receipt,
 inode/content and single file. No production test hook is introduced.
 
-## Manual matrix — NOT RUN here; reserved for task 9.2
+## Task 9.2 headed follow-up
+
+For human desktop acceptance, use the detailed Russian
+[manual protocol](manual-acceptance.md) and copy the
+[per-browser report template](manual-report-template.md). It covers real chooser
+installation, conditional loopback prompts, native image consent, normal installed
+extension restart, open-editor preservation and Git-status observations. These
+documents are instructions/templates, not additional PASS evidence.
+
+See [acceptance.md](acceptance.md) for the executed official Chrome/Chromium 156
+product runs, native CDN deny/allow evidence, complete scenario-to-test mapping,
+Git-status contention regression and remaining chooser/loopback limits. The
+opt-in `native-acceptance.js` / `native-input.py` use isolated Xvfb and real XTest
+input without permission pregrants. Reproduction commands and evidence hashes
+are in that report; this driver is separate from `test:browser`.
+
+## Original task-9.1 manual matrix
 
 Automation uses the trusted `chrome://extensions` developerPrivate API to
 pregrant/remove exact optional image hosts in disposable profiles. Popup-in-tab
 capture is clicked without stealing source focus; localhost manifest access
 supplies the automation grant. This does **not** exercise real toolbar popup
 activation, activeTab consent, native loopback/local-network prompts or permission
-dialog grant/denial. These cases need a person in headed **official Chrome and
-Chromium** with fresh profiles. No official Chrome download/run or task-9.2 PASS
-is part of this change. The future `acceptance.md` should be created only from
-those actual runs, with OS/browser version and separate observed results.
+dialog grant/denial. Those require separate headed **official Chrome and
+Chromium** runs with fresh profiles. No official Chrome download/run or native
+permission PASS is part of the task-9.1 automated suite. The task-9.2 report above
+records those separately executed checks and their remaining evidence limits.
 
 Optional local manual fixtures:
 

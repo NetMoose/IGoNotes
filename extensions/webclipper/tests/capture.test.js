@@ -54,6 +54,16 @@ describe('extractPage', () => {
     expect(result.html).not.toMatch(/Outside selection|not selected|<form|<iframe/);
     expect(result.text).toContain('Первый rich paragraph');
   });
+  it('never clones selection resources in the live document', () => {
+    const doc = page('selection');
+    const { range } = select(doc, doc.querySelector('#chosen'));
+    // A live Range can start image requests even when its fragment is detached.
+    const liveClone = vi.spyOn(range, 'cloneContents').mockImplementation(() => { throw new Error('live resource activation'); });
+    const result = unchanged(doc, () => extractPage(doc, 'selection'));
+    expect(result.html).toContain('<img');
+    expect(result.text).toContain('Первый rich paragraph');
+    expect(liveClone).not.toHaveBeenCalled();
+  });
   it('accepts an image-only selection', () => {
     const doc = page('selection'); const range = doc.createRange(); range.selectNode(doc.querySelector('img')); doc.getSelection().addRange(range);
     expect(unchanged(doc, () => extractPage(doc, 'selection')).html).toContain('<img');

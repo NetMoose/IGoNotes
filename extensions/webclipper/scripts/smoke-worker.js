@@ -1,3 +1,4 @@
+import { extensionWorker } from '../tests/browser/extension-worker.js';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { marked } from '../tests/helpers/app-markdown.js';
@@ -29,7 +30,7 @@ try {
     await cdp.send('Log.enable');
     await cdp.send('Runtime.enable');
   };
-  const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker', { timeout: 15000 });
+  const worker = await extensionWorker(context);
   const id = new URL(worker.url()).host;
   assert.match(id, /^[a-p]{32}$/);
   assert.equal(await worker.evaluate(() => chrome.runtime.onInstalled.hasListeners()), true);
@@ -101,6 +102,9 @@ try {
 
   const page = await context.newPage();
   await inspect(page);
+  // Finish the source page’s normal foreground loads before observing capture.
+  // Chromium may defer images in a background tab until bringToFront().
+  await page.bringToFront();
   await page.goto(fixtureURL);
   await page.waitForLoadState('networkidle');
   await page.evaluate(() => {

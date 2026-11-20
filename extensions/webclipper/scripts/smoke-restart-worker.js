@@ -1,3 +1,4 @@
+import { extensionWorker } from '../tests/browser/extension-worker.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -28,7 +29,7 @@ async function connect() {
   context = browser.contexts()[0]; context.setDefaultTimeout(7000);
   await fenceNetwork(context, failures);
   context.on('page', page => page.on('pageerror', e => failures.push(e.message)));
-  const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker');
+  const worker = await extensionWorker(context);
   extensionId = new URL(worker.url()).host;
 }
 async function reopen(draftId) {

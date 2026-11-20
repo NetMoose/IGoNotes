@@ -1,3 +1,4 @@
+import { extensionWorker } from '../tests/browser/extension-worker.js';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 
@@ -8,7 +9,7 @@ const fault = process.env.CLIPPER_SMOKE_FAULT;
 assert.ok(['hang-evaluate', 'close-fail', 'close-hang'].includes(fault));
 const browser = await chromium.connectOverCDP(endpoint);
 const context = browser.contexts()[0];
-const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker', { timeout: 15000 });
+const worker = await extensionWorker(context);
 assert.match(new URL(worker.url()).host, /^[a-p]{32}$/);
 assert.equal(await worker.evaluate(() => chrome.runtime.onInstalled.hasListeners()), true);
 
