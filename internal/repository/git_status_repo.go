@@ -95,6 +95,17 @@ func encodeGitStatus(status model.GitStatus) (encodedGitStatus, error) {
 }
 
 func (r *GitStatusRepository) Get(ctx context.Context, repositoryPath string) (model.GitStatus, bool, error) {
+	var status model.GitStatus
+	var found bool
+	err := retryClipImportLocked(ctx, func() error {
+		var err error
+		status, found, err = r.get(ctx, repositoryPath)
+		return err
+	})
+	return status, found, err
+}
+
+func (r *GitStatusRepository) get(ctx context.Context, repositoryPath string) (model.GitStatus, bool, error) {
 	status, err := scanGitStatus(r.db.QueryRowContext(ctx, `
 		SELECT repository_path, base_name, state, operation_id, stage,
 			ahead, behind, consecutive_failures,
@@ -113,6 +124,16 @@ func (r *GitStatusRepository) Get(ctx context.Context, repositoryPath string) (m
 }
 
 func (r *GitStatusRepository) List(ctx context.Context) ([]model.GitStatus, error) {
+	var statuses []model.GitStatus
+	err := retryClipImportLocked(ctx, func() error {
+		var err error
+		statuses, err = r.list(ctx)
+		return err
+	})
+	return statuses, err
+}
+
+func (r *GitStatusRepository) list(ctx context.Context) ([]model.GitStatus, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT repository_path, base_name, state, operation_id, stage,
 			ahead, behind, consecutive_failures,

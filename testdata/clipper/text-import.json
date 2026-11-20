@@ -1,0 +1,12 @@
+{
+  "import_id": "550e8400-e29b-41d4-a716-446655440000",
+  "base": "target",
+  "destination_revision": "REPLACE_WITH_FOLDERS_DESTINATION_REVISION",
+  "parent": "",
+  "filename": "text-import.md",
+  "markdown": "---\ntitle: \"Локальный text import\"\nsource: \"https://example.test/article\"\ncaptured_at: \"2026-10-21T12:00:00Z\"\n---\n\n# Локальный text import\n\nПодготовленный UTF-8 Markdown без вложений.\n",
+  "source_url": "https://example.test/article",
+  "captured_at": "2026-10-21T12:00:00Z",
+  "assets": [],
+  "external_images": []
+}

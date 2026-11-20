@@ -447,7 +447,7 @@ func scanNotes(root *os.Root) ([]model.NoteNode, error) {
 		}
 
 		// Пропускаем скрытые папки (.git) и assets
-		if walkPath != "." && entry.IsDir() && (strings.HasPrefix(entry.Name(), ".") || strings.EqualFold(entry.Name(), "assets")) {
+		if walkPath != "." && entry.IsDir() && !noteDirectoryVisible(entry.Name()) {
 			return fs.SkipDir
 		}
 

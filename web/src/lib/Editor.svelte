@@ -7,12 +7,13 @@
   import { languages } from '@codemirror/language-data';
   import { syntaxTree } from '@codemirror/language';
   import { autocompletion, closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
-  import { marked } from 'marked';
+  import { Marked } from 'marked';
   import { markedHighlight } from 'marked-highlight';
   import hljs from 'highlight.js';
   import { uploadAsset } from './api.js';
+  import { resolveImagePath } from './imagePath.js';
 
-  marked.use(markedHighlight({
+  const marked = new Marked(markedHighlight({
     langPrefix: 'hljs language-',
     highlight(code, lang) {
       const language = hljs.getLanguage(lang) ? lang : 'plaintext';
@@ -352,7 +353,11 @@
     const match = md.match(frontmatterRegex);
     
     if (match) {
-      const frontmatterText = match[1].trim();
+      // HTML discards the first LF immediately after <pre>; compensate so the
+      // metadata text keeps its leading blank lines as well as its whitespace.
+      const frontmatterText = match[1].replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[char]).replace(/^\n/, '\n\n');
       markdownContent = md.replace(frontmatterRegex, "");
       
       frontmatterHtml = `
@@ -377,22 +382,24 @@
       return `![${parts[0].trim()}](/api/raw?path=${urlPath})`;
     });
 
-    let html = marked(processedMd);
+    let html = marked.parse(processedMd);
     
-    // Перехватываем стандартные относительные Markdown-картинки ![alt](image.png)
-    html = html.replace(/<img([^>]*)src="([^"]+)"([^>]*)>/g, (match, before, src, after) => {
-      if (!src.startsWith('http') && !src.startsWith('data:') && !src.startsWith('/api/raw')) {
-        return `<img${before}src="/api/raw?path=${encodeURIComponent(src)}"${after}>`;
-      }
-      return match;
-    });
-
     // Убираем атрибут disabled у чекбоксов, чтобы они стали кликабельными
     html = html.replace(/<input([^>]*)disabled([^>]*)>/g, '<input$1$2>');
     // Все ссылки в превью открываем в новой вкладке
     html = html.replace(/<a /g, '<a target="_blank" rel="noopener noreferrer" ');
     
-    return frontmatterHtml + html;
+    // Read decoded attributes and let the DOM escape them on serialization.
+    // This is image-path handling, not a sanitizer for arbitrary Markdown HTML.
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    for (const image of template.content.querySelectorAll('img[src]')) {
+      const src = resolveImagePath(image.getAttribute('src'), noteId);
+      if (src === null) image.removeAttribute('src');
+      else image.setAttribute('src', src);
+    }
+
+    return frontmatterHtml + template.innerHTML;
   }
 
   function handlePreviewClick(e) {

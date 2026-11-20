@@ -1,4 +1,4 @@
-.PHONY: all ui ui-deps ui-test go test test-git test-race vet verify clean
+.PHONY: clipper-deps clipper clipper-verify clipper-browser clipper-package all ui ui-deps ui-test go test test-git test-race vet verify clean
 
 APP_NAME := igonotes
 BUILD_DIR := builds
@@ -38,3 +38,19 @@ verify: ui-test ui
 
 clean:
 	rm -rf $(BUILD_DIR) web/dist
+
+# Standalone extension; it is never embedded in the Go binary. Python 3 packages ZIPs.
+clipper-deps:
+	npm --prefix extensions/webclipper ci
+
+clipper: clipper-deps
+	npm --prefix extensions/webclipper run build
+
+clipper-verify: clipper-deps
+	npm --prefix extensions/webclipper run verify
+
+clipper-browser: ui clipper-deps
+	npm --prefix extensions/webclipper run test:browser
+
+clipper-package: clipper
+	python3 extensions/webclipper/scripts/package.py

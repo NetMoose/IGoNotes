@@ -16,13 +16,23 @@ http://127.0.0.1:8080
 
 Все пути ниже абсолютны относительно этого URL и начинаются с `/api`. JSON-запросы передаются с `Content-Type: application/json`; загрузка файла использует `multipart/form-data`.
 
+Порт настраивается при запуске: `igonotes --port 9000` использует `http://127.0.0.1:9000`. В настройках расширения нужно указать фактический loopback URL и порт этой же установки; это не удалённый API.
+
 ### Локальный доступ и первичная настройка
 
-Все API-маршруты защищены `RequireLocalOrigin`: `Host` должен быть локальным (`localhost` или loopback IP). Если передан `Origin`, его схема, нормализованный хост и порт должны совпадать с запросом; `localhost` и `127.0.0.1` не взаимозаменяемы. `Sec-Fetch-Site: cross-site` отклоняется. Клиент без `Origin` допускается при локальном `Host`. Отказ — `403 forbidden_origin`; это не API для удалённого доступа или произвольного CORS.
+Обычные API и management Clipper защищены `RequireLocalOrigin`: `Host` должен быть локальным (`localhost` или loopback IP). Если передан `Origin`, его схема, нормализованный хост и порт должны совпадать с запросом; `localhost` и `127.0.0.1` не взаимозаменяемы. `Sec-Fetch-Site: cross-site` отклоняется. Клиент без `Origin` допускается при локальном `Host`. Отказ — `403 forbidden_origin`; это не API для удалённого доступа или произвольного CORS. Для `/api/clipper/v1/` действует отдельный Bearer/Origin guard, описанный ниже.
 
 Заметки и **все Git-маршруты**, включая probe и status, требуют завершённой первичной настройки (`428 setup_required`). `/api/info`, `/api/config`, `/api/setup`, `/api/bases`, `/api/bases/switch` и выбор каталога не обёрнуты в `RequireSetup`, но проверяют свои условия в сервисах. Неподдерживаемый метод возвращает `405 method_not_allowed` и заголовок `Allow`.
 
 `id`, `parent_id`, `path` заметки, пути файлов и назначения разрешения конфликтов относительны **корню выбранной базы**, а не проекту или каталогу конфигурации. Они не могут выходить из базы, быть абсолютными или обращаться к компонентам `.git`; символьная ссылка не позволяет обойти границу базы. Путь самой базы в настройках, `base_path` и `repository_path` — пути каталогов файловой системы. Значения query-параметров необходимо URL-кодировать.
+
+### Глобальная граница служебного хранения
+
+Уже применяется на startup, `POST /api/setup`, добавлении/изменении баз, `PUT /api/config` и переключении базы. Корень базы не может содержать каталог конфигурации, SQLite `metadata.db` и её sidecars (`-wal`, `-shm`, `-journal`, super-journal), либо отдельный `<appDataDir>/clipper-staging/`; база также не может совпадать с приватным каталогом или находиться внутри него. Каталоги конфигурации и staging зарезервированы целиком. `appDataDir` — `~/.igonotes`; штатный `<appDataDir>/bases/default` разрешён. Поле `base_dir` является контейнером: проверяются фактические `bases[].path`, включая неактивные.
+
+Проверка учитывает native separators, регистр Windows, канонические пути, идентичность доступных файлов и symlink aliases существующих предков ещё не созданных путей. Отказ — `422 {"code":"invalid_base_path","message":"base path overlaps private application storage","field":"path"}` без приватных абсолютных путей. При отказе конфигурация, runtime и пользовательские файлы сохраняются; setup/create отклоняется до создания каталога. Текущие origin/setup guards и их приоритет остаются прежними. Смена конфигурации не может включить постоянный staging в базу во время upload; сетевое чтение не требует глобального lifecycle lock.
+
+Несовместимая существующая конфигурация останавливает startup до открытия SQLite/индексации; `--base` не исключает проверки остальных баз. Автоматического переноса/удаления нет: остановите приложение, сделайте резервную копию, вручную отделите каталог заметок от служебных данных и исправьте все несовместимые `bases[].path` в `config.json`; при необходимости вынесите `--config` из базы и обновите параметры запуска. Подробности — в руководстве пользователя. Это не синхронизация с внешними процессами, подменяющими файловую систему. HTTP text import/status Web Clipper доступны; staging зарезервирован постоянно, даже когда временных запросов нет.
 
 ## Таблица маршрутов
 
@@ -56,8 +66,245 @@ http://127.0.0.1:8080
 | PUT | `/api/git/conflicts/resolve` | 200 | Разрешить один конфликт |
 | POST | `/api/git/conflicts/complete?base=<name>` | 202 | Завершить разрешённое слияние |
 | POST | `/api/git/conflicts/abort?base=<name>` | 202 | Отменить слияние и приостановить синхронизацию |
+| GET | `/api/clipper/connections` | 200 | Публичные метаданные подключений, включая отозванные |
+| POST | `/api/clipper/connections` | 201 | Создать подключение и один раз выдать секрет |
+| DELETE | `/api/clipper/connections?id=<id>` | 204, без тела | Отозвать подключение |
+| GET | `/api/clipper/v1/info` | 200 | Версия протокола и приложения, лимиты и MIME |
+| GET | `/api/clipper/v1/bases` | 200 | Имена настроенных баз |
+| GET | `/api/clipper/v1/folders?base=<name>` | 200 | Папки выбранной базы и ревизия назначения |
+| POST | `/api/clipper/v1/imports` | 201 / 200 / 202 | Новый import с изображениями или без / успешный replay / pending APIError |
+| GET | `/api/clipper/v1/imports?id=<uuid>` | 200 | Снимок состояния известной попытки |
+| GET | `/api/clipper/imports` | 200 | Локальный административный список незавершённых импортов |
+| POST | `/api/clipper/imports/abandon?id=<uuid>` | 200 | Прекратить recovery_required; снимок rejected, файлы сохраняются |
 
 `POST /api/sync` обновляет только индекс файловой системы; Git-синхронизация запускается через `POST /api/git/sync`.
+
+## Web Clipper v1 — discovery и HTTP import доступны
+
+Доступны управление подключениями, три discovery GET-маршрута и HTTP import/status `/api/clipper/v1/` с Bearer-доступом, включая публикацию проверенных изображений и автоматическое локальное восстановление импорта при запуске. Административные recovery list/abandon endpoints и UI доступны только локальному интерфейсу. Chromium-расширение доступно как локальная сборка Load unpacked: Article/Selection преобразуются в Markdown, транзакционно сохраняются локально и открываются в отдельном редакторе; доступны доверенные настройки подключения. Захват не вызывает HTTP API и не читает секрет. Метаданные хранятся отдельно от body; имя предлагается при первом захвате, скачивание собирает безопасный YAML frontmatter. Доступны явные Prepare/Retry изображений, отдельное подтверждение внешних ссылок и ручной Send с подтверждением назначения, persist-before-POST и GET/exact replay прежнего ID (8.5), восстановление interrupted preparing/sending после editor/worker/browser close и server restart (8.6). Установка описана в [руководстве пользователя](user.md#установка-расширения-из-исходников-и-первая-проверка). DTO и лимиты находятся в `internal/model/clipper.go`: импорт использует `ClipperManifest`, `ClipperImportResult`, `ClipperImportStatusResponse`.
+
+Клиентское восстановление доступно: это локальная read-only классификация и проверка cached bytes. Mount/reopen/worker wake/offline→online/сохранение настроек/доступность сервера не вызывают GET status, POST import или image fetch. **Check attempt** выполняет только GET; **Check / retry exact attempt** — GET, затем POST **только при unknown**, с прежними ID/manifest/digest/endpoint/destination_revision/Blob. Прерванные prepared/posting, pending/recovery_required и sticky request_changed остаются frozen; restored view не меняет lifecycle CAS другой вкладки. Повреждённые метаданные/receipt сохраняются fail-closed. Уже сохранённый совпадающий `succeeded` receipt позволяет ручную **локальную cleanup без HTTP и без connection**, даже при другом текущем endpoint; это не retarget. Во всех сетевых Check/retry другой endpoint блокирует **и GET, и POST** прежней попытки до восстановления исходного адреса; новый токен там допустим. Для новой публикации после restart process-local destination_revision требует Load/выбор/явный Confirm; исторический completed replay по ID/digest ищется до old-revision validation. Подтверждённые сохранённые данные переживают close, несохранённые правки/незаконченные потоки такой гарантии не имеют. Полный workflow — в [руководстве пользователя](user.md#установка-расширения-из-исходников-и-первая-проверка); оставшаяся расширенная приёмка и CI/distribution относятся к разделу 9.
+
+### Клиентские изображения и локальные квоты (не новые серверные полномочия)
+
+Capture сохраняет pending URL metadata, не байты. Только ручные **Prepare images** / **Retry images / grant access** запрашивают optional host permission для точной схемы/хоста; Chrome patterns охватывают все порты, отказ/platform-pattern failure видимы без расширения policy. Fetch использует `credentials: omit`, без Cookie/Authorization/Bearer, `redirect: error` (не следует даже CDN 302) и no-referrer; cookie-protected картинки могут быть недоступны. Credentials в URL, blob/canvas, unsafe schemes, localhost и private/loopback literal IP не обходятся. Literal screening не является DNS-rebinding защитой. Поддерживаемые data PNG/JPEG/GIF/WebP декодируются локально; APNG/animated WebP/SVG/PDF не становятся допустимыми assets от наличия data URL. Клиентский structural preflight не заменяет полную серверную валидацию.
+
+Сканер обрабатывает Markdown AST images, не raw HTML `<img>`: последние не получает/не переписывает и не гарантирует их автономность. Для прошедшего URL-политику HTTP(S)-источника отдельные **Keep external reference** + **Confirm external references** подтверждают точный URL и непустую причину; checkbox без Confirm не разблокирует readiness. Это fallback для unprepared/failed (включая неподдерживаемый формат по допустимому HTTP URL); UI также допускает намеренный external для уже ready HTTP image. Data/unsafe/noneligible источники нужно подготовить либо исправить/удалить, не авторизовать выдуманным URL. Выбор transient и сбрасывается при body/source/lifecycle change, retry и reopen/switch; title-only edit сохраняет его. После persist попытки acknowledgements уже входят в неизменный manifest. Внешние ссылки означают `not fully offline / uses external images`; сеть может понадобиться при рендеринге вне расширения. Сам редактор показывает plaintext URL/status/MIME/bytes, без remote thumbnails.
+
+**Stored locally** требует проверенных committed IDB Blob bytes. Исправный кэш используется без source fetch после закрытия страницы/отзыва permission; готовые частичные checkpoints переживают browser restart, остальное требует ручного Prepare. Локальные квоты — 50 drafts и 250 MiB физических Blob плюс metadata overhead; browser quota может быть меньше, автоматического eviction расширением нет. **Download Markdown** экспортирует полный текущий YAML+body, включая unsaved text, без images/archive/global draft export. Автоматического backup профиля нет; серверный согласованный backup описан отдельно ниже. Серверные лимиты `/info` относятся к полному `manifest.markdown`, включая YAML, и всему wire body; локальные квоты их не увеличивают.
+
+### Доступ и preflight — доступны
+
+`RequireClipper` требует локальный Host (`localhost` или loopback IP). Переданный `Origin` должен быть единственным и иметь точную форму `chrome-extension://` + 32 строчные буквы `a`–`p`, без порта, пути или завершающего `/`. Web Origin, `null`, пустой или несколько Origin отклоняются как `403 forbidden_origin`. Отсутствие Origin допускается, но не отменяет Bearer. `Sec-Fetch-Site: cross-site` само по себе не запрещает запрос расширения.
+
+Обычный запрос требует ровно один заголовок `Authorization: Bearer <secret>` с целым секретом подключения; токен не передаётся в query. Имя схемы Bearer нечувствительно к регистру, секрет не должен содержать пробелы или посторонние символы. Отсутствующий, некорректный, неизвестный или отозванный секрет даёт `401 clipper_unauthorized`. Проверка идёт в порядке Host/Origin → Bearer → метод → setup → handler. Поэтому действующий токен при незавершённой настройке даёт `428 setup_required`; неподдерживаемый метод после авторизации — `405 method_not_allowed`, `Allow: GET, OPTIONS` для discovery и `GET, POST, OPTIONS` для imports. По умолчанию endpoint — `http://127.0.0.1:8080`, порт меняется флагом `--port`.
+
+`OPTIONS` выполняет preflight **без Bearer и без проверки setup**: требуются допустимый extension Origin, ровно один `Access-Control-Request-Method: GET` (для imports также разрешён `POST`) и, если запрошены заголовки, только подмножество `Authorization`, `Content-Type` (имена нечувствительны к регистру). Успех — `204` без тела, с точным `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods` для запрошенного метода и согласованными `Access-Control-Allow-Headers`. Недопустимый origin/метод/набор заголовков — `403 forbidden_origin`. Wildcard и credentials не выдаются; ответы имеют `Vary: Origin`, preflight также варьируется по запрошенным методу и заголовкам.
+
+Bearer Clipper не открывает `/api/config`, `/api/save`, Git API или management: там действуют отдельные `RequireLocalOrigin`/setup guards. Успешные discovery-ответы имеют `Content-Type: application/json` и `Cache-Control: no-store`; текущие guards и preflight не гарантируют `no-store` на всех ответах.
+
+Неизвестные пути `/api/clipper/v1` и `/api/clipper/v1/...`, включая завершающий `/` и дочерние пути discovery/imports, проходят тот же guard: авторизованный GET после setup получает `404 {"code":"not_found","message":"Not found"}`, а не SPA. Неизвестные management-пути `/api/clipper/...` используют same-origin/setup guards и также возвращают JSON `404` после их прохождения. Import handler зарегистрирован ровно на `/api/clipper/v1/imports`.
+
+### Discovery: запросы и ответы — доступны
+
+| Метод / путь | Запрос | HTTP и тело ответа |
+|:---|:---|:---|
+| `GET /api/clipper/v1/info` | Без тела | `200`, info ниже |
+| `GET /api/clipper/v1/bases` | Без тела | `200 {"bases":["work","personal"]}`; только имена, без абсолютных путей/Git config |
+| `GET /api/clipper/v1/folders?base=work` | Имя базы в query | `200 {"base":"work","folders":["","research","research/articles"],"destination_revision":"opaque"}` |
+
+`info` возвращает `protocol_version` из модели отдельно от `app_name`/`app_version` запущенного Go-бинарника из `internal/appinfo` (не npm-версию). `dev` — значение сборки разработки. Для будущего клиента несовместимая версия должна прекращать отправку:
+
+```json
+{"protocol_version":1,"app_name":"IGoNotes","app_version":"dev","limits":{"markdown_bytes":5242880,"assets":100,"asset_bytes":10485760,"total_asset_bytes":52428800,"multipart_bytes":67108864,"image_pixels":40000000,"gif_frames":100,"gif_total_pixels":200000000},"supported_image_types":["image/png","image/jpeg","image/gif","image/webp"]}
+```
+
+Объявленные лимиты включительные: Markdown — 5 MiB точных декодированных UTF-8 байтов, максимум 100 assets, каждое изображение — 10 MiB, сумма изображений — 50 MiB, всё HTTP multipart-тело вместе с JSON escaping overhead, manifest, MIME-заголовками и разделителями — 64 MiB (`1 MiB = 1048576` байт). `image_pixels` — 40000000 пикселей на изображение, логический canvas GIF и каждый его кадр; `gif_frames` — 100 кадров; `gif_total_pixels` — 200000000 пикселей суммарно по кадрам одного GIF. Превышение любого бюджета — `413 clipper_too_large`. JSON-часть может превышать 5 MiB, если декодированный Markdown укладывается в лимит. Поддерживаются статические PNG/JPEG/WebP и GIF, включая анимацию; APNG, animated WebP и SVG/PDF дают `415 clipper_unsupported_image`. Корректные вложения публикуются вместе с Markdown через HTTP import. Старый лимит `/api/assets` не меняется.
+
+`bases` возвращает только имена в порядке конфигурации. Пустые списки сериализуются как `[]`, не `null`. Discovery не выдаёт абсолютные пути, Git-настройки/секреты, токен/digest подключения или содержимое заметок.
+
+`folders` требует ровно один явно заданный непустой `base`, без подстановки активной базы. Отсутствующий, пустой/пробельный, повторный `base` или некорректный query — `400 clipper_invalid_request`; максимум 1024 байта значения и 8192 байта raw query, превышение также даёт `400`. Имя ищется точно, без trimming; неизвестная база — `404 clipper_destination_not_found`. Невозможность безопасно открыть/обойти корень, включая исчезнувший корень, — `409 clipper_destination_changed`, без внутренних путей или частичного списка.
+
+Список папок отсортирован лексикографически, содержит только существующие относительные папки, видимые в дереве заметок, и обязательно корень `""`, с `/` как разделителем, без завершающего `/`. Символьные ссылки, все каталоги с именем, начинающимся с `.`, и каталоги `assets` без учёта регистра пропускаются вместе со всем поддеревом на любом уровне вложенности. Например, `.hidden`, `ASSETS`, `nested/.cache/deep` и `nested/assets/x` не предлагаются. Можно выбрать неактивную базу: discovery не читает Markdown, не переключает `current_base` и не меняет конфигурацию или индекс заметок.
+
+### Ревизия назначения и повторное подтверждение
+
+`destination_revision` — случайный непрозрачный handle привязки имени базы к каноническому пути и физической идентичности корня, не путь и не ревизия текста. Process-local `ClipperDestinationService` повторно выдаёт тот же handle при неизменной привязке. Успешные rename, смена пути/rebind и forget инвалидируют прежнюю привязку; возврат конфигурации к прежнему имени/пути (ABA) её не восстанавливает. Изменение физической идентичности корня делает прежний handle устаревшим. Переключение активной базы или изменение только Git-настроек не инвалидирует неизменную привязку.
+
+Новый registry, в том числе после **перезапуска IGoNotes**, не принимает старые handles. Для **нового импорта** клиент обязан заново получить bases/folders и revision и явно запросить подтверждение базы/папки у пользователя; нельзя молча заменить revision или перенаправить отправку. Проверка устаревшей revision при новой публикации возвращает `409 clipper_destination_changed`. Импорт не переключает активную базу и не создаёт родительские папки.
+
+Исключение durable replay: точный replay уже успешно завершённой попытки сначала ищет устойчивый receipt и возвращает исторический result **до текущей проверки назначения/revision и политики видимости parent**, в том числе после restart. Это не новый импорт: uncertain attempt сохраняет прежние ID и payload, а не получает свежую revision автоматически. Строгая проверка manifest/digest и авторизация остаются обязательными.
+
+### Импорт: запросы и ответы — доступны для текста
+
+| Метод / путь | Запрос | HTTP и тело ответа |
+|:---|:---|:---|
+| `POST /api/clipper/v1/imports` | Multipart, описанный ниже | `201` и result при новой публикации; `200` и тот же result при завершённом успешном replay |
+| `GET /api/clipper/v1/imports?id=550e8400-e29b-41d4-a716-446655440000` | UUID в query | `200` и снимок состояния ниже; состояние не кодируется HTTP-статусом этого GET |
+
+Сервер не загружает URL из manifest и не генерирует title/frontmatter: клиент передаёт уже подготовленный Markdown, включая нужные YAML-метаданные.
+
+### Multipart и manifest — Markdown и изображения
+
+POST принимает только `multipart/form-data; boundary=...`, без query и без дополнительных параметров outer Content-Type. Ровно одна часть `manifest`: `Content-Disposition: form-data; name="manifest"` и `Content-Type: application/json` (допускается только дополнительный `charset=utf-8`). Бинарные части разрешены в любом порядке, в том числе до manifest: имя части должно точно совпадать с объявленным asset ID, каждая объявленная часть обязательна ровно один раз. MIME бинарной части без параметров должен совпасть с descriptor и фактическим форматом байтов; size и SHA-256 проверяются сервером. Необязательный `filename` игнорируется и не определяет путь на диске. Другие part headers, включая Content-Transfer-Encoding, не допускаются. Голый JSON, отсутствующие/неописанные/повторные части, mismatch size/hash/MIME, повреждённые/обрезанные данные и некорректный envelope дают `400 clipper_invalid_request`. Допускаются как `assets: []`, так и проверенные вложения. Используйте стандартный multipart writer с CRLF: closing delimiter без SP/HTAB padding, затем CRLF либо сразу EOF; LF-only closing и любой epilogue, даже после корректного closing, запрещены. Похожая на delimiter строка внутри бинарных данных сама по себе не является closing.
+
+На точном imports endpoint **все** ответы, включая guards, ошибки и OPTIONS, имеют `Cache-Control: no-store`; JSON-ответы — `Content-Type: application/json`. Host/Origin/Bearer/setup проверяются до чтения тела и создания staging. После полного staging и строгого разбора секрет повторно авторизуется перед вызовом Import: отзыв во время upload даёт `401`, без публикации; operational auth error — безопасный `500`. Приватные временные файлы доступны только до возврата importer и затем удаляются на любом исходе. Отзыв после этой проверки не отменяет уже принятую операцию.
+
+Все десять полей manifest обязательны, `null` не допускается; пустые списки передаются как `[]`. DTO не выполняет эту валидацию автоматически. Пример без вложений:
+
+```json
+{"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","destination_revision":"opaque","parent":"","filename":"clip.md","markdown":"Hello\n","source_url":"https://example.test/","captured_at":"2026-10-21T12:00:00Z","assets":[],"external_images":[]}
+```
+
+Пример descriptors для клипа с изображением и явно подтверждённой внешней ссылкой (sha256 — SHA-256 байтов изображения, не Markdown):
+
+```json
+{"assets":[{"id":"a1","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","media_type":"image/png","size":123}],"external_images":[{"url":"https://example.test/unavailable.png","reason":"permission_denied"}]}
+```
+
+`import_id` — случайный UUID v4 в lowercase форме `8-4-4-4-12`; asset `id` — уникальная ASCII-строка по `[A-Za-z0-9_-]{1,64}`, кроме зарезервированного `manifest`. `sha256` — 64 lowercase hex символа без префикса; `size` — целое число байтов от 1 до лимита. MIME — ровно одно из четырёх значений info, без параметров. `captured_at` — корректная UTC RFC3339 строка с `Z` (допускаются 1–9 цифр дробной секунды); её исходное строковое представление сохраняется. `source_url` и внешние URL — абсолютные HTTP(S) URL; `reason` — непустая строка причины, не HTML. Пустые строки не заменяются отсутствием поля.
+
+`parent` — существующая относительная папка, видимая в дереве заметок, либо `""`; `filename` — один безопасный компонент с `.md`. Новый импорт с любым компонентом `parent`, начинающимся с `.`, либо равным `assets` без учёта регистра отклоняется как `400 clipper_invalid_request`, включая ручной запрос в активную или неактивную базу и вложенные пути вроде `nested/.cache/deep` и `nested/assets/x`. Эта политика применяется до journal claim и файловых записей. Она не меняет синтаксическую проверку/canonical digest и применяется после поиска receipt: точный replay ранее завершённой попытки возвращает исторический результат. Политика относится только к родительским папкам заметки, не к её filename и не к серверным attachment paths. Абсолютные пути, выход из корня, `.git`, separators/control characters и Windows reserved names/characters отклоняются. Markdown — непустой подготовленный текст; сервер сохраняет его без нормализации окончаний строк.
+
+Изображения публикуются как `assets/images/clip-<import_id>-<sha256>.<verified-ext>` (`png`, `jpg`, `gif`, `webp`); attachment paths не задаются multipart filename. Одинаковые SHA-256/verified-ext внутри одной попытки дают один физический файл, даже при нескольких asset IDs. Существующие файлы никогда не перезаписываются и не принимаются как свои, даже при совпадении байтов. Заметка публикуется последней. Markdown сохраняется точно: клиент заранее подготавливает ссылки, например `../../assets/images/clip-<import_id>-<sha256>.png` для `research/articles/note.md`; сервер не выполняет глобальную замену URL. Preview редактора разрешает явно начинающиеся с `./`/`../` image paths относительно папки текущей заметки, нормализует их и отклоняет выход выше корня до вызова существующего `/api/raw`. Bare paths (включая `assets/images/...`) и wiki-links сохраняют base-root трактовку; готовые `/api/raw` и HTTP(S)/data-image URLs не переписываются. Правила percent-кодирования и символов имени описаны в [руководстве пользователя](user.md#пути-изображений-в-preview). Контракты note/raw API и ревизии не меняются.
+
+До записи в базу importer копирует проверенные bytes из request directory в собственный случайный подкаталог зарезервированного private staging, синхронизирует bytes/каталоги и сохраняет immutable journal v2 с источниками восстановления. Handler всегда удаляет исходный request directory. После устойчивого success receipt или подтверждённого безопасного отказа собственные источники удаляются; при pending/неопределённой публикации сохраняются. Возможен частичный результат: только в исходной критической секции разрешена очистка своих неизменённых assets по native identity и hash. Неопределённый rename (включая EEXIST), изменение файла пользователем, ошибки index/receipt после публикации заметки требуют recovery, а не обещания all-or-nothing.
+
+HTTP handler использует публичный строгий `DecodeClipperManifest` из `internal/service/clip_import_manifest.go`. Decoder требует все поля также внутри asset/external-image объектов, отклоняет `null`, неизвестные и повторные ключи на любом уровне (в том числе escape-эквивалентные), неверные типы и trailing JSON. Вход ограничен 64 MiB, включая JSON escapes; превышение — `clipper_too_large`. Проверка descriptors не проверяет фактические байты изображений и не обращается к сети/файловой системе.
+
+Отдельный `service.StageClip` уже проверяет фактические bytes: потоковый hash/size и приватный spool, структурный preflight до выделения пикселей и полное декодирование (всех GIF-кадров). PNG проверяется до IEND с CRC всех chunks и точным zlib/IDAT-потоком, JPEG — до EOI, WebP — по полному RIFF framing, GIF — до trailer; данные после конца контейнера отклоняются. Исходные изображения не перекодируются, URL не загружаются. Вызов валидатора сам по себе не означает принятие или durable сохранение image import.
+
+Уточнения границ валидации v1: `base` — точное непустое имя без крайних пробелов, как сохранённое SettingsService, без trimming при импорте; `destination_revision` — непрозрачная непустая/непробельная строка. `parent` использует только `/`, без пустых компонентов, `.`/`..`, обратных слешей или завершающего `/`; пустая строка обозначает корень. Каждый компонент пути, включая filename, исключает `.git` без учёта регистра, управляющие Unicode-символы, Windows-символы `<>:"/\|?*`, завершающие точки/ASCII-пробелы и device names (включая имена с расширением, `CONIN$`/`CONOUT$`, `COM1`–`COM9`, `LPT1`–`LPT9` и варианты с `¹²³`). Filename имеет непустую основу и точный lowercase суффикс `.md`. Markdown должен содержать хотя бы один непробельный Unicode-символ; UTF-8 и лимит проверяются по точным байтам.
+
+Клиентский `formatNote({title, sourceUrl, capturedAt, markdown})` собирает точный префикс `---\ntitle: <quoted>\nsource: <quoted>\nclipped_at: <quoted>\n---\n\n` и неизменённый body; quoted — безопасные double-quoted YAML 1.2 строки, включая строковый timestamp UTC RFC3339 `Z`. Например, `title: "Лес 🌲"`, `source: "https://example.org/?q=1#part"`. Это содержимое поля `markdown`, без нового wire-поля title: `source_url` и `captured_at` также передаются исходными значениями. Сервер не разбирает/пересобирает frontmatter. Предложенный filename независим от title, ограничен клиентом 255 UTF-8 байтами и не гарантирует уникальность; конфликт остаётся `409 note_conflict`. Сборка immutable upload snapshot и preflight ручного filename относятся к задаче 8.
+
+URL ограничен 8192 UTF-8 байтами: обязательны HTTP(S), host, отсутствие credentials, обратного слеша, пробелов/управляющих символов и percent-encoded управляющих символов/невалидного UTF-8. Fragment разрешён; URL сохраняется точно, включая регистр и escapes. `external_images` содержит максимум 100 элементов (превышение — `clipper_too_large`); `reason` — валидный UTF-8, непустой/непробельный, максимум 1024 байта, без управляющих символов и `<`/`>` (не HTML). Небезопасный/слишком длинный URL или reason — `clipper_invalid_request`. Порядок внешних изображений сохраняется.
+
+### Canonical manifest / request digest v1 — реализован
+
+Digest вычисляется **после строгой валидации** как SHA-256 следующих канонических UTF-8 байтов и хранится как 64 lowercase hex символа без префикса. Он не является полем manifest. Каноническое значение — JSON-массив с фиксированными позициями (имена ниже обозначают значения полей):
+
+```text
+["igonotes-clipper",1,import_id,base,destination_revision,parent,filename,markdown,source_url,captured_at,
+ [[asset.id,asset.sha256,asset.media_type,asset.size],...],
+ [[external.url,external.reason],...]]
+```
+
+Правила, обязательные и для Go, и для JavaScript:
+
+1. В этом массиве представлены ВСЕ поля manifest, плюс фиксированные domain separator и версия. Объектов и порядка их свойств в канонических байтах нет; порядок свойств входного JSON не влияет на digest.
+2. Asset descriptors сортируются по возрастанию ASCII-байтов `id`, лексикографически (префикс раньше более длинной строки). Исходный порядок `assets` и порядок multipart parts не влияют на digest. `external_images` сохраняет порядок manifest; перестановка этих элементов меняет digest. Пустые массивы — `[]`, не `null`; отсутствующие поля и `null` не нормализуются, а отклоняются.
+3. Числа `1` и `size` записываются десятичными ASCII-цифрами без знака, ведущих нулей, дробной части или exponent. Между токенами нет пробелов/переводов строк, нет BOM и завершающего LF.
+4. Строки заключаются в ASCII `"`. Экранируются только `"` как `\"`, обратная косая черта как `\\`, U+0008/0009/000A/000C/000D как `\b`, `\t`, `\n`, `\f`, `\r`; остальные U+0000–001F как `\u00xx` с lowercase hex. `/`, `<`, `>`, `&`, U+007F и все остальные Unicode scalar values, включая U+2028/U+2029 и emoji, записываются непосредственно UTF-8. Запрещены невалидный UTF-8 и непарные UTF-16 surrogates; замена на U+FFFD не допускается.
+5. Unicode normalization, trimming, URL normalization, изменение регистра, переформатирование даты и перевод CRLF в LF НЕ выполняются. Сохраняются точные значения декодированных строк; `markdown` особенно сохраняется побайтно. Различные JSON escapes входного запроса, обозначающие одну строку, дают одинаковый digest.
+6. Digest не включает Bearer, endpoint, multipart boundaries/headers/filename, порядок частей и сами бинарные байты. Он включает их проверенные SHA-256/size/MIME descriptors; сервер самостоятельно проверяет байты. Новый токен не меняет digest. Обычные `encoding/json` и `JSON.stringify` без явного обеспечения этих правил не являются определением канонизации (в частности HTML и Unicode escaping).
+
+Тестовый вектор для полного manifest без вложений выше: канонические байты — следующая **одна строка**, где `\n` — два ASCII-символа escape, без LF после `]`:
+
+```json
+["igonotes-clipper",1,"550e8400-e29b-41d4-a716-446655440000","work","opaque","","clip.md","Hello\n","https://example.test/","2026-10-21T12:00:00Z",[],[]]
+```
+
+Ожидаемый SHA-256: `4e864bead648d1e1d07e3d4d4695ed9adc270eb13619e0827d858876036b34b0`.
+
+Общие Go/JS vectors: `testdata/clipper/manifest-digests.json`. Каждый элемент содержит `name`, полный `manifest`, строку `canonical` (после JSON-декодирования — точные канонические UTF-8 байты без завершающего LF) и bare hex `digest`. Векторы покрывают пример выше, сортировку assets, Unicode/HTML/control escaping, порядок внешних изображений и точные CRLF/URL/timestamp значения.
+
+### Result, состояния и replay — доступны
+
+Успех POST: `201 Created` для новой публикации, `200 OK` для точного завершённого replay; одинаковое тело result:
+
+```json
+{"import_id":"550e8400-e29b-41d4-a716-446655440000","base":"work","path":"clip.md","revision":"sha256:66a045b452102c59d840ec097d59d9467e13a3f34f6494e539ffd32c1bb35f18","warnings":[]}
+```
+
+`path` относителен исторической базе; `revision` — SHA-256 записанного текста с префиксом `sha256:`. `warnings` всегда массив строк, в том числе для подтверждённых внешних изображений. Успех означает устойчивый receipt после публикации и обновления индекса активной базы, но не Git push.
+
+GET известного import_id всегда `200`, с одним из следующих тел (сокращённый `id` ниже означает полный UUID):
+
+| Состояние | Тело GET (200) | Поведение точного POST replay |
+|:---|:---|:---|
+| `pending` | `{"import_id":"id","state":"pending"}` | `202 {"code":"clipper_import_pending","message":"Clipper import pending"}`; затем GET/точный replay |
+| `succeeded` | `{"import_id":"id","state":"succeeded","result":{...}}`, result выше | `200` исходный result без повторной записи |
+| `rejected` | `{"import_id":"id","state":"rejected","error":{"code":"note_conflict","message":"Note already exists"}}` | Исходный HTTP отказ и исходный APIError (например `409 note_conflict`) |
+| `recovery_required` | `{"import_id":"id","state":"recovery_required","error":{"code":"clipper_recovery_required","message":"Clipper import requires recovery"}}` | `409 clipper_recovery_required`; новый ID автоматически не создаётся |
+
+Pending не содержит `result`/`error`; succeeded содержит только `result`; rejected/recovery_required — только `error`. Тот же ID с другим digest всегда даёт `409 clipper_request_changed`, не заменяя прежний receipt. Завершённый replay ищется **до** проверки устаревшего destination handle: результат доступен после restart/rename базы/смены токена в той же установке, без проверки текущего файла и без восстановления впоследствии удалённых файлов. Result описывает историческое назначение. Неизвестный либо некорректный ID при GET — `400 clipper_invalid_request`; отсутствие receipt не доказывает, что конкурентный POST не завершится.
+
+Расширение проверяет receipt до локальной очистки: точные import_id/base/path (`parent/filename`), `sha256:<hex>` полного manifest.markdown и упорядоченный `warnings: string[]`, равный причинам external_images. Только совпадающий успех POST 200/201 либо GET succeeded разрешает сохранить terminal result и атомарно удалить собственные draft/assets/attempts; физические Blob до этого сохраняются. Несовпадение, malformed JSON, timeout/network/5xx сохраняют immutable attempt как uncertain. Auth/setup требуют переподключения на прежнем endpoint; токен можно заменить без изменения digest. Pending/recovery_required удерживают попытку. Git gate консервативно отображается как pending даже для journal rejected. Persisted `clipper_request_changed` — sticky identity conflict: поздние cross-window success/rejection/auth outcomes не снимают hold, не разрешают ещё POST или cleanup; требуется ручное исследование исходной попытки в IGoNotes, а не обход новым ID. Подтверждённые payload/destination/note_conflict rejections и валидный GET rejected позволяют исправить черновик с новым ID после повторного подтверждения назначения; abandoned дополнительно предупреждает о возможных файлах/дубликате. Ни один автоматический reconnect не отправляет POST.
+
+Timeout, сетевой обрыв и 5xx сами по себе означают неопределённый исход: сохранять immutable attempt, включая ID, весь payload и исходную destination_revision, и запрашивать GET/повторять точно тот же POST. Не удалять expected checks, не менять базу/папку/filename/Markdown/revision для обхода отказа и не создавать новый ID, пока исход не разрешён. `pending` и `recovery_required` не являются rejected; `400` на GET неизвестного/некорректного ID не доказывает отсутствие ещё выполняющегося POST. Только подтверждённый rejected (явный окончательный отказ POST либо снимок `state: rejected`, в том числе с `internal_error`) позволяет исправить запрос и создать новый ID после повторного подтверждения назначения. Один `500 internal_error` такого подтверждения не даёт.
+
+Private SQLite journal хранит точный Markdown, `prepared`/`publishing`, checkpoints и durable receipt; незавершённые состояния отображаются как `pending`/`recovery_required`, новые публикации в корень с unresolved import блокируются. При запуске `ClipImportService.RecoverLocal(ctx) error` вызывается после local Git recovery, до GitManager.Start, первичной фоновой индексации и HTTP. Ошибка БД или отмена recovery прерывает запуск с безопасной ошибкой без приватной диагностики; durable per-record `recovery_required` не останавливает сервер, доступен через Bearer GET status и локальный административный список и не блокирует обычную работу несвязанных баз.
+
+Recovery сопоставляет журнал с текущим настроенным физическим корнем, native identity, SHA/size всех note/assets/temp и собственных private sources. Перемещение/переименование того же корня с обновлением настройки допустимо; receipt сохраняет исторические base/path и revision `sha256:<hex>`. Чужие/изменённые файлы, неизвестные схемы, потерянные источники и недоказуемое владение дают durable `clipper_recovery_required` без перезаписи/удаления public files; Git conflict также запрещает изменения worktree. Ошибки БД и отмена возвращаются вызывающему коду, остальные записи могут обрабатываться независимо. Terminal receipts не перепроверяются и не восстанавливают удалённые позднее файлы.
+
+Одинаковые bytes/hash и pathname не заменяют native identity: скопированный корень, temp/final или private source может потребовать ручного восстановления даже после полного backup restore. Молчаливого присвоения файлов по одному hash нет. Journal и pending owned sources нельзя удалять для снятия root gate. Crash после terminal receipt до cleanup может оставить private orphan: startup пропускает terminal запись, не выполняет слепую рекурсивную очистку и не делает поздний public rollback. Эти гарантии lifecycle не сериализуют независимые злонамеренные изменения filesystem другими процессами.
+
+Backup/restore — ручная операция при полностью остановленном приложении, после завершения HTTP/Git workers и закрытия SQLite: согласованно сохраняют фактический config directory, SQLite с необходимыми sidecars, private staging и все базы с assets. Копия только live SQLite или частичный restore не являются атомарным снимком импорта. Schema migration v5 не имеет автоматического downgrade; старым бинарникам нужен pre-upgrade комплект. Пути, сохранение новой работы перед rollback и ограничения native identity описаны в [руководстве пользователя](user.md#резервная-копия-и-восстановление), ownership/CAS и порядок locks — в [руководстве разработчика](developer.md#http-import-web-clipper).
+
+#### Локальное управление незавершёнными импортами
+
+`GET /api/clipper/imports` и `POST /api/clipper/imports/abandon?id=<lowercase-UUID-v4>` используют `RequireLocalOrigin` и `RequireSetup`. Clipper Bearer не даёт административных полномочий: любой заголовок Authorization отклоняется с `403 forbidden_origin`, в том числе без Origin. Origin/Authorization guard выполняется до проверки метода и setup; неподдерживаемый метод — `405 method_not_allowed` с Allow, незавершённая настройка — `428 setup_required`. Точные маршруты имеют приоритет над fallback `/api/clipper/`; Bearer namespace `/api/clipper/v1/` сохраняет отдельные правила. Ответы имеют `Cache-Control: no-store`.
+
+GET принимает пустое тело и не принимает query-параметры. Ответ `200`: `{"imports":[]}` либо `{"imports":[{"import_id":"12345678-1234-4123-8123-123456789abc","base":"notes","path":"nested/note.md","state":"recovery_required","error":{"code":"clipper_recovery_required","message":"Clipper import requires recovery"}}]}`. Только незавершённые записи: `prepared`/`publishing` представлены как `pending` без error; `recovery_required` — с фиксированной безопасной ошибкой. Base/path исторические, путь относительный; абсолютные корни, staging references, identity/hash/digest, конфигурация и journal не возвращаются.
+
+POST принимает **пустое тело**, без JSON. Требуется ровно один `id`, raw query не более 8192 байт; лишние/повторные параметры, неверный UUID, непустое тело и неизвестный ID дают `400 clipper_invalid_request`. Только `recovery_required` можно прекратить. `pending`, `succeeded` и другие `rejected` дают `409 clipper_import_not_abandonable` (`Clipper import is not eligible for abandonment`). Повтор уже подтверждённого abandon идемпотентен. Успех `200`: `{"import_id":"12345678-1234-4123-8123-123456789abc","state":"rejected","error":{"code":"clipper_import_abandoned","message":"Clipper import abandoned; files may already exist"}}`.
+
+Abandon изменяет только terminal metadata, не удаляет и не меняет public/private файлы или journal. Файлы могут уже существовать. Старый ID с прежним payload всегда возвращает отказ, в том числе после restart; другой payload — прежний `409 clipper_request_changed`. Из `ListUnfinished` исключается только прекращённая запись: другие незавершённые операции того же корня продолжают блокировать публикацию. Git paused/conflict и выбранная активная база не меняются. Ошибка БД даёт безопасный `500 internal_error`; при потерянном ответе проверяйте список/status или явно повторите abandon, не считая файлы удалёнными.
+
+Новые private plans для text/image imports до файловых эффектов сохраняют ordered `warnings`, включая дубликаты и явный пустой массив. Receipt использует именно эту durable metadata. Отсутствующее поле или `null` в старом незавершённом плане означает неизвестные warnings, а не `[]`; local recovery оставляет такую попытку для ручного вмешательства. Завершённые исторические receipts воспроизводятся без изменений.
+
+### Ошибки Clipper
+
+Форма — существующий `APIError {code,message,field?}`. Пример: `409 {"code":"clipper_destination_changed","message":"Clipper destination changed"}`. Типизированные Clipper errors получают фиксированные безопасные сообщения; внутренние пути, токены и wrapped diagnostics не выдаются.
+
+Discovery и import используют коды ниже; origin/method/namespace ошибки описаны выше. `clipper_import_abandoned` — окончательный отказ после административного abandon. `clipper_unsupported_image` возможен при проверке descriptor, MIME и неподдерживаемой анимации.
+
+| HTTP | code | Значение / пример message |
+|:---|:---|:---|
+| 401 | `clipper_unauthorized` | `Clipper authorization failed` |
+| 400 | `clipper_invalid_request` | `Invalid Clipper request`; JSON/manifest/hash/part mismatch или неизвестный ID GET |
+| 413 | `clipper_too_large` | `Clipper request exceeds limits` |
+| 415 | `clipper_unsupported_image` | `Unsupported Clipper image` |
+| 404 | `clipper_destination_not_found` | `Clipper destination not found` |
+| 409 | `clipper_destination_changed` | `Clipper destination changed` |
+| 409 | `note_conflict` | `Note already exists`; существующий файл не перезаписывается |
+| 409 | `git_conflict_pending` | `git conflict pending`; существующее значение service gate |
+| 409 | `clipper_request_changed` | `Clipper request changed` |
+| 409 | `clipper_recovery_required` | `Clipper import requires recovery`; не окончательный отказ |
+| 409 | `clipper_import_abandoned` | `Clipper import abandoned; files may already exist` |
+| 409 | `clipper_import_not_abandonable` | `Clipper import is not eligible for abandonment` |
+| 202 | `clipper_import_pending` | `Clipper import pending`; ещё не успех и не отказ |
+| 428 | `setup_required` | `setup required`; существующий setup gate |
+| 500 | `internal_error` | `Internal server error`; неизвестная ошибка, не подтверждённый rejected |
+
+## Подключения в локальных настройках — доступны
+
+В интерфейсе: `Настройки` → `Веб-клиппер`, перед вкладкой `О программе`. Доступны список, создание по названию, одноразовый показ и скрытие секрета, отзыв, состояния загрузки и ошибки с повторной загрузкой списка. Секрет копируется вручную в **Connection token** в **Connection settings** установленного через Load unpacked расширения вместе с **Endpoint**. Доступны проверка подключения, локальный захват, ручная отправка и восстановление прерванных операций (8.6).
+
+Management использует существующие `RequireLocalOrigin` и `RequireSetup`: локальный Host, совпадение переданного Origin по схеме/хосту/порту, отказ для `Sec-Fetch-Site: cross-site`, завершённый setup. `localhost` и `127.0.0.1` не взаимозаменяемы для same-origin, в том числе на пользовательском порту. Без Origin запрос с локальным Host допустим. Bearer здесь не требуется и не обходит guards: Origin расширения получает `403 forbidden_origin` даже с действующим токеном; незавершённая настройка для поддерживаемого метода — `428 setup_required`.
+
+Зарегистрирован ровно путь `/api/clipper/connections`, без завершающего `/` и дочерних маршрутов. Неподдерживаемые методы после origin-проверки возвращают `405 method_not_allowed`, `Allow: DELETE, GET, POST`.
+
+| Метод / путь | Запрос | Ответ |
+|:---|:---|:---|
+| `POST /api/clipper/connections` | `{"label":"Laptop"}` | `201 {"connection":{"id":"connection-id","label":"Laptop","created_at":"2026-10-21T12:00:00Z","revoked_at":null},"secret":"<one-time-secret>"}`, `Cache-Control: no-store` |
+| `GET /api/clipper/connections` | Без тела | `200 {"connections":[{"id":"connection-id","label":"Laptop","created_at":"2026-10-21T12:00:00Z","revoked_at":null}]}` |
+| `DELETE /api/clipper/connections?id=connection-id` | Без тела | `204`, без тела |
+
+Имена полей и статусы соответствуют handler fixtures; `connection-id`, `<one-time-secret>` и время в таблице — иллюстративные значения. Реальный ID — 32 lowercase hex символа. Выданный непрозрачный секрет имеет форму `<IDhex32>.<random-base64url43>`: ID, точка и 32 случайных байта (256 бит) в base64url без padding. Клиент переносит всю строку целиком. SQLite хранит SHA-256 digest всей строки, не исходный секрет; в Config и URL токен не помещается. GET не выдаёт ни секрет, ни digest, пустой список — `{"connections":[]}`.
+
+POST принимает один JSON-объект с `label`, максимум **4 KiB (4096 байт)** тела. Неизвестные поля, trailing JSON/данные, `null`, неверные типы и превышение лимита отклоняются как `400 {"code":"clipper_invalid_request","message":"Invalid Clipper request"}` (не `413`). Название — непустая после trimming строка, до 128 Unicode-символов до trimming, без управляющих символов; крайние пробелы удаляются. `Cache-Control: no-store` устанавливается обработчиком создания и на его ошибках.
+
+DELETE требует ровно один непустой `id`; отсутствующий, пустой/пробельный, повторный или неизвестный ID и некорректный query возвращают тот же `400 clipper_invalid_request`. Неизвестные внутренние ошибки — `500 {"code":"internal_error","message":"Internal server error"}`, без внутренних диагностик.
+
+`created_at`/`revoked_at` — UTC RFC3339 timestamps, возможны дробные секунды; `revoked_at: null` означает активное подключение. Отозванная metadata остаётся в списке. Повторный DELETE существующего отозванного ID также возвращает `204`, сохраняя **первую** дату отзыва. После отзыва секрет получает `401 clipper_unauthorized` на discovery/import/status. POST повторно проверяет секрет после staging; отзыв после этой проверки не отменяет уже принятую публикацию.
+
+При потерянном ответе POST, timeout или 5xx подключение могло уже сохраниться. Обновите список, отзовите лишнюю/нераспознанную запись, затем **явно** создайте новое подключение, если нужно. Автоповтор POST создаёт ещё одно подключение, а не возвращает прежний секрет. Утерянный секрет не восстанавливается; новое подключение получает новый ID и секрет, даже с тем же label.
+
+Область `Authorization: Bearer <secret>` ограничена Clipper v1: info, имена баз/папок, text import и статус. `<secret>` — очевидный placeholder, не рабочий секрет; используйте целую строку, выданную при создании подключения.
+
+Он не предоставляет доступ к существующим API заметок, Config, Git или management, не меняет их origin/setup правила и не служит авторизацией удалённого сервера.
 
 ## Заметки, файлы и ревизии
 

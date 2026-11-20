@@ -9,6 +9,7 @@ vi.mock('./api.js', async (importOriginal) => {
 
 import { uploadAsset } from './api.js'
 import EditorHost from '../test/EditorHost.svelte'
+import Editor from './Editor.svelte'
 
 function deferred() {
   let resolve
@@ -200,5 +201,94 @@ describe('Editor image uploads', () => {
 
     await user.click(within(editor).getByRole('button', { name: 'Ссылка' }))
     expectEditorFocusClasses(editor)
+  })
+})
+
+describe('Editor preview image paths and frontmatter', () => {
+  async function preview(content, noteId = 'research/articles/note.md') {
+    const result = render(Editor, { noteId, content })
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Предварительный просмотр' }))
+    return result
+  }
+
+  it('resolves nested images, legacy uploads and wiki links without changing external URLs', async () => {
+    const { container } = await preview([
+      '![clip](../../assets/images/clip.png)',
+      '![same](./same.png)',
+      '![upload](assets/images/upload.png)',
+      '![[assets/images/wiki.png]]',
+      '![[./wiki.png]]',
+      '![web](https://example.com/a.png?x=1&y=2)',
+      '![data](data:image/png;base64,AAAA)',
+      '![raw](/api/raw?path=assets%2Fimages%2Fready.png)',
+      '![escape](../../../escape.png)',
+      '![scheme](javascript:evil)',
+    ].join('\n\n'))
+    const images = container.querySelector('article').querySelectorAll('img')
+    const sources = [...images].map((image) => image.getAttribute('src'))
+    expect(sources).toEqual([
+      '/api/raw?path=assets%2Fimages%2Fclip.png',
+      '/api/raw?path=research%2Farticles%2Fsame.png',
+      '/api/raw?path=assets%2Fimages%2Fupload.png',
+      '/api/raw?path=assets%2Fimages%2Fwiki.png',
+      '/api/raw?path=.%2Fwiki.png',
+      'https://example.com/a.png?x=1&y=2',
+      'data:image/png;base64,AAAA',
+      '/api/raw?path=assets%2Fimages%2Fready.png',
+      null, null,
+    ])
+  })
+
+  it('uses the current note path after switching notes while preview stays open', async () => {
+    const content = '![same](./same.png)'
+    const { container, rerender } = await preview(content)
+    expect(container.querySelector('article img')).toHaveAttribute('src', '/api/raw?path=research%2Farticles%2Fsame.png')
+    await rerender({ noteId: 'other/note.md', content })
+    expect(container.querySelector('article img')).toHaveAttribute('src', '/api/raw?path=other%2Fsame.png')
+  })
+
+  it('renders frontmatter as exact literal text, including HTML-like title and quotes', async () => {
+    const frontmatter = '  title: "<img src=x onerror=evil()> & <b>hello</b>"\nsource: \'<&>"\'\n  '
+    const { container } = await preview(`---\n${frontmatter}\n---\n# Body`)
+    const details = container.querySelector('article details')
+    expect(details.querySelector('pre').textContent).toBe(frontmatter)
+    expect(details.querySelector('img, b, [onerror]')).toBeNull()
+    expect(container.querySelector('article h1')).toHaveTextContent('Body')
+  })
+
+  it('round-trips encoded filenames and escaped HTML image attributes without injecting API parameters', async () => {
+    const { container } = await preview('<img src="./%E5%9B%BE%20a%2520.png?x=1&amp;path=outside#part" alt="&quot;&lt;alt&gt;" title="&quot; onerror=&quot;evil">')
+    const image = container.querySelector('article img')
+    const url = new URL(image.getAttribute('src'), 'http://localhost')
+    expect([...url.searchParams.keys()]).toEqual(['path'])
+    expect(url.searchParams.get('path')).toBe('research/articles/图 a%20.png?x=1&path=outside#part')
+    expect(image.getAttribute('alt')).toBe('"<alt>')
+    expect(image.getAttribute('title')).toBe('" onerror="evil')
+    expect(image.hasAttribute('onerror')).toBe(false)
+  })
+
+  it('preserves leading blank lines inside frontmatter text', async () => {
+    const frontmatter = '\n\ntitle: "<&>"\n'
+    const { container } = await preview(`---\n${frontmatter}\n---\nBody`)
+    expect(container.querySelector('article details pre').textContent).toBe(frontmatter)
+  })
+
+  it('keeps Markdown image title and alt text escaped while resolving its URL', async () => {
+    const { container } = await preview('![&quot;&lt;alt&gt;](./a%20b%2520.png "&quot; onerror=&quot;evil")')
+    const image = container.querySelector('article img')
+    expect(image).toHaveAttribute('src', '/api/raw?path=research%2Farticles%2Fa%20b%2520.png')
+    expect(image).toHaveAttribute('alt', '"<alt>')
+    expect(image).toHaveAttribute('title', '" onerror="evil')
+    expect(image.hasAttribute('onerror')).toBe(false)
+  })
+
+  it('retains highlighted code, interactive tasks and link attributes', async () => {
+    const { container } = await preview('```js\nconst answer = 42\n```\n\n- [ ] task\n\n[link](https://example.com)')
+    expect(container.querySelector('article code')).toHaveClass('hljs', 'language-js')
+    expect(container.querySelector('article code span')).toBeInTheDocument()
+    const checkbox = container.querySelector('article input[type="checkbox"]')
+    expect(checkbox).not.toBeDisabled()
+    expect(container.querySelector('article a')).toHaveAttribute('target', '_blank')
+    expect(container.querySelector('article a')).toHaveAttribute('rel', 'noopener noreferrer')
   })
 })

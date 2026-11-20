@@ -60,18 +60,22 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 		return fmt.Errorf("определить каталог конфигурации: %w", err)
 	}
 	configFile := filepath.Join(resolvedConfigDir, "config.json")
-	configService := service.NewConfigService(configFile)
 
 	appDataDir, err := resolveDataDir(os.UserHomeDir)
 	if err != nil {
 		return fmt.Errorf("определить каталог данных: %w", err)
 	}
+	dbPath := filepath.Join(appDataDir, "metadata.db")
+	privateStorage, err := service.NewPrivateStoragePolicy(resolvedConfigDir, dbPath, filepath.Join(appDataDir, "clipper-staging"))
+	if err != nil {
+		return fmt.Errorf("определить служебное хранение: %w", err)
+	}
+	configService := service.NewConfigService(configFile, privateStorage)
 	basePath, err := service.ResolveStartupBase(configService, options.base, appDataDir)
 	if err != nil {
 		return fmt.Errorf("выбрать базу заметок: %w", err)
 	}
 
-	dbPath := filepath.Join(appDataDir, "metadata.db")
 	db, err := repository.InitDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("инициализировать БД: %w", err)
@@ -113,12 +117,21 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 			returnErr = errors.Join(returnErr, gitLifecycleError("закрыть менеджер Git", err))
 		}
 	}()
+	clipperDestinationService := service.NewClipperDestinationService(settingsService)
+	clipImportRepo := repository.NewClipImportRepository(db)
+	clipImportService, err := service.NewClipImportService(settingsService, clipperDestinationService, noteService, clipImportRepo)
+	if err != nil {
+		return gitLifecycleError("инициализировать сервис импорта Clipper", err)
+	}
 	configuredSnapshots, err := configuredGitSnapshots(settingsService)
 	if err != nil {
 		return gitLifecycleError("получить настройки локальных репозиториев Git", err)
 	}
 	if err := gitManager.RecoverLocal(ctx, configuredSnapshots); err != nil {
 		return gitLifecycleError("восстановить локальные репозитории Git", err)
+	}
+	if err := clipImportService.RecoverLocal(ctx); err != nil {
+		return gitLifecycleError("восстановить импорт Clipper", err)
 	}
 	if err := gitManager.Start(); err != nil {
 		return gitLifecycleError("запустить менеджер Git", err)
@@ -137,6 +150,14 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	}()
 
 	noteHandler := handlers.NewNoteHandler(noteService)
+	clipperConnectionRepo := repository.NewClipperConnectionRepository(db)
+	clipperConnectionService := service.NewClipperConnectionService(clipperConnectionRepo)
+	clipperConnectionHandler := handlers.NewClipperConnectionHandler(clipperConnectionService)
+	clipperDiscoveryHandler := handlers.NewClipperDiscoveryHandler(clipperDestinationService)
+	clipImportHandler, err := handlers.NewClipImportHandler(clipImportService, settingsService)
+	if err != nil {
+		return gitLifecycleError("инициализировать обработчик импорта Clipper", err)
+	}
 	settingsHandler := handlers.NewSettingsHandler(settingsService)
 	directoryPicker := service.NewDirectoryPicker(service.ExecCommandRunner{}, runtime.GOOS)
 	systemHandler := handlers.NewSystemHandler(directoryPicker)
@@ -148,6 +169,10 @@ func runServer(ctx context.Context, args []string) (returnErr error) {
 	spaHandler := handlers.NewSPAHandler(distFS)
 
 	router := handlers.NewRouter(noteHandler, settingsHandler, settingsService, spaHandler)
+	handlers.RegisterClipperConnectionRoutes(router, clipperConnectionHandler, settingsService)
+	handlers.RegisterClipImportManagementRoutes(router, handlers.NewClipImportManagementHandler(clipImportService), settingsService)
+	handlers.RegisterClipperDiscoveryRoutes(router, clipperDiscoveryHandler, clipperConnectionService, settingsService)
+	handlers.RegisterClipImportRoutes(router, clipImportHandler, clipperConnectionService, settingsService)
 	handlers.RegisterGitRoutes(router, gitHandler, settingsService)
 	gitConflictHandler := handlers.NewGitConflictHandler(gitManager)
 	handlers.RegisterGitConflictRoutes(router, gitConflictHandler, settingsService)

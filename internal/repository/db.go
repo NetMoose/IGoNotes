@@ -117,6 +117,54 @@ var migrations = []migration{
 			CREATE INDEX git_operations_unfinished ON git_operations(state, updated_at) WHERE state IN ('queued', 'running');
 		`,
 	},
+	{
+		version: 5,
+		sql: `
+			CREATE TABLE clipper_connections (
+				id TEXT NOT NULL PRIMARY KEY CHECK (length(id) > 0),
+				label TEXT NOT NULL CHECK (length(label) > 0),
+				secret_digest TEXT NOT NULL UNIQUE
+					CHECK (length(secret_digest) = 64 AND secret_digest NOT GLOB '*[^0-9a-f]*'),
+				created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+				revoked_at TEXT CHECK (revoked_at IS NULL OR length(revoked_at) > 0)
+			);
+
+			-- Receipts are global by import_id, independent of connection lifetime
+			-- and subsequent base renames, root replacements or configuration changes.
+			CREATE TABLE clip_imports (
+				import_id TEXT NOT NULL PRIMARY KEY CHECK (length(import_id) > 0),
+				request_digest TEXT NOT NULL
+					CHECK (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+				base_name TEXT NOT NULL CHECK (length(base_name) > 0),
+				base_path TEXT NOT NULL CHECK (length(base_path) > 0),
+				root_identity TEXT NOT NULL CHECK (length(root_identity) > 0),
+				destination_revision TEXT NOT NULL CHECK (length(destination_revision) > 0),
+				note_path TEXT NOT NULL CHECK (length(note_path) > 0),
+				note_content_hash TEXT NOT NULL
+					CHECK (length(note_content_hash) = 64 AND note_content_hash NOT GLOB '*[^0-9a-f]*'),
+				-- The complete plan (note/assets paths, hashes, ownership and private
+				-- disk staging references) must be committed before filesystem writes.
+				-- No blob data belongs here. Journal shape is owned by the importer.
+				journal_json TEXT NOT NULL
+					CHECK (json_valid(journal_json) AND json_type(journal_json) = 'object'),
+				state TEXT NOT NULL
+					CHECK (state IN ('prepared', 'publishing', 'succeeded', 'rejected', 'recovery_required')),
+				result_json TEXT
+					CHECK (result_json IS NULL OR (json_valid(result_json) AND json_type(result_json) = 'object')),
+				-- Persist only safe public errors; private diagnostics stay out of receipts.
+				error_code TEXT NOT NULL DEFAULT '',
+				error_message TEXT NOT NULL DEFAULT '',
+				error_field TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+				updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+				CHECK (state != 'succeeded' OR result_json IS NOT NULL),
+				CHECK (state NOT IN ('rejected', 'recovery_required') OR (length(error_code) > 0 AND length(error_message) > 0))
+			);
+
+			CREATE INDEX clip_imports_unfinished ON clip_imports(state, updated_at)
+			WHERE state IN ('prepared', 'publishing', 'recovery_required');
+		`,
+	},
 }
 
 // InitDB инициализирует подключение к SQLite и создает таблицы

@@ -133,3 +133,45 @@ jobs:
                 go build -trimpath -o "$output" ./cmd/api
             done
           done
+
+  webclipper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            extensions/webclipper/package-lock.json
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build embedded frontend for the real Go fixture
+        run: npm --prefix web ci && npm --prefix web run build
+      - name: Prepare Go modules for offline browser fixtures
+        run: go mod download
+      - name: Install extension dependencies
+        run: npm --prefix extensions/webclipper ci
+      - name: Audit extension dependencies
+        run: npm --prefix extensions/webclipper audit --audit-level=high
+      - name: Verify extension and build standalone dist
+        run: npm --prefix extensions/webclipper run verify
+      - name: Install CI Chromium and system dependencies
+        run: node extensions/webclipper/node_modules/playwright-core/cli.js install --with-deps chromium
+      - name: Package and test the extracted extension
+        shell: bash
+        env:
+          # Disposable CI runner: headed acceptance with sandbox is recorded separately.
+          CLIPPER_SMOKE_NO_SANDBOX: '1'
+        run: |
+          set -euo pipefail
+          python3 extensions/webclipper/scripts/package.py "$RUNNER_TEMP/webclipper.zip"
+          mkdir "$RUNNER_TEMP/webclipper-unpacked"
+          python3 -m zipfile -e "$RUNNER_TEMP/webclipper.zip" "$RUNNER_TEMP/webclipper-unpacked"
+          export CLIPPER_SMOKE_EXTENSION_PATH="$RUNNER_TEMP/webclipper-unpacked"
+          export CHROMIUM_PATH="$(node -e "process.stdout.write(require('./extensions/webclipper/node_modules/playwright-core').chromium.executablePath())")"
+          npm --prefix extensions/webclipper run test:browser

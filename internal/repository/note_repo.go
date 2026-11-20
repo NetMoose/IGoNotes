@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"sync"
@@ -69,16 +70,22 @@ func (r *NoteRepository) ReplaceAll(nodes []model.NoteNode) error {
 }
 
 func (r *NoteRepository) BeginReplaceAll(nodes []model.NoteNode) (commit func() error, rollback func() error, operationErr error, rollbackErr error) {
-	tx, err := r.db.Begin()
+	return r.BeginReplaceAllContext(context.Background(), nodes)
+}
+
+// BeginReplaceAllContext keeps recovery cancellable while waiting for SQLite or
+// the connection pool. Cancellation before commit preserves the previous index.
+func (r *NoteRepository) BeginReplaceAllContext(ctx context.Context, nodes []model.NoteNode) (commit func() error, rollback func() error, operationErr error, rollbackErr error) {
+	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err, nil
 	}
 
-	if _, err := tx.Exec("DELETE FROM notes"); err != nil {
+	if _, err := tx.ExecContext(ctx, "DELETE FROM notes"); err != nil {
 		return rollbackReplacePreparation(tx, nil, err)
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO notes (id, title, path, parent_id, type) VALUES (?, ?, ?, ?, ?)")
+	stmt, err := tx.PrepareContext(ctx, "INSERT INTO notes (id, title, path, parent_id, type) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
 		return rollbackReplacePreparation(tx, nil, err)
 	}
@@ -88,7 +95,7 @@ func (r *NoteRepository) BeginReplaceAll(nodes []model.NoteNode) (commit func() 
 		if node.ParentID != "" {
 			parentID = node.ParentID
 		}
-		if _, err := stmt.Exec(node.ID, node.Name, node.Path, parentID, node.Type); err != nil {
+		if _, err := stmt.ExecContext(ctx, node.ID, node.Name, node.Path, parentID, node.Type); err != nil {
 			return rollbackReplacePreparation(tx, stmt, err)
 		}
 	}

@@ -1,0 +1,44 @@
+[
+  {
+    "name": "quotes-newlines-injection",
+    "input": { "title": "A \"quote\"\n---\nextra: yes", "sourceUrl": "https://example.test/a?q=%22yes%22&x=1#part:two", "capturedAt": "2026-10-23T12:00:00.123456789Z", "markdown": "---\r\nuser: body\r\n---\r\nNo final newline" },
+    "expectedFilename": "A _quote__---_extra_ yes.md",
+    "fullMarkdown": "---\ntitle: \"A \\\"quote\\\"\\n---\\nextra: yes\"\nsource: \"https://example.test/a?q=%22yes%22&x=1#part:two\"\nclipped_at: \"2026-10-23T12:00:00.123456789Z\"\n---\n\n---\r\nuser: body\r\n---\r\nNo final newline"
+  },
+  {
+    "name": "unicode-html-data",
+    "input": { "title": "<b>Кириллица 🌲</b> & 'текст'", "sourceUrl": "https://example.test/?q=кириллица&emoji=🌲#frag", "capturedAt": "2026-10-23T12:00:00Z", "markdown": "# Тело 🌍\n" },
+    "expectedFilename": "_b_Кириллица 🌲__b_ & 'текст'.md",
+    "fullMarkdown": "---\ntitle: \"<b>Кириллица 🌲</b> & 'текст'\"\nsource: \"https://example.test/?q=кириллица&emoji=🌲#frag\"\nclipped_at: \"2026-10-23T12:00:00Z\"\n---\n\n# Тело 🌍\n"
+  },
+  {
+    "name": "unicode-breaks-controls",
+    "input": { "title": "a\u0085b\u2028c\u2029d\u007f\u009fe\t\\", "sourceUrl": "http://example.test/?x=a:b#original", "capturedAt": "2026-10-23T12:00:00.000Z", "markdown": "Body\r\n" },
+    "expectedFilename": "a_b_c_d__e__.md",
+    "fullMarkdown": "---\ntitle: \"a\\u0085b\\u2028c\\u2029d\\u007f\\u009fe\\t\\\\\"\nsource: \"http://example.test/?x=a:b#original\"\nclipped_at: \"2026-10-23T12:00:00.000Z\"\n---\n\nBody\r\n"
+  },
+  {
+    "name": "windows-device",
+    "input": { "title": "COM¹.MD", "sourceUrl": "https://example.test/", "capturedAt": "2026-10-23T12:00:00Z", "markdown": "Body" },
+    "expectedFilename": "_COM¹.md",
+    "fullMarkdown": "---\ntitle: \"COM¹.MD\"\nsource: \"https://example.test/\"\nclipped_at: \"2026-10-23T12:00:00Z\"\n---\n\nBody"
+  },
+  {
+    "name": "utf8-filename-boundary",
+    "input": { "title": "🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲", "sourceUrl": "https://example.test/", "capturedAt": "2026-10-23T12:00:00Z", "markdown": "Body" },
+    "expectedFilename": "🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲.md",
+    "fullMarkdown": "---\ntitle: \"🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲🌲\"\nsource: \"https://example.test/\"\nclipped_at: \"2026-10-23T12:00:00Z\"\n---\n\nBody"
+  },
+  {
+    "name": "truncated-windows-device",
+    "input": { "title": "CON                                                                                                                                                                                                                                                                    x", "sourceUrl": "https://example.test/", "capturedAt": "2026-10-23T12:00:00Z", "markdown": "Body\r\n" },
+    "expectedFilename": "_CON.md",
+    "fullMarkdown": "---\ntitle: \"CON                                                                                                                                                                                                                                                                    x\"\nsource: \"https://example.test/\"\nclipped_at: \"2026-10-23T12:00:00Z\"\n---\n\nBody\r\n"
+  },
+  {
+    "name": "empty-title",
+    "input": { "title": "", "sourceUrl": "https://example.test/?a=1&b=2#x", "capturedAt": "2026-10-23T12:00:00Z", "markdown": "Body\n\n" },
+    "expectedFilename": "clip.md",
+    "fullMarkdown": "---\ntitle: \"\"\nsource: \"https://example.test/?a=1&b=2#x\"\nclipped_at: \"2026-10-23T12:00:00Z\"\n---\n\nBody\n\n"
+  }
+]

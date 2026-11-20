@@ -263,6 +263,51 @@ export function getConfig() {
   return request('/api/config', { method: 'GET' })
 }
 
+function validClipperConnection(value) {
+  return isObject(value)
+    && typeof value.id === 'string' && value.id.length > 0
+    && typeof value.label === 'string'
+    && typeof value.created_at === 'string'
+    && (value.revoked_at === null || typeof value.revoked_at === 'string')
+}
+
+export async function getClipperConnections() {
+  return requestChecked(await requestWithStatus('/api/clipper/connections', { method: 'GET' }),
+    (value) => isObject(value) && Array.isArray(value.connections) && value.connections.every(validClipperConnection))
+}
+
+export async function createClipperConnection(label) {
+  return requestChecked(await requestWithStatus('/api/clipper/connections', {
+    method: 'POST',
+    body: jsonBody({ label }),
+  }), (value) => isObject(value) && validClipperConnection(value.connection)
+    && typeof value.secret === 'string' && value.secret.length > 0)
+}
+
+export async function revokeClipperConnection(id) {
+  const { status } = await requestWithStatus(`/api/clipper/connections?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+  if (status !== 204) throw invalidResponse(status)
+}
+
+function validClipperPublicError(value) {
+  return isObject(value) && typeof value.code === 'string' && typeof value.message === 'string'
+}
+
+export async function getClipperImports() {
+  return requestChecked(await requestWithStatus('/api/clipper/imports', { method: 'GET' }),
+    (value) => isObject(value) && Array.isArray(value.imports) && value.imports.every((item) =>
+      isObject(item) && typeof item.import_id === 'string' && item.import_id.length > 0
+      && typeof item.base === 'string' && typeof item.path === 'string'
+      && ['pending', 'recovery_required'].includes(item.state)
+      && (item.error === undefined || validClipperPublicError(item.error))))
+}
+
+export async function abandonClipperImport(id) {
+  return requestChecked(await requestWithStatus(`/api/clipper/imports/abandon?id=${encodeURIComponent(id)}`, { method: 'POST' }),
+    (value) => isObject(value) && value.import_id === id && value.state === 'rejected'
+      && validClipperPublicError(value.error) && value.error.code === 'clipper_import_abandoned')
+}
+
 export function probeGit({ base, git_url, git_branch = '' }) {
   return requestGit('/api/git/probe', {
     method: 'POST',

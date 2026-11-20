@@ -26,6 +26,7 @@ go.work.sum
 .env
 
 opencode.json
+.opencode
 igonotes
 .vscode
 __debug*
@@ -33,3 +34,8 @@ main
 
 # Build directory
 builds/
+extensions/webclipper/tests/browser/results.json
+extensions/webclipper/tests/browser/outer-results.json
+extensions/webclipper/tests/browser/profile-results.json
+
+.agents/

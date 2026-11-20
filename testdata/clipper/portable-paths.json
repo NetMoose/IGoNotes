@@ -1,0 +1,11 @@
+[
+  {"name":"dotless-i-device-filename","filename":"CONıN$.md","parent":"","manifestValid":false,"visibleParent":true,"proposal":{"title":"CONıN$","filename":"_CONıN$.md"}},
+  {"name":"dotless-i-device-parent","filename":"note.md","parent":"research/CONıN$","manifestValid":false,"visibleParent":true},
+  {"name":"ascii-space-device-stem","filename":"conın$ .md","parent":"","manifestValid":false,"visibleParent":true,"proposal":{"title":"conın$ .ext","filename":"_conın$ .ext.md"}},
+  {"name":"nonascii-space-is-not-device-trimming","filename":"CONIN$ .md","parent":"","manifestValid":true,"visibleParent":true,"proposal":{"title":"CONıN$ .ext","filename":"CONıN$ .ext.md"}},
+  {"name":"long-s-assets-parent","filename":"note.md","parent":"research/aſsets","manifestValid":true,"visibleParent":false},
+  {"name":"sharp-s-is-not-assets","filename":"note.md","parent":"research/aßets","manifestValid":true,"visibleParent":true},
+  {"name":"mixedcase-assets-parent","filename":"note.md","parent":"research/AsSeTs","manifestValid":true,"visibleParent":false},
+  {"name":"hidden-parent","filename":"note.md","parent":"research/.cache","manifestValid":true,"visibleParent":false},
+  {"name":"sharp-s-is-not-device-expansion","filename":"CONıNß.md","parent":"","manifestValid":true,"visibleParent":true,"proposal":{"title":"CONıNß","filename":"CONıNß.md"}}
+]

@@ -10,10 +10,13 @@ vi.mock('../api.js', async (importOriginal) => {
     getInfo: vi.fn(),
     updateBase: vi.fn(),
     forgetBase: vi.fn(),
+    getClipperConnections: vi.fn(),
+    getClipperImports: vi.fn().mockResolvedValue({ imports: [] }),
+    createClipperConnection: vi.fn(),
   }
 })
 
-import { ApiError, createBase, forgetBase, getInfo, updateBase } from '../api.js'
+import { ApiError, createBase, forgetBase, getInfo, updateBase, getClipperConnections, createClipperConnection } from '../api.js'
 import BaseCard from './BaseCard.svelte'
 import SettingsWorkspace from './SettingsWorkspace.svelte'
 
@@ -99,6 +102,8 @@ describe('SettingsWorkspace', () => {
     vi.mocked(updateBase).mockReset()
     vi.mocked(forgetBase).mockReset()
     vi.mocked(getInfo).mockReset().mockResolvedValue({ app_name: 'IGoNotes', app_version: 'v0.0.1-alpha.99' })
+    vi.mocked(getClipperConnections).mockReset().mockResolvedValue({ connections: [] })
+    vi.mocked(createClipperConnection).mockReset()
   })
 
   it('renders the bases tab, paths, current state, and only an eligible Forget action', () => {
@@ -154,6 +159,10 @@ describe('SettingsWorkspace', () => {
       const basesTab = screen.getByRole('tab', { name: 'Базы заметок' })
       const gitTab = screen.getByRole('tab', { name: 'Git-синхронизация' })
       const aboutTab = screen.getByRole('tab', { name: 'О программе' })
+      const clipperTab = screen.getByRole('tab', { name: 'Веб-клиппер' })
+      expect(screen.getAllByRole('tab').map((tab) => tab.textContent.trim())).toEqual([
+        'Базы заметок', 'Git-синхронизация', 'Веб-клиппер', 'О программе',
+      ])
       expect(tablist).toHaveAttribute('aria-orientation', 'horizontal')
 
       basesTab.focus()
@@ -162,6 +171,12 @@ describe('SettingsWorkspace', () => {
       expect(gitTab).toHaveAttribute('aria-selected', 'true')
       expect(screen.getByRole('tabpanel', { name: 'Git-синхронизация' })).not.toHaveAttribute('hidden')
 
+      await user.keyboard('{ArrowRight}')
+      expect(clipperTab).toHaveFocus()
+      expect(clipperTab).toHaveAttribute('aria-selected', 'true')
+      const clipperPanel = screen.getByRole('tabpanel', { name: 'Веб-клиппер' })
+      expect(clipperTab).toHaveAttribute('aria-controls', clipperPanel.id)
+      expect(clipperPanel).toHaveAttribute('aria-labelledby', clipperTab.id)
       await user.keyboard('{ArrowRight}')
       expect(aboutTab).toHaveFocus()
       const aboutPanel = screen.getByRole('tabpanel', { name: 'О программе' })
@@ -176,6 +191,8 @@ describe('SettingsWorkspace', () => {
       await user.keyboard('{ArrowUp}')
       expect(aboutTab).toHaveFocus()
       await user.keyboard('{ArrowUp}')
+      expect(clipperTab).toHaveFocus()
+      await user.keyboard('{ArrowUp}')
       expect(gitTab).toHaveFocus()
       await user.keyboard('{ArrowUp}')
       expect(basesTab).toHaveFocus()
@@ -187,6 +204,42 @@ describe('SettingsWorkspace', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+
+  it('destroys the one-time secret on tab navigation without changing config', async () => {
+    const user = userEvent.setup()
+    const secret = 'workspace-only-secret'
+    vi.mocked(createClipperConnection).mockResolvedValue({
+      connection: { id: 'new', label: 'Browser', created_at: '2026-10-21', revoked_at: null }, secret,
+    })
+    const { props } = renderWorkspace()
+    expect(getClipperConnections).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('tab', { name: 'Веб-клиппер' }))
+    await user.type(screen.getByLabelText('Название подключения'), 'Browser')
+    await user.click(screen.getByRole('button', { name: 'Создать подключение' }))
+    expect(await screen.findByText(secret)).toBeVisible()
+    await user.click(screen.getByRole('tab', { name: 'О программе' }))
+    expect(document.body.textContent).not.toContain(secret)
+    await user.click(screen.getByRole('tab', { name: 'Веб-клиппер' }))
+    expect(document.body.textContent).not.toContain(secret)
+    expect(props.onConfigChange).not.toHaveBeenCalled()
+    expect(JSON.stringify(config)).not.toContain(secret)
+  })
+
+  it('ignores a late secret after leaving the clipper tab and reentering', async () => {
+    const user = userEvent.setup()
+    const request = deferred()
+    vi.mocked(createClipperConnection).mockReturnValue(request.promise)
+    renderWorkspace()
+    await user.click(screen.getByRole('tab', { name: 'Веб-клиппер' }))
+    await user.type(screen.getByLabelText('Название подключения'), 'Browser')
+    await user.click(screen.getByRole('button', { name: 'Создать подключение' }))
+    await user.click(screen.getByRole('tab', { name: 'Базы заметок' }))
+    await user.click(screen.getByRole('tab', { name: 'Веб-клиппер' }))
+    request.resolve({ connection: { id: 'late', label: 'Browser', created_at: '2026-10-21', revoked_at: null }, secret: 'late-secret' })
+    await request.promise
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Создать подключение' })).toBeEnabled())
+    expect(document.body.textContent).not.toContain('late-secret')
   })
 
   it('forwards Git data and sync callback through the enabled Git panel', async () => {

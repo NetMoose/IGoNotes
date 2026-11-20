@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Local permission fixture</title></head>
+<body><article><h1>Local permission fixture</h1>
+<p>Select this paragraph and the image below to test Selection. Article capture
+must preserve the page and create a durable local draft without contacting Go.</p>
+<p>{{ARTICLE}}</p>
+<img alt="local public-named image" src="http://images.example.test:{{PORT}}/pixel.gif">
+<img alt="direct CDN permission" src="http://cdn.example.test:{{PORT}}/pixel.gif">
+<img alt="missing external fallback" data-src="http://cdn.example.test:{{PORT}}/missing.gif">
+<img alt="redirect must fail" data-src="http://images.example.test:{{PORT}}/redirect">
+</article></body></html>
