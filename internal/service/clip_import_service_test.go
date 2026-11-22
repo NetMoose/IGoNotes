@@ -682,53 +682,53 @@ func TestClipImportExcludedNoteParentsRejectedBeforeClaim(t *testing.T) {
 }
 
 func TestClipImportVisibleNestedParentsAppearInTree(t *testing.T) {
-	f := newClipImportFixture(t)
-	for _, dir := range []string{"nested/normal", ".hidden/deep", "assets/images", "nested/.cache/deep", "nested/ASSETS/x"} {
-		if err := os.MkdirAll(filepath.Join(f.active, filepath.FromSlash(dir)), 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	listing, err := f.dest.Folders("active")
-	if err != nil || !reflect.DeepEqual(listing.Folders, []string{"", "nested", "nested/normal"}) {
-		t.Fatalf("discovery = %+v, %v", listing, err)
-	}
-	for i, filename := range []string{".hidden.md", "assets.md", "ASSETS.md"} {
-		m := f.manifest(t, "active")
-		m.ImportID = []string{"550e8400-e29b-41d4-a716-446655440001", "550e8400-e29b-41d4-a716-446655440002", "550e8400-e29b-41d4-a716-446655440003"}[i]
-		m.Parent, m.Filename = "nested/normal", filename
-		status, _, err := f.service.Import(context.Background(), m)
-		if err != nil || status.Result == nil || status.Result.Path != "nested/normal/"+filename {
-			t.Fatalf("visible nested import = %+v, %v", status, err)
-		}
-	}
-	tree, err := f.notes.GetTree()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var ids []string
-	var walk func([]model.NoteNode)
-	walk = func(nodes []model.NoteNode) {
-		for _, node := range nodes {
-			ids = append(ids, node.ID)
-			walk(node.Children)
-		}
-	}
-	walk(tree)
+	// Test each spelling independently on case-insensitive filesystems too.
 	for _, filename := range []string{".hidden.md", "assets.md", "ASSETS.md"} {
-		found := false
-		for _, id := range ids {
-			if id == "nested/normal/"+filename {
-				found = true
+		t.Run(filename, func(t *testing.T) {
+			f := newClipImportFixture(t)
+			for _, dir := range []string{"nested/normal", ".hidden/deep", "assets/images", "nested/.cache/deep", "nested/ASSETS/x"} {
+				if err := os.MkdirAll(filepath.Join(f.active, filepath.FromSlash(dir)), 0700); err != nil {
+					t.Fatal(err)
+				}
 			}
-		}
-		if !found {
-			t.Fatalf("note missing from GetTree: %v", ids)
-		}
-	}
-	for _, id := range ids {
-		if strings.Contains(id, ".cache") || strings.HasPrefix(id, ".hidden/") || id == ".hidden" || id == "assets" || strings.HasPrefix(id, "nested/ASSETS") {
-			t.Fatalf("index visibility expanded: %v", ids)
-		}
+			listing, err := f.dest.Folders("active")
+			if err != nil || !reflect.DeepEqual(listing.Folders, []string{"", "nested", "nested/normal"}) {
+				t.Fatalf("discovery = %+v, %v", listing, err)
+			}
+			m := f.manifest(t, "active")
+			m.Parent, m.Filename = "nested/normal", filename
+			status, _, err := f.service.Import(context.Background(), m)
+			if err != nil || status.Result == nil || status.Result.Path != "nested/normal/"+filename {
+				t.Fatalf("visible nested import = %+v, %v", status, err)
+			}
+			tree, err := f.notes.GetTree()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			var walk func([]model.NoteNode)
+			walk = func(nodes []model.NoteNode) {
+				for _, node := range nodes {
+					ids = append(ids, node.ID)
+					walk(node.Children)
+				}
+			}
+			walk(tree)
+			found := false
+			for _, id := range ids {
+				if id == "nested/normal/"+filename {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("note missing from GetTree: %v", ids)
+			}
+			for _, id := range ids {
+				if strings.Contains(id, ".cache") || strings.HasPrefix(id, ".hidden/") || id == ".hidden" || id == "assets" || strings.HasPrefix(id, "nested/ASSETS") {
+					t.Fatalf("index visibility expanded: %v", ids)
+				}
+			}
+		})
 	}
 }
 

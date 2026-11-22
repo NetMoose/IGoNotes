@@ -185,6 +185,10 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+	// Serialize this application's readers and writers through the SQL pool.
+	// Otherwise concurrent index/journal/status operations can fail SQLITE_BUSY
+	// against each other. Independent DB handles still arbitrate through SQLite.
+	db.SetMaxOpenConns(1)
 
 	fail := func(err error) (*sql.DB, error) {
 		return nil, errors.Join(err, db.Close())
