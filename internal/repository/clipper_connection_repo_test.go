@@ -231,6 +231,8 @@ func TestClipperConnectionRepositoryContentionWaitAndCancellation(t *testing.T) 
 				if err := repo.Create(t.Context(), connection, digest); err != nil {
 					t.Fatal(err)
 				}
+				// Exercise SQLite lock retries, separately from the production pool wait.
+				db.SetMaxOpenConns(2)
 				locker, err := db.Conn(t.Context())
 				if err != nil {
 					t.Fatal(err)

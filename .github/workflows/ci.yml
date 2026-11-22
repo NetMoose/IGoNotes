@@ -68,6 +68,11 @@ jobs:
           cache: true
       - name: Native Git version
         run: git --version
+      - name: Repeat clipper recovery and portable filename regressions
+        if: matrix.suite != 'git'
+        run: >-
+          go test ./cmd/api ./internal/service -count=10 -timeout=5m
+          -run '^(TestRunServerClipRecoveryBeforeHTTP|TestClipImportVisibleNestedParentsAppearInTree)$'
       - name: Full Go suite with mandatory native Git
         shell: bash
         env:
@@ -119,6 +124,12 @@ jobs:
           cache: true
       - name: Verify tests, race detector, vet, and build
         run: make verify all
+      - name: Repeat concurrent SQLite claim regressions under race detector
+        env:
+          GOMAXPROCS: '2'
+        run: >-
+          go test -race ./internal/repository -count=30 -timeout=5m
+          -run '^(TestClipImportConcurrentClaimAcrossConnections|TestNoteRepositoryIndexReplacementSerializesOtherWrites)$'
       - name: Cross-compile all release platforms
         shell: bash
         run: |
